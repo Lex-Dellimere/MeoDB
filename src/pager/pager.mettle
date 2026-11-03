@@ -89,13 +89,16 @@
 //   name would close a cycle. The pager calls hook_commit(ctx, commit_seq,
 //   time_us) after the journal is gone (the commit is durable), with a
 //   CLOCK_REALTIME timestamp from platform/clock_linux.mettle, and calls
-//   hook_rollback(ctx, ok) on every rollback path (explicit, close and free
-//   with an open transaction; free with unflushed autocommit changes). ok =
-//   false means the outcome is uncertain (the rollback itself failed, or
-//   pages may have reached the disk), so the feed reports a gap instead of
-//   silently dropping. Recovery at open calls nothing: there is no hook before
-//   open returns, and a recovered transaction was never committed, so it was
-//   never published by anyone.
+//   hook_event(ctx, code) for everything else: MEO_HOOK_ROLLBACK on every
+//   successful rollback (explicit, and the implicit ones in close and free
+//   with an open transaction); MEO_HOOK_UNCERTAIN when captured changes are
+//   dropped but the outcome on disk is not known (the rollback itself failed,
+//   free or a failed close-flush dropped autocommit changes an eviction may
+//   already have written), so the feed reports a gap instead of silently
+//   dropping; MEO_HOOK_DETACH once when the pager is closed or freed, after
+//   which the hook is gone. Recovery at open calls nothing: there is no hook
+//   before open returns, and a recovered transaction was never committed, so
+//   it was never published by anyone.
 // * One writer thread per pager. The pager is not thread-safe; the hook runs on
 //   the writer's thread. Only the feed's reader side is meant for other
 //   threads.
@@ -117,6 +120,11 @@ export const MEO_PAGER_CREATE: int32 = 1;
 export const MEO_PAGER_READONLY: int32 = 2;
 export const MEO_MIN_FRAMES: int32 = 8;
 export const MEO_MAX_PAGES: uint32 = 1048576; // 4 GiB at 4096; the phase-1 cap
+
+// hook_event codes (see the header note on the commit hook).
+export const MEO_HOOK_ROLLBACK: int32 = 1;  // the open transaction was undone
+export const MEO_HOOK_UNCERTAIN: int32 = 2; // changes dropped, disk state unknown
+export const MEO_HOOK_DETACH: int32 = 3;    // pager closing; last call
 
 // --- types (PHASE1.md section 5.9) -----------------------------------------
 
@@ -153,7 +161,7 @@ export struct MeoPager {
   // Commit hook (see the header note). 0 = none.
   hook_ctx: rawptr;
   hook_commit: fn(rawptr, uint64, int64) -> void;
-  hook_rollback: fn(rawptr, bool) -> void;
+  hook_event: fn(rawptr, int32) -> void;
   prepared: bool;    // commit_prepare has bumped commit_seq for this txn
   unflushed: bool;   // modified with no transaction open since the last flush
 }
@@ -568,11 +576,12 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
   p->n_frames = 0;
   p->n_dirty = 0;
   p->meta_dirty = false;
-  // The hook's ctx may outlive the pager (a feed is freed separately); a closed
-  // pager never calls it again.
+  // The hook's ctx may outlive the pager (a feed is freed separately): tell it
+  // the pager is going, then never call it again.
+  meo_pager_notify_event(p, MEO_HOOK_DETACH);
   p->hook_ctx = 0;
   p->hook_commit = 0;
-  p->hook_rollback = 0;
+  p->hook_event = 0;
   p->prepared = false;
   p->unflushed = false;
   p->closed = true;
@@ -706,7 +715,7 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
   p->lock = 0;
   p->hook_ctx = 0;
   p->hook_commit = 0;
-  p->hook_rollback = 0;
+  p->hook_event = 0;
   p->prepared = false;
   p->unflushed = false;
   p->meta_dirty = false;
@@ -814,7 +823,9 @@ export fn meo_pager_close(p: MeoPager*) -> int32 {
   // The public flush: unflushed autocommit changes are counted and published
   // here, exactly as an explicit flush would.
   var rc: int32 = meo_pager_flush(p);
-  if (rc != MEO_OK && p->unflushed) { meo_pager_notify_rollback(p, false); }
+  if (rc != MEO_OK && p->unflushed) {
+    meo_pager_notify_event(p, MEO_HOOK_UNCERTAIN);
+  }
   if (rc != MEO_OK && first == MEO_OK) { first = rc; }
   rc = meo_pager_sync(p);
   if (rc != MEO_OK && first == MEO_OK) { first = rc; }
@@ -840,7 +851,7 @@ export fn meo_pager_free(p: MeoPager*) {
     } else if (p->unflushed) {
       // Changes made outside a transaction are dropped here, but an eviction
       // may already have written some of them: the outcome is uncertain.
-      meo_pager_notify_rollback(p, false);
+      meo_pager_notify_event(p, MEO_HOOK_UNCERTAIN);
     }
     meo_pager_release_all(p);
   }
@@ -1483,14 +1494,14 @@ export fn meo_pager_rollback(p: MeoPager*) -> int32 {
   if (rc != MEO_OK) {
     // The file may be half restored and the transaction is still open: the
     // feed must not trust anything it captured, so the outcome is uncertain.
-    meo_pager_notify_rollback(p, false);
+    meo_pager_notify_event(p, MEO_HOOK_UNCERTAIN);
     return meo_pager_fail(p, rc, 0);
   }
   meo_jrn_destroy(j);
   p->journal = 0;
   p->prepared = false;
   p->unflushed = false;
-  meo_pager_notify_rollback(p, true);
+  meo_pager_notify_event(p, MEO_HOOK_ROLLBACK);
   // The cache still holds the new content. Drop every frame and reload page 0
   // from the restored file, which also restores p->meta and p->page_count.
   i = 0;
@@ -1564,35 +1575,44 @@ fn meo_pager_notify_commit(p: MeoPager*) {
   p->hook_commit(p->hook_ctx, p->meta.commit_seq, now_us);
 }
 
-fn meo_pager_notify_rollback(p: MeoPager*, ok: bool) {
-  if (p->hook_rollback == 0) { return; }
-  p->hook_rollback(p->hook_ctx, ok);
+fn meo_pager_notify_event(p: MeoPager*, code: int32) {
+  if (p->hook_event == 0) { return; }
+  p->hook_event(p->hook_ctx, code);
 }
 
-// Install (or, with all three 0, remove) the commit hook. Refused with
-// -MEO_ERR_USAGE while a transaction is open: a hook attached halfway through
+// Install the commit hook (all three arguments non-zero; meo_pager_clear_hook
+// removes it). Refused with -MEO_ERR_USAGE while a transaction is open: a hook attached halfway through
 // would publish a transaction it saw only part of. Answers MEO_OK, or 1 when
 // the pager already holds modifications made outside a transaction that the
 // next flush will count -- the new hook did not see them, so its owner should
-// treat the next commit as a gap. Removing the hook is always allowed.
+// treat the next commit as a gap.
 export fn meo_pager_set_hook(p: MeoPager*, ctx: rawptr,
     meo_commit_cb: fn(rawptr, uint64, int64) -> void,
-    meo_rollback_cb: fn(rawptr, bool) -> void) -> int32 {
+    meo_event_cb: fn(rawptr, int32) -> void) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
-  var removing: bool = ctx == 0 && meo_commit_cb == 0 && meo_rollback_cb == 0;
-  if (removing) {
-    p->hook_ctx = 0;
-    p->hook_commit = 0;
-    p->hook_rollback = 0;
-    return MEO_OK;
+  if (ctx == 0 || meo_commit_cb == 0 || meo_event_cb == 0) {
+    return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
   }
   if (p->journal != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   p->hook_ctx = ctx;
   p->hook_commit = meo_commit_cb;
-  p->hook_rollback = meo_rollback_cb;
+  p->hook_event = meo_event_cb;
   if (p->unflushed) { return 1; }
+  return MEO_OK;
+}
+
+// Remove the commit hook. Always allowed, even mid-transaction (the hook's
+// owner decides what an unfinished transaction means to it). A function
+// pointer parameter cannot be passed a literal 0, hence a separate call.
+export fn meo_pager_clear_hook(p: MeoPager*) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  p->hook_ctx = 0;
+  p->hook_commit = 0;
+  p->hook_event = 0;
   return MEO_OK;
 }
 
