@@ -6,11 +6,11 @@ Milestones in build order. A milestone is done when every exit criterion is chec
 Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback journal.
 - [x] 12 bins green debug + release, 0 warnings (commit 65b533f).
 
-## M1 — Phase-3 gate (run 1)
+## M1 — Phase-3 gate (done)
 The b-tree is proven on top of the journal before SQL depends on it.
-- [ ] `phase3` bin: K1 commit is durable after reopen; K2 rollback restores the exact pre-txn key set and page_count; K3 a forked child dies after the journal fsync, and reopen shows the pre-txn tree; K4 the same crash after a root split, and the tree passes `meo_btn_check` with pre-txn keys; K5 a small journal cap gives `-MEO_ERR_NOSPC`, then rollback leaves the tree intact.
+- [x] `phase3` bin: K1 commit is durable after reopen; K2 rollback restores the exact pre-txn key set and page_count; K3 a forked child dies after the journal fsync, and reopen shows the pre-txn tree; K4 the same crash after a root split, and the tree passes `meo_btn_check` with pre-txn keys; K5 a small journal cap gives `-MEO_ERR_NOSPC`, then rollback leaves the tree intact.
 
-## M2 — Embedded relational core + SQL v1 (run 1)
+## M2 — Embedded relational core + SQL v1
 Layers 3, 4a, 5. Consumer: flux_orm.
 - [ ] B-tree delete; a 20k-op random insert/delete/seek/next run matches a sorted-array oracle at n_frames=8.
 - [ ] CREATE TABLE IF NOT EXISTS, INSERT (multi-row), SELECT with WHERE `=`/`IN`/`IS [NOT] NULL`/`AND`, ORDER BY, LIMIT, OFFSET, UPDATE, DELETE. Data survives close/reopen (AC S3, S5).
