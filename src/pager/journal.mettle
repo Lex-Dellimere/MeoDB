@@ -1,0 +1,549 @@
+// pager/journal: the rollback journal FILE FORMAT, its records, and the
+// append/replay operations over raw bytes.
+//
+// PHASE3.md 3B. A journal is a separate file, `<db>-journal`, holding the
+// before-image of every page a transaction is about to change. It is the undo
+// log that makes an interrupted commit recoverable at the next open.
+//
+// This module deliberately does not import pager/pager.mettle. The pager owns
+// the frame table, the transaction entry points and the before-image hook; the
+// journal owns the file layout, the record append, the checksum and replay.
+// That split is the same one pager/freelist.mettle uses, and it is what keeps
+// the import graph acyclic (pager imports journal, journal imports only
+// error/, format/ and platform/).
+//
+// Layout (PHASE3.md 3B), little-endian through format/bytes.mettle:
+//
+//   header, 64 bytes used:
+//     0   u32  magic        0x4A4B4444
+//     4   u16  version      1
+//     6   u16  reserved     0
+//     8   u32  page_size
+//     12  u32  n_records
+//     16  u64  db_size_pages
+//     24  u32  db_write_version
+//     28  u32  checksum     CRC32 of [0,28) then [64, 64 + n_records*4100)
+//     32  ...zero to 64
+//
+//   record, 4100 bytes, immediately after the header:
+//     0   u32  page_no
+//     4   u8[4096] before-image
+//
+// The checksum is over the header bytes that precede it and the whole record
+// region, in that order. It is maintained incrementally: the record region's
+// CRC is folded in as each record is appended, and jrn_crc_combine prepends the
+// 28 header bytes without re-reading the records. Recomputing the whole region
+// on every append would be O(n^2) I/O on a journal that can hold 65536 records.
+//
+// Capacity (PHASE3.md 3B): the file grows on demand. begin sets the record cap
+// to min(db_size_pages + 64, cap); each append truncates the file to one more
+// record and writes it. The hard cap is DK_JRN_MAX_RECORDS = 65536 (256 MiB at
+// 4100 bytes a record). Exceeding it is -DK_ERR_NOSPC, never a dropped
+// before-image.
+//
+// "First touch only" is tracked by a bitmap of the pages that existed when the
+// transaction began. A per-frame flag would be lost when the frame is evicted
+// and the page is re-read, and a second before-image would then overwrite the
+// state rollback must restore. Pages allocated during the transaction are
+// beyond db_size_pages and need no before-image: rollback restores page_count,
+// so they cease to exist.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../format/page.mettle";
+import "../format/crc32.mettle";
+import "../platform/file.mettle";
+import "../platform/file_linux.mettle" if linux;
+
+// --- constants (PHASE3.md 3B) ----------------------------------------------
+
+export const DK_JRN_MAGIC: uint32 = 0x4A4B4444; // on disk the bytes read "DDKJ"
+export const DK_JRN_VERSION: int32 = 1;
+export const DK_JRN_HDR: int32 = 64;
+export const DK_JRN_RECORD: int32 = 4 + DK_PAGE_SIZE; // 4100
+export const DK_JRN_MAX_RECORDS: int32 = 65536; // 256 MiB of journal
+
+// Header field offsets. Named once; never write a bare number for a field.
+const JRN_OFF_MAGIC: int64 = 0;
+const JRN_OFF_VERSION: int64 = 4;
+const JRN_OFF_RESERVED: int64 = 6;
+const JRN_OFF_PAGE_SIZE: int64 = 8;
+const JRN_OFF_N_RECORDS: int64 = 12;
+const JRN_OFF_DB_PAGES: int64 = 16;
+const JRN_OFF_DB_WV: int64 = 24;
+const JRN_OFF_CHECKSUM: int64 = 28;
+// The checksum covers the header bytes before the checksum field.
+const JRN_CHECKSUM_HDR_BYTES: int64 = 28;
+
+// --- types -----------------------------------------------------------------
+
+export struct DkJournal {
+  file: DkFile;
+  path: string;          // owned copy of "<db>-journal"
+  n_records: int32;
+  cap: int32;            // min(db_size_pages + 64, the pager's cap)
+  db_size_pages: uint32; // the page count rollback restores
+  db_write_version: uint32;
+  rec_crc: uint32;       // CRC of the record region, maintained on append
+  seen: uint8*;          // bitmap: page numbers already journaled
+}
+
+// The create/open failure channel. dk_jrn_create answers 0, so the pager reads
+// the specific code here, exactly as dk_pager_open does for its own failures.
+var dk_jrn_last_err: int32 = DK_OK;
+
+export fn dk_jrn_last_error() -> int32 {
+  return dk_jrn_last_err;
+}
+
+fn jrn_fail(code: int32) -> int32 {
+  dk_jrn_last_err = code;
+  return code;
+}
+
+// --- path ------------------------------------------------------------------
+
+// "<db>-journal", owned by the caller (free(path.chars)). The temporary from
+// the concatenation is bound to a local and returned, which is the documented
+// ownership rule for an interpolated string.
+fn jrn_path(db_path: string) -> string {
+  var out: string = db_path + "-journal";
+  return out;
+}
+
+// --- checksum --------------------------------------------------------------
+
+// One step of the GF(2) matrix used by crc32_combine: mat * vec over GF(2).
+fn jrn_gf2_times(mat: uint32*, vec: uint32) -> uint32 {
+  var sum: uint32 = 0;
+  var v: uint32 = vec;
+  var i: int32 = 0;
+  while (v != 0) {
+    if ((v & (uint32)1) != 0) { sum = sum ^ mat[i]; }
+    v = v >> 1;
+    i += 1;
+  }
+  return sum;
+}
+
+// square = mat * mat over GF(2).
+fn jrn_gf2_square(square: uint32*, mat: uint32*) {
+  var n: int32 = 0;
+  while (n < 32) {
+    square[n] = jrn_gf2_times(mat, mat[n]);
+    n += 1;
+  }
+}
+
+// CRC32(A || B) from CRC32(A), CRC32(B) and len(B). This is zlib's
+// crc32_combine over the same reflected polynomial as format/crc32.mettle, so
+// the journal can keep the record region's CRC and prepend the 28 header bytes
+// without re-reading the records on every append.
+fn jrn_crc_combine(crc1: uint32, crc2: uint32, len2: int64) -> uint32 {
+  if (len2 <= 0) { return crc1; }
+  var odd: uint32[32];
+  var even: uint32[32];
+  // odd = the operator for one zero bit.
+  odd[0] = (uint32)0xEDB88320;
+  var row: uint32 = 1;
+  var n: int32 = 1;
+  while (n < 32) {
+    odd[n] = row;
+    row = row << 1;
+    n += 1;
+  }
+  jrn_gf2_square(&even[0], &odd[0]); // two zero bits
+  jrn_gf2_square(&odd[0], &even[0]); // four zero bits
+  var l: int64 = len2;
+  while (true) {
+    jrn_gf2_square(&even[0], &odd[0]);
+    if ((l & 1) != 0) { crc1 = jrn_gf2_times(&even[0], crc1); }
+    l = l >> 1;
+    if (l == 0) { break; }
+    jrn_gf2_square(&odd[0], &even[0]);
+    if ((l & 1) != 0) { crc1 = jrn_gf2_times(&odd[0], crc1); }
+    l = l >> 1;
+    if (l == 0) { break; }
+  }
+  return crc1 ^ crc2;
+}
+
+// The combine must agree with a direct CRC of the concatenation, or the
+// checksum written on append would not be the checksum replay validates.
+@test fn jrn_combine_matches_direct() -> int32 {
+  var a: uint8[10];
+  var b: uint8[20];
+  var i: int32 = 0;
+  while (i < 10) {
+    a[i] = (uint8)(i * 7 + 3);
+    i += 1;
+  }
+  i = 0;
+  while (i < 20) {
+    b[i] = (uint8)(i * 11 + 5);
+    i += 1;
+  }
+  var ca: uint32 = dk_crc32(&a[0], 10);
+  var cb: uint32 = dk_crc32(&b[0], 20);
+  var combined: uint32 = jrn_crc_combine(ca, cb, 20);
+  var direct: uint32 = dk_crc32_update(ca, &b[0], 20);
+  if (combined != direct) { return 1; }
+  return 0;
+}
+
+// --- header ----------------------------------------------------------------
+
+// Write the 64-byte header for the journal's current n_records and rec_crc.
+// The caller fsyncs; this only makes the bytes reach the file.
+fn jrn_write_header(j: DkJournal*) -> int32 {
+  var hdr: uint8[64];
+  dk_bytes_zero(&hdr[0], 64);
+  dk_put_u32le(&hdr[0], JRN_OFF_MAGIC, DK_JRN_MAGIC);
+  dk_put_u16le(&hdr[0], JRN_OFF_VERSION, (uint16)DK_JRN_VERSION);
+  dk_put_u16le(&hdr[0], JRN_OFF_RESERVED, 0);
+  dk_put_u32le(&hdr[0], JRN_OFF_PAGE_SIZE, (uint32)DK_PAGE_SIZE);
+  dk_put_u32le(&hdr[0], JRN_OFF_N_RECORDS, (uint32)j->n_records);
+  dk_put_u64le(&hdr[0], JRN_OFF_DB_PAGES, (uint64)j->db_size_pages);
+  dk_put_u32le(&hdr[0], JRN_OFF_DB_WV, j->db_write_version);
+  var hcrc: uint32 = dk_crc32(&hdr[0], JRN_CHECKSUM_HDR_BYTES);
+  var full: uint32 = jrn_crc_combine(hcrc, j->rec_crc,
+    (int64)j->n_records * (int64)DK_JRN_RECORD);
+  dk_put_u32le(&hdr[0], JRN_OFF_CHECKSUM, full);
+  return dk_file_write_at(j->file, 0, &hdr[0], (int64)DK_JRN_HDR);
+}
+
+// Read and structurally validate the header of an open journal file. Answers
+// the record count through `out_n`; the checksum is validated separately by
+// jrn_validate_checksum, because that needs the record region.
+fn jrn_read_header(f: DkFile, hdr: uint8*, out_n: int32*) -> int32 {
+  var rc: int32 = dk_file_read_at(f, 0, hdr, (int64)DK_JRN_HDR);
+  if (rc != DK_JRN_HDR) { return -DK_ERR_CORRUPT; }
+  if (dk_get_u32le(hdr, JRN_OFF_MAGIC) != DK_JRN_MAGIC) {
+    return -DK_ERR_CORRUPT;
+  }
+  if ((int32)dk_get_u16le(hdr, JRN_OFF_VERSION) != DK_JRN_VERSION) {
+    return -DK_ERR_CORRUPT;
+  }
+  if (dk_get_u32le(hdr, JRN_OFF_PAGE_SIZE) != (uint32)DK_PAGE_SIZE) {
+    return -DK_ERR_CORRUPT;
+  }
+  var n: int32 = (int32)dk_get_u32le(hdr, JRN_OFF_N_RECORDS);
+  if (n < 0 || n > DK_JRN_MAX_RECORDS) { return -DK_ERR_CORRUPT; }
+  out_n[0] = n;
+  return DK_OK;
+}
+
+// Validate the checksum over [0,28) and the record region. Reads the record
+// region in chunks, so a 256 MiB journal does not need a 256 MiB buffer. A
+// short file (a torn commit) is CORRUPT: replay must not trust n_records past
+// what the file holds.
+fn jrn_validate_checksum(f: DkFile, hdr: uint8*, n: int32) -> int32 {
+  var need: int64 = (int64)n * (int64)DK_JRN_RECORD;
+  var size: int64 = dk_file_size(f);
+  if (size < 0) { return (int32)size; }
+  if (size < (int64)DK_JRN_HDR + need) { return -DK_ERR_CORRUPT; }
+  var hcrc: uint32 = dk_crc32(hdr, JRN_CHECKSUM_HDR_BYTES);
+  var rec_crc: uint32 = 0;
+  var buf: uint8* = malloc((int64)DK_PAGE_SIZE);
+  if (buf == 0) { return -DK_ERR_NOMEM; }
+  var got: int64 = 0;
+  while (got < need) {
+    var chunk: int64 = need - got;
+    if (chunk > (int64)DK_PAGE_SIZE) { chunk = (int64)DK_PAGE_SIZE; }
+    var rc: int32 = dk_file_read_at(f, (int64)DK_JRN_HDR + got, buf, chunk);
+    if (rc != (int32)chunk) {
+      free(buf);
+      return -DK_ERR_CORRUPT;
+    }
+    rec_crc = dk_crc32_update(rec_crc, buf, chunk);
+    got += chunk;
+  }
+  free(buf);
+  var full: uint32 = jrn_crc_combine(hcrc, rec_crc, need);
+  if (full != dk_get_u32le(hdr, JRN_OFF_CHECKSUM)) {
+    return -DK_ERR_CORRUPT;
+  }
+  return DK_OK;
+}
+
+// --- bitmap ----------------------------------------------------------------
+
+fn jrn_seen(j: DkJournal*, page_no: uint32) -> bool {
+  var byte: int64 = (int64)page_no / 8;
+  var bit: int32 = (int32)((int64)page_no % 8);
+  return (j->seen[byte] & (uint8)((uint32)1 << bit)) != 0;
+}
+
+fn jrn_mark_seen(j: DkJournal*, page_no: uint32) {
+  var byte: int64 = (int64)page_no / 8;
+  var bit: int32 = (int32)((int64)page_no % 8);
+  j->seen[byte] = j->seen[byte] | (uint8)((uint32)1 << bit);
+}
+
+// --- create / destroy ------------------------------------------------------
+
+// Start a journal for `db_path`. The file is truncated to its 64-byte header
+// and fsynced before this returns, so the header is durable before any data
+// page can be written. Answers 0 on failure; dk_jrn_last_error has the code.
+export fn dk_jrn_create(db_path: string, db_size_pages: uint32,
+  db_write_version: uint32, cap: int32) -> DkJournal* {
+  dk_jrn_last_err = DK_OK;
+  var jpath: string = jrn_path(db_path);
+  if (jpath.chars == 0) {
+    jrn_fail(-DK_ERR_NOMEM);
+    return 0;
+  }
+  var f: DkFile = dk_file_open(jpath,
+    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  if (!f.is_open) {
+    jrn_fail((int32)(0 - f.handle));
+    free(jpath.chars);
+    return 0;
+  }
+  var j: DkJournal* = new DkJournal;
+  if (j == 0) {
+    dk_file_close(f);
+    free(jpath.chars);
+    jrn_fail(-DK_ERR_NOMEM);
+    return 0;
+  }
+  j->file = f;
+  j->path = jpath;
+  j->n_records = 0;
+  j->rec_crc = 0;
+  j->db_size_pages = db_size_pages;
+  j->db_write_version = db_write_version;
+  // The cap is the smaller of the pager's bound and the pages this database
+  // can possibly need before-images for, plus 64 pages of headroom.
+  var want: int64 = (int64)db_size_pages + 64;
+  var c: int64 = (int64)cap;
+  if (c > want) { c = want; }
+  if (c < 1) { c = 1; }
+  j->cap = (int32)c;
+  var bits: int64 = ((int64)db_size_pages + 7) / 8;
+  if (bits < 1) { bits = 1; }
+  j->seen = malloc(bits);
+  if (j->seen == 0) {
+    dk_file_close(f);
+    free(jpath.chars);
+    free(j);
+    jrn_fail(-DK_ERR_NOMEM);
+    return 0;
+  }
+  dk_bytes_zero(j->seen, bits);
+  var rc: int32 = dk_file_truncate(f, (int64)DK_JRN_HDR);
+  if (rc == DK_OK) { rc = jrn_write_header(j); }
+  if (rc == DK_OK) { rc = dk_file_sync(f); }
+  if (rc != DK_OK) {
+    dk_file_close(f);
+    free(j->seen);
+    free(jpath.chars);
+    free(j);
+    jrn_fail(rc);
+    return 0;
+  }
+  return j;
+}
+
+// Close the journal file, remove it, and free the journal. Used after a
+// successful commit, after a rollback, and as the last-resort cleanup in the
+// pager's destructor. A missing file is not an error here: the journal is
+// already gone, which is the state the caller wanted.
+export fn dk_jrn_destroy(j: DkJournal*) {
+  if (j == 0) { return; }
+  dk_file_close(j->file);
+  dk_file_unlink(j->path);
+  if (j->seen != 0) { free(j->seen); }
+  free(j->path.chars);
+  free(j);
+}
+
+// --- append ----------------------------------------------------------------
+
+// Does `page_no` still need a before-image in this transaction? False for a
+// page allocated after begin (it did not exist, so rollback removes it) and
+// false for a page already journaled (the first before-image is the state to
+// restore). The pager asks this before reading the old page from disk.
+export fn dk_jrn_needs(j: DkJournal*, page_no: uint32) -> bool {
+  if (j == 0) { return false; }
+  if (page_no >= j->db_size_pages) { return false; }
+  return !jrn_seen(j, page_no);
+}
+
+// Append the before-image of `page_no` and fsync the journal. The record is
+// written first, then the header that counts it, then the sync: a crash before
+// the sync leaves a header that does not count the record, and replay ignores
+// it. -DK_ERR_NOSPC when the cap is reached; the before-image is never dropped.
+export fn dk_jrn_append(j: DkJournal*, page_no: uint32, before: uint8*) -> int32 {
+  if (j == 0 || before == 0) { return -DK_ERR_USAGE; }
+  if (page_no >= j->db_size_pages) { return DK_OK; }
+  if (jrn_seen(j, page_no)) { return DK_OK; }
+  if (j->n_records >= j->cap) { return -DK_ERR_NOSPC; }
+  var off: int64 = (int64)DK_JRN_HDR
+    + (int64)j->n_records * (int64)DK_JRN_RECORD;
+  var rc: int32 = dk_file_truncate(j->file, off + (int64)DK_JRN_RECORD);
+  if (rc != DK_OK) { return rc; }
+  var pn: uint8[4];
+  dk_put_u32le(&pn[0], 0, page_no);
+  rc = dk_file_write_at(j->file, off, &pn[0], 4);
+  if (rc != DK_OK) { return rc; }
+  rc = dk_file_write_at(j->file, off + 4, before, (int64)DK_PAGE_SIZE);
+  if (rc != DK_OK) { return rc; }
+  j->rec_crc = dk_crc32_update(j->rec_crc, &pn[0], 4);
+  j->rec_crc = dk_crc32_update(j->rec_crc, before, (int64)DK_PAGE_SIZE);
+  j->n_records += 1;
+  jrn_mark_seen(j, page_no);
+  rc = jrn_write_header(j);
+  if (rc != DK_OK) { return rc; }
+  return dk_file_sync(j->file);
+}
+
+// --- replay ----------------------------------------------------------------
+
+// Write every before-image back to `db_file`, then truncate it to the page
+// count the journal restores. The caller fsyncs and removes the journal. The
+// write is idempotent: replaying the same records twice writes the same bytes.
+fn jrn_replay_records(f: DkFile, db_file: DkFile, n: int32,
+  db_size_pages: uint32) -> int32 {
+  var buf: uint8* = malloc((int64)DK_PAGE_SIZE);
+  if (buf == 0) { return -DK_ERR_NOMEM; }
+  var i: int32 = 0;
+  while (i < n) {
+    var off: int64 = (int64)DK_JRN_HDR + (int64)i * (int64)DK_JRN_RECORD;
+    var pn: uint8[4];
+    var rc: int32 = dk_file_read_at(f, off, &pn[0], 4);
+    if (rc != 4) {
+      free(buf);
+      return -DK_ERR_CORRUPT;
+    }
+    var page_no: uint32 = dk_get_u32le(&pn[0], 0);
+    // A record for a page the restored database does not have is corruption,
+    // not something to write past the end of the file.
+    if (page_no >= db_size_pages) {
+      free(buf);
+      return -DK_ERR_CORRUPT;
+    }
+    rc = dk_file_read_at(f, off + 4, buf, (int64)DK_PAGE_SIZE);
+    if (rc != DK_PAGE_SIZE) {
+      free(buf);
+      return -DK_ERR_CORRUPT;
+    }
+    rc = dk_file_write_at(db_file,
+      (int64)page_no * (int64)DK_PAGE_SIZE, buf, (int64)DK_PAGE_SIZE);
+    if (rc != DK_OK) {
+      free(buf);
+      return rc;
+    }
+    i += 1;
+  }
+  free(buf);
+  return DK_OK;
+}
+
+// Undo a live transaction: write every before-image back, truncate the db to
+// the page count the journal restores, and fsync. The journal is left in place
+// for the caller to destroy, so a crash during rollback is replayed again at
+// the next open (idempotent).
+export fn dk_jrn_rollback(j: DkJournal*, db_file: DkFile) -> int32 {
+  if (j == 0) { return -DK_ERR_USAGE; }
+  var rc: int32 = jrn_replay_records(j->file, db_file, j->n_records,
+    j->db_size_pages);
+  if (rc != DK_OK) { return rc; }
+  rc = dk_file_truncate(db_file,
+    (int64)j->db_size_pages * (int64)DK_PAGE_SIZE);
+  if (rc != DK_OK) { return rc; }
+  return dk_file_sync(db_file);
+}
+
+// --- recovery at open ------------------------------------------------------
+
+// Replay a hot journal for `db_path` into `db_file`, before the pager reads
+// page 0. No journal is DK_OK. A journal with n_records = 0 is a begin that
+// never modified anything: it is removed and ignored. A checksum failure, a
+// torn record region, or a hot journal with no database is -DK_ERR_CORRUPT;
+// nothing is written in those cases. A read-only pager cannot replay and
+// answers -DK_ERR_READONLY.
+export fn dk_jrn_recover(db_path: string, db_file: DkFile,
+  read_only: bool, max_pages: uint32) -> int32 {
+  var jpath: string = jrn_path(db_path);
+  if (jpath.chars == 0) { return -DK_ERR_NOMEM; }
+  var f: DkFile = dk_file_open(jpath, DK_OPEN_READ);
+  if (!f.is_open) {
+    // No journal file: the common case.
+    free(jpath.chars);
+    return DK_OK;
+  }
+  var size: int64 = dk_file_size(f);
+  if (size < 0) {
+    dk_file_close(f);
+    free(jpath.chars);
+    return (int32)size;
+  }
+  if (size == 0) {
+    // begin did not finish writing its header, so no data page was written.
+    dk_file_close(f);
+    var zrc: int32 = dk_file_unlink(jpath);
+    free(jpath.chars);
+    return zrc;
+  }
+  if (size < (int64)DK_JRN_HDR) {
+    dk_file_close(f);
+    free(jpath.chars);
+    return -DK_ERR_CORRUPT;
+  }
+  var hdr: uint8[64];
+  var n: int32 = 0;
+  var rc: int32 = jrn_read_header(f, &hdr[0], &n);
+  if (rc != DK_OK) {
+    dk_file_close(f);
+    free(jpath.chars);
+    return rc;
+  }
+  rc = jrn_validate_checksum(f, &hdr[0], n);
+  if (rc != DK_OK) {
+    dk_file_close(f);
+    free(jpath.chars);
+    return rc;
+  }
+  if (n == 0) {
+    // Not hot: a begin that changed nothing. Remove it and open normally.
+    dk_file_close(f);
+    var nrc: int32 = dk_file_unlink(jpath);
+    free(jpath.chars);
+    return nrc;
+  }
+  if (read_only) {
+    dk_file_close(f);
+    free(jpath.chars);
+    return -DK_ERR_READONLY;
+  }
+  var db_pages: uint32 = (uint32)dk_get_u64le(&hdr[0], JRN_OFF_DB_PAGES);
+  if (db_pages == 0 || db_pages > max_pages) {
+    dk_file_close(f);
+    free(jpath.chars);
+    return -DK_ERR_CORRUPT;
+  }
+  var dsize: int64 = dk_file_size(db_file);
+  if (dsize <= 0) {
+    // A hot journal with no database is not something to guess about.
+    dk_file_close(f);
+    free(jpath.chars);
+    return -DK_ERR_CORRUPT;
+  }
+  rc = jrn_replay_records(f, db_file, n, db_pages);
+  if (rc == DK_OK) {
+    rc = dk_file_truncate(db_file,
+      (int64)db_pages * (int64)DK_PAGE_SIZE);
+  }
+  if (rc == DK_OK) { rc = dk_file_sync(db_file); }
+  dk_file_close(f);
+  if (rc != DK_OK) {
+    free(jpath.chars);
+    return rc;
+  }
+  // The journal is removed last, after the restored database is durable.
+  rc = dk_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}

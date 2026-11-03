@@ -1,0 +1,74 @@
+// format/varint: unsigned LEB128 plus zigzag for signed values.
+//
+// PHASE1.md section 5.6. Not order-preserving: these are for record payloads
+// only, never for b-tree keys. Every failure is a negative DK_ERR_*.
+
+import "../error/status.mettle";
+
+// Number of bytes dk_varint_put will write for `v`: 1..10.
+export fn dk_varint_len(v: uint64) -> int32 {
+  var n: int32 = 1;
+  var x: uint64 = v;
+  while (x >= (uint64)0x80) {
+    x = x >> 7;
+    n += 1;
+  }
+  return n;
+}
+
+// Write `v` as LEB128 into buf[0, cap). Returns the byte count, or
+// -DK_ERR_FULL when the buffer cannot hold the encoding (nothing written).
+export fn dk_varint_put(buf: uint8*, cap: int64, v: uint64) -> int32 {
+  var n: int32 = dk_varint_len(v);
+  if ((int64)n > cap) { return -DK_ERR_FULL; }
+  var x: uint64 = v;
+  var i: int32 = 0;
+  while (i < n) {
+    var b: uint8 = (uint8)(x & (uint64)0x7F);
+    x = x >> 7;
+    if (i < n - 1) {
+      b = b | (uint8)0x80;
+    }
+    buf[(int64)i] = b;
+    i += 1;
+  }
+  return n;
+}
+
+// Read a LEB128 value from buf[0, cap) into *out. Returns the byte count, or
+// -DK_ERR_CORRUPT when the buffer ends before the value terminates or the
+// encoding does not fit a u64. A null `out` is -DK_ERR_USAGE.
+export fn dk_varint_get(buf: uint8*, cap: int64, out: uint64*) -> int32 {
+  if (out == 0) { return -DK_ERR_USAGE; }
+  var value: uint64 = 0;
+  var i: int64 = 0;
+  while (i < cap) {
+    var b: uint8 = buf[i];
+    if (i == 9) {
+      // The tenth byte carries at most the 64th bit; anything else overflows.
+      if (b > (uint8)1) { return -DK_ERR_CORRUPT; }
+    }
+    value = value | (((uint64)(b & (uint8)0x7F)) << (7 * i));
+    if ((b & (uint8)0x80) == 0) {
+      *out = value;
+      return (int32)(i + 1);
+    }
+    i += 1;
+  }
+  return -DK_ERR_CORRUPT;
+}
+
+// Map a signed value to an unsigned one order-preservingly over the zigzag
+// ordering: 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, ...
+export fn dk_zigzag_enc(v: int64) -> uint64 {
+  return (uint64)(((uint64)(v << 1)) ^ ((uint64)(v >> 63)));
+}
+
+// Inverse of dk_zigzag_enc.
+export fn dk_zigzag_dec(v: uint64) -> int64 {
+  if ((v & (uint64)1) == 0) { return (int64)(v >> 1); }
+  // Odd: the value is -(v/2 + 1), written as ~(v/2) to stay in unsigned
+  // arithmetic (the bit pattern of INT64_MIN is the correct answer for
+  // UINT64_MAX).
+  return (int64)(~((uint64)(v >> 1)));
+}

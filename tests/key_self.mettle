@@ -1,0 +1,451 @@
+// key_self: the key encoding's own tests -- PHASE2.md 2B and E3.
+//
+// The b-tree sorts keys with dk_key_compare, a byte comparison, so these cases
+// assert byte order and exact bytes, not just that an encoding round-trips: an
+// encoder and a comparator can agree with each other and both be wrong.
+//
+//   k_int_order    E3: -2^63 .. 2^63-1 in ascending order under
+//                  dk_key_compare, both directions per pair. A plain
+//                  big-endian uint64 fails here: it puts -1 above 0.
+//   k_int_bytes    the sign flip at the byte level: -1 is 0x7F.., 0 is 0x80..
+//                  and 1 is 0x80..01, so a forgotten high bit is visible in the
+//                  bytes and not merely inferred from a comparison.
+//   k_text_order   "" < "a" < "ab" < "b", plus "ab" < "abc" and "A" < "a". A
+//                  comparator that compares lengths first puts "b" before
+//                  "ab", which is the bug E3 names.
+//   k_tags         each field starts with its DK_KEY_* tag, except the rowid,
+//                  which starts with its payload.
+//   k_composite    fields concatenate in index order: (1,5) < (1,6) < (2,0)
+//                  and (1, max) < (2, min). No separators are involved.
+//   k_cap_full     a cap one byte short is -DK_ERR_FULL and writes nothing: an
+//                  encoder that writes the tag before checking capacity, or
+//                  that accepts an exact-fit buffer and overwrites, is caught.
+//
+// Run from the repo root:
+//   ./tools/mettle --build tests/key_self.mettle -o build/laneB/key_self
+//   ./build/laneB/key_self
+//
+// Every case prints PASS, a failure prints FAIL <label> and the exit status is
+// non-zero if anything failed.
+
+import "std/io";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/types/key.mettle";
+
+const K_BUFSZ: int32 = 64;
+
+var k_failures: int32 = 0;
+
+// Report a named check. Returns the condition so a case can stop at the first
+// check it cannot continue past.
+fn k_ok(cond: bool, label: string) -> bool {
+  if (cond) { return true; }
+  println("FAIL {label}");
+  k_failures += 1;
+  return false;
+}
+
+fn k_i32(got: int32, want: int32, label: string) -> bool {
+  if (got == want) { return true; }
+  println("FAIL {label}: expected {want}, got {got}");
+  k_failures += 1;
+  return false;
+}
+
+fn k_byte(got: uint8, want: uint8, label: string) -> bool {
+  if (got == want) { return true; }
+  println("FAIL {label}: expected {(int64)want}, got {(int64)got}");
+  k_failures += 1;
+  return false;
+}
+
+// a sorts strictly before b, and b strictly after a. Both directions, because
+// a comparator that always answers -1 passes a one-directional pair.
+fn k_order(a: uint8*, an: int32, b: uint8*, bn: int32, label: string) -> bool {
+  var c: int32 = dk_key_compare(a, an, b, bn);
+  if (c != -1) {
+    println("FAIL {label}: expected -1, got {c}");
+    k_failures += 1;
+    return false;
+  }
+  var d: int32 = dk_key_compare(b, bn, a, an);
+  if (d != 1) {
+    println("FAIL {label}: expected 1 in reverse, got {d}");
+    k_failures += 1;
+    return false;
+  }
+  return true;
+}
+
+fn k_same(a: uint8*, an: int32, b: uint8*, bn: int32, label: string) -> bool {
+  var c: int32 = dk_key_compare(a, an, b, bn);
+  if (c == 0) { return true; }
+  println("FAIL {label}: expected 0, got {c}");
+  k_failures += 1;
+  return false;
+}
+
+// Encode two tagged int64 fields into one key, the way a composite index does.
+fn k_pair(buf: uint8*, cap: int32, first: int64, second: int64) -> int32 {
+  var n: int32 = dk_key_int(buf, cap, first);
+  if (n < 0) { return n; }
+  var m: int32 = dk_key_int(buf + (int64)n, cap - n, second);
+  if (m < 0) { return m; }
+  return n + m;
+}
+
+// Encode a tagged int64 field followed by an untagged rowid field.
+fn k_int_rowid(buf: uint8*, cap: int32, v: int64, rowid: int64) -> int32 {
+  var n: int32 = dk_key_int(buf, cap, v);
+  if (n < 0) { return n; }
+  var m: int32 = dk_key_rowid(buf + (int64)n, cap - n, rowid);
+  if (m < 0) { return m; }
+  return n + m;
+}
+
+// Encode a text key into a fresh buffer and compare it against another: the
+// text ordering cases are pairs of strings, so the buffers are local.
+fn k_order_text(sa: string, sb: string, label: string) -> bool {
+  var a: uint8[K_BUFSZ];
+  var b: uint8[K_BUFSZ];
+  var na: int32 = dk_key_text(&a[0], K_BUFSZ, sa);
+  var nb: int32 = dk_key_text(&b[0], K_BUFSZ, sb);
+  if (!k_ok(na > 0, "text: first key encodes")) { return false; }
+  if (!k_ok(nb > 0, "text: second key encodes")) { return false; }
+  return k_order(&a[0], na, &b[0], nb, label);
+}
+
+// Two strings encode to the same key.
+fn k_same_text(sa: string, sb: string, label: string) -> bool {
+  var a: uint8[K_BUFSZ];
+  var b: uint8[K_BUFSZ];
+  var na: int32 = dk_key_text(&a[0], K_BUFSZ, sa);
+  var nb: int32 = dk_key_text(&b[0], K_BUFSZ, sb);
+  if (!k_ok(na > 0, "text: first key encodes")) { return false; }
+  if (!k_ok(nb > 0, "text: second key encodes")) { return false; }
+  return k_same(&a[0], na, &b[0], nb, label);
+}
+
+// Assert the 9 bytes of dk_key_int(v) against a hand-written big-endian
+// payload. The expectation never comes from the encoder.
+fn k_int_payload(v: int64, want: uint8*, label: string) -> bool {
+  var k: uint8[K_BUFSZ];
+  var n: int32 = dk_key_int(&k[0], K_BUFSZ, v);
+  if (!k_i32(n, 9, "payload: 9 bytes")) { return false; }
+  if (!k_byte(k[0], (uint8)DK_KEY_INT, "payload: int tag")) { return false; }
+  var i: int32 = 0;
+  while (i < 8) {
+    if (!k_byte(k[1 + i], want[i], label)) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+// --- the cases -------------------------------------------------------------
+
+fn k_int_order() -> int32 {
+  var a: uint8[K_BUFSZ];
+  var b: uint8[K_BUFSZ];
+  var minv: int64 = (int64)((uint64)1 << 63);
+  var maxv: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
+  var vals: int64[7] = [ minv, (int64)(-1000), (int64)(-1), (int64)0,
+                         (int64)1, (int64)1000, maxv ];
+
+  var i: int32 = 0;
+  while (i < 7) {
+    if (!k_i32(dk_key_int(&a[0], K_BUFSZ, vals[i]), 9, "int: encodes 9 bytes")) {
+      return 1;
+    }
+    i += 1;
+  }
+
+  // Adjacent pairs, ascending: -2^63 < -1000 < -1 < 0 < 1 < 1000 < 2^63-1.
+  i = 0;
+  while (i < 6) {
+    var na: int32 = dk_key_int(&a[0], K_BUFSZ, vals[i]);
+    var nb: int32 = dk_key_int(&b[0], K_BUFSZ, vals[i + 1]);
+    if (!k_order(&a[0], na, &b[0], nb, "E3: signed int order")) {
+      println("     pair {i}: {vals[i]} then {vals[i + 1]}");
+      return 1;
+    }
+    i += 1;
+  }
+
+  // The extremes against each other, not only their neighbours.
+  var nlo: int32 = dk_key_int(&a[0], K_BUFSZ, minv);
+  var nhi: int32 = dk_key_int(&b[0], K_BUFSZ, maxv);
+  if (!k_order(&a[0], nlo, &b[0], nhi, "E3: int64 min < int64 max")) {
+    return 1;
+  }
+  println("PASS k_int_order");
+  return 0;
+}
+
+fn k_int_bytes() -> int32 {
+  var minv: int64 = (int64)((uint64)1 << 63);
+  var maxv: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
+
+  // -2^63 flips to 0, so all eight payload bytes are zero.
+  var w_min: uint8[8] = [ (uint8)0x00, (uint8)0x00, (uint8)0x00, (uint8)0x00,
+                          (uint8)0x00, (uint8)0x00, (uint8)0x00, (uint8)0x00 ];
+  if (!k_int_payload(minv, &w_min[0], "bytes: -2^63 payload")) { return 1; }
+
+  // -1 flips to 0x7FFF..FF: just below zero's 0x8000..00.
+  var w_neg1: uint8[8] = [ (uint8)0x7F, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF,
+                           (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF ];
+  if (!k_int_payload((int64)(-1), &w_neg1[0], "bytes: -1 payload")) { return 1; }
+
+  // -2 is one below -1, and the difference is in the last payload byte.
+  var w_neg2: uint8[8] = [ (uint8)0x7F, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF,
+                           (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFE ];
+  if (!k_int_payload((int64)(-2), &w_neg2[0], "bytes: -2 payload")) { return 1; }
+
+  var w_zero: uint8[8] = [ (uint8)0x80, (uint8)0x00, (uint8)0x00, (uint8)0x00,
+                           (uint8)0x00, (uint8)0x00, (uint8)0x00, (uint8)0x00 ];
+  if (!k_int_payload((int64)0, &w_zero[0], "bytes: 0 payload")) { return 1; }
+
+  // 1 is big-endian: the 0x01 is the *last* byte of the payload.
+  var w_one: uint8[8] = [ (uint8)0x80, (uint8)0x00, (uint8)0x00, (uint8)0x00,
+                          (uint8)0x00, (uint8)0x00, (uint8)0x00, (uint8)0x01 ];
+  if (!k_int_payload((int64)1, &w_one[0], "bytes: 1 payload")) { return 1; }
+
+  // 2^63-1 flips to all ones.
+  var w_max: uint8[8] = [ (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF,
+                          (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF ];
+  if (!k_int_payload(maxv, &w_max[0], "bytes: 2^63-1 payload")) { return 1; }
+
+  println("PASS k_int_bytes");
+  return 0;
+}
+
+fn k_text_order() -> int32 {
+  // E3: "" < "a" < "ab" < "b".
+  if (!k_order_text("", "a", "E3: text empty < a")) { return 1; }
+  if (!k_order_text("a", "ab", "E3: text a < ab")) { return 1; }
+  if (!k_order_text("ab", "b", "E3: text ab < b")) { return 1; }
+  // The prefix rule again, one byte deeper.
+  if (!k_order_text("ab", "abc", "text: prefix sorts first")) { return 1; }
+  // Raw bytes, no case folding: 0x41 before 0x61.
+  if (!k_order_text("A", "a", "text: raw byte order")) { return 1; }
+  if (!k_same_text("b", "b", "text: equal strings")) { return 1; }
+
+  // The encoding is the tag plus the untouched bytes: no terminator, no length
+  // prefix, so "ab" is exactly three bytes.
+  var t: uint8[K_BUFSZ];
+  var n: int32 = dk_key_text(&t[0], K_BUFSZ, "ab");
+  if (!k_i32(n, 3, "text: 1 + strlen bytes")) { return 1; }
+  if (!k_byte(t[0], (uint8)DK_KEY_TEXT, "text: text tag")) { return 1; }
+  if (!k_byte(t[1], (uint8)0x61, "text: first raw byte")) { return 1; }
+  if (!k_byte(t[2], (uint8)0x62, "text: second raw byte")) { return 1; }
+
+  println("PASS k_text_order");
+  return 0;
+}
+
+fn k_tags() -> int32 {
+  var k: uint8[K_BUFSZ];
+
+  // Tagged fields: one tag byte then the payload.
+  if (!k_i32(dk_key_int(&k[0], K_BUFSZ, (int64)7), 9, "tags: int is tag + 8")) {
+    return 1;
+  }
+  if (!k_byte(k[0], (uint8)DK_KEY_INT, "tags: int tag first")) { return 1; }
+
+  if (!k_i32(dk_key_text(&k[0], K_BUFSZ, "x"), 2, "tags: text is tag + 1")) {
+    return 1;
+  }
+  if (!k_byte(k[0], (uint8)DK_KEY_TEXT, "tags: text tag")) { return 1; }
+
+  if (!k_i32(dk_key_null(&k[0], K_BUFSZ), 1, "tags: null is a bare tag")) {
+    return 1;
+  }
+  if (!k_byte(k[0], (uint8)DK_KEY_NULL, "tags: null tag")) { return 1; }
+
+  // The rowid field carries no tag: rowid 0 starts with its payload's 0x80,
+  // and 8 bytes come back, not 9.
+  if (!k_i32(dk_key_rowid(&k[0], K_BUFSZ, (int64)0), 8, "tags: rowid has no tag")) {
+    return 1;
+  }
+  if (!k_byte(k[0], (uint8)0x80, "tags: rowid payload at offset 0")) { return 1; }
+
+  println("PASS k_tags");
+  return 0;
+}
+
+fn k_composite() -> int32 {
+  var a: uint8[K_BUFSZ];
+  var b: uint8[K_BUFSZ];
+
+  // Two tagged fields concatenate: 9 + 9 bytes.
+  var na: int32 = k_pair(&a[0], K_BUFSZ, (int64)1, (int64)5);
+  if (!k_i32(na, 18, "composite: two int fields")) { return 1; }
+
+  var nb: int32 = k_pair(&b[0], K_BUFSZ, (int64)1, (int64)6);
+  if (!k_order(&a[0], na, &b[0], nb, "composite: (1,5) < (1,6)")) { return 1; }
+
+  var nc: int32 = k_pair(&b[0], K_BUFSZ, (int64)2, (int64)0);
+  if (!k_order(&a[0], na, &b[0], nc, "composite: (1,5) < (2,0)")) { return 1; }
+
+  // The same pair in another buffer compares equal: the encoding is canonical.
+  var nd: int32 = k_pair(&b[0], K_BUFSZ, (int64)1, (int64)5);
+  if (!k_same(&a[0], na, &b[0], nd, "composite: (1,5) == (1,5)")) { return 1; }
+
+  // The first field decides even when the second is at its extreme.
+  var minv: int64 = (int64)((uint64)1 << 63);
+  var maxv: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
+  var ne: int32 = k_pair(&a[0], K_BUFSZ, (int64)1, maxv);
+  var nf: int32 = k_pair(&b[0], K_BUFSZ, (int64)2, minv);
+  if (!k_order(&a[0], ne, &b[0], nf, "composite: (1,max) < (2,min)")) {
+    return 1;
+  }
+
+  // An index key is fields then the rowid: 9 + 8 bytes, and the rowid only
+  // decides after the fields agree.
+  var ng: int32 = k_int_rowid(&a[0], K_BUFSZ, (int64)1, (int64)5);
+  if (!k_i32(ng, 17, "composite: int + rowid is 9 + 8")) { return 1; }
+  var nh: int32 = k_int_rowid(&b[0], K_BUFSZ, (int64)1, (int64)6);
+  if (!k_order(&a[0], ng, &b[0], nh, "composite: (1,r5) < (1,r6)")) { return 1; }
+  var ni: int32 = k_int_rowid(&b[0], K_BUFSZ, (int64)2, (int64)0);
+  if (!k_order(&a[0], ng, &b[0], ni, "composite: (1,r5) < (2,r0)")) { return 1; }
+
+  println("PASS k_composite");
+  return 0;
+}
+
+fn k_cap_full() -> int32 {
+  var buf: uint8[K_BUFSZ];
+
+  // An int key is 9 bytes, so cap 8 is exactly one byte short. Nothing may be
+  // written: the tag comes after the capacity check, not before it.
+  dk_bytes_zero(&buf[0], K_BUFSZ);
+  if (!k_i32(dk_key_int(&buf[0], 8, (int64)12345), -DK_ERR_FULL,
+             "cap: int cap 8 is FULL")) {
+    return 1;
+  }
+  if (!k_byte(buf[0], (uint8)0, "cap: int FULL wrote nothing")) { return 1; }
+  if (!k_i32(dk_key_int(&buf[0], 9, (int64)12345), 9, "cap: int cap 9 fits")) {
+    return 1;
+  }
+
+  // A text key is 1 + strlen, so cap 1 cannot hold "a" (2 bytes).
+  dk_bytes_zero(&buf[0], K_BUFSZ);
+  if (!k_i32(dk_key_text(&buf[0], 1, "a"), -DK_ERR_FULL,
+             "cap: text cap 1 is FULL")) {
+    return 1;
+  }
+  if (!k_byte(buf[0], (uint8)0, "cap: text FULL wrote nothing")) { return 1; }
+  if (!k_i32(dk_key_text(&buf[0], 2, "a"), 2, "cap: text cap 2 fits")) {
+    return 1;
+  }
+
+  // The empty string still needs the tag byte.
+  dk_bytes_zero(&buf[0], K_BUFSZ);
+  if (!k_i32(dk_key_text(&buf[0], 0, ""), -DK_ERR_FULL,
+             "cap: empty text cap 0 is FULL")) {
+    return 1;
+  }
+  if (!k_i32(dk_key_text(&buf[0], 1, ""), 1, "cap: empty text cap 1 fits")) {
+    return 1;
+  }
+
+  // A null key is the tag alone.
+  dk_bytes_zero(&buf[0], K_BUFSZ);
+  if (!k_i32(dk_key_null(&buf[0], 0), -DK_ERR_FULL, "cap: null cap 0 is FULL")) {
+    return 1;
+  }
+  if (!k_byte(buf[0], (uint8)0, "cap: null FULL wrote nothing")) { return 1; }
+  if (!k_i32(dk_key_null(&buf[0], 1), 1, "cap: null cap 1 fits")) { return 1; }
+
+  // A rowid is 8 bytes with no tag.
+  dk_bytes_zero(&buf[0], K_BUFSZ);
+  if (!k_i32(dk_key_rowid(&buf[0], 7, (int64)0), -DK_ERR_FULL,
+             "cap: rowid cap 7 is FULL")) {
+    return 1;
+  }
+  if (!k_byte(buf[0], (uint8)0, "cap: rowid FULL wrote nothing")) { return 1; }
+  if (!k_i32(dk_key_rowid(&buf[0], 8, (int64)0), 8, "cap: rowid cap 8 fits")) {
+    return 1;
+  }
+
+  // A bad buffer argument is a usage error, not a capacity error: the caller
+  // must not write through a null pointer.
+  if (!k_i32(dk_key_int(0, 9, (int64)0), -DK_ERR_USAGE,
+             "cap: null buffer is USAGE")) {
+    return 1;
+  }
+  if (!k_i32(dk_key_int(&buf[0], -1, (int64)0), -DK_ERR_USAGE,
+             "cap: negative cap is USAGE")) {
+    return 1;
+  }
+
+  println("PASS k_cap_full");
+  return 0;
+}
+
+// --- interpreter @test -----------------------------------------------------
+//
+// main() proves the byte layout; these run under `mettle test` so the shared
+// gate can never report "0 checks passed" for this lane. Pure logic only: no
+// println and no runtime string helpers.
+
+@test fn k_key_tags_match_the_contract() -> int64 {
+  assert_eq(DK_KEY_INT, 1);
+  assert_eq(DK_KEY_TEXT, 2);
+  assert_eq(DK_KEY_NULL, 3);
+  assert_eq(DK_KEY_ROWID, 4);
+  return 0;
+}
+
+@test fn k_signed_int_order_in_the_interpreter() -> int64 {
+  var lo: uint8[16];
+  var hi: uint8[16];
+
+  // -1 is 0x7F.., not 0xFF..: the sign flip, then big-endian.
+  var n: int32 = dk_key_int(&lo[0], 16, (int64)-1);
+  assert_eq((int64)n, 9);
+  assert_eq((int64)lo[0], DK_KEY_INT);
+  assert_eq((int64)lo[1], 0x7F);
+  assert_eq((int64)lo[8], 0xFF);
+
+  // 0 is 0x80..00 and 1 is 0x80..01, so 1 is above 0.
+  n = dk_key_int(&hi[0], 16, (int64)0);
+  assert_eq((int64)n, 9);
+  assert_eq((int64)hi[1], 0x80);
+  assert_eq((int64)hi[8], 0x00);
+  assert_eq((int64)dk_key_compare(&lo[0], n, &hi[0], n), -1);
+
+  n = dk_key_int(&hi[0], 16, (int64)1);
+  assert_eq((int64)n, 9);
+  assert_eq((int64)hi[1], 0x80);
+  assert_eq((int64)hi[8], 0x01);
+  assert_eq((int64)dk_key_compare(&hi[0], n, &lo[0], n), 1);
+  return 0;
+}
+
+@test fn k_text_prefix_in_the_interpreter() -> int64 {
+  var a: uint8[16];
+  var b: uint8[16];
+  var na: int32 = dk_key_text(&a[0], 16, "ab");
+  var nb: int32 = dk_key_text(&b[0], 16, "b");
+  assert_eq((int64)na, 3);
+  assert_eq((int64)nb, 2);
+  // "ab" < "b" by bytes; a comparator that compared lengths first reverses it.
+  assert_eq((int64)dk_key_compare(&a[0], na, &b[0], nb), -1);
+  return 0;
+}
+
+fn main() -> int32 {
+  if (k_int_order() != 0) { return 1; }
+  if (k_int_bytes() != 0) { return 1; }
+  if (k_text_order() != 0) { return 1; }
+  if (k_tags() != 0) { return 1; }
+  if (k_composite() != 0) { return 1; }
+  if (k_cap_full() != 0) { return 1; }
+  if (k_failures != 0) {
+    println("FAIL key_self: {k_failures} check(s) failed");
+    return 1;
+  }
+  println("PASS key_self");
+  return 0;
+}

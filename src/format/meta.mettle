@@ -1,0 +1,125 @@
+// format/meta: page 0's body — magic, version, page size, page count, roots,
+// and the transaction/write-version counters.
+//
+// PHASE1.md sections 4 and 5.8. The body starts at offset 16 and the free area
+// of the meta page starts at DK_META_BODY (128). As everywhere in format/, the
+// page is explicit encode/decode at fixed offsets; no struct is overlaid.
+
+import "../error/status.mettle";
+import "bytes.mettle";
+import "page.mettle";
+
+export const DK_ROOT_FREELIST: int32 = 0;
+export const DK_ROOT_CATALOG: int32 = 1;
+export const DK_ROOT_BTREE: int32 = 2;
+export const DK_ROOT_COUNT: int32 = 3;
+
+// Meta body offsets, in absolute page bytes.
+const META_OFF_MAGIC: int64 = 16;
+const META_OFF_VERSION: int64 = 20;
+const META_OFF_PAGE_SIZE: int64 = 22;
+const META_OFF_PAGE_COUNT: int64 = 24;
+const META_OFF_FREELIST_ROOT: int64 = 28;
+const META_OFF_CATALOG_ROOT: int64 = 32;
+const META_OFF_BTREE_ROOT: int64 = 36;
+const META_OFF_TXN_ID: int64 = 40;
+const META_OFF_WRITE_VERSION: int64 = 48;
+const META_OFF_RESERVED: int64 = 56;
+const META_RESERVED_BYTES: int64 = (int64)DK_META_BODY - META_OFF_RESERVED;
+
+export struct DkMeta {
+  valid: bool;
+  magic: uint32;
+  version: int32;
+  page_size: int32;
+  page_count: uint32;
+  freelist_root: uint32;
+  catalog_root: uint32;
+  btree_root: uint32;
+  txn_id: uint64;
+  write_version: uint64;
+}
+
+// Decode the meta body. A bad magic, version or page size returns a zeroed
+// DkMeta with valid = false; it is not an error, because the pager decides
+// what a bad header means (dk_meta_check is the function that fails).
+export fn dk_meta_read(p: uint8*) -> DkMeta {
+  var bad: DkMeta;
+  var magic: uint32 = dk_get_u32le(p, META_OFF_MAGIC);
+  var version: int32 = (int32)dk_get_u16le(p, META_OFF_VERSION);
+  var page_size: int32 = (int32)dk_get_u16le(p, META_OFF_PAGE_SIZE);
+  if (magic != DK_MAGIC) { return bad; }
+  if (version != DK_FORMAT_VERSION) { return bad; }
+  if (page_size != DK_PAGE_SIZE) { return bad; }
+
+  var m: DkMeta;
+  m.valid = true;
+  m.magic = magic;
+  m.version = version;
+  m.page_size = page_size;
+  m.page_count = dk_get_u32le(p, META_OFF_PAGE_COUNT);
+  m.freelist_root = dk_get_u32le(p, META_OFF_FREELIST_ROOT);
+  m.catalog_root = dk_get_u32le(p, META_OFF_CATALOG_ROOT);
+  m.btree_root = dk_get_u32le(p, META_OFF_BTREE_ROOT);
+  m.txn_id = dk_get_u64le(p, META_OFF_TXN_ID);
+  m.write_version = dk_get_u64le(p, META_OFF_WRITE_VERSION);
+  return m;
+}
+
+// Validate page 0 as a database header. Magic is tested first, so a foreign
+// file is NOT_A_DB even when its bytes would also fail the structural check;
+// then a known-magic file with a version or page size we do not speak is
+// VERSION; then the page structure itself is CORRUPT (PHASE1.md section 7).
+export fn dk_meta_check(p: uint8*) -> int32 {
+  if (dk_get_u32le(p, META_OFF_MAGIC) != DK_MAGIC) {
+    return -DK_ERR_NOT_A_DB;
+  }
+  if ((int32)dk_get_u16le(p, META_OFF_VERSION) != DK_FORMAT_VERSION) {
+    return -DK_ERR_VERSION;
+  }
+  if ((int32)dk_get_u16le(p, META_OFF_PAGE_SIZE) != DK_PAGE_SIZE) {
+    return -DK_ERR_VERSION;
+  }
+  if (dk_page_type(p) != DK_PAGE_META) { return -DK_ERR_CORRUPT; }
+  if (dk_page_check(p) != DK_OK) { return -DK_ERR_CORRUPT; }
+  return DK_OK;
+}
+
+// Write the body and reseal. The page must already carry the meta header
+// (dk_page_init with DK_PAGE_META); this function owns the body, not the
+// header.
+export fn dk_meta_write(p: uint8*, m: DkMeta) -> int32 {
+  dk_put_u32le(p, META_OFF_MAGIC, m.magic);
+  dk_put_u16le(p, META_OFF_VERSION, (uint16)m.version);
+  dk_put_u16le(p, META_OFF_PAGE_SIZE, (uint16)m.page_size);
+  dk_put_u32le(p, META_OFF_PAGE_COUNT, m.page_count);
+  dk_put_u32le(p, META_OFF_FREELIST_ROOT, m.freelist_root);
+  dk_put_u32le(p, META_OFF_CATALOG_ROOT, m.catalog_root);
+  dk_put_u32le(p, META_OFF_BTREE_ROOT, m.btree_root);
+  dk_put_u64le(p, META_OFF_TXN_ID, m.txn_id);
+  dk_put_u64le(p, META_OFF_WRITE_VERSION, m.write_version);
+  dk_bytes_zero(p + META_OFF_RESERVED, META_RESERVED_BYTES);
+  dk_page_seal(p);
+  return DK_OK;
+}
+
+// Root page number for a DK_ROOT_* slot; 0 means "none". An unknown slot also
+// answers 0, the same as a valid-but-empty root.
+export fn dk_meta_root(m: DkMeta, which: int32) -> uint32 {
+  switch (which) {
+    case DK_ROOT_FREELIST: { return m.freelist_root; }
+    case DK_ROOT_CATALOG: { return m.catalog_root; }
+    case DK_ROOT_BTREE: { return m.btree_root; }
+  }
+  return 0;
+}
+
+// Set a DK_ROOT_* slot. An out-of-range slot is -DK_ERR_RANGE.
+export fn dk_meta_set_root(m: DkMeta*, which: int32, page_no: uint32) -> int32 {
+  switch (which) {
+    case DK_ROOT_FREELIST: { m->freelist_root = page_no; return DK_OK; }
+    case DK_ROOT_CATALOG: { m->catalog_root = page_no; return DK_OK; }
+    case DK_ROOT_BTREE: { m->btree_root = page_no; return DK_OK; }
+  }
+  return -DK_ERR_RANGE;
+}

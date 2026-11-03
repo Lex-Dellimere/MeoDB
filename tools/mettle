@@ -1,0 +1,32 @@
+#!/bin/sh
+# Compiler locator for dacor.
+#
+#   ./tools/mettle --build src/main.mettle -o build/dacor
+#   ./tools/mettle test src/main.mettle
+#
+# Resolution: $METTLE, then the head build in the sibling raize/ tree, then
+# ~/.mbuild's v0.17.0 release (too old for std/collections|hash|encoding).
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ -n "${METTLE:-}" ]; then
+  exec "$METTLE" "$@"
+fi
+
+head="$here/../raize/mettle-build/bin/mettle"
+if [ -x "$head" ]; then
+  exec "$head" "$@"
+fi
+
+rel="$HOME/.mbuild/toolchains/v0.17.0/linux/bin/mettle"
+if [ -x "$rel" ]; then
+  echo "warning: using the v0.17.0 release compiler; std/collections, std/hash" >&2
+  echo "         and std/encoding are unavailable. Build head into ../raize or" >&2
+  echo "         set \$METTLE. See NOTES.md section 1." >&2
+  exec "$rel" "$@"
+fi
+
+echo "error: no Mettle compiler found. Set \$METTLE, or build one:" >&2
+echo "  cp -r ../Mettle/{src,include,stdlib,Makefile} .compiler/ && make -C .compiler -j" >&2
+echo "  export METTLE=\$PWD/.compiler/bin/mettle" >&2
+exit 127

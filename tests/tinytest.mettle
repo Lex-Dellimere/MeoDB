@@ -1,0 +1,77 @@
+// tinytest: the reporting layer for the phase-1 integration suite.
+//
+// The phase-1 tests are programs, not @test functions (PHASE1.md section 8):
+// they need real files, a 4096-byte page on the heap and a predictable working
+// directory, none of which the compile-time interpreter gives them. This module
+// is only the reporting half; tests/phase1.mettle owns the cases.
+//
+// Usage, one check per line, short-circuiting the case at the first failure:
+//
+//   if (!dk_t_check_i64(dk_page_free_end(p), 3989, "t1: free_end")) { return 1; }
+//
+// A failing check prints "FAIL <case>: <detail>" and counts itself. The case
+// prints "PASS <name>" when it runs to the end, and dk_t_report maps the
+// failure count to an exit code. Nothing here allocates memory or touches a
+// file, and nothing here can throw: every check reports and returns.
+
+import "std/io";
+
+// Checks that failed since the process started. Only dk_t_report reads it.
+var dk_t_failures: int32 = 0;
+
+// `cond` must be true. Returns true on pass so a case can stop at the first
+// failure; a caller that ignores the result still leaves an exit code behind.
+export fn dk_t_check(cond: bool, name: string) -> bool {
+  if (cond) { return true; }
+  println("FAIL {name}: expected true");
+  dk_t_failures += 1;
+  return false;
+}
+
+// `cond` must be false. Separate from dk_t_check on purpose: "expected false"
+// in a message is the difference between a broken predicate and a broken
+// test, and this is the check for "an error was refused".
+export fn dk_t_check_false(cond: bool, name: string) -> bool {
+  if (!cond) { return true; }
+  println("FAIL {name}: expected false");
+  dk_t_failures += 1;
+  return false;
+}
+
+// a == b. Both sides are printed when they differ, so the failure names the
+// value that moved, not just the expression.
+export fn dk_t_check_i64(a: int64, b: int64, name: string) -> bool {
+  if (a == b) { return true; }
+  println("FAIL {name}: expected {b}, got {a}");
+  dk_t_failures += 1;
+  return false;
+}
+
+// The first differing byte of a and b over n bytes, reported with its index
+// and both values: a page round-trip that loses one byte in the middle must
+// name the byte, because "pages differ" is not a bug report.
+export fn dk_t_check_bytes(a: uint8*, b: uint8*, n: int64, name: string) -> bool {
+  if (a == 0 || b == 0) {
+    println("FAIL {name}: null buffer");
+    dk_t_failures += 1;
+    return false;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    if (a[i] != b[i]) {
+      println("FAIL {name}: byte {i}: expected {(int64)b[i]}, got {(int64)a[i]}");
+      dk_t_failures += 1;
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The exit code: 0 when every check passed, 1 when any check failed. Called
+// once, at the end of main, on both the success and the failure path.
+export fn dk_t_report() -> int32 {
+  if (dk_t_failures == 0) { return 0; }
+  println("{dk_t_failures} check(s) failed");
+  return 1;
+}

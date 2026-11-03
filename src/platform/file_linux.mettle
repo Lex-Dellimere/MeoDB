@@ -1,0 +1,219 @@
+// platform/file_linux: the Linux x86-64 backend for the dk_file_* contract in
+// file.mettle. Every byte here reaches the kernel through a raw syscall; there
+// is no libc, no stdio and no cursor: reads and writes are pread64/pwrite64 so
+// they never move the descriptor's seek offset.
+//
+// No errno escapes this file. A syscall's negative result is consumed by
+// dk_file_err and becomes -DK_ERR_IO / -DK_ERR_NOMEM / -DK_ERR_USAGE; callers
+// above the platform layer only ever see those three codes.
+//
+// Syscall numbers follow Linux x86-64. The set is exactly what PHASE1.md 5.3
+// needs: open(2), close(3), pread64(17), pwrite64(18), fsync(74),
+// ftruncate(77), plus lseek(8) for dk_file_size, rename(82) for
+// dk_file_rename and unlink(87) for dk_file_unlink.
+
+import "../error/status.mettle";
+import "file.mettle";
+import "std/mem";
+
+const DK_SYS_OPEN: int64 = 2;
+const DK_SYS_CLOSE: int64 = 3;
+const DK_SYS_LSEEK: int64 = 8;
+const DK_SYS_PREAD64: int64 = 17;
+const DK_SYS_PWRITE64: int64 = 18;
+const DK_SYS_FSYNC: int64 = 74;
+const DK_SYS_FTRUNCATE: int64 = 77;
+const DK_SYS_RENAME: int64 = 82;
+const DK_SYS_UNLINK: int64 = 87;
+
+// open(2) flag bits, translated from the DK_OPEN_* API bits.
+const DK_O_WRONLY: int64 = 1;
+const DK_O_RDWR: int64 = 2;
+const DK_O_CREAT: int64 = 64;
+const DK_O_EXCL: int64 = 128;
+const DK_O_MODE: int64 = 420;  // 0644
+
+// lseek(2) whence values.
+const DK_SEEK_SET: int64 = 0;
+const DK_SEEK_CUR: int64 = 1;
+const DK_SEEK_END: int64 = 2;
+
+// Errno values this backend distinguishes. Everything else -- ENOENT, EACCES,
+// ENOSPC, EIO, ... -- is a kernel refusal and becomes DK_ERR_IO.
+const DK_E_BADF: int64 = 9;
+const DK_E_NOMEM: int64 = 12;
+const DK_E_FAULT: int64 = 14;
+const DK_E_ISDIR: int64 = 21;
+const DK_E_INVAL: int64 = 22;
+const DK_E_NFILE: int64 = 23;
+const DK_E_MFILE: int64 = 24;
+const DK_E_NAMETOOLONG: int64 = 36;
+
+// A read_at count is returned as int32, so a larger request is refused rather
+// than truncated into a bogus (possibly negative) count.
+const DK_MAX_READ: int64 = 2147483647;
+
+// `code` is the already-negative status a failed open reports, not the
+// positive DK_ERR_* constant.
+//
+// A struct returned as a literal is an IR-lowering ICE on this compiler; the
+// result is bound to a local first (same reason as dk_file_open).
+fn dk_file_failed(code: int32) -> DkFile {
+  var out: DkFile = { handle: (int64)code, is_open: false };
+  return out;
+}
+
+// Map a negative syscall result to the only three codes the platform layer is
+// allowed to expose. Exhausted descriptors count as NOMEM (the resource is
+// allocated), a malformed request or a dead descriptor is USAGE (bad argument
+// / bad state), and the kernel refusing to do the work is IO.
+fn dk_file_err(rc: int64) -> int32 {
+  var e: int64 = 0 - rc;
+  if (e == DK_E_NOMEM || e == DK_E_MFILE || e == DK_E_NFILE) {
+    return -DK_ERR_NOMEM;
+  }
+  if (e == DK_E_BADF || e == DK_E_INVAL || e == DK_E_FAULT || e == DK_E_ISDIR
+      || e == DK_E_NAMETOOLONG) {
+    return -DK_ERR_USAGE;
+  }
+  return -DK_ERR_IO;
+}
+
+// A NUL-terminated copy of a Mettle string, for the kernel. The length is
+// bytes, not characters; the string is a borrowed view with no terminator
+// guarantee, so it is copied rather than passed through.
+fn dk_file_cpath(path: string) -> cstring {
+  var n: int64 = (int64)path.length;
+  var out: cstring = malloc(n + 1);
+  if (out == 0) { return 0; }
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = path.chars[i];
+    i = i + 1;
+  }
+  out[n] = 0;
+  return out;
+}
+
+export fn dk_file_open(path: string, flags: int32) -> DkFile {
+  var can_read: bool = (flags & DK_OPEN_READ) != 0;
+  var can_write: bool = (flags & DK_OPEN_WRITE) != 0;
+  if ((int64)path.length <= 0) { return dk_file_failed(-DK_ERR_USAGE); }
+  if (!can_read && !can_write) { return dk_file_failed(-DK_ERR_USAGE); }
+
+  var oflags: int64 = 0;
+  if (can_read && can_write) {
+    oflags = DK_O_RDWR;
+  } else if (can_write) {
+    oflags = DK_O_WRONLY;
+  }
+  // DK_OPEN_CREATE never truncates: reopening an existing database must not
+  // erase it. A caller that wants an empty file truncates explicitly.
+  if ((flags & DK_OPEN_CREATE) != 0) { oflags = oflags | DK_O_CREAT; }
+  if ((flags & DK_OPEN_EXCL) != 0) { oflags = oflags | DK_O_EXCL; }
+
+  var cpath: cstring = dk_file_cpath(path);
+  if (cpath == 0) { return dk_file_failed(-DK_ERR_NOMEM); }
+  var fd: int64 = syscall(DK_SYS_OPEN, cpath, oflags, DK_O_MODE);
+  free(cpath);
+  if (fd < 0) { return dk_file_failed(dk_file_err(fd)); }
+  var out: DkFile = { handle: fd, is_open: true };
+  return out;
+}
+
+export fn dk_file_close(f: DkFile) -> int32 {
+  if (!f.is_open) { return DK_OK; }
+  var rc: int64 = syscall(DK_SYS_CLOSE, f.handle);
+  if (rc < 0) {
+    // A DkFile is a value; closing it cannot mark the caller's copy. So a
+    // second close of the same value reaches the kernel as EBADF, and that is
+    // precisely the already-closed case, which is DK_OK. A caller that changes
+    // the file's identity (a reused descriptor) must not keep a stale handle.
+    var e: int64 = 0 - rc;
+    if (e == DK_E_BADF) { return DK_OK; }
+    return dk_file_err(rc);
+  }
+  return DK_OK;
+}
+
+export fn dk_file_read_at(f: DkFile, off: int64, buf: uint8*, len: int64) -> int32 {
+  if (!f.is_open || f.handle < 0) { return -DK_ERR_USAGE; }
+  if (off < 0 || len < 0) { return -DK_ERR_USAGE; }
+  if (len > DK_MAX_READ) { return -DK_ERR_USAGE; }
+  if (len == 0) { return 0; }
+  if (buf == 0) { return -DK_ERR_USAGE; }
+  var rc: int64 = syscall(DK_SYS_PREAD64, f.handle, (int64)buf, len, off);
+  if (rc < 0) { return dk_file_err(rc); }
+  if (rc > len) { return -DK_ERR_IO; }
+  return (int32)rc;
+}
+
+export fn dk_file_write_at(f: DkFile, off: int64, buf: uint8*, len: int64) -> int32 {
+  if (!f.is_open || f.handle < 0) { return -DK_ERR_USAGE; }
+  if (off < 0 || len < 0) { return -DK_ERR_USAGE; }
+  if (len == 0) { return DK_OK; }
+  if (buf == 0) { return -DK_ERR_USAGE; }
+  var rc: int64 = syscall(DK_SYS_PWRITE64, f.handle, (int64)buf, len, off);
+  if (rc < 0) { return dk_file_err(rc); }
+  // A short write means the file system is lying. Report failure, never success.
+  if (rc != len) { return -DK_ERR_IO; }
+  return DK_OK;
+}
+
+export fn dk_file_sync(f: DkFile) -> int32 {
+  if (!f.is_open || f.handle < 0) { return -DK_ERR_USAGE; }
+  var rc: int64 = syscall(DK_SYS_FSYNC, f.handle);
+  if (rc < 0) { return dk_file_err(rc); }
+  return DK_OK;
+}
+
+// The size is the offset at end-of-file. The seek offset is saved and restored
+// so this stays a query even for a backend that shares the descriptor.
+export fn dk_file_size(f: DkFile) -> int64 {
+  if (!f.is_open || f.handle < 0) { return (int64)(0 - DK_ERR_USAGE); }
+  var saved: int64 = syscall(DK_SYS_LSEEK, f.handle, (int64)0, DK_SEEK_CUR);
+  var end: int64 = syscall(DK_SYS_LSEEK, f.handle, (int64)0, DK_SEEK_END);
+  if (saved >= 0) { syscall(DK_SYS_LSEEK, f.handle, saved, DK_SEEK_SET); }
+  if (end < 0) { return (int64)dk_file_err(end); }
+  return end;
+}
+
+export fn dk_file_truncate(f: DkFile, size: int64) -> int32 {
+  if (!f.is_open || f.handle < 0) { return -DK_ERR_USAGE; }
+  if (size < 0) { return -DK_ERR_USAGE; }
+  var rc: int64 = syscall(DK_SYS_FTRUNCATE, f.handle, size);
+  if (rc < 0) { return dk_file_err(rc); }
+  return DK_OK;
+}
+
+// PHASE1.md 5.3 schedules rename for phase 3, but the pager's atomic-replace
+// path cannot exist without it, and it is one syscall: same contract, same
+// errno mapping, nothing else changes.
+export fn dk_file_rename(from: string, to: string) -> int32 {
+  if ((int64)from.length <= 0 || (int64)to.length <= 0) { return -DK_ERR_USAGE; }
+  var cfrom: cstring = dk_file_cpath(from);
+  if (cfrom == 0) { return -DK_ERR_NOMEM; }
+  var cto: cstring = dk_file_cpath(to);
+  if (cto == 0) {
+    free(cfrom);
+    return -DK_ERR_NOMEM;
+  }
+  var rc: int64 = syscall(DK_SYS_RENAME, cfrom, cto);
+  free(cfrom);
+  free(cto);
+  if (rc < 0) { return dk_file_err(rc); }
+  return DK_OK;
+}
+
+// Remove a path (PHASE1.md 5.3, phase 3). The journal is the only caller: it
+// is the one way a journal file can delete itself. A missing path is
+// -DK_ERR_IO, which the caller decides whether to care about.
+export fn dk_file_unlink(path: string) -> int32 {
+  if ((int64)path.length <= 0) { return -DK_ERR_USAGE; }
+  var cpath: cstring = dk_file_cpath(path);
+  if (cpath == 0) { return -DK_ERR_NOMEM; }
+  var rc: int64 = syscall(DK_SYS_UNLINK, cpath);
+  free(cpath);
+  if (rc < 0) { return dk_file_err(rc); }
+  return DK_OK;
+}

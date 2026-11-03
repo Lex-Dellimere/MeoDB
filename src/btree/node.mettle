@@ -1,0 +1,429 @@
+// btree/node: what the bytes in a b-tree node cell mean.
+//
+// PHASE2.md section 2D. A node is a DK_PAGE_BTREE_LEAF or a
+// DK_PAGE_BTREE_INNER page; the header, the dense cell-pointer array, the u16
+// length prefix in front of every body and the free gap all belong to
+// format/page.mettle. This module owns only the cell layout:
+//
+//   inner cell:  [len:u16] [child:u32] [key bytes...]
+//   leaf  cell:  [len:u16] [key bytes...] [rowid:u64]
+//
+// The HIGHEST cell of an inner node (index n_cells - 1) is the right-child
+// pointer: a four-byte body with no key. Cells 0..n_cells-2 each carry
+// (key, left_child), and the one order invariant everything here depends on is
+//
+//   key_i is the smallest key in the subtree under child_{i+1}
+//
+// i.e. cell i's child holds the keys strictly below cell i's key, and the cell
+// after it holds the keys at or above that key. That is why descent takes the
+// first key strictly greater than the target, and why a split copies a leaf's
+// first upper key up (B+ style: the key stays in the leaf) while an inner split
+// moves its middle key up (the key leaves both halves, because it is the fence
+// between them). The same invariant is what dk_bt_next's range scan relies on
+// to find the next leaf.
+//
+// Keys are opaque bytes here: ordering is the caller's comparator
+// (fn(uint8*, int32, uint8*, int32) -> int32) and this module must not import
+// src/types/ (PHASE2.md 2D).
+//
+// No struct is overlaid on a page, nothing here allocates, and every
+// multi-byte read or write goes through format/bytes.mettle. The `src` argument
+// of the rebuild functions is a DK_PAGE_SIZE _copy_ of the page being rebuilt
+// (the caller's scratch buffer): rebuilding re-initialises the destination, so
+// reading the old cells from the destination itself would destroy them.
+
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../format/page.mettle";
+
+// Bytes of the child page number at the front of an inner cell body.
+export const DK_BTN_INNER_CHILD: int32 = 4;
+
+// Bytes of the rowid at the end of a leaf cell body.
+export const DK_BTN_LEAF_ROWID: int32 = 8;
+
+// A cell costs its body, the u16 length prefix format/page.mettle puts in
+// front of it, and its two bytes of cell pointer.
+const DK_BTN_CELL_OVERHEAD: int32 = 2 + 2;
+
+// --- node identity and structural check ------------------------------------
+
+// True for a leaf page.
+export fn dk_btn_is_leaf(buf: uint8*) -> bool {
+  return dk_page_type(buf) == DK_PAGE_BTREE_LEAF;
+}
+
+// The page-level structure plus the node-level rules dk_page_check cannot know:
+// a leaf cell is at least a rowid long, the right-child cell of an inner node is
+// exactly a child pointer, and every other inner cell is at least that long.
+// Sort order is the writer's invariant and is not re-proved here.
+export fn dk_btn_check(buf: uint8*) -> int32 {
+  var rc: int32 = dk_page_check(buf);
+  if (rc != DK_OK) { return rc; }
+  var t: int32 = dk_page_type(buf);
+  var n: int32 = dk_page_n_cells(buf);
+  if (t == DK_PAGE_BTREE_LEAF) {
+    var i: int32 = 0;
+    while (i < n) {
+      if (dk_page_cell_len(buf, i) < DK_BTN_LEAF_ROWID) {
+        return -DK_ERR_CORRUPT;
+      }
+      i += 1;
+    }
+    return DK_OK;
+  }
+  if (t != DK_PAGE_BTREE_INNER) { return -DK_ERR_CORRUPT; }
+  if (n < 1) { return -DK_ERR_CORRUPT; }
+  var j: int32 = 0;
+  while (j < n - 1) {
+    if (dk_page_cell_len(buf, j) < DK_BTN_INNER_CHILD) {
+      return -DK_ERR_CORRUPT;
+    }
+    j += 1;
+  }
+  if (dk_page_cell_len(buf, n - 1) != DK_BTN_INNER_CHILD) {
+    return -DK_ERR_CORRUPT;
+  }
+  return DK_OK;
+}
+
+// --- cell accessors ---------------------------------------------------------
+
+// Length of inner cell i's key, or -1 when i is not a keyed cell (the
+// right-child cell has no key, and out-of-range indices are not cells).
+export fn dk_btn_inner_key_len(buf: uint8*, i: int32) -> int32 {
+  var n: int32 = dk_page_n_cells(buf);
+  if (i < 0 || i >= n - 1) { return -1; }
+  var len: int32 = dk_page_cell_len(buf, i);
+  if (len < DK_BTN_INNER_CHILD) { return -1; }
+  return len - DK_BTN_INNER_CHILD;
+}
+
+// Pointer to inner cell i's key bytes, or 0 when i is not a keyed cell.
+export fn dk_btn_inner_key_ptr(buf: uint8*, i: int32) -> uint8* {
+  if (dk_btn_inner_key_len(buf, i) < 0) { return 0; }
+  return dk_page_cell_ptr(buf, i) + DK_BTN_INNER_CHILD;
+}
+
+// Child page number of cell i. Valid for every cell including the right-child
+// cell, which is the whole point of that cell being a bare pointer.
+export fn dk_btn_inner_child(buf: uint8*, i: int32) -> uint32 {
+  var ptr: uint8* = dk_page_cell_ptr(buf, i);
+  if (ptr == 0) { return 0; }
+  return dk_get_u32le(ptr, 0);
+}
+
+// Length of leaf cell i's key, or -1 when i is not a leaf cell index.
+export fn dk_btn_leaf_key_len(buf: uint8*, i: int32) -> int32 {
+  var len: int32 = dk_page_cell_len(buf, i);
+  if (len < DK_BTN_LEAF_ROWID) { return -1; }
+  return len - DK_BTN_LEAF_ROWID;
+}
+
+// Pointer to leaf cell i's key bytes, or 0 when i is not a leaf cell index.
+export fn dk_btn_leaf_key_ptr(buf: uint8*, i: int32) -> uint8* {
+  if (dk_btn_leaf_key_len(buf, i) < 0) { return 0; }
+  return dk_page_cell_ptr(buf, i);
+}
+
+// The rowid a leaf cell carries, or 0 when i is not a leaf cell index.
+export fn dk_btn_leaf_rowid(buf: uint8*, i: int32) -> uint64 {
+  var klen: int32 = dk_btn_leaf_key_len(buf, i);
+  if (klen < 0) { return 0; }
+  return dk_get_u64le(dk_page_cell_ptr(buf, i), (int64)klen);
+}
+
+// Replace a leaf cell's rowid. The body length is unchanged, so the cell stays
+// where it is and the page stays packed; DK_ERR_RANGE when i is not a cell.
+export fn dk_btn_leaf_set_rowid(buf: uint8*, i: int32, v: uint64) -> int32 {
+  var klen: int32 = dk_btn_leaf_key_len(buf, i);
+  if (klen < 0) { return -DK_ERR_RANGE; }
+  dk_put_u64le(dk_page_cell_ptr(buf, i), (int64)klen, v);
+  return DK_OK;
+}
+
+// --- search ----------------------------------------------------------------
+
+// Index of the first leaf cell whose key is not less than `key` (lower bound),
+// 0..n_cells. An index equal to n_cells means every key in the leaf is smaller.
+export fn dk_btn_leaf_search(buf: uint8*, key: uint8*, klen: int32,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32) -> int32 {
+  var lo: int32 = 0;
+  var hi: int32 = dk_page_n_cells(buf);
+  while (lo < hi) {
+    var mid: int32 = lo + (hi - lo) / 2;
+    var c: int32 = cmp_cb(dk_btn_leaf_key_ptr(buf, mid),
+      dk_btn_leaf_key_len(buf, mid), key, klen);
+    if (c < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// The child of an inner node a search for `key` must descend into: the first
+// cell whose key is strictly greater than the target, or the right child when
+// no separator is greater. Returns 0..n_cells-1.
+export fn dk_btn_inner_child_index(buf: uint8*, key: uint8*, klen: int32,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32) -> int32 {
+  var n: int32 = dk_page_n_cells(buf);
+  var lo: int32 = 0;
+  var hi: int32 = n - 1; // the keyed cells are 0..n-2
+  while (lo < hi) {
+    var mid: int32 = lo + (hi - lo) / 2;
+    var c: int32 = cmp_cb(dk_btn_inner_key_ptr(buf, mid),
+      dk_btn_inner_key_len(buf, mid), key, klen);
+    if (c > 0) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
+// --- room ------------------------------------------------------------------
+
+// Can this leaf take one more (key, rowid) cell? Nodes are only ever built by
+// the rebuild functions below, which repack the page from scratch, so the free
+// gap is the whole free space and free bytes is the exact test.
+export fn dk_btn_leaf_room(buf: uint8*, klen: int32) -> bool {
+  if (klen < 0) { return false; }
+  return dk_page_free_bytes(buf) >= klen + DK_BTN_LEAF_ROWID
+    + DK_BTN_CELL_OVERHEAD;
+}
+
+// Same, for one more (key, left_child) cell in an inner node.
+export fn dk_btn_inner_room(buf: uint8*, klen: int32) -> bool {
+  if (klen < 0) { return false; }
+  return dk_page_free_bytes(buf) >= klen + DK_BTN_INNER_CHILD
+    + DK_BTN_CELL_OVERHEAD;
+}
+
+// --- appending cells -------------------------------------------------------
+//
+// These append to a page whose header is fresh (dk_page_init) and whose cells
+// are already in order: dk_page_alloc hands out the next-lowest body and
+// dk_page_insert_cell appends the pointer, so the page stays packed and every
+// pointer stays below the one before it (format/page.mettle rule 9).
+
+// Append a (key, rowid) cell to a leaf. DK_OK or a negative code from
+// dk_page_alloc / dk_page_insert_cell.
+export fn dk_btn_leaf_append(buf: uint8*, key: uint8*, klen: int32,
+    rowid: uint64) -> int32 {
+  var off: int32 = dk_page_alloc(buf, klen + DK_BTN_LEAF_ROWID);
+  if (off < 0) { return off; }
+  dk_bytes_copy(buf + off, key, (int64)klen);
+  dk_put_u64le(buf, (int64)(off + klen), rowid);
+  return dk_page_insert_cell(buf, off, dk_page_n_cells(buf));
+}
+
+// Append a (key, left_child) cell to an inner node.
+export fn dk_btn_inner_append(buf: uint8*, child: uint32, key: uint8*,
+    klen: int32) -> int32 {
+  var off: int32 = dk_page_alloc(buf, klen + DK_BTN_INNER_CHILD);
+  if (off < 0) { return off; }
+  dk_put_u32le(buf, (int64)off, child);
+  dk_bytes_copy(buf + off + DK_BTN_INNER_CHILD, key, (int64)klen);
+  return dk_page_insert_cell(buf, off, dk_page_n_cells(buf));
+}
+
+// Append the bare right-child cell of an inner node. It must be the LAST cell;
+// dk_btn_check rejects an inner node whose highest cell carries a key.
+export fn dk_btn_inner_append_right(buf: uint8*, child: uint32) -> int32 {
+  var off: int32 = dk_page_alloc(buf, DK_BTN_INNER_CHILD);
+  if (off < 0) { return off; }
+  dk_put_u32le(buf, (int64)off, child);
+  return dk_page_insert_cell(buf, off, dk_page_n_cells(buf));
+}
+
+// --- rebuilding a node -----------------------------------------------------
+
+// Leaf cell i of a sequence that is the source's n cells with one new cell
+// inserted at index `at`.
+fn leaf_seq_key_ptr(src: uint8*, at: int32, key: uint8*, i: int32) -> uint8* {
+  if (i == at) { return key; }
+  var j: int32 = i;
+  if (i > at) { j = i - 1; }
+  return dk_btn_leaf_key_ptr(src, j);
+}
+
+fn leaf_seq_key_len(src: uint8*, at: int32, klen: int32, i: int32) -> int32 {
+  if (i == at) { return klen; }
+  var j: int32 = i;
+  if (i > at) { j = i - 1; }
+  return dk_btn_leaf_key_len(src, j);
+}
+
+fn leaf_seq_rowid(src: uint8*, at: int32, rowid: uint64, i: int32) -> uint64 {
+  if (i == at) { return rowid; }
+  var j: int32 = i;
+  if (i > at) { j = i - 1; }
+  return dk_btn_leaf_rowid(src, j);
+}
+
+// Rebuild `dst` as the leaf `src` with (key, rowid) inserted at index `at`
+// (0..n_cells, n_cells appends). The page is repacked from scratch, so every
+// pointer ends up below the one before it. -DK_ERR_FULL when the result would
+// not fit; dst is then unmodified, because the size is checked before the
+// first byte moves.
+export fn dk_btn_leaf_insert(dst: uint8*, src: uint8*, key: uint8*,
+    klen: int32, rowid: uint64, at: int32) -> int32 {
+  var n: int32 = dk_page_n_cells(src);
+  if (at < 0 || at > n) { return -DK_ERR_RANGE; }
+  if (!dk_btn_leaf_room(src, klen)) { return -DK_ERR_FULL; }
+  var rc: int32 = dk_page_init(dst, DK_PAGE_BTREE_LEAF);
+  if (rc != DK_OK) { return rc; }
+  var i: int32 = 0;
+  while (i <= n) {
+    rc = dk_btn_leaf_append(dst, leaf_seq_key_ptr(src, at, key, i),
+      leaf_seq_key_len(src, at, klen, i), leaf_seq_rowid(src, at, rowid, i));
+    if (rc != DK_OK) { return rc; }
+    i += 1;
+  }
+  return DK_OK;
+}
+
+// Split a full leaf into `lo` and `hi` while inserting (key, rowid) at `at`.
+// `src` is the old leaf's bytes. The two halves are the sequence's lower and
+// upper half by cell count, so the separator the caller copies up is exactly
+// hi's first key, and that key STAYS in hi: it is the smallest key of the new
+// subtree, which is what the parent's cell must name (PHASE2.md 2D).
+export fn dk_btn_leaf_split(lo: uint8*, hi: uint8*, src: uint8*, key: uint8*,
+    klen: int32, rowid: uint64, at: int32) -> int32 {
+  var n: int32 = dk_page_n_cells(src);
+  if (at < 0 || at > n) { return -DK_ERR_RANGE; }
+  if (n < 1) { return -DK_ERR_CORRUPT; }
+  var mid: int32 = (n + 1) / 2;
+  var rc: int32 = dk_page_init(lo, DK_PAGE_BTREE_LEAF);
+  if (rc != DK_OK) { return rc; }
+  rc = dk_page_init(hi, DK_PAGE_BTREE_LEAF);
+  if (rc != DK_OK) { return rc; }
+  var i: int32 = 0;
+  while (i <= n) {
+    var dst: uint8* = lo;
+    if (i >= mid) { dst = hi; }
+    rc = dk_btn_leaf_append(dst, leaf_seq_key_ptr(src, at, key, i),
+      leaf_seq_key_len(src, at, klen, i), leaf_seq_rowid(src, at, rowid, i));
+    if (rc != DK_OK) { return rc; }
+    i += 1;
+  }
+  return DK_OK;
+}
+
+// The combined inner node built from `src` (n cells) plus one new cell at child
+// index `at`: children y[0..n], keys q[0..n-1], where the new cell is
+// (q[at] = key, y[at] = child) and y[at+1] = sibling.
+fn inner_seq_key_ptr(src: uint8*, at: int32, key: uint8*, i: int32) -> uint8* {
+  if (i == at) { return key; }
+  var j: int32 = i;
+  if (i > at) { j = i - 1; }
+  return dk_btn_inner_key_ptr(src, j);
+}
+
+fn inner_seq_key_len(src: uint8*, at: int32, klen: int32, i: int32) -> int32 {
+  if (i == at) { return klen; }
+  var j: int32 = i;
+  if (i > at) { j = i - 1; }
+  return dk_btn_inner_key_len(src, j);
+}
+
+fn inner_seq_child(src: uint8*, at: int32, child: uint32, sibling: uint32,
+    i: int32) -> uint32 {
+  if (i == at) { return child; }
+  if (i == at + 1) { return sibling; }
+  var j: int32 = i;
+  if (i > at + 1) { j = i - 1; }
+  return dk_btn_inner_child(src, j);
+}
+
+// Rebuild `dst` as the inner node `src` with the cell (key, child) inserted at
+// child index `at`, where `sibling` is the page that takes the child slot after
+// the new key. That is the parent half of a split: `child` is the node that
+// just divided, and its upper half is `sibling`. -DK_ERR_FULL when the result
+// would not fit (the caller then splits this node instead); dst is unmodified
+// in that case.
+export fn dk_btn_inner_insert(dst: uint8*, src: uint8*, at: int32,
+    child: uint32, sibling: uint32, key: uint8*, klen: int32) -> int32 {
+  var n: int32 = dk_page_n_cells(src);
+  if (n < 1) { return -DK_ERR_CORRUPT; }
+  if (at < 0 || at > n - 1) { return -DK_ERR_RANGE; }
+  if (!dk_btn_inner_room(src, klen)) { return -DK_ERR_FULL; }
+  var rc: int32 = dk_page_init(dst, DK_PAGE_BTREE_INNER);
+  if (rc != DK_OK) { return rc; }
+  var i: int32 = 0;
+  while (i < at) {
+    rc = dk_btn_inner_append(dst, dk_btn_inner_child(src, i),
+      dk_btn_inner_key_ptr(src, i), dk_btn_inner_key_len(src, i));
+    if (rc != DK_OK) { return rc; }
+    i += 1;
+  }
+  rc = dk_btn_inner_append(dst, child, key, klen);
+  if (rc != DK_OK) { return rc; }
+  i = at + 1;
+  while (i <= n - 1) {
+    rc = dk_btn_inner_append(dst, inner_seq_child(src, at, child, sibling, i),
+      inner_seq_key_ptr(src, at, key, i), inner_seq_key_len(src, at, klen, i));
+    if (rc != DK_OK) { return rc; }
+    i += 1;
+  }
+  return dk_btn_inner_append_right(dst,
+    inner_seq_child(src, at, child, sibling, n));
+}
+
+// Split the combined inner node (src plus the new cell at `at`) into `lo` and
+// `hi`, and write the key that no longer belongs to either half into
+// `sep_out` (capacity is the caller's; a separator is a key that was already in
+// a page, so a DK_PAGE_SIZE buffer always holds it).
+//
+// The separator is q[m]: it is the smallest key of hi's subtree, so it moves
+// UP to the parent and is absent from both halves - the opposite of the leaf
+// split, where the separator stays in the upper leaf. `sep_out` may alias `key`
+// (the caller reuses one buffer down the tree): the copy is the last thing this
+// function does, after every read of `key`.
+export fn dk_btn_inner_split_insert(lo: uint8*, hi: uint8*, src: uint8*,
+    at: int32, child: uint32, sibling: uint32, key: uint8*, klen: int32,
+    sep_out: uint8*, sep_len_out: int32*) -> int32 {
+  var n: int32 = dk_page_n_cells(src);
+  // The combined node has n keys; a full page has hundreds, so a source with
+  // fewer than two cells cannot be split and is a caller error, not a state
+  // this function has to invent a split for.
+  if (n < 2) { return -DK_ERR_CORRUPT; }
+  if (at < 0 || at > n - 1) { return -DK_ERR_RANGE; }
+  var m: int32 = n / 2;
+  var rc: int32 = dk_page_init(lo, DK_PAGE_BTREE_INNER);
+  if (rc != DK_OK) { return rc; }
+  rc = dk_page_init(hi, DK_PAGE_BTREE_INNER);
+  if (rc != DK_OK) { return rc; }
+
+  // Lower half: cells 0..m-1, right child y[m].
+  var i: int32 = 0;
+  while (i < m) {
+    rc = dk_btn_inner_append(lo, inner_seq_child(src, at, child, sibling, i),
+      inner_seq_key_ptr(src, at, key, i), inner_seq_key_len(src, at, klen, i));
+    if (rc != DK_OK) { return rc; }
+    i += 1;
+  }
+  rc = dk_btn_inner_append_right(lo,
+    inner_seq_child(src, at, child, sibling, m));
+  if (rc != DK_OK) { return rc; }
+
+  // Upper half: cells m+1..n-1, right child y[n]. q[m] goes up.
+  i = m + 1;
+  while (i < n) {
+    rc = dk_btn_inner_append(hi, inner_seq_child(src, at, child, sibling, i),
+      inner_seq_key_ptr(src, at, key, i), inner_seq_key_len(src, at, klen, i));
+    if (rc != DK_OK) { return rc; }
+    i += 1;
+  }
+  rc = dk_btn_inner_append_right(hi,
+    inner_seq_child(src, at, child, sibling, n));
+  if (rc != DK_OK) { return rc; }
+
+  var sl: int32 = inner_seq_key_len(src, at, klen, m);
+  dk_bytes_copy(sep_out, inner_seq_key_ptr(src, at, key, m), (int64)sl);
+  sep_len_out[0] = sl;
+  return DK_OK;
+}

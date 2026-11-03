@@ -1,0 +1,62 @@
+# dacor — a relational storage engine written in Mettle.
+#
+#   mbuild build         debug, target linux -> build/linux/debug/dacor
+#   mbuild build -r      release
+#   mbuild check         type-check every src/ file on its own
+#   mbuild test          @test functions in the compile-time interpreter
+#   mbuild run dacor     build and run the smoke entry
+#   mbuild run b_self    build and run one test program
+#
+# Compiler: head, not the v0.17.0 release (dacor uses syscall() for
+# pread/pwrite/fsync). Point mbuild at it, or pass --mettle:
+#   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/raize/mettle-build/bin/mettle
+# See NOTES.md section 1.
+
+[package]
+name = "dacor"
+version = "0.1.0"
+
+[build]
+targets = ["linux"]
+
+[profile.release]
+flags = ["--release"]
+
+[bin.dacor]
+main = "src/main.mettle"
+
+[bin.s0_self]
+main = "tests/s0_self.mettle"
+
+[bin.a_self]
+main = "tests/a_self.mettle"
+
+[bin.b_self]
+main = "tests/b_self.mettle"
+
+[bin.c_self]
+main = "tests/c_self.mettle"
+
+[bin.phase1]
+main = "tests/phase1.mettle"
+
+[bin.key_self]
+main = "tests/key_self.mettle"
+
+[bin.freelist_self]
+main = "tests/freelist_self.mettle"
+
+[bin.btree_self]
+main = "tests/btree_self.mettle"
+
+# The phase-2 gate: the whole stack in one run (PHASE2.md I1..I4). Declaring it
+# here is what puts it in tools/check.sh, which derives its bin list from these
+# sections, so it runs in both profiles instead of only by hand.
+[bin.phase2]
+main = "tests/phase2.mettle"
+
+[bin.j_self]
+main = "tests/j_self.mettle"
+
+[bin.journal_self]
+main = "tests/journal_self.mettle"

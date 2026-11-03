@@ -1,0 +1,95 @@
+// format/bytes: the single home of little-endian byte access.
+//
+// Nothing outside this module may index a uint8* to build or read a
+// multi-byte integer. PHASE1.md section 1: endianness is decided here and
+// nowhere else. Offsets are the caller's contract: no bounds checking.
+
+// Read a little-endian u16 at byte offset `off`.
+@inline export fn dk_get_u16le(p: uint8*, off: int64) -> uint16 {
+  return (uint16)p[off] | (((uint16)p[off + 1]) << 8);
+}
+
+// Read a little-endian u32 at byte offset `off`.
+@inline export fn dk_get_u32le(p: uint8*, off: int64) -> uint32 {
+  return ((uint32)p[off])
+    | (((uint32)p[off + 1]) << 8)
+    | (((uint32)p[off + 2]) << 16)
+    | (((uint32)p[off + 3]) << 24);
+}
+
+// Read a little-endian u64 at byte offset `off`.
+@inline export fn dk_get_u64le(p: uint8*, off: int64) -> uint64 {
+  return ((uint64)p[off])
+    | (((uint64)p[off + 1]) << 8)
+    | (((uint64)p[off + 2]) << 16)
+    | (((uint64)p[off + 3]) << 24)
+    | (((uint64)p[off + 4]) << 32)
+    | (((uint64)p[off + 5]) << 40)
+    | (((uint64)p[off + 6]) << 48)
+    | (((uint64)p[off + 7]) << 56);
+}
+
+// Write a little-endian u16 at byte offset `off`.
+@inline export fn dk_put_u16le(p: uint8*, off: int64, v: uint16) {
+  p[off] = (uint8)(v & 0xFF);
+  p[off + 1] = (uint8)((v >> 8) & 0xFF);
+}
+
+// Write a little-endian u32 at byte offset `off`.
+@inline export fn dk_put_u32le(p: uint8*, off: int64, v: uint32) {
+  p[off] = (uint8)(v & 0xFF);
+  p[off + 1] = (uint8)((v >> 8) & 0xFF);
+  p[off + 2] = (uint8)((v >> 16) & 0xFF);
+  p[off + 3] = (uint8)((v >> 24) & 0xFF);
+}
+
+// Write a little-endian u64 at byte offset `off`.
+@inline export fn dk_put_u64le(p: uint8*, off: int64, v: uint64) {
+  p[off] = (uint8)(v & 0xFF);
+  p[off + 1] = (uint8)((v >> 8) & 0xFF);
+  p[off + 2] = (uint8)((v >> 16) & 0xFF);
+  p[off + 3] = (uint8)((v >> 24) & 0xFF);
+  p[off + 4] = (uint8)((v >> 32) & 0xFF);
+  p[off + 5] = (uint8)((v >> 40) & 0xFF);
+  p[off + 6] = (uint8)((v >> 48) & 0xFF);
+  p[off + 7] = (uint8)((v >> 56) & 0xFF);
+}
+
+// Zero `n` bytes starting at `p`.
+@inline export fn dk_bytes_zero(p: uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    p[i] = 0;
+    i += 1;
+  }
+}
+
+// Copy `n` non-overlapping bytes from `src` to `dst`.
+@inline export fn dk_bytes_copy(dst: uint8*, src: uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = src[i];
+    i += 1;
+  }
+}
+
+// Byte-wise equality over `n` bytes.
+@inline export fn dk_bytes_equal(a: uint8*, b: uint8*, n: int64) -> bool {
+  var i: int64 = 0;
+  while (i < n) {
+    if (a[i] != b[i]) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+// memcmp over `n` bytes: -1, 0 or 1 (not the raw difference).
+@inline export fn dk_bytes_compare(a: uint8*, b: uint8*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) {
+    if (a[i] < b[i]) { return -1; }
+    if (a[i] > b[i]) { return 1; }
+    i += 1;
+  }
+  return 0;
+}

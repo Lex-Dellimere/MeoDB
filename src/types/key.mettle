@@ -1,0 +1,109 @@
+// types/key: order-preserving key encoding for the b-tree.
+//
+// PHASE2.md 2B. A b-tree keeps keys sorted by comparing bytes
+// (dk_key_compare), so an encoded key must compare the way its value sorts
+// logically -- not merely round-trip. A signed int64 therefore cannot be
+// stored as a plain big-endian uint64: that puts -1 at 0xFFFF...FF, above 0,
+// and puts every negative above every non-negative.
+//
+// One encoded field is:
+//
+//   [tag:u8][payload]   dk_key_int (9 bytes), dk_key_text (1 + len), dk_key_null (1)
+//   [payload]           dk_key_rowid (8 bytes), the only field with no tag
+//
+// A composite key is the fields concatenated in index order, with no
+// separators: the b-tree only compares whole keys against whole keys of the
+// same index, so nothing ever needs to find a field boundary again.
+//
+// The 8-byte payload is big-endian with the sign bit flipped, so the order of
+// the unsigned bit pattern equals the signed order. format/bytes.mettle owns
+// byte order, so the flip is spelled "byte-reverse the value, then write it
+// little-endian": a byte-reversed little-endian u64 is a big-endian u64, and
+// the endian decision stays in one module.
+//
+// Nothing here allocates. Every failure is a negative DK_ERR_*.
+
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+
+export const DK_KEY_INT: int32 = 1;
+export const DK_KEY_TEXT: int32 = 2;
+export const DK_KEY_NULL: int32 = 3;
+export const DK_KEY_ROWID: int32 = 4;
+
+// Byte-reverse a uint64: the big-endian writer, since dk_put_u64le is
+// little-endian and bytes.mettle is the only place allowed to say so.
+fn key_bswap64(v: uint64) -> uint64 {
+  var r: uint64 = 0;
+  var x: uint64 = v;
+  var i: int32 = 0;
+  while (i < 8) {
+    r = (r << 8) | (x & (uint64)0xFF);
+    x = x >> 8;
+    i += 1;
+  }
+  return r;
+}
+
+// Write the order-preserving 8-byte payload of `v` at buf[off, off + 8).
+fn key_put_int64(buf: uint8*, off: int32, v: int64) {
+  // The shift, not a literal: an int32 literal cannot spell 2^63.
+  var x: uint64 = ((uint64)v) ^ ((uint64)1 << 63);
+  dk_put_u64le(buf, (int64)off, key_bswap64(x));
+}
+
+// Encode a tagged int64 key: [DK_KEY_INT][8 bytes]. Returns 9, or
+// -DK_ERR_FULL when cap < 9 (nothing is written).
+export fn dk_key_int(buf: uint8*, cap: int32, v: int64) -> int32 {
+  if (buf == 0 || cap < 0) { return -DK_ERR_USAGE; }
+  if (cap < 9) { return -DK_ERR_FULL; }
+  buf[0] = (uint8)DK_KEY_INT;
+  key_put_int64(buf, 1, v);
+  return 9;
+}
+
+// Encode a rowid for the tail of an index key: the same order-preserving
+// encoding as dk_key_int, with no tag. Returns 8, or -DK_ERR_FULL when
+// cap < 8 (nothing is written).
+export fn dk_key_rowid(buf: uint8*, cap: int32, v: int64) -> int32 {
+  if (buf == 0 || cap < 0) { return -DK_ERR_USAGE; }
+  if (cap < 8) { return -DK_ERR_FULL; }
+  key_put_int64(buf, 0, v);
+  return 8;
+}
+
+// Encode a tagged text key: [DK_KEY_TEXT][the raw UTF-8 bytes]. Returns
+// 1 + s.length, or -DK_ERR_FULL when the buffer cannot hold that (nothing is
+// written). The bytes are not escaped or terminated, so a string that is a
+// prefix of another sorts first under dk_key_compare.
+export fn dk_key_text(buf: uint8*, cap: int32, s: string) -> int32 {
+  if (buf == 0 || cap < 0) { return -DK_ERR_USAGE; }
+  var n: int64 = (int64)s.length;
+  if (n > (int64)cap - 1) { return -DK_ERR_FULL; }
+  buf[0] = (uint8)DK_KEY_TEXT;
+  dk_bytes_copy(buf + 1, s.chars, n);
+  return (int32)(n + 1);
+}
+
+// Encode a tagged null key: [DK_KEY_NULL], one byte. Returns 1, or
+// -DK_ERR_FULL if the buffer cannot hold the tag.
+export fn dk_key_null(buf: uint8*, cap: int32) -> int32 {
+  if (buf == 0 || cap < 0) { return -DK_ERR_USAGE; }
+  if (cap < 1) { return -DK_ERR_FULL; }
+  buf[0] = (uint8)DK_KEY_NULL;
+  return 1;
+}
+
+// Compare two encoded keys: lexicographic over the common prefix, then the
+// shorter key first. Returns -1, 0 or 1.
+export fn dk_key_compare(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
+  var n: int32 = an;
+  if (bn < n) { n = bn; }
+  if (n > 0) {
+    var c: int32 = dk_bytes_compare(a, b, (int64)n);
+    if (c != 0) { return c; }
+  }
+  if (an < bn) { return -1; }
+  if (an > bn) { return 1; }
+  return 0;
+}

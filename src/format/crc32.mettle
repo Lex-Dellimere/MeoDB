@@ -1,0 +1,34 @@
+// format/crc32: CRC-32/ISO-HDLC (the zlib/PKZIP CRC).
+//
+// Reflected polynomial 0xEDB88320, init 0xFFFFFFFF, final xor 0xFFFFFFFF.
+// Implemented bitwise, deliberately: no 256-entry table, no module global, no
+// init call, no lazy-init flag. Eight shift/xor rounds per byte is fast enough
+// for a 4096-byte page, is thread-safe by construction, and can be exercised
+// directly from a test. PHASE1.md section 5.5.
+
+// CRC of one buffer, from scratch.
+export fn dk_crc32(data: uint8*, len: int64) -> uint32 {
+  return dk_crc32_update(0, data, len);
+}
+
+// Continue a CRC over the next chunk. `crc` is the already-finalised value
+// returned by the previous call (or 0 for the first chunk); the function
+// un-finalises, folds in the new bytes, and finalises again.
+export fn dk_crc32_update(crc: uint32, data: uint8*, len: int64) -> uint32 {
+  var c: uint32 = crc ^ (uint32)0xFFFFFFFF;
+  var i: int64 = 0;
+  while (i < len) {
+    c = c ^ (uint32)data[i];
+    var bit: int32 = 0;
+    while (bit < 8) {
+      if ((c & (uint32)1) != 0) {
+        c = (c >> 1) ^ (uint32)0xEDB88320;
+      } else {
+        c = c >> 1;
+      }
+      bit += 1;
+    }
+    i += 1;
+  }
+  return c ^ (uint32)0xFFFFFFFF;
+}

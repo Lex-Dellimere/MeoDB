@@ -1,0 +1,1460 @@
+// pager/pager: the frame table, the page-number hash, clock eviction, pin
+// accounting, page allocation and the flush that makes those pages durable.
+//
+// PHASE1.md sections 5.9, 6, 6b and 7. This module sits on platform/file.mettle
+// for I/O and format/{page,meta}.mettle for bytes; it knows nothing about
+// errnos, about what a page means, or about any layer above it.
+//
+// NO ATOMICITY IN PHASE 1. Eviction writes a dirty page back in place, so a
+// torn write leaves a page half old and half new, and a crash between writing a
+// page and writing the meta leaves the file with more pages than page_count
+// records. Nothing above this layer may assume that a flush, a write-back or a
+// crash leaves the database consistent; the page-level journal that fixes it is
+// phase 3. The one ordering guarantee phase 1 does give -- page 0 last, then
+// fsync -- is the one that stops a durable page_count from running ahead of the
+// pages it counts.
+//
+// journal and lock stay 0: no journal, no locking, no threads.
+//
+// PHASE2.md section 2C adds the freelist: a freed page becomes reusable, and
+// the chain of DK_PAGE_FREELIST pages lives entirely on disk (meta.freelist_root
+// is the head, 0 = none), so it survives close/reopen with no in-memory state.
+// The page format and the chain algorithm over page bytes are in
+// pager/freelist.mettle; the frame pinning, the meta root and the error matrix
+// are here, because dk_pager_alloc has to consult the freelist before it
+// extends the file and this module cannot import a module that imports it.
+// dk_free_init/take/put/count are therefore defined here rather than in
+// freelist.mettle; every program that imports the pager sees them either way.
+//
+// Five things PHASE1.md 5.9 does not spell out, and why each is what it is:
+//
+// * `meta_dirty` and `closed` are documented fields of DkPager in PHASE1.md
+//   5.9 and 6b.12 states the rule they serve. Page 0 is an ordinary evictable
+//   frame (section 6b and test T4 require it: with n_frames frames a caller may
+//   hold n_frames-1 pages pinned and still expect a successful get, so page 0
+//   cannot be permanently pinned), but an `alloc` must make the new page_count
+//   durable and `get(0)` must never hand back what the disk still said when
+//   p->meta has moved on. `meta_dirty` carries both obligations while page 0 is
+//   not resident; dk_pager_meta_refresh encodes p->meta into the frame every
+//   time page 0 is installed while the flag is set. flush_plan reports page 0
+//   exactly once: from this flag, or from the meta frame's dirty bit when page
+//   0 is resident and was written through.
+// * `dk_pager_close` frees every buffer and array and sets `closed`, but not
+//   the DkPager itself; dk_pager_free releases the block. PHASE1.md section 7
+//   requires a second close of the same handle to answer DK_OK, which is only
+//   definable while the handle is still allocated, so the struct outlives the
+//   close and `closed` is what makes it not live. The cost is one small struct
+//   per open/close cycle; phase 1 accepts it rather than trade a defined double
+//   close for a use-after-free.
+// * open validates identity before integrity: dk_meta_check runs before
+//   dk_page_verify, which is the reverse of 5.9's step 5 then 6. Section 7 and
+//   T6 require a foreign file and a flipped magic byte at offset 16 to be
+//   NOT_A_DB, and either also breaks the CRC, so checksum-first would answer
+//   CORRUPT to a test that is written for NOT_A_DB. A bad checksum on a
+//   structurally sound page 0 is still CORRUPT, so section 7's checksum row is
+//   reachable either way.
+// * get verifies a page's checksum as it enters the cache (5.9 only says to
+//   read the page). This is the one place page bytes come off the disk, so it
+//   is the one place corruption can be caught before a caller reads it; a page
+//   that fails is not installed. Section 6b.11 makes the other half of that
+//   promise: everything this pager writes is sealed first, so a page that came
+//   through the pager always verifies.
+// * a failed open has no pager to record the code in, so dk_pager_err(0) and
+//   dk_pager_err_arg(0) answer for the last failed dk_pager_open. Section 7 and
+//   T6 ask for the specific code after a refused open, and that is the only
+//   channel a null return leaves. Phase 1 has no threads, so one slot is
+//   enough. A DK_PAGER_CREATE|DK_PAGER_READONLY open is treated as "no create"
+//   for the same reason it is refused nothing else: a read-only pager could not
+//   initialise the file, so a zero-byte one is NOT_A_DB.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../format/page.mettle";
+import "../format/meta.mettle";
+import "../platform/file.mettle";
+import "../platform/file_linux.mettle" if linux;
+import "freelist.mettle";
+import "journal.mettle";
+
+// --- constants (PHASE1.md section 2) ---------------------------------------
+
+export const DK_PAGER_CREATE: int32 = 1;
+export const DK_PAGER_READONLY: int32 = 2;
+export const DK_MIN_FRAMES: int32 = 8;
+export const DK_MAX_PAGES: uint32 = 1048576; // 4 GiB at 4096; the phase-1 cap
+
+// --- types (PHASE1.md section 5.9) -----------------------------------------
+
+export struct DkFrame {
+  data: uint8*;      // DK_PAGE_SIZE bytes, owned by the pager
+  page_no: uint32;   // meaningful while in_use
+  pin: int32;
+  in_use: bool;
+  dirty: bool;
+  referenced: bool;  // clock second-chance bit
+}
+
+export struct DkPager {
+  file: DkFile;
+  page_size: int32;
+  page_count: uint32;
+  frames: DkFrame*;
+  n_frames: int32;
+  index: int32*;     // open addressing; value = frame_index + 1, 0 = empty
+  index_cap: int32;  // power of two, >= 2 * n_frames
+  hand: int32;       // clock hand
+  n_dirty: int32;
+  write_count: int64; // pages written through dk_pager_write_page
+  err: int32;        // positive DK_ERR_* of the last failure, DK_OK otherwise
+  err_arg: int64;
+  read_only: bool;
+  closed: bool;      // set by dk_pager_close; makes a second close a no-op
+  meta_dirty: bool;  // p->meta differs from the bytes in the page-0 frame
+  meta: DkMeta;      // page 0, kept in sync with the frame
+  path: string;      // owned copy of the db path, for the journal name
+  journal: rawptr;   // DkJournal* while a transaction is open, else 0
+  journal_cap: int32; // dk_pager_set_journal_cap; default DK_JRN_MAX_RECORDS
+  lock: rawptr;      // phase 9; always 0 in phase 1
+}
+
+// The open-failure channel. dk_pager_open answers 0, so there is no pager to
+// record the code in; PHASE1.md section 7 and T6 still require the specific
+// code to be readable, so dk_pager_err(0) and dk_pager_err_arg(0) report the
+// last failed open. Two opens must not interleave -- phase 1 is single-threaded
+// by construction (no locking, no threads).
+var dk_pager_last_open_err: int32 = DK_OK;
+var dk_pager_last_open_err_arg: int64 = 0;
+
+// --- status helpers --------------------------------------------------------
+
+// Record a failure. `rc` is the negative form a dk_* function returns;
+// dk_pager_err reports the positive DK_ERR_* constant that section 7's table is
+// written in. Returns `rc` so a caller can `return dk_pager_fail(...)`.
+fn dk_pager_fail(p: DkPager*, rc: int32, arg: int64) -> int32 {
+  var code: int32 = rc;
+  if (code > 0) { code = 0 - code; }
+  p->err = 0 - code;
+  p->err_arg = arg;
+  return code;
+}
+
+// Same recording, for the functions that answer a DkFrame* and so have no
+// int32 return channel of their own.
+fn dk_pager_fail_ptr(p: DkPager*, rc: int32, arg: int64) -> DkFrame* {
+  var code: int32 = rc;
+  if (code > 0) { code = 0 - code; }
+  p->err = 0 - code;
+  p->err_arg = arg;
+  return 0;
+}
+
+fn dk_pager_clear_err(p: DkPager*) {
+  p->err = DK_OK;
+  p->err_arg = 0;
+}
+
+// A pager is live until dk_pager_close runs on it. After that every buffer is
+// gone and only `closed` and the recorded error are meaningful (see the header
+// note); dk_pager_free is what ends the block.
+fn dk_pager_is_live(p: DkPager*) -> bool {
+  return !p->closed;
+}
+
+// An owned copy of `s`, for the pager's own copy of the database path. The
+// caller frees out.chars. A zero-length result has chars == 0.
+fn dk_pager_copy_string(s: string) -> string {
+  var out: string;
+  var n: int64 = (int64)s.length;
+  out.chars = malloc(n + 1);
+  if (out.chars == 0) {
+    out.length = 0;
+    return out;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    out.chars[i] = s.chars[i];
+    i += 1;
+  }
+  out.chars[n] = 0;
+  out.length = (uint64)n;
+  return out;
+}
+
+// --- frame table internals -------------------------------------------------
+
+// Frame i. Written as an address-of an element rather than by scaling the
+// pointer, because struct-pointer arithmetic is not part of the contract.
+fn dk_pager_frame_at(p: DkPager*, i: int32) -> DkFrame* {
+  return &p->frames[i];
+}
+
+// Table size: the next power of two at or above 2 * n_frames, so the open
+// addressed table is never more than half full and the probe loops always
+// terminate on an empty slot.
+fn dk_pager_index_cap(n_frames: int32) -> int32 {
+  var want: int64 = 2 * (int64)n_frames;
+  var cap: int64 = 1;
+  while (cap < want) { cap = cap * 2; }
+  // An int32 table of slots; anything larger is a request we cannot serve.
+  if (cap > (int64)1073741824) { return -DK_ERR_NOMEM; }
+  return (int32)cap;
+}
+
+// Multiplicative hash into a slot. The multiplier is odd and the table size is
+// a power of two, so distinct page numbers below the table size never collide
+// and clustered page numbers still spread.
+fn dk_pager_slot_of(page_no: uint32, mask: int32) -> int32 {
+  var h: uint32 = page_no * (uint32)0x9E3779B1;
+  return (int32)(h & (uint32)mask);
+}
+
+// Is slot k inside the cyclic interval [lo, hi]?
+fn dk_pager_slot_in_range(lo: int32, k: int32, hi: int32) -> bool {
+  if (lo <= hi) { return (k >= lo) && (k <= hi); }
+  return (k >= lo) || (k <= hi);
+}
+
+// Frame index holding page_no, or -1 when it is not cached.
+fn dk_pager_find(p: DkPager*, page_no: uint32) -> int32 {
+  var mask: int32 = p->index_cap - 1;
+  var slot: int32 = dk_pager_slot_of(page_no, mask);
+  var probes: int32 = 0;
+  while (probes < p->index_cap) {
+    var v: int32 = p->index[slot];
+    if (v == 0) { return -1; }
+    if (p->frames[v - 1].page_no == page_no) { return v - 1; }
+    slot = (slot + 1) & mask;
+    probes += 1;
+  }
+  return -1;
+}
+
+fn dk_pager_index_insert(p: DkPager*, page_no: uint32, fi: int32) {
+  var mask: int32 = p->index_cap - 1;
+  var slot: int32 = dk_pager_slot_of(page_no, mask);
+  while (p->index[slot] != 0) { slot = (slot + 1) & mask; }
+  p->index[slot] = fi + 1;
+}
+
+// Backward-shift deletion (PHASE1.md section 6): empty the slot, then re-seat
+// every entry of the probe cluster that lost its path to its home slot. No
+// tombstone is ever left, and none is needed: the table is fixed at
+// index_cap >= 2 * n_frames, so tombstones could fill it permanently.
+fn dk_pager_index_remove(p: DkPager*, page_no: uint32) {
+  var mask: int32 = p->index_cap - 1;
+  var i: int32 = dk_pager_slot_of(page_no, mask);
+  var probes: int32 = 0;
+  while (probes < p->index_cap) {
+    if (p->index[i] == 0) { return; }
+    if (p->frames[p->index[i] - 1].page_no == page_no) { break; }
+    i = (i + 1) & mask;
+    probes += 1;
+  }
+  if (probes >= p->index_cap) { return; }
+
+  var j: int32 = i;
+  while (true) {
+    p->index[i] = 0;
+    while (true) {
+      j = (j + 1) & mask;
+      if (p->index[j] == 0) { return; }
+      var home: int32 = dk_pager_slot_of(p->frames[p->index[j] - 1].page_no,
+        mask);
+      // Move the entry at j down into the hole at i only when the hole is on
+      // its probe path, i.e. when i lies in the cyclic interval [home, j].
+      // Otherwise the entry is still reachable where it is and the hole is
+      // left for the next entry that does need it.
+      if (dk_pager_slot_in_range(home, i, j)) { break; }
+    }
+    p->index[i] = p->index[j];
+    i = j;
+  }
+}
+
+// --- dirty accounting ------------------------------------------------------
+
+fn dk_pager_mark_dirty(p: DkPager*, f: DkFrame*) {
+  if (!f->dirty) {
+    f->dirty = true;
+    p->n_dirty += 1;
+  }
+}
+
+// What the next flush owes for page 0: the pager's own copy is stale, or the
+// caller wrote page 0 through its frame.
+fn dk_pager_meta_pending(p: DkPager*) -> bool {
+  if (p->meta_dirty) { return true; }
+  var fi: int32 = dk_pager_find(p, 0);
+  if (fi < 0) { return false; }
+  return p->frames[fi].dirty;
+}
+
+// Page 0 is never allowed to go stale (PHASE1.md 5.9 and 6b.12). Whenever a
+// frame is about to hold page 0 and p->meta is ahead of the bytes in it, encode
+// p->meta before the caller can decode the frame: the disk copy left behind by
+// an eviction carries whatever page_count, roots and txn_id it had at that
+// moment, and handing that back would silently answer for an older database.
+fn dk_pager_meta_refresh(p: DkPager*, f: DkFrame*) -> int32 {
+  if (f->page_no != 0 || !p->meta_dirty) { return DK_OK; }
+  var rc: int32 = dk_meta_write(f->data, p->meta);
+  if (rc != DK_OK) { return rc; }
+  // The frame now differs from the disk, so it owes a write-back as well.
+  dk_pager_mark_dirty(p, f);
+  return DK_OK;
+}
+
+// Record that page 0 must be rewritten. When the meta frame happens to be
+// resident it is re-encoded from p->meta at once, so a `get(0)` can never hand
+// back a body that disagrees with the pager's own copy.
+fn dk_pager_meta_touch(p: DkPager*) {
+  p->meta_dirty = true;
+  var fi: int32 = dk_pager_find(p, 0);
+  if (fi < 0) { return; }
+  dk_pager_meta_refresh(p, dk_pager_frame_at(p, fi));
+}
+
+// How many pages the next flush would write: every dirty page above 0, plus
+// page 0 when the meta is pending.
+fn dk_pager_plan_count(p: DkPager*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < p->n_frames) {
+    var f: DkFrame* = dk_pager_frame_at(p, i);
+    if (f->in_use && f->dirty && f->page_no > 0) { n += 1; }
+    i += 1;
+  }
+  if (dk_pager_meta_pending(p)) { n += 1; }
+  return n;
+}
+
+// --- eviction --------------------------------------------------------------
+
+// Clock second-chance scan (PHASE1.md section 6), bounded by 2 * n_frames. An
+// unused frame is taken at once; a pinned frame is NEVER a candidate; a
+// referenced frame loses its second chance and is looked at again next pass.
+// Returns -1 when everything in reach is pinned.
+fn dk_pager_pick_victim(p: DkPager*) -> int32 {
+  var n: int32 = p->n_frames;
+  var scanned: int32 = 0;
+  while (scanned < 2 * n) {
+    var fi: int32 = p->hand;
+    p->hand = (p->hand + 1) % n;
+    var f: DkFrame* = dk_pager_frame_at(p, fi);
+    scanned += 1;
+    if (!f->in_use) { return fi; }
+    if (f->pin > 0) { continue; }
+    if (f->referenced) {
+      f->referenced = false;
+      continue;
+    }
+    return fi;
+  }
+  return -1;
+}
+
+// The one place a page reaches the disk (PHASE3.md 3A). Sealing happens here,
+// so no caller can write an unsealed page, and 3B's before-image append hangs
+// off the journal hook below. Exactly DK_PAGE_SIZE bytes at
+// page_no * DK_PAGE_SIZE, all-or-error: the file write primitive writes all of
+// len or fails. Every writer -- eviction, flush, and anything added later -- goes
+// through this function and nothing else.
+fn dk_pager_write_page(p: DkPager*, page_no: uint32, page: uint8*) -> int32 {
+  dk_page_seal(page);
+  // The before-image is appended and fsynced before the page it protects is
+  // written (PHASE3.md 3B). The old bytes come from the disk, not from the
+  // frame: the frame already holds the new content. dk_jrn_needs is false for
+  // a page allocated after begin and for a page already journaled, so a page
+  // that is evicted, re-read and written again keeps its first before-image.
+  if (p->journal != 0) {
+    var j: DkJournal* = (DkJournal*)p->journal;
+    if (dk_jrn_needs(j, page_no)) {
+      var before: uint8* = malloc((int64)DK_PAGE_SIZE);
+      if (before == 0) { return -DK_ERR_NOMEM; }
+      var boff: int64 = (int64)page_no * (int64)DK_PAGE_SIZE;
+      var brc: int32 = dk_file_read_at(p->file, boff, before,
+        (int64)DK_PAGE_SIZE);
+      if (brc != DK_PAGE_SIZE) {
+        free(before);
+        return -DK_ERR_CORRUPT;
+      }
+      var arc: int32 = dk_jrn_append(j, page_no, before);
+      free(before);
+      if (arc != DK_OK) { return arc; }
+    }
+  }
+  var off: int64 = (int64)page_no * (int64)DK_PAGE_SIZE;
+  var rc: int32 = dk_file_write_at(p->file, off, page, (int64)DK_PAGE_SIZE);
+  if (rc != DK_OK) { return rc; }
+  p->write_count += 1;
+  return DK_OK;
+}
+
+// Write a dirty frame back to its page and clear the dirty bit. The page is
+// sealed by dk_pager_write_page immediately before the write, never after, so
+// the bytes on disk are exactly the frame's bytes and they pass
+// dk_page_verify. A failed write changes nothing: the caller abandons the
+// eviction and the frame stays valid and dirty.
+fn dk_pager_write_back(p: DkPager*, f: DkFrame*) -> int32 {
+  var rc: int32 = dk_pager_write_page(p, f->page_no, f->data);
+  if (rc != DK_OK) { return rc; }
+  if (f->dirty) {
+    f->dirty = false;
+    p->n_dirty -= 1;
+  }
+  // A resident meta frame that has just been written carries the durable
+  // page_count, so the pending rewrite is satisfied.
+  if (f->page_no == 0) { p->meta_dirty = false; }
+  return DK_OK;
+}
+
+// Take frame `fi` for `page_no`: write it back when it is dirty, unlink the
+// page it used to hold, then leave it in_use, pinned once, clean and
+// unreferenced-by-the-index. The page's bytes are the caller's next step: get
+// reads them, alloc zeroes them.
+fn dk_pager_take_frame(p: DkPager*, fi: int32, page_no: uint32) -> int32 {
+  var f: DkFrame* = dk_pager_frame_at(p, fi);
+  if (f->in_use) {
+    if (f->dirty) {
+      var rc: int32 = dk_pager_write_back(p, f);
+      if (rc != DK_OK) { return rc; }
+    }
+    dk_pager_index_remove(p, f->page_no);
+    f->in_use = false;
+  }
+  f->page_no = page_no;
+  f->in_use = true;
+  f->pin = 1;
+  f->dirty = false;
+  f->referenced = true;
+  return DK_OK;
+}
+
+// Read page_no into frame fi and verify it. get is the one path by which page
+// bytes enter the cache, so it is the one place a corrupt page can be caught
+// before a caller sees it.
+fn dk_pager_load_page(p: DkPager*, fi: int32, page_no: uint32) -> int32 {
+  var f: DkFrame* = dk_pager_frame_at(p, fi);
+  var off: int64 = (int64)page_no * (int64)DK_PAGE_SIZE;
+  var rc: int32 = dk_file_read_at(p->file, off, f->data, (int64)DK_PAGE_SIZE);
+  if (rc < 0) { return rc; }
+  // A short read means the file is shorter than page_count claims: a torn
+  // write or a file touched underneath us, never a page we may hand out.
+  if (rc != DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
+  if (dk_page_verify(f->data) != DK_OK) { return -DK_ERR_CORRUPT; }
+  // Page 0 has just been installed after an eviction: replace the bytes the
+  // disk still has with p->meta before the caller can decode them.
+  if (page_no == 0) { return dk_pager_meta_refresh(p, f); }
+  return DK_OK;
+}
+
+// --- flush internals -------------------------------------------------------
+
+// Write one page of the flush plan. A resident frame is written from its own
+// buffer (page 0 first re-encoded when p->meta is the authority). Page 0 that
+// is not resident -- the only plan entry that can be absent from the table --
+// is encoded from p->meta into a scratch buffer; dk_page_init gives it the
+// same header every meta page has, so the bytes are the ones a resident frame
+// would have produced.
+fn dk_pager_write_planned(p: DkPager*, page_no: uint32) -> int32 {
+  var fi: int32 = dk_pager_find(p, page_no);
+  if (fi >= 0) {
+    var f: DkFrame* = dk_pager_frame_at(p, fi);
+    if (page_no == 0 && p->meta_dirty) { dk_meta_write(f->data, p->meta); }
+    return dk_pager_write_page(p, page_no, f->data);
+  }
+  var buf: uint8* = malloc((int64)DK_PAGE_SIZE);
+  if (buf == 0) { return -DK_ERR_NOMEM; }
+  var rc: int32 = dk_page_init(buf, DK_PAGE_META);
+  if (rc == DK_OK) { rc = dk_meta_write(buf, p->meta); }
+  if (rc == DK_OK) { rc = dk_pager_write_page(p, page_no, buf); }
+  free(buf);
+  return rc;
+}
+
+// After a successful sync the plan's pages are durable: drop their dirty bits.
+fn dk_pager_mark_written(p: DkPager*, page_no: uint32) {
+  if (page_no == 0) { p->meta_dirty = false; }
+  var fi: int32 = dk_pager_find(p, page_no);
+  if (fi < 0) { return; }
+  var f: DkFrame* = dk_pager_frame_at(p, fi);
+  if (f->dirty) {
+    f->dirty = false;
+    p->n_dirty -= 1;
+  }
+}
+
+// --- lifecycle internals ---------------------------------------------------
+
+// Free every frame buffer and both arrays, then close the file. Returns the
+// close code; the pager is closed afterwards (closed = true, see the header
+// note). Safe on a pager whose buffers were only partly allocated, which is why
+// it guards data == 0.
+fn dk_pager_release_all(p: DkPager*) -> int32 {
+  var i: int32 = 0;
+  while (i < p->n_frames) {
+    var f: DkFrame* = dk_pager_frame_at(p, i);
+    if (f->data != 0) {
+      free(f->data);
+      f->data = 0;
+    }
+    i += 1;
+  }
+  if (p->frames != 0) {
+    free(p->frames);
+    p->frames = 0;
+  }
+  if (p->index != 0) {
+    free(p->index);
+    p->index = 0;
+  }
+  // A journal still attached here means the caller freed a pager without
+  // closing it (close rolls back). Remove the file so the descriptor and the
+  // journal do not outlive the pager; the transaction is lost, which is the
+  // documented cost of freeing without closing.
+  if (p->journal != 0) {
+    dk_jrn_destroy((DkJournal*)p->journal);
+    p->journal = 0;
+  }
+  if (p->path.chars != 0) {
+    free(p->path.chars);
+    p->path.chars = 0;
+    p->path.length = 0;
+  }
+  var rc: int32 = dk_file_close(p->file);
+  p->file.is_open = false;
+  p->n_frames = 0;
+  p->n_dirty = 0;
+  p->meta_dirty = false;
+  p->closed = true;
+  return rc;
+}
+
+// Read and validate page 0 of an existing file and leave it resident, unpinned.
+//
+// Identity before integrity: a foreign file and a flipped magic byte both break
+// the CRC as well, and PHASE1.md section 7 (and T6) require NOT_A_DB for
+// exactly those two cases, so dk_meta_check runs before dk_page_verify. A bad
+// checksum on a structurally sound page 0 is still CORRUPT.
+fn dk_pager_load_page_zero(p: DkPager*) -> int32 {
+  var f: DkFrame* = dk_pager_frame_at(p, 0);
+  var rc: int32 = dk_file_read_at(p->file, 0, f->data, (int64)DK_PAGE_SIZE);
+  if (rc < 0) { return rc; }
+  if (rc != DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
+  var mrc: int32 = dk_meta_check(f->data);
+  if (mrc != DK_OK) { return mrc; }
+  var m: DkMeta = dk_meta_read(f->data);
+  if (!m.valid) { return -DK_ERR_CORRUPT; }
+  if (dk_page_verify(f->data) != DK_OK) { return -DK_ERR_CORRUPT; }
+
+  p->meta = m;
+  p->page_count = m.page_count;
+  f->page_no = 0;
+  f->in_use = true;
+  f->pin = 0;
+  f->dirty = false;
+  // Second chance: page 0 is the page every alloc has to rewrite, so it earns
+  // its way past the first clock pass instead of being evicted by the first
+  // miss.
+  f->referenced = true;
+  dk_pager_index_insert(p, 0, 0);
+  p->hand = 0;
+  return DK_OK;
+}
+
+// A zero-byte file opened with DK_PAGER_CREATE: page 0 only, on disk before
+// open returns (PHASE1.md section 5.9 step 2).
+fn dk_pager_init_new(p: DkPager*) -> int32 {
+  var f: DkFrame* = dk_pager_frame_at(p, 0);
+  var rc: int32 = dk_page_init(f->data, DK_PAGE_META);
+  if (rc != DK_OK) { return rc; }
+
+  var m: DkMeta;
+  m.valid = true;
+  m.magic = DK_MAGIC;
+  m.version = DK_FORMAT_VERSION;
+  m.page_size = DK_PAGE_SIZE;
+  m.page_count = 1;
+  m.freelist_root = 0;
+  m.catalog_root = 0;
+  m.btree_root = 0;
+  m.txn_id = 0;
+  m.write_version = 1;
+  p->meta = m;
+  p->page_count = 1;
+
+  rc = dk_meta_write(f->data, m);
+  if (rc != DK_OK) { return rc; }
+  f->page_no = 0;
+  f->in_use = true;
+  f->pin = 1;
+  f->dirty = true;
+  f->referenced = true;
+  dk_pager_index_insert(p, 0, 0);
+  p->n_dirty = 1;
+  p->meta_dirty = true;
+
+  rc = dk_pager_flush(p);
+  if (rc != DK_OK) { return rc; }
+  f->pin = 0;
+  return DK_OK;
+}
+
+// --- open / close ----------------------------------------------------------
+
+fn dk_pager_open_failed(code: int32, arg: int64) -> DkPager* {
+  dk_pager_last_open_err = code;
+  dk_pager_last_open_err_arg = arg;
+  return 0;
+}
+
+export fn dk_pager_open(path: string, n_frames: int32, flags: int32) -> DkPager* {
+  dk_pager_last_open_err = DK_OK;
+  dk_pager_last_open_err_arg = 0;
+  if (n_frames < DK_MIN_FRAMES) {
+    return dk_pager_open_failed(DK_ERR_USAGE, (int64)n_frames);
+  }
+  var cap: int32 = dk_pager_index_cap(n_frames);
+  if (cap < 0) {
+    return dk_pager_open_failed(DK_ERR_NOMEM, (int64)n_frames);
+  }
+
+  var read_only: bool = (flags & DK_PAGER_READONLY) != 0;
+  var want_create: bool = (flags & DK_PAGER_CREATE) != 0;
+  // A read-only pager is opened read-only: it must not create a file it could
+  // never initialise, so a zero-byte file is NOT_A_DB to it, not a new db.
+  var oflags: int32 = DK_OPEN_READ;
+  if (!read_only) {
+    oflags = DK_OPEN_READ | DK_OPEN_WRITE;
+    if (want_create) { oflags = oflags | DK_OPEN_CREATE; }
+  }
+  var file: DkFile = dk_file_open(path, oflags);
+  if (!file.is_open) {
+    return dk_pager_open_failed((int32)(0 - file.handle), 0);
+  }
+
+  var p: DkPager* = new DkPager;
+  if (p == 0) {
+    dk_file_close(file);
+    return dk_pager_open_failed(DK_ERR_NOMEM, 0);
+  }
+  p->file = file;
+  p->page_size = DK_PAGE_SIZE;
+  p->page_count = 0;
+  p->n_frames = n_frames;
+  p->index_cap = cap;
+  p->hand = 0;
+  p->n_dirty = 0;
+  p->write_count = 0;
+  p->err = DK_OK;
+  p->err_arg = 0;
+  p->read_only = read_only;
+  p->closed = false;
+  p->journal = 0;
+  p->journal_cap = DK_JRN_MAX_RECORDS;
+  p->lock = 0;
+  p->meta_dirty = false;
+  p->path = dk_pager_copy_string(path);
+  if (p->path.chars == 0) {
+    dk_pager_release_all(p);
+    free(p);
+    return dk_pager_open_failed(DK_ERR_NOMEM, 0);
+  }
+
+  // new T[n] is zeroed, so an unprepared frame has data == 0 and in_use false.
+  var frames: DkFrame[] = new DkFrame[n_frames];
+  var index: int32[] = new int32[cap];
+  p->frames = frames.data;
+  p->index = index.data;
+
+  // One page buffer per frame, allocated up front: the get and alloc paths must
+  // not have to allocate in the middle of an eviction, where a failure would
+  // leave the table half changed.
+  var i: int32 = 0;
+  while (i < n_frames) {
+    var buf: uint8* = malloc((int64)DK_PAGE_SIZE);
+    if (buf == 0) {
+      dk_pager_release_all(p);
+      free(p);
+      return dk_pager_open_failed(DK_ERR_NOMEM, 0);
+    }
+    frames[i].data = buf;
+    i += 1;
+  }
+
+  // A hot journal is replayed before anything else (PHASE3.md 3B): before
+  // page 0 is read, before the size is trusted, before a new database is
+  // created. Recovery may truncate the file back to the journal's page count.
+  var jrc: int32 = dk_jrn_recover(path, p->file, read_only, DK_MAX_PAGES);
+  if (jrc != DK_OK) {
+    dk_pager_release_all(p);
+    free(p);
+    return dk_pager_open_failed(0 - jrc, 0);
+  }
+
+  var size: int64 = dk_file_size(p->file);
+  if (size < 0) {
+    var code: int32 = (int32)(0 - size);
+    dk_pager_release_all(p);
+    free(p);
+    return dk_pager_open_failed(code, size);
+  }
+  if (size == 0) {
+    // A read-only pager never creates: it could not write page 0 even if the
+    // file were ours to initialise, so CREATE is ignored and a zero-byte file
+    // is simply not a database yet.
+    if (!want_create || read_only) {
+      dk_pager_release_all(p);
+      free(p);
+      return dk_pager_open_failed(DK_ERR_NOT_A_DB, size);
+    }
+    var irc: int32 = dk_pager_init_new(p);
+    if (irc != DK_OK) {
+      dk_pager_release_all(p);
+      free(p);
+      return dk_pager_open_failed(0 - irc, size);
+    }
+    return p;
+  }
+  // Phase 1 never truncates the file, so a partial page is never ours.
+  if (size % (int64)DK_PAGE_SIZE != 0) {
+    dk_pager_release_all(p);
+    free(p);
+    return dk_pager_open_failed(DK_ERR_CORRUPT, size);
+  }
+  var rc: int32 = dk_pager_load_page_zero(p);
+  if (rc != DK_OK) {
+    dk_pager_release_all(p);
+    free(p);
+    return dk_pager_open_failed(0 - rc, size);
+  }
+  // A page_count that disagrees with the file's length is a torn write or a
+  // foreign file. Trusting either number would be a repair, and repairing is
+  // not this layer's job.
+  if (size / (int64)DK_PAGE_SIZE != (int64)p->meta.page_count) {
+    dk_pager_release_all(p);
+    free(p);
+    return dk_pager_open_failed(DK_ERR_CORRUPT, size);
+  }
+  return p;
+}
+
+// Flush, sync, close the file and free every buffer and array. The DkPager
+// block survives so a second close can be answered DK_OK (PHASE1.md section 7);
+// dk_pager_free is what releases it.
+export fn dk_pager_close(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  // Second close is DK_OK (PHASE1.md section 7); the handle outlives it.
+  if (!dk_pager_is_live(p)) { return DK_OK; }
+
+  var first: int32 = DK_OK;
+  // A close with an open transaction rolls it back: closing is not committing,
+  // and leaving a hot journal behind would make the next open undo a
+  // transaction the caller never committed.
+  if (p->journal != 0) {
+    var rrc: int32 = dk_pager_rollback(p);
+    if (rrc != DK_OK) { first = rrc; }
+  }
+  var rc: int32 = dk_pager_flush(p);
+  if (rc != DK_OK && first == DK_OK) { first = rc; }
+  rc = dk_pager_sync(p);
+  if (rc != DK_OK && first == DK_OK) { first = rc; }
+  // Everything is freed on the error path too: a failed flush must not leak a
+  // frame buffer or an array.
+  rc = dk_pager_release_all(p);
+  if (rc != DK_OK && first == DK_OK) { first = rc; }
+  p->err = 0 - first;
+  p->err_arg = 0;
+  return first;
+}
+
+// Release the DkPager block itself, after close (even a failed close). It does
+// not flush: freeing is not closing, so a caller that never closed gets its
+// buffers and file handle back and nothing is written.
+export fn dk_pager_free(p: DkPager*) {
+  if (p == 0) { return; }
+  if (!p->closed) {
+    // Freeing without closing is a caller error, but it must not leave a hot
+    // journal that would undo the next open. Roll back first, then release.
+    if (p->journal != 0) { dk_pager_rollback(p); }
+    dk_pager_release_all(p);
+  }
+  free(p);
+}
+
+// --- roots -----------------------------------------------------------------
+
+// Write a DK_ROOT_* slot. The pager's meta is authoritative in memory and page
+// 0 is rewritten by the next flush, exactly like page_count (see the header
+// note on meta_dirty).
+export fn dk_pager_set_root(p: DkPager*, which: int32, page_no: uint32) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if (p->read_only) {
+    return dk_pager_fail(p, -DK_ERR_READONLY, (int64)which);
+  }
+  var rc: int32 = dk_meta_set_root(&p->meta, which, page_no);
+  if (rc != DK_OK) { return dk_pager_fail(p, rc, (int64)which); }
+  dk_pager_meta_touch(p);
+  return DK_OK;
+}
+
+// --- page access -----------------------------------------------------------
+
+export fn dk_pager_get(p: DkPager*, page_no: uint32, write: bool) -> DkFrame* {
+  if (p == 0) { return 0; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail_ptr(p, -DK_ERR_USAGE, 0); }
+  // A write intent on a read-only pager is refused before anything is pinned.
+  if (write && p->read_only) {
+    return dk_pager_fail_ptr(p, -DK_ERR_READONLY, (int64)page_no);
+  }
+
+  var fi: int32 = dk_pager_find(p, page_no);
+  if (fi >= 0) {
+    var hit: DkFrame* = dk_pager_frame_at(p, fi);
+    var mrc: int32 = dk_pager_meta_refresh(p, hit);
+    if (mrc != DK_OK) { return dk_pager_fail_ptr(p, mrc, (int64)page_no); }
+    hit->pin += 1;
+    hit->referenced = true;
+    return hit;
+  }
+
+  // A cached page is reachable even before the meta that counts it is durable
+  // (PHASE1.md section 5.9: alloc caches first, flushes later).
+  if ((int64)page_no >= (int64)p->page_count) {
+    return dk_pager_fail_ptr(p, -DK_ERR_RANGE, (int64)page_no);
+  }
+
+  fi = dk_pager_pick_victim(p);
+  if (fi < 0) {
+    // Every frame in reach is pinned: refuse rather than evict a page a caller
+    // still holds. No frame is touched.
+    return dk_pager_fail_ptr(p, -DK_ERR_BUSY, (int64)page_no);
+  }
+  var rc: int32 = dk_pager_take_frame(p, fi, page_no);
+  if (rc != DK_OK) {
+    // A failed write-back abandons the eviction; the frame stays as it was.
+    return dk_pager_fail_ptr(p, rc, (int64)page_no);
+  }
+  rc = dk_pager_load_page(p, fi, page_no);
+  if (rc != DK_OK) {
+    // Nothing references the frame and its old contents are gone, so hand it
+    // back to the clock as a free frame rather than leave it half installed.
+    var f: DkFrame* = dk_pager_frame_at(p, fi);
+    f->in_use = false;
+    f->pin = 0;
+    f->page_no = 0;
+    f->dirty = false;
+    f->referenced = false;
+    return dk_pager_fail_ptr(p, rc, (int64)page_no);
+  }
+  dk_pager_index_insert(p, page_no, fi);
+  return dk_pager_frame_at(p, fi);
+}
+
+export fn dk_pager_release(p: DkPager*, f: DkFrame*, dirty: bool) -> int32 {
+  if (p == 0 || f == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if (f->pin <= 0) {
+    // The bug this catches is a caller releasing a page it does not hold: the
+    // pin count would go negative and the frame would become evictable while
+    // somebody still reads it.
+    return dk_pager_fail(p, -DK_ERR_USAGE, (int64)f->page_no);
+  }
+  if (dirty && p->read_only) {
+    return dk_pager_fail(p, -DK_ERR_READONLY, (int64)f->page_no);
+  }
+  f->pin -= 1;
+  if (dirty) { dk_pager_mark_dirty(p, f); }
+  return DK_OK;
+}
+
+// --- freelist (PHASE2.md section 2C) ---------------------------------------
+//
+// The chain lives on disk: meta.freelist_root is the head, every freelist page
+// links to the next, and every page the chain names is reusable. There is no
+// in-memory index, so take/put/count walk the chain through the pager and the
+// chain survives close/reopen by construction.
+//
+// Two consequences worth naming:
+// * a take that finds a head page holding only its link hands that whole page
+//   out and advances the root. An emptied chain page is therefore never
+//   leaked; draining the freelist yields its chain pages too.
+// * a push that finds the head full makes a new head, and dk_pager_alloc may
+//   supply it FROM the freelist (one free page becomes a chain page) instead
+//   of growing the file. That is why the old root is re-read after the alloc.
+
+// Pin the freelist page `page_no` and prove it is one: inside the file, of
+// type DK_PAGE_FREELIST, structurally sound. Every walk goes through here, so
+// a chain that loops or names a data page is CORRUPT rather than an infinite
+// scan or a silently empty list. Answers 0 with dk_pager_err set on failure.
+fn dk_pager_free_get(p: DkPager*, page_no: uint32, write: bool) -> DkFrame* {
+  if ((int64)page_no >= (int64)p->page_count) {
+    return dk_pager_fail_ptr(p, -DK_ERR_CORRUPT, (int64)page_no);
+  }
+  var f: DkFrame* = dk_pager_get(p, page_no, write);
+  if (f == 0) { return 0; }
+  var rc: int32 = dk_page_check(f->data);
+  if (rc == DK_OK && dk_page_type(f->data) != DK_PAGE_FREELIST) {
+    rc = -DK_ERR_CORRUPT;
+  }
+  if (rc != DK_OK) {
+    dk_pager_release(p, f, false);
+    return dk_pager_fail_ptr(p, rc, (int64)page_no);
+  }
+  return f;
+}
+
+// What the freelist can see of `page_no`: 0 = nothing, 1 = it is listed as
+// free, 2 = it is one of the chain's own pages, negative = failure. Freeing a
+// listed page twice and freeing a chain page are both CORRUPT (PHASE2.md
+// section 2C); telling them apart here keeps the walk in one place.
+fn dk_pager_free_probe(p: DkPager*, page_no: uint32) -> int32 {
+  var root: uint32 = p->meta.freelist_root;
+  var walked: uint32 = 0;
+  while (root != 0) {
+    if (root == page_no) { return 2; }
+    var f: DkFrame* = dk_pager_free_get(p, root, false);
+    if (f == 0) { return 0 - p->err; }
+    var listed: bool = dk_free_page_has(f->data, page_no);
+    var next: uint32 = dk_free_page_next(f->data);
+    dk_pager_release(p, f, false);
+    if (listed) { return 1; }
+    root = next;
+    walked += 1;
+    // A chain that loops names more pages than the file holds; stop instead of
+    // spinning. The bound is the file itself, not an arbitrary constant.
+    if ((int64)walked > (int64)p->page_count) { return -DK_ERR_CORRUPT; }
+  }
+  return 0;
+}
+
+// Validate the whole chain without changing it. Phase 2C keeps no in-memory
+// freelist state, so this is not how take/put start up: it is the check a
+// caller (or a test) runs before trusting a file, and it is what proves the
+// chain read back after a reopen is sound. -DK_ERR_CORRUPT for a chain that
+// loops, names a page outside the file, is not a freelist page, or holds a
+// cell that is not a 4-byte page number or not a live page number.
+export fn dk_free_init(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  var root: uint32 = p->meta.freelist_root;
+  var walked: uint32 = 0;
+  while (root != 0) {
+    var f: DkFrame* = dk_pager_free_get(p, root, false);
+    if (f == 0) { return 0 - p->err; }
+    var n: int32 = dk_page_n_cells(f->data);
+    var bad: bool = false;
+    var i: int32 = 0;
+    while (i < n) {
+      if (dk_page_cell_len(f->data, i) != DK_FREE_CELL_BODY) { bad = true; }
+      i += 1;
+    }
+    // Cell 0 is the link; cells 1..n-1 must be pages this file really has.
+    // Page 0 is never free, so a 0 here is corruption too.
+    i = 1;
+    while (i < n) {
+      var v: uint32 = dk_free_page_at(f->data, i);
+      if (v == 0 || (int64)v >= (int64)p->page_count) { bad = true; }
+      i += 1;
+    }
+    var next: uint32 = dk_free_page_next(f->data);
+    dk_pager_release(p, f, false);
+    if (bad) { return dk_pager_fail(p, -DK_ERR_CORRUPT, (int64)root); }
+    root = next;
+    walked += 1;
+    if ((int64)walked > (int64)p->page_count) {
+      return dk_pager_fail(p, -DK_ERR_CORRUPT, (int64)root);
+    }
+  }
+  return DK_OK;
+}
+
+// Take the newest free page number, or 0 when the freelist is empty. LIFO, so
+// a reuse returns the pages in the order they were freed, newest first.
+// 0 is both the empty answer and the failure answer (PHASE2.md names the
+// return uint32), so a caller checks dk_pager_err: it is DK_OK for an empty
+// freelist and the failure code otherwise.
+export fn dk_free_take(p: DkPager*) -> uint32 {
+  if (p == 0) { return 0; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) {
+    dk_pager_fail(p, -DK_ERR_USAGE, 0);
+    return 0;
+  }
+  if (p->read_only) {
+    dk_pager_fail(p, -DK_ERR_READONLY, (int64)p->meta.freelist_root);
+    return 0;
+  }
+  var root: uint32 = p->meta.freelist_root;
+  if (root == 0) { return 0; }
+  var f: DkFrame* = dk_pager_free_get(p, root, true);
+  if (f == 0) { return 0; }
+  if (dk_free_page_count(f->data) >= 1) {
+    var v: uint32 = dk_free_page_pop(f->data);
+    dk_pager_release(p, f, true);
+    return v;
+  }
+  // Only the link is left: the head page is entirely reusable, so hand the
+  // page itself out and move the head to its successor.
+  var next: uint32 = dk_free_page_next(f->data);
+  dk_pager_release(p, f, false);
+  var rc: int32 = dk_pager_set_root(p, DK_ROOT_FREELIST, next);
+  if (rc != DK_OK) { return 0; }
+  return root;
+}
+
+// Is `page_no` in the frame table with a pin on it? An index lookup, not a
+// read: a page that is not resident is not pinned, and asking must not fault
+// it in.
+fn dk_pager_page_pinned(p: DkPager*, page_no: uint32) -> bool {
+  var fi: int32 = dk_pager_find(p, page_no);
+  if (fi < 0) { return false; }
+  return p->frames[fi].pin > 0;
+}
+
+// Push `page_no` onto the freelist. -DK_ERR_USAGE for page 0 (PHASE2.md 2C),
+// -DK_ERR_RANGE for a page the file does not have, -DK_ERR_USAGE for a page the
+// caller still has pinned, -DK_ERR_CORRUPT for a page the freelist can already
+// see (a double free, or a freelist page itself).
+export fn dk_free_put(p: DkPager*, page_no: uint32) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) {
+    return dk_pager_fail(p, -DK_ERR_USAGE, (int64)page_no);
+  }
+  if (p->read_only) {
+    return dk_pager_fail(p, -DK_ERR_READONLY, (int64)page_no);
+  }
+  if (page_no == 0) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if ((int64)page_no >= (int64)p->page_count) {
+    return dk_pager_fail(p, -DK_ERR_RANGE, (int64)page_no);
+  }
+  // A page the caller still has pinned is refused (PHASE2.md section 2C). The
+  // frame table is the only record of who owns a buffer: the next alloc hands
+  // this page to a new owner and zeroes it under the stale frame pointer, and
+  // nothing later can tell that it happened.
+  if (dk_pager_page_pinned(p, page_no)) {
+    return dk_pager_fail(p, -DK_ERR_USAGE, (int64)page_no);
+  }
+  var probe: int32 = dk_pager_free_probe(p, page_no);
+  if (probe == 1 || probe == 2) {
+    return dk_pager_fail(p, -DK_ERR_CORRUPT, (int64)page_no);
+  }
+  if (probe < 0) { return dk_pager_fail(p, probe, (int64)page_no); }
+
+  var root: uint32 = p->meta.freelist_root;
+  if (root == 0) {
+    // No chain yet: the head is a new page at the end of the file. The
+    // freelist is empty, so this alloc cannot come back out of it.
+    var nf: DkFrame* = dk_pager_alloc(p);
+    if (nf == 0) { return 0 - p->err; }
+    var new_root: uint32 = nf->page_no;
+    var irc: int32 = dk_free_page_init(nf->data, 0);
+    var prc: int32 = irc;
+    if (irc == DK_OK) { prc = dk_free_page_push(nf->data, page_no); }
+    dk_pager_release(p, nf, prc == DK_OK);
+    if (prc != DK_OK) { return dk_pager_fail(p, prc, (int64)new_root); }
+    return dk_pager_set_root(p, DK_ROOT_FREELIST, new_root);
+  }
+
+  var f: DkFrame* = dk_pager_free_get(p, root, true);
+  if (f == 0) { return 0 - p->err; }
+  var rc: int32 = dk_free_page_push(f->data, page_no);
+  if (rc != -DK_ERR_FULL) {
+    dk_pager_release(p, f, rc == DK_OK);
+    if (rc != DK_OK) { return dk_pager_fail(p, rc, (int64)page_no); }
+    return DK_OK;
+  }
+  dk_pager_release(p, f, false);
+
+  // The head is full: a new page becomes the head and links to the old one.
+  var hf: DkFrame* = dk_pager_alloc(p);
+  if (hf == 0) { return 0 - p->err; }
+  var head: uint32 = hf->page_no;
+  var hrc: int32 = dk_free_page_init(hf->data, p->meta.freelist_root);
+  if (hrc == DK_OK) { hrc = dk_free_page_push(hf->data, page_no); }
+  dk_pager_release(p, hf, hrc == DK_OK);
+  if (hrc != DK_OK) { return dk_pager_fail(p, hrc, (int64)head); }
+  return dk_pager_set_root(p, DK_ROOT_FREELIST, head);
+}
+
+// How many pages the freelist holds, across the whole chain. 0 with
+// dk_pager_err set when the chain cannot be read.
+export fn dk_free_count(p: DkPager*) -> int64 {
+  if (p == 0) { return 0; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) {
+    dk_pager_fail(p, -DK_ERR_USAGE, 0);
+    return 0;
+  }
+  var root: uint32 = p->meta.freelist_root;
+  var total: int64 = 0;
+  var walked: uint32 = 0;
+  while (root != 0) {
+    var f: DkFrame* = dk_pager_free_get(p, root, false);
+    if (f == 0) { return 0; }
+    total += (int64)dk_free_page_count(f->data);
+    var next: uint32 = dk_free_page_next(f->data);
+    dk_pager_release(p, f, false);
+    root = next;
+    walked += 1;
+    if ((int64)walked > (int64)p->page_count) {
+      dk_pager_fail(p, -DK_ERR_CORRUPT, (int64)root);
+      return 0;
+    }
+  }
+  return total;
+}
+
+// --- page allocation -------------------------------------------------------
+
+export fn dk_pager_alloc(p: DkPager*) -> DkFrame* {
+  if (p == 0) { return 0; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail_ptr(p, -DK_ERR_USAGE, 0); }
+  if (p->read_only) {
+    return dk_pager_fail_ptr(p, -DK_ERR_READONLY, (int64)p->page_count);
+  }
+  // A free page is reused before the file grows (PHASE2.md section 2C).
+  // dk_free_take answers 0 both for an empty freelist and for a failure, so
+  // the recorded error is what tells the two apart.
+  var reuse: uint32 = dk_free_take(p);
+  if (p->err != DK_OK) {
+    return dk_pager_fail_ptr(p, 0 - p->err, p->err_arg);
+  }
+  if (reuse != 0) {
+    var r: DkFrame* = dk_pager_get(p, reuse, true);
+    if (r == 0) { return 0; }
+    // Every byte, for the same reason the extend path below zeroes: the page
+    // still holds whatever its last owner left there (PHASE1.md 6b.9).
+    dk_bytes_zero(r->data, (int64)DK_PAGE_SIZE);
+    dk_pager_mark_dirty(p, r);
+    return r;
+  }
+  // The hard cap of PHASE1.md section 2: the page number is uint32 and the file
+  // is page_count * 4096, so 4 GiB is the phase-1 ceiling.
+  if (p->page_count >= DK_MAX_PAGES) {
+    return dk_pager_fail_ptr(p, -DK_ERR_NOSPC, (int64)p->page_count);
+  }
+
+  var fi: int32 = dk_pager_pick_victim(p);
+  if (fi < 0) { return dk_pager_fail_ptr(p, -DK_ERR_BUSY, 0); }
+  var page_no: uint32 = p->page_count;
+  var rc: int32 = dk_pager_take_frame(p, fi, page_no);
+  if (rc != DK_OK) {
+    // page_count has not moved, so the page number is not burned.
+    return dk_pager_fail_ptr(p, rc, (int64)page_no);
+  }
+  var f: DkFrame* = dk_pager_frame_at(p, fi);
+  // Every one of the 4096 bytes, whatever this frame held before: stale bytes
+  // are an information leak (PHASE1.md section 6b.9).
+  dk_bytes_zero(f->data, (int64)DK_PAGE_SIZE);
+  dk_pager_index_insert(p, page_no, fi);
+  p->page_count += 1;
+  dk_pager_mark_dirty(p, f);
+  // The new page_count only becomes durable with page 0.
+  p->meta.page_count = p->page_count;
+  dk_pager_meta_touch(p);
+  return f;
+}
+
+// PHASE2.md section 2C: a freed page is pushed onto the persistent freelist,
+// and the validation (page 0, a page the file does not have, a page the caller
+// still has pinned, a double free, a read-only pager) lives in dk_free_put so
+// there is exactly one copy of it. Refusing a pinned page is what keeps the
+// next alloc from zeroing a buffer a live frame pointer still names.
+export fn dk_pager_free_page(p: DkPager*, page_no: uint32) -> int32 {
+  return dk_free_put(p, page_no);
+}
+
+// --- durability ------------------------------------------------------------
+
+export fn dk_pager_flush_plan(p: DkPager*, out: uint32*, cap: int32) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  var need: int32 = dk_pager_plan_count(p);
+  if (cap < need) { return dk_pager_fail(p, -DK_ERR_FULL, (int64)need); }
+  if (need > 0 && out == 0) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+
+  // Ascending selection: repeatedly take the smallest page number above the
+  // last one written. n_frames is small and the plan is inspected, not hot.
+  var n: int32 = 0;
+  var last: uint32 = 0;
+  var more: bool = true;
+  while (more) {
+    var best: uint32 = 0;
+    var found: bool = false;
+    var i: int32 = 0;
+    while (i < p->n_frames) {
+      var f: DkFrame* = dk_pager_frame_at(p, i);
+      // page_no > last >= 0, so page 0 is never selected here; it goes last.
+      if (f->in_use && f->dirty && f->page_no > last) {
+        if (!found || f->page_no < best) {
+          best = f->page_no;
+          found = true;
+        }
+      }
+      i += 1;
+    }
+    if (found) {
+      out[n] = best;
+      n += 1;
+      last = best;
+    }
+    more = found;
+  }
+  // The meta last: a durable page_count that runs ahead of the durable pages it
+  // counts is a corrupt database.
+  if (dk_pager_meta_pending(p)) {
+    out[n] = 0;
+    n += 1;
+  }
+  return n;
+}
+
+export fn dk_pager_flush(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  var need: int32 = dk_pager_plan_count(p);
+  if (p->read_only && need > 0) {
+    return dk_pager_fail(p, -DK_ERR_READONLY, (int64)need);
+  }
+  if (need == 0) {
+    // Nothing to write. A flush still means "make what is on the disk durable",
+    // and a read-only pager can reach here (an fsync on a read-only file is
+    // legal), which is what lets close() work for one.
+    var zrc: int32 = dk_file_sync(p->file);
+    if (zrc != DK_OK) { return dk_pager_fail(p, zrc, 0); }
+    return DK_OK;
+  }
+
+  var plan: uint32[] = new uint32[need];
+  var got: int32 = dk_pager_flush_plan(p, plan.data, need);
+  if (got < 0) {
+    free(plan.data);
+    return dk_pager_fail(p, got, (int64)need);
+  }
+  var i: int32 = 0;
+  while (i < got) {
+    var rc: int32 = dk_pager_write_planned(p, plan[i]);
+    if (rc != DK_OK) {
+      free(plan.data);
+      // Nothing is marked clean: the pages were not all written, so the next
+      // flush must try again.
+      return dk_pager_fail(p, rc, (int64)plan[i]);
+    }
+    i += 1;
+  }
+  // Page 0 is already in the plan, last, so this one sync covers the whole
+  // write set. Only after it succeeds are the pages clean.
+  var src: int32 = dk_file_sync(p->file);
+  if (src != DK_OK) {
+    free(plan.data);
+    return dk_pager_fail(p, src, 0);
+  }
+  var k: int32 = 0;
+  while (k < got) {
+    dk_pager_mark_written(p, plan[k]);
+    k += 1;
+  }
+  free(plan.data);
+  return DK_OK;
+}
+
+export fn dk_pager_sync(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  var rc: int32 = dk_file_sync(p->file);
+  if (rc != DK_OK) { return dk_pager_fail(p, rc, 0); }
+  return DK_OK;
+}
+
+// --- transactions (PHASE3.md 3B) -------------------------------------------
+//
+// A transaction is a rollback journal attached to the pager. begin writes and
+// fsyncs the journal header; every page write through dk_pager_write_page
+// appends the page's before-image and fsyncs it before the new bytes reach the
+// disk; commit flushes the database, fsyncs it, and only then removes the
+// journal; rollback writes the before-images back, truncates the file to the
+// journal's page count, fsyncs, and removes the journal.
+//
+// The journal is attached to the pager, not to a frame, so an eviction, a
+// flush and the non-resident page-0 path all reach it through the one write
+// chokepoint. The journal's own bitmap decides "first touch", which is what
+// keeps a page that is evicted and re-read from getting a second before-image.
+
+export fn dk_pager_begin(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if (p->read_only) {
+    return dk_pager_fail(p, -DK_ERR_READONLY, 0);
+  }
+  if (p->journal != 0) {
+    return dk_pager_fail(p, -DK_ERR_USAGE, 0);
+  }
+  var j: DkJournal* = dk_jrn_create(p->path, p->page_count,
+    (uint32)p->meta.write_version, p->journal_cap);
+  if (j == 0) {
+    return dk_pager_fail(p, dk_jrn_last_error(), (int64)p->page_count);
+  }
+  p->journal = (rawptr)j;
+  return DK_OK;
+}
+
+export fn dk_pager_commit(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if (p->journal == 0) {
+    return dk_pager_fail(p, -DK_ERR_USAGE, 0);
+  }
+  // Write every dirty page (each before-image is appended by the chokepoint
+  // before its page), then fsync the database. Only after that is the journal
+  // removed: a commit that deleted the journal first would lose the undo log
+  // for pages that were not yet durable.
+  var rc: int32 = dk_pager_flush(p);
+  if (rc != DK_OK) { return dk_pager_fail(p, rc, 0); }
+  rc = dk_pager_sync(p);
+  if (rc != DK_OK) { return dk_pager_fail(p, rc, 0); }
+  dk_jrn_destroy((DkJournal*)p->journal);
+  p->journal = 0;
+  return DK_OK;
+}
+
+export fn dk_pager_rollback(p: DkPager*) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if (p->journal == 0) {
+    return dk_pager_fail(p, -DK_ERR_USAGE, 0);
+  }
+  // A pinned frame is a caller still reading a page this rollback is about to
+  // invalidate. Refuse rather than hand back a stale pointer.
+  var i: int32 = 0;
+  while (i < p->n_frames) {
+    if (p->frames[i].in_use && p->frames[i].pin > 0) {
+      return dk_pager_fail(p, -DK_ERR_BUSY, (int64)p->frames[i].page_no);
+    }
+    i += 1;
+  }
+  var j: DkJournal* = (DkJournal*)p->journal;
+  var rc: int32 = dk_jrn_rollback(j, p->file);
+  if (rc != DK_OK) { return dk_pager_fail(p, rc, 0); }
+  dk_jrn_destroy(j);
+  p->journal = 0;
+  // The cache still holds the new content. Drop every frame and reload page 0
+  // from the restored file, which also restores p->meta and p->page_count.
+  i = 0;
+  while (i < p->n_frames) {
+    var f: DkFrame* = dk_pager_frame_at(p, i);
+    f->in_use = false;
+    f->pin = 0;
+    f->page_no = 0;
+    f->dirty = false;
+    f->referenced = false;
+    i += 1;
+  }
+  i = 0;
+  while (i < p->index_cap) {
+    p->index[i] = 0;
+    i += 1;
+  }
+  p->n_dirty = 0;
+  p->meta_dirty = false;
+  p->hand = 0;
+  rc = dk_pager_load_page_zero(p);
+  if (rc != DK_OK) { return dk_pager_fail(p, rc, 0); }
+  return DK_OK;
+}
+
+export fn dk_pager_journal_attached(p: DkPager*) -> bool {
+  if (p == 0) { return false; }
+  return p->journal != 0;
+}
+
+// Lower the journal's record cap for this pager. It exists so a test can prove
+// NOSPC on a small database instead of allocating 65536 pages, and so an
+// embedder can bound the journal. The cap is read at begin; changing it while
+// a transaction is open is refused.
+export fn dk_pager_set_journal_cap(p: DkPager*, records: int32) -> int32 {
+  if (p == 0) { return -DK_ERR_USAGE; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) { return dk_pager_fail(p, -DK_ERR_USAGE, 0); }
+  if (records < 1) { return dk_pager_fail(p, -DK_ERR_USAGE, (int64)records); }
+  if (p->journal != 0) {
+    return dk_pager_fail(p, -DK_ERR_USAGE, (int64)records);
+  }
+  p->journal_cap = records;
+  return DK_OK;
+}
+
+// --- introspection ---------------------------------------------------------
+
+export fn dk_pager_err(p: DkPager*) -> int32 {
+  if (p == 0) { return dk_pager_last_open_err; }
+  return p->err;
+}
+
+export fn dk_pager_err_arg(p: DkPager*) -> int64 {
+  if (p == 0) { return dk_pager_last_open_err_arg; }
+  return p->err_arg;
+}
+
+export fn dk_pager_page_count(p: DkPager*) -> uint32 {
+  if (p == 0) { return 0; }
+  return p->page_count;
+}
+
+export fn dk_pager_frames(p: DkPager*) -> int32 {
+  if (p == 0) { return 0; }
+  return p->n_frames;
+}
+
+export fn dk_pager_dirty_count(p: DkPager*) -> int32 {
+  if (p == 0) { return 0; }
+  return p->n_dirty;
+}
+
+// How many pages have gone through dk_pager_write_page. A test uses it to
+// prove an eviction write-back and a flush both take the chokepoint rather
+// than a private path to the file write primitive (PHASE3.md 3A).
+export fn dk_pager_write_count(p: DkPager*) -> int64 {
+  if (p == 0) { return 0; }
+  return p->write_count;
+}
+
+export fn dk_pager_root(p: DkPager*, which: int32) -> uint32 {
+  if (p == 0) { return 0; }
+  return dk_meta_root(p->meta, which);
+}
+
+export fn dk_pager_txn_id(p: DkPager*) -> uint64 {
+  if (p == 0) { return 0; }
+  return p->meta.txn_id;
+}
+
+// No return channel in PHASE1.md 5.9, so a refused write is reported through
+// dk_pager_err like every other failure.
+export fn dk_pager_set_txn_id(p: DkPager*, id: uint64) {
+  if (p == 0) { return; }
+  dk_pager_clear_err(p);
+  if (!dk_pager_is_live(p)) {
+    p->err = DK_ERR_USAGE;
+    return;
+  }
+  if (p->read_only) {
+    p->err = DK_ERR_READONLY;
+    return;
+  }
+  p->meta.txn_id = id;
+  dk_pager_meta_touch(p);
+}

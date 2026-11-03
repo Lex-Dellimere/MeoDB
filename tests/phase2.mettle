@@ -1,0 +1,1047 @@
+// phase2: the phase-2 gate -- the whole stack in one run (PHASE2.md, I1..I4).
+//
+// A program, not @test functions: it needs real files in build/, a pager and
+// page-sized buffers, none of which the compile-time interpreter provides.
+//
+//   ./tools/mettle --build tests/phase2.mettle -o build/gate/p2
+//   ./build/gate/p2
+//
+// This is the integration half of the phase-2 gate: the unit suites prove each
+// module (a_self, key_self, freelist_self, btree_self), this proves the SEAMS
+// -- pager + page format + ordering + freelist + b-tree in one file, in the
+// shapes only the whole stack can produce.
+//
+//   I1  a 1000-key b-tree over the real pager with 8 frames (the pager's
+//       minimum, so the tree is larger than the cache and every split forces
+//       eviction and write-back), stored root, flush, close, reopen, then a
+//       walk comparing every key and every rowid.
+//       Catches a split whose write is lost to an eviction, a root update lost
+//       across flush/close, and a cursor that skips or repeats a row.
+//
+//   I2  the same tree, exercised through the page format's new extents: every
+//       leaf must pass dk_page_check, every cell's extent must exactly abut its
+//       neighbour (so the extents describe the page, not just the length
+//       prefixes), defrag every leaf, and the walk must produce the identical
+//       key/rowid sequence. Catches a defrag that shifts a body without fixing
+//       its extent, and a page format whose extents disagree with its pointers.
+//
+//   I3  a freelist round trip interleaved with the tree: build the tree, free
+//       three of its leaves, reopen (the freelist must survive), rebuild the
+//       tree from page 0, and require that the rebuild reuses the freed pages
+//       instead of extending the file. Catches a freelist that only lives in
+//       memory, and an allocator that ignores the freelist and extends.
+//
+//   I4  corruption: a single flipped byte in a leaf cell's length prefix,
+//       reopened, and a seek into that leaf must answer -DK_ERR_CORRUPT rather
+//       than a wrong row. Two shapes: the prefix flipped together with a
+//       repaired checksum (only PHASE2.md 2A's extent rules can catch it --
+//       this is the case that proves 2A paid for itself), and the bare flip
+//       whose checksum no longer matches (the phase-1 integrity layer).
+//
+// Every case names the bug it catches, and each was watched failing under a
+// deliberate mutation of src/ bounded by `timeout 15`, with the mutant
+// reverted and hash-checked immediately; the record is in PHASE2-RESULT.md.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+import "tinytest.mettle";
+
+const P2_TREE: string = "build/phase2_tree.dat";
+const P2_FREE: string = "build/phase2_free.dat";
+const P2_CORRUPT: string = "build/phase2_corrupt.dat";
+const P2_CORRUPT_CRC: string = "build/phase2_corrupt_crc.dat";
+
+// 100-byte keys: types/key.mettle's 9-byte int encoding plus a constant tail,
+// so the integer prefix still decides the order and a leaf holds 36 cells
+// instead of 194. That is what makes a 1000-key tree ~30 pages against the
+// 8-frame cache -- with 9-byte keys the whole tree fits in the cache and I1's
+// eviction/write-back half would prove nothing.
+const P2_WIDE: int32 = 100;
+const P2_KEYS: int32 = 1000;
+
+// I3's tree is small on purpose and its size is derived, not decorative: a
+// wide leaf fills at 36 cells and splits 18/19, so 37 keys make two leaves,
+// 35 more fill both halves (72 keys, both full), and the 73rd must split
+// again. That is exactly three leaves plus one root -- four pages -- and the
+// three leaves freed below plus the freelist's own head page are exactly the
+// four pages the rebuild needs, so "the file did not grow" is arithmetic that
+// can hold rather than a hope.
+const P2_I3_KEYS: int32 = 73;
+
+// I4 needs a tree with more than one leaf so the corrupted leaf is a leaf and
+// not the root, and no more.
+const P2_I4_KEYS: int32 = 100;
+
+// Fixed seed: debug, release and every re-run insert the keys in the same
+// order, so a failure is reproducible and the two builds are comparable.
+const P2_SEED: uint32 = 20260201;
+
+// Every rowid is P2_ROWID_BASE + key, so a walk that returns both in ascending
+// order is two independent order assertions (the key bytes and the rowids).
+const P2_ROWID_BASE: uint64 = 5000000;
+
+// A leaf holds 36 of these keys, so 1000 keys make ~28 leaves. The bound is
+// checked, not assumed: a key-width change that outgrew it fails loudly.
+const P2_MAX_LEAVES: int32 = 64;
+
+// The pager's minimum (DK_MIN_FRAMES, pager.mettle) and therefore the smallest
+// cache this integration run can use.
+const P2_FRAMES: int32 = 8;
+
+// The key I4 corrupts the leaf of. Any key works; a middle key is chosen so
+// the descent crosses at least one inner node.
+const P2_I4_KEY: int64 = 50;
+
+// The row the walk expects at a given index: rowid and key agree by
+// construction, so a walk compares the same number twice for two reasons.
+fn p2_rowid(v: int64) -> uint64 {
+  return P2_ROWID_BASE + (uint64)v;
+}
+
+// Make `path` a zero-byte file, the state DK_PAGER_CREATE is defined against;
+// the phase-1 platform surface has no unlink.
+fn p2_reset(path: string) -> int32 {
+  var f: DkFile = dk_file_open(path,
+    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  if (!f.is_open) { return -DK_ERR_IO; }
+  var rc: int32 = dk_file_truncate(f, 0);
+  dk_file_close(f);
+  return rc;
+}
+
+fn p2_pass(name: string) {
+  println("PASS {name}");
+}
+
+// Frames the pager currently has pinned. PHASE2.md 2D's cursor contract is
+// "exactly one leaf frame at a time", and the pin count is the only observable
+// form of it: a leak is invisible until the frame table runs out.
+fn p2_pins(p: DkPager*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < dk_pager_frames(p)) {
+    if (p->frames[i].pin > 0) { n += 1; }
+    i += 1;
+  }
+  return n;
+}
+
+// Encode key `v` at width `klen`: types/key.mettle's order-preserving int
+// encoding, then a constant tail. The comparator compares the common prefix
+// first, so the integer still decides the order.
+fn p2_make_key(buf: uint8*, v: int64, klen: int32) -> int32 {
+  var n: int32 = dk_key_int(buf, klen, v);
+  if (n < 0) { return n; }
+  var i: int32 = n;
+  while (i < klen) {
+    buf[i] = (uint8)0x5A;
+    i += 1;
+  }
+  return klen;
+}
+
+// Deterministic LCG (the Numerical Recipes multiplier), so the insert order is
+// identical in every build.
+fn p2_rand(state: uint32*) -> uint32 {
+  var s: uint32 = state[0] * (uint32)1664525 + (uint32)1013904223;
+  state[0] = s;
+  return s;
+}
+
+// Fill `order` with 0..n-1 shuffled by the LCG: Fisher-Yates, so every key
+// appears exactly once and the tree is built by a genuinely random order
+// rather than an ascending one (an ascending build hides most split bugs).
+fn p2_shuffle(order: int32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    order[i] = i;
+    i += 1;
+  }
+  var state: uint32[1];
+  state[0] = P2_SEED;
+  i = n - 1;
+  while (i > 0) {
+    var r: uint32 = p2_rand(&state[0]);
+    var j: int32 = (int32)(r % (uint32)(i + 1));
+    var t: int32 = order[i];
+    order[i] = order[j];
+    order[j] = t;
+    i -= 1;
+  }
+}
+
+fn p2_insert(p: DkPager*, root: uint32*, v: int64, klen: int32,
+    label: string) -> int32 {
+  var kb: uint8[P2_WIDE];
+  var kn: int32 = p2_make_key(&kb[0], v, klen);
+  if (kn < 0) {
+    println("FAIL {label}: key {v} does not encode");
+    return 1;
+  }
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var rc: int32 = dk_bt_insert(p, root, &dk_key_compare, kk, p2_rowid(v));
+  if (rc != DK_OK) {
+    println("FAIL {label}: insert {v} answered {rc}");
+    return 1;
+  }
+  return 0;
+}
+
+fn p2_lookup(p: DkPager*, root: uint32, v: int64, klen: int32,
+    label: string) -> int32 {
+  var kb: uint8[P2_WIDE];
+  var kn: int32 = p2_make_key(&kb[0], v, klen);
+  if (kn < 0) { return 1; }
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var rid: uint64 = 0;
+  var rc: int32 = dk_bt_lookup(p, root, &dk_key_compare, kk, &rid);
+  if (!dk_t_check_i64(rc, DK_OK, "{label}: lookup {v}")) { return 1; }
+  if (!dk_t_check_i64((int64)rid, (int64)p2_rowid(v),
+      "{label}: lookup {v} rowid")) {
+    return 1;
+  }
+  return 0;
+}
+
+fn p2_build(p: DkPager*, root: uint32*, order: int32*, n: int32, klen: int32,
+    label: string) -> int32 {
+  var i: int32 = 0;
+  while (i < n) {
+    var v: int64 = (int64)order[i];
+    if (p2_insert(p, root, v, klen, label) != 0) { return 1; }
+    i += 1;
+  }
+  return 0;
+}
+
+// Walk the whole tree in key order from key 0 and require, row by row, that
+// the key is exactly the encoding of the row index and the rowid is exactly its
+// base -- so order, completeness and the rowid payload are all asserted, and a
+// skipped, repeated or reordered row fails on the row it happens at. The pin
+// count is checked while the cursor holds a leaf and after it closes, because
+// "exactly one leaf frame at a time" is the tree's contract with the pager.
+fn p2_walk(p: DkPager*, root: uint32, expect: int32, klen: int32,
+    label: string) -> int32 {
+  var kb: uint8[P2_WIDE];
+  var kn: int32 = p2_make_key(&kb[0], 0, klen);
+  if (kn < 0) { return 1; }
+  var k0: DkBtKey = { data: &kb[0], len: kn };
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, k0);
+  if (rc < 0) {
+    println("FAIL {label}: seek 0 answered {rc}");
+    return 1;
+  }
+  if (!dk_t_check_i64(rc, DK_OK, "{label}: seek 0 finds the first row")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)p2_pins(p), 1,
+      "{label}: the seek pins exactly one leaf")) {
+    dk_bt_close(p, &c);
+    return 1;
+  }
+  var want: uint8[P2_WIDE];
+  var seen: int32 = 0;
+  while (rc == 0) {
+    var wn: int32 = p2_make_key(&want[0], (int64)seen, klen);
+    if (wn < 0) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    if (!dk_t_check_i64(
+        (int64)dk_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf), (int64)wn,
+        "{label}: row {seen} key length")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    if (!dk_t_check_bytes(dk_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf),
+        &want[0], (int64)wn, "{label}: row {seen} ascending key")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    var rid: uint64 = 0;
+    if (!dk_t_check_i64(dk_bt_rowid(p, &c, &rid), DK_OK,
+        "{label}: row {seen} rowid read")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    if (!dk_t_check_i64((int64)rid, (int64)p2_rowid((int64)seen),
+        "{label}: row {seen} rowid")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    if (!dk_t_check_i64((int64)p2_pins(p), 1,
+        "{label}: advancing pins exactly one leaf")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    seen += 1;
+    rc = dk_bt_next(p, &c);
+    if (rc < 0) {
+      println("FAIL {label}: next {rc} after {seen} rows");
+      dk_bt_close(p, &c);
+      return 1;
+    }
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64((int64)seen, (int64)expect,
+      "{label}: the walk saw every row")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)p2_pins(p), 0,
+      "{label}: the walk leaves nothing pinned")) {
+    return 1;
+  }
+  return 0;
+}
+
+// Record the page number of every leaf the cursor visits, in order, once each.
+// The cursor's leaf is pinned while it is read, so this is also a scan of the
+// tree's leaf chain as the reader sees it. -1 on failure.
+fn p2_leaf_pages(p: DkPager*, root: uint32, out: uint32*, cap: int32,
+    klen: int32, label: string) -> int32 {
+  var kb: uint8[P2_WIDE];
+  var kn: int32 = p2_make_key(&kb[0], 0, klen);
+  if (kn < 0) { return -1; }
+  var k0: DkBtKey = { data: &kb[0], len: kn };
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, k0);
+  if (rc < 0) {
+    println("FAIL {label}: leaf scan seek {rc}");
+    return -1;
+  }
+  var n: int32 = 0;
+  var last: uint32 = 0;
+  while (rc == 0) {
+    var page: uint32 = c.leaf->page_no;
+    if (page != last) {
+      if (n >= cap) {
+        dk_bt_close(p, &c);
+        println("FAIL {label}: more leaves than the {cap}-entry buffer");
+        return -1;
+      }
+      out[n] = page;
+      n += 1;
+      last = page;
+    }
+    rc = dk_bt_next(p, &c);
+    if (rc < 0) {
+      println("FAIL {label}: leaf scan next {rc}");
+      dk_bt_close(p, &c);
+      return -1;
+    }
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64((int64)p2_pins(p), 0,
+      "{label}: the leaf scan leaves nothing pinned")) {
+    return -1;
+  }
+  return n;
+}
+
+// The page format's extent invariant, read back from a page that was written
+// and loaded: cell 0's extent ends at the end of the page, and every cell's
+// extent ends exactly where the next-higher extent's length prefix begins, so
+// the extents tile the packed cell region with no gap and no overlap. This is
+// what "the extents describe the cells" means beyond "the lengths read back".
+fn p2_extents_ok(buf: uint8*, page: uint32, label: string) -> int32 {
+  var n: int32 = dk_page_n_cells(buf);
+  if (!dk_t_check((int64)n > 0, "{label}: leaf {page} has cells")) {
+    return 1;
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    var off: int32 = dk_page_cell_off(buf, i);
+    var len: int32 = dk_page_cell_len(buf, i);
+    if (!dk_t_check((int64)len > 0, "{label}: leaf {page} cell {i} length")) {
+      return 1;
+    }
+    var want_hi: int32 = DK_PAGE_SIZE;
+    if (i > 0) { want_hi = dk_page_cell_off(buf, i - 1) - 2; }
+    if (!dk_t_check_i64((int64)(off + len), (int64)want_hi,
+        "{label}: leaf {page} cell {i} extent abuts the one above")) {
+      return 1;
+    }
+    i += 1;
+  }
+  var lowest: int32 = dk_page_cell_off(buf, n - 1) - 2;
+  if (!dk_t_check_i64((int64)lowest, (int64)dk_page_free_end(buf),
+      "{label}: leaf {page} extents reach free_end")) {
+    return 1;
+  }
+  return 0;
+}
+
+// Open `path` for writing, build a tree of `keys` keys in `order`, store the
+// root in the meta and flush, then close. Leaves the file ready to reopen.
+fn p2_make_tree(path: string, order: int32*, keys: int32, klen: int32,
+    label: string) -> int32 {
+  var rc: int32 = p2_reset(path);
+  if (!dk_t_check_i64(rc, DK_OK, "{label}: reset")) { return 1; }
+  var p: DkPager* = dk_pager_open(path, P2_FRAMES, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "{label}: create")) { return 1; }
+  var root: uint32 = 0;
+  if (p2_build(p, &root, order, keys, klen, label) != 0) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_set_root(p, DK_ROOT_BTREE, root), DK_OK,
+      "{label}: store the root")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_flush(p), DK_OK, "{label}: flush")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "{label}: close")) {
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_free(p);
+  return 0;
+}
+
+// The page number of the leaf a search for `v` lands on. Closes the cursor, so
+// the caller's pin count is untouched.
+fn p2_leaf_for(p: DkPager*, root: uint32, v: int64, klen: int32,
+    out: uint32*) -> int32 {
+  var kb: uint8[P2_WIDE];
+  var kn: int32 = p2_make_key(&kb[0], v, klen);
+  if (kn < 0) { return 1; }
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  if (rc != DK_OK) { return 1; }
+  out[0] = c.leaf->page_no;
+  dk_bt_close(p, &c);
+  return 0;
+}
+
+// Seek `v` and require exactly -DK_ERR_CORRUPT: the refusal, not a wrong row
+// and not an ordinary "absent" answer.
+fn p2_refuse_seek(p: DkPager*, root: uint32, v: int64, klen: int32,
+    label: string) -> int32 {
+  var kb: uint8[P2_WIDE];
+  var kn: int32 = p2_make_key(&kb[0], v, klen);
+  if (kn < 0) { return 1; }
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+      "{label}: the seek into the corrupted leaf is CORRUPT")) {
+    dk_bt_close(p, &c);
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)c.err, (int64)DK_ERR_CORRUPT,
+      "{label}: the cursor records the code")) {
+    dk_bt_close(p, &c);
+    return 1;
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64((int64)p2_pins(p), 0,
+      "{label}: a refused seek leaves nothing pinned")) {
+    return 1;
+  }
+  var rid: uint64 = 0;
+  rc = dk_bt_lookup(p, root, &dk_key_compare, kk, &rid);
+  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+      "{label}: the lookup of the same key is CORRUPT")) {
+    return 1;
+  }
+  return 0;
+}
+
+// --- I1: 1000 keys, 8 frames, flush, close, reopen, walk every row ---------
+
+fn p2_i1() -> int32 {
+  var order: int32[] = new int32[P2_KEYS];
+  if (!dk_t_check(order.data != 0, "I1: order buffer")) { return 1; }
+  defer free(order.data);
+  p2_shuffle(order.data, P2_KEYS);
+  if (p2_make_tree(P2_TREE, order.data, P2_KEYS, P2_WIDE, "I1") != 0) {
+    return 1;
+  }
+
+  // The tree the pager wrote: stored root, and a page count above the frame
+  // count. I1's premise is eviction, not decoration -- with 9-byte keys the
+  // tree would fit the cache and every write-back assertion below would pass
+  // without a split ever crossing an eviction.
+  var ro: DkPager* = dk_pager_open(P2_TREE, P2_FRAMES, DK_PAGER_READONLY);
+  if (!dk_t_check(ro != 0, "I1: reopen")) { return 1; }
+  var root: uint32 = dk_pager_root(ro, DK_ROOT_BTREE);
+  if (!dk_t_check(root != 0, "I1: the root is in the meta")) {
+    dk_pager_close(ro);
+    dk_pager_free(ro);
+    return 1;
+  }
+  if (!dk_t_check((int64)dk_pager_page_count(ro) > (int64)P2_FRAMES,
+      "I1: the tree is larger than the 8-frame cache")) {
+    dk_pager_close(ro);
+    dk_pager_free(ro);
+    return 1;
+  }
+  if (p2_walk(ro, root, P2_KEYS, P2_WIDE, "I1") != 0) {
+    dk_pager_close(ro);
+    dk_pager_free(ro);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(ro), DK_OK, "I1: close reopened")) {
+    dk_pager_free(ro);
+    return 1;
+  }
+  dk_pager_free(ro);
+  p2_pass("I1");
+  return 0;
+}
+
+// --- I2: the same tree, every leaf defragged, the walk unchanged -----------
+
+fn p2_i2() -> int32 {
+  var p: DkPager* = dk_pager_open(P2_TREE, P2_FRAMES, 0);
+  if (!dk_t_check(p != 0, "I2: reopen read-write")) { return 1; }
+  var root: uint32 = dk_pager_root(p, DK_ROOT_BTREE);
+  if (!dk_t_check(root != 0, "I2: the root is in the meta")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var leaves: uint32[] = new uint32[P2_MAX_LEAVES];
+  if (!dk_t_check(leaves.data != 0, "I2: leaf buffer")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  defer free(leaves.data);
+  var snap: uint8[] = new uint8[DK_PAGE_SIZE];
+  if (!dk_t_check(snap.data != 0, "I2: page snapshot buffer")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  defer free(snap.data);
+
+  var n: int32 = p2_leaf_pages(p, root, leaves.data, P2_MAX_LEAVES, P2_WIDE,
+    "I2");
+  if (n < 0) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check((int64)n >= 2, "I2: the tree has more than one leaf")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    var page: uint32 = leaves[i];
+    var f: DkFrame* = dk_pager_get(p, page, true);
+    if (!dk_t_check(f != 0, "I2: leaf {page} is readable")) {
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    if (!dk_t_check_i64(dk_page_check(f->data), DK_OK,
+        "I2: leaf {page} passes the page check")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    if (p2_extents_ok(f->data, page, "I2") != 0) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    // A phase-2 leaf only ever grows by appending or is rebuilt from scratch
+    // (there is no delete), so it must be packed: reclaimable == free bytes
+    // means no dead extent is stranded behind a hole.
+    if (!dk_t_check_i64((int64)dk_page_reclaimable(f->data),
+        (int64)dk_page_free_bytes(f->data),
+        "I2: leaf {page} has no stranded extents")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    var fe: int32 = dk_page_free_end(f->data);
+    dk_bytes_copy(snap.data, f->data, (int64)DK_PAGE_SIZE);
+    if (!dk_t_check_i64(dk_page_defrag(f->data), DK_OK,
+        "I2: defrag leaf {page}")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    // Defrag on a packed page is the identity, and saying so is the assertion:
+    // a repack that moved a body without moving its pointer, or that computed
+    // its cursor from the wrong base, changes free_end or a byte.
+    if (!dk_t_check_i64((int64)dk_page_free_end(f->data), (int64)fe,
+        "I2: defrag leaves a packed leaf where it was")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    if (!dk_t_check_bytes(f->data, snap.data, (int64)DK_PAGE_SIZE,
+        "I2: defrag changes no byte of leaf {page}")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    if (!dk_t_check_i64(dk_page_check(f->data), DK_OK,
+        "I2: leaf {page} still passes after defrag")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    if (!dk_t_check_i64(dk_page_verify(f->data), DK_OK,
+        "I2: leaf {page} still matches its checksum")) {
+      dk_pager_release(p, f, false);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    dk_pager_release(p, f, true);
+    i += 1;
+  }
+  if (!dk_t_check_i64(dk_pager_flush(p), DK_OK, "I2: flush the defragged tree")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "I2: close")) {
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_free(p);
+
+  // The same walk again, from a fresh pager over the reopened file: order and
+  // contents must be exactly what I1 read.
+  var ro: DkPager* = dk_pager_open(P2_TREE, P2_FRAMES, DK_PAGER_READONLY);
+  if (!dk_t_check(ro != 0, "I2: reopen after defrag")) { return 1; }
+  var root2: uint32 = dk_pager_root(ro, DK_ROOT_BTREE);
+  if (!dk_t_check_i64((int64)root2, (int64)root,
+      "I2: the root survived the defrag and the flush")) {
+    dk_pager_close(ro);
+    dk_pager_free(ro);
+    return 1;
+  }
+  if (p2_walk(ro, root2, P2_KEYS, P2_WIDE, "I2") != 0) {
+    dk_pager_close(ro);
+    dk_pager_free(ro);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(ro), DK_OK, "I2: close reopened")) {
+    dk_pager_free(ro);
+    return 1;
+  }
+  dk_pager_free(ro);
+  p2_pass("I2");
+  return 0;
+}
+
+// --- I3: freelist round trip interleaved with the tree ---------------------
+
+fn p2_i3() -> int32 {
+  var rc: int32 = p2_reset(P2_FREE);
+  if (!dk_t_check_i64(rc, DK_OK, "I3: reset")) { return 1; }
+  var order: int32[] = new int32[P2_I3_KEYS];
+  if (!dk_t_check(order.data != 0, "I3: order buffer")) { return 1; }
+  defer free(order.data);
+  p2_shuffle(order.data, P2_I3_KEYS);
+
+  var p: DkPager* = dk_pager_open(P2_FREE, P2_FRAMES, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "I3: create")) { return 1; }
+  var root: uint32 = 0;
+  if (p2_build(p, &root, order.data, P2_I3_KEYS, P2_WIDE, "I3") != 0) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)p2_pins(p), 0,
+      "I3: inserts leave nothing pinned")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var original: uint32 = dk_pager_page_count(p);
+
+  // Free three of the tree's leaves. This destroys the tree on purpose: the
+  // rebuild below is the point, and a freed leaf is exactly what the rebuild
+  // has to get back.
+  var leaves: uint32[] = new uint32[P2_MAX_LEAVES];
+  if (!dk_t_check(leaves.data != 0, "I3: leaf buffer")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  defer free(leaves.data);
+  var n: int32 = p2_leaf_pages(p, root, leaves.data, P2_MAX_LEAVES, P2_WIDE,
+    "I3");
+  if (n < 3) {
+    println("FAIL I3: the tree has {n} leaves, need 3 to free");
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var i: int32 = 0;
+  while (i < 3) {
+    rc = dk_pager_free_page(p, leaves[i]);
+    if (!dk_t_check_i64(rc, DK_OK, "I3: free leaf {leaves[i]}")) {
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    i += 1;
+  }
+  if (!dk_t_check_i64(dk_free_count(p), 3, "I3: three pages are free")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  // The first free has no chain to push onto, so the pager allocates the
+  // freelist head page itself: the round trip's one page of cost, named here
+  // rather than discovered by the assertion below.
+  if (!dk_t_check_i64((int64)dk_pager_page_count(p), (int64)original + 1,
+      "I3: the freelist head page is the round trip's only page")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_flush(p), DK_OK, "I3: flush the freelist")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "I3: close")) {
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_free(p);
+
+  // Reopen: the freelist is on disk, not in memory. PHASE2.md 2C's E4 property,
+  // checked here at the seam the tree cares about.
+  var q: DkPager* = dk_pager_open(P2_FREE, P2_FRAMES, 0);
+  if (!dk_t_check(q != 0, "I3: reopen")) { return 1; }
+  if (!dk_t_check_i64(dk_free_init(q), DK_OK,
+      "I3: the freelist chain is sound after the reopen")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_free_count(q), 3,
+      "I3: three free pages survived the reopen")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  var before_rebuild: uint32 = dk_pager_page_count(q);
+  if (!dk_t_check_i64((int64)before_rebuild, (int64)original + 1,
+      "I3: the reopened page count")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+
+  // Rebuild the tree from page 0 in the same pager. Every allocation must come
+  // out of the freelist before the file extends: the three freed leaves plus
+  // the freelist head page are exactly the four pages the tree needs.
+  var root2: uint32 = 0;
+  if (p2_build(q, &root2, order.data, P2_I3_KEYS, P2_WIDE, "I3 rebuild") != 0) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)dk_pager_page_count(q), (int64)before_rebuild,
+      "I3: the rebuild did not grow the file")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_free_count(q), 0,
+      "I3: the rebuild consumed every free page")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)p2_pins(q), 0,
+      "I3: the rebuild leaves nothing pinned")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (p2_walk(q, root2, P2_I3_KEYS, P2_WIDE, "I3") != 0) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  // The tree the frees destroyed is not reclaimed, only the pages that were
+  // handed back are. Phase 2 has no delete and no page walker (PHASE2.md 2F),
+  // so the old root is still a live b-tree page in this file; saying so keeps
+  // the "known gap" in the gate report checkable instead of narrated.
+  var stale: DkFrame* = dk_pager_get(q, root, false);
+  if (!dk_t_check(stale != 0, "I3: the discarded root is still a page")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)dk_page_type(stale->data),
+      (int64)DK_PAGE_BTREE_INNER,
+      "I3: the discarded root stays allocated (no delete, PHASE2.md 2F)")) {
+    dk_pager_release(q, stale, false);
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  dk_pager_release(q, stale, false);
+  if (!dk_t_check(root2 != root, "I3: the rebuild built a new root")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_set_root(q, DK_ROOT_BTREE, root2), DK_OK,
+      "I3: store the rebuilt root")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_flush(q), DK_OK, "I3: flush the rebuild")) {
+    dk_pager_close(q);
+    dk_pager_free(q);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(q), DK_OK, "I3: close")) {
+    dk_pager_free(q);
+    return 1;
+  }
+  dk_pager_free(q);
+  p2_pass("I3");
+  return 0;
+}
+
+// --- I4: a flipped length prefix is CORRUPT, never a wrong row -------------
+
+// Case A: the length prefix is lengthened so cell 1's extent runs into cell 0's
+// prefix, and the page is resealed. The checksum therefore agrees with the
+// corrupted bytes -- dk_page_verify passes -- and only PHASE2.md 2A's extent
+// rules can refuse it. Without them the leaf's search reads keys of the wrong
+// length and answers a wrong row, which is the corruption class 2A exists for.
+fn p2_i4_extent() -> int32 {
+  var order: int32[] = new int32[P2_I4_KEYS];
+  if (!dk_t_check(order.data != 0, "I4a: order buffer")) { return 1; }
+  defer free(order.data);
+  p2_shuffle(order.data, P2_I4_KEYS);
+  if (p2_make_tree(P2_CORRUPT, order.data, P2_I4_KEYS, P2_WIDE, "I4a") != 0) {
+    return 1;
+  }
+
+  var p: DkPager* = dk_pager_open(P2_CORRUPT, P2_FRAMES, 0);
+  if (!dk_t_check(p != 0, "I4a: reopen read-write")) { return 1; }
+  var root: uint32 = dk_pager_root(p, DK_ROOT_BTREE);
+  if (!dk_t_check(root != 0, "I4a: the root is in the meta")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  // The baseline: before the corruption the row is found with the right rowid,
+  // so the refusal below is the corruption and not a broken tree.
+  if (p2_lookup(p, root, P2_I4_KEY, P2_WIDE, "I4a") != 0) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var leaf: uint32[1];
+  if (p2_leaf_for(p, root, P2_I4_KEY, P2_WIDE, &leaf[0]) != 0) {
+    println("FAIL I4a: the leaf of key {P2_I4_KEY} was not found");
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var f: DkFrame* = dk_pager_get(p, leaf[0], true);
+  if (!dk_t_check(f != 0, "I4a: the leaf is readable")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_page_check(f->data), DK_OK,
+      "I4a: the leaf passes the page check before the corruption")) {
+    dk_pager_release(p, f, false);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check((int64)dk_page_n_cells(f->data) >= 2,
+      "I4a: the leaf has a second cell to corrupt")) {
+    dk_pager_release(p, f, false);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var off1: int32 = dk_page_cell_off(f->data, 1);
+  var len1: int32 = dk_page_cell_len(f->data, 1);
+  if (!dk_t_check((int64)(off1 + len1 + 16) <= (int64)DK_PAGE_SIZE,
+      "I4a: the lengthened extent stays inside the page")) {
+    dk_pager_release(p, f, false);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  // One u16 written over the length prefix: the flipped "byte" is the length's
+  // low half, and +16 is enough to cross into the extent above on a packed
+  // page (cells are adjacent, so any growth does).
+  dk_put_u16le(f->data, (int64)(off1 - 2), (uint16)(len1 + 16));
+  dk_page_seal(f->data);
+  if (!dk_t_check_i64(dk_page_verify(f->data), DK_OK,
+      "I4a: the resealed page matches its checksum")) {
+    dk_pager_release(p, f, false);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_page_check(f->data), -DK_ERR_CORRUPT,
+      "I4a: only the extent rules can see the corrupted length")) {
+    dk_pager_release(p, f, false);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_release(p, f, true);
+  if (!dk_t_check_i64(dk_pager_flush(p), DK_OK, "I4a: write the corrupted leaf")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "I4a: close")) {
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_free(p);
+
+  var ro: DkPager* = dk_pager_open(P2_CORRUPT, P2_FRAMES, DK_PAGER_READONLY);
+  if (!dk_t_check(ro != 0, "I4a: reopen read-only")) { return 1; }
+  var rc: int32 = p2_refuse_seek(ro, root, P2_I4_KEY, P2_WIDE, "I4a");
+  var crc: int32 = dk_pager_close(ro);
+  dk_pager_free(ro);
+  if (rc != 0) { return 1; }
+  if (!dk_t_check_i64(crc, DK_OK, "I4a: close reopened")) { return 1; }
+  p2_pass("I4a_extent");
+  return 0;
+}
+
+// Case B: the same byte flipped with no reseal, written straight through the
+// file surface, so the page's checksum no longer matches its bytes. This is the
+// literal shape in the gate brief and the phase-1 integrity layer: the pager's
+// load refuses the page before any node reader sees it. It also shows that
+// case A is not relying on the checksum -- there, the checksum is valid.
+fn p2_i4_crc() -> int32 {
+  var order: int32[] = new int32[P2_I4_KEYS];
+  if (!dk_t_check(order.data != 0, "I4b: order buffer")) { return 1; }
+  defer free(order.data);
+  p2_shuffle(order.data, P2_I4_KEYS);
+  if (p2_make_tree(P2_CORRUPT_CRC, order.data, P2_I4_KEYS, P2_WIDE, "I4b")
+      != 0) {
+    return 1;
+  }
+
+  var p: DkPager* = dk_pager_open(P2_CORRUPT_CRC, P2_FRAMES, 0);
+  if (!dk_t_check(p != 0, "I4b: reopen read-write")) { return 1; }
+  var root: uint32 = dk_pager_root(p, DK_ROOT_BTREE);
+  if (!dk_t_check(root != 0, "I4b: the root is in the meta")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  var leaf: uint32[1];
+  if (p2_leaf_for(p, root, P2_I4_KEY, P2_WIDE, &leaf[0]) != 0) {
+    println("FAIL I4b: the leaf of key {P2_I4_KEY} was not found");
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "I4b: close before scribbling")) {
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_free(p);
+
+  var page: uint8[] = new uint8[DK_PAGE_SIZE];
+  if (!dk_t_check(page.data != 0, "I4b: page buffer")) { return 1; }
+  defer free(page.data);
+  var fh: DkFile = dk_file_open(P2_CORRUPT_CRC, DK_OPEN_READ | DK_OPEN_WRITE);
+  if (!dk_t_check(fh.is_open, "I4b: open the file to scribble")) { return 1; }
+  var got: int32 = dk_file_read_at(fh, (int64)leaf[0] * (int64)DK_PAGE_SIZE,
+    page.data, (int64)DK_PAGE_SIZE);
+  if (!dk_t_check_i64((int64)got, (int64)DK_PAGE_SIZE,
+      "I4b: read the leaf page back")) {
+    dk_file_close(fh);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_page_verify(page.data), DK_OK,
+      "I4b: the leaf is intact before the scribble")) {
+    dk_file_close(fh);
+    return 1;
+  }
+  var off1: int32 = dk_page_cell_off(page.data, 1);
+  var len1: int32 = dk_page_cell_len(page.data, 1);
+  dk_put_u16le(page.data, (int64)(off1 - 2), (uint16)(len1 ^ 1));
+  if (!dk_t_check_i64(dk_page_verify(page.data), -DK_ERR_CORRUPT,
+      "I4b: the flipped length prefix breaks the checksum")) {
+    dk_file_close(fh);
+    return 1;
+  }
+  // No dk_page_seal: the bytes are written exactly as the corruption left
+  // them, which is what a torn or foreign write looks like on disk.
+  var wrote: int32 = dk_file_write_at(fh, (int64)leaf[0] * (int64)DK_PAGE_SIZE,
+    page.data, (int64)DK_PAGE_SIZE);
+  if (!dk_t_check_i64(wrote, DK_OK, "I4b: write the corrupted page back")) {
+    dk_file_close(fh);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_file_sync(fh), DK_OK, "I4b: sync the corruption")) {
+    dk_file_close(fh);
+    return 1;
+  }
+  dk_file_close(fh);
+
+  var ro: DkPager* = dk_pager_open(P2_CORRUPT_CRC, P2_FRAMES,
+    DK_PAGER_READONLY);
+  if (!dk_t_check(ro != 0, "I4b: reopen read-only")) { return 1; }
+  var rc: int32 = p2_refuse_seek(ro, root, P2_I4_KEY, P2_WIDE, "I4b");
+  var close_rc: int32 = dk_pager_close(ro);
+  dk_pager_free(ro);
+  if (rc != 0) { return 1; }
+  if (!dk_t_check_i64(close_rc, DK_OK, "I4b: close reopened")) { return 1; }
+  p2_pass("I4b_checksum");
+  return 0;
+}
+
+fn main() -> int32 {
+  if (p2_i1() != 0) { return 1; }
+  if (p2_i2() != 0) { return 1; }
+  if (p2_i3() != 0) { return 1; }
+  if (p2_i4_extent() != 0) { return 1; }
+  if (p2_i4_crc() != 0) { return 1; }
+  return dk_t_report();
+}

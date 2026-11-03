@@ -1,0 +1,989 @@
+// btree_self: the phase-2D b-tree suite (PHASE2.md sections 2D and 2E).
+//
+// A program, not @test functions: every case needs real files in build/, a
+// pager and page-sized buffers, none of which the compile-time interpreter
+// provides.
+//
+//   ./tools/mettle --build tests/btree_self.mettle -o build/laneD/b
+//   ./build/laneD/b
+//
+// Prints "PASS <case>" per case and "FAIL <case>: <detail>" per failing check,
+// and returns non-zero on the first failure. tests/tinytest.mettle is the
+// reporting layer.
+//
+// Cases, each with the bug it exists to catch:
+//   b1_leaf            one leaf: insert out of order, look every key up, look
+//                      up an absent key, replace a rowid, seek's lower bound,
+//                      walk the leaf, and check the pin count after each step.
+//                      Catches an insert that appends instead of inserting in
+//                      key order, a lookup that misses a key, a seek that
+//                      answers the largest key <= target instead of the
+//                      smallest >= target, and a cursor that keeps a frame
+//                      pinned (or pins a second one).
+//   b2_root_split      enough keys to split leaves and then the root. Catches a
+//                      split that loses a key, a root that is never replaced
+//                      through root*, and a scan that walks off the last leaf.
+//   b3_e5              PHASE2.md 2E E5: 1000 keys in pseudo-random order at
+//                      n_frames = 256, look every one up, then seek and walk
+//                      asserting ascending order and exactly 1000 rows. Every
+//                      key is then re-inserted and the walk repeats: a rewrite
+//                      must replace, not add a second row (unique keys).
+//   b4_e6              PHASE2.md 2E E6: 1000 inserts with n_frames = 8, so the
+//                      tree has far more pages than the cache and splits force
+//                      eviction and write-back, then flush, close, reopen and
+//                      walk comparing every key. Catches a split whose write is
+//                      lost to an eviction and a root update lost across the
+//                      flush.
+//   b6_wide            2000 wide keys, which make the tree three levels deep so
+//                      an INNER node splits: the case where the separator
+//                      leaves both halves instead of staying in the upper leaf.
+//                      Catches an inner split that keeps the moved key, drops a
+//                      child pointer, or leaves an outer separator naming a key
+//                      its subtree no longer starts at.
+//   b5_e7              PHASE2.md 2E E7: a root-to-leaf chain at the depth cap is
+//                      walked; one level deeper is -DK_ERR_CORRUPT for lookup,
+//                      insert and seek, not a crash or a stack overflow. A FULL
+//                      16-level chain also refuses the insert whose split would
+//                      reach the root and build a seventeenth level.
+//
+// Every case was watched failing under a deliberate mutation of btree/ bounded
+// by `timeout 15`, and every mutant was reverted and hash-checked before the
+// next one ran; the mutants and the first failure each produced are part of
+// this stage's mutation record.
+
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+import "tinytest.mettle";
+import "std/io";
+import "std/mem";
+
+const B_LEAF: string = "build/btree_self_leaf.dat";
+const B_SPLIT: string = "build/btree_self_split.dat";
+const B_E5: string = "build/btree_self_e5.dat";
+const B_E6: string = "build/btree_self_e6.dat";
+const B_E7: string = "build/btree_self_e7.dat";
+const B_WIDE_PATH: string = "build/btree_self_wide.dat";
+
+// Every rowid in the ordered cases is B_ROWID_BASE + key, so a scan that
+// returns rowids in ascending order is also evidence the KEYS are in ascending
+// order, independently of the key bytes the scan compares.
+const B_ROWID_BASE: uint64 = 1000000;
+
+// The pseudo-random insert order is generated from this seed. Fixed, so debug
+// and release runs (and every re-run) produce the same order and the same
+// failure.
+const B_SEED: uint32 = 12345;
+
+// The largest key the ordered cases insert.
+const B_E5_KEYS: int32 = 1000;
+
+// Key widths. A key is types/key.mettle's 9-byte encoding; the wide case pads
+// it to B_WIDE bytes with a constant tail, so the integer prefix still decides
+// the order and a leaf holds 36 cells instead of 194. That is what makes the
+// tree deep enough (three levels) for an INNER node to split at 2000 keys.
+const B_KEY: int32 = 9;
+const B_WIDE: int32 = 100;
+const B_WIDE_KEYS: int32 = 2000;
+
+// The full-chain shape of E7's second half, derived from the page arithmetic
+// rather than written down: a wide inner cell costs B_WIDE key + 4 child body
+// + 2 length prefix + 2 pointer = 108 bytes, and the bare right-child cell
+// (4 + 2 + 2 = 8) must fit the same 4080-byte cell area, so the keyed maximum
+// is (4080 - 8) / 108 = 37 (4004 bytes used). A wide leaf cell costs
+// B_WIDE + 8 rowid + 4 = 112, so a leaf holds 4080 / 112 = 36.
+const B_FULL_INNER_CELL: int32 = B_WIDE + 4 + 4;
+const B_FULL_INNER_KEYS: int32 =
+  (DK_PAGE_SIZE - DK_PAGE_HDR - (4 + 4)) / B_FULL_INNER_CELL;
+const B_FULL_LEAF_CELL: int32 = B_WIDE + 8 + 4;
+const B_FULL_LEAF_KEYS: int32 = (DK_PAGE_SIZE - DK_PAGE_HDR) / B_FULL_LEAF_CELL;
+// Every separator and leaf key in that chain is below this, so a descent for it
+// takes the right child at every level.
+const B_FULL_ABOVE: int64 = 1000;
+
+// Make `path` a zero-byte file, the state DK_PAGER_CREATE is defined against;
+// there is no unlink in the phase-1 platform surface.
+fn b_reset(path: string) -> int32 {
+  var f: DkFile = dk_file_open(path,
+    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  if (!f.is_open) { return -DK_ERR_IO; }
+  var rc: int32 = dk_file_truncate(f, 0);
+  dk_file_close(f);
+  return rc;
+}
+
+fn b_pass(name: string) {
+  println("PASS {name}");
+}
+
+// Frames the pager currently has pinned. The cursor contract (PHASE2.md 2D) is
+// "exactly one leaf frame at a time", and the pin count is the only observable
+// form of it: a leaked pin is invisible until the frame table runs out.
+fn b_pins(p: DkPager*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < dk_pager_frames(p)) {
+    if (p->frames[i].pin > 0) { n += 1; }
+    i += 1;
+  }
+  return n;
+}
+
+// The key bytes of the row the cursor holds.
+fn b_cursor_key(c: DkBtCursor*) -> uint8* {
+  return dk_btn_leaf_key_ptr(c->leaf->data, c->slot_in_leaf);
+}
+
+fn b_cursor_key_len(c: DkBtCursor*) -> int32 {
+  return dk_btn_leaf_key_len(c->leaf->data, c->slot_in_leaf);
+}
+
+// Encode key `v` at width `klen`: the order-preserving int encoding, then a
+// constant tail. The comparator looks at the common prefix first, so the
+// integer still decides the order.
+fn b_make_key(buf: uint8*, v: int64, klen: int32) -> int32 {
+  var n: int32 = dk_key_int(buf, klen, v);
+  if (n < 0) { return n; }
+  var i: int32 = n;
+  while (i < klen) {
+    buf[i] = (uint8)0x5A;
+    i += 1;
+  }
+  return klen;
+}
+
+// How many levels the leaf a seek for `v` lands on is below the root (1 = the
+// root itself is a leaf). -1 on failure. Closes the cursor, so the caller's pin
+// count is untouched.
+fn b_depth(p: DkPager*, root: uint32, v: int64, klen: int32) -> int32 {
+  var kb: uint8[B_WIDE];
+  var kn: int32 = b_make_key(&kb[0], v, klen);
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  if (rc < 0) { return -1; }
+  var d: int32 = c.depth;
+  dk_bt_close(p, &c);
+  return d;
+}
+
+// Walk the whole tree from `first`, proving the scan: `expect` rows, the key at
+// row i is exactly the encoding of first + i (so the order is ascending AND
+// complete: no key is skipped, duplicated or reordered), and when rowid_base is
+// not negative the rowid is rowid_base + i. Returns 0, or 1 after reporting the
+// first failure.
+fn b_scan(p: DkPager*, root: uint32, first: int64, expect: int32,
+    rowid_base: int64, klen: int32, label: string) -> int32 {
+  var kb: uint8[B_WIDE];
+  var kn: int32 = b_make_key(&kb[0], first, klen);
+  if (kn < 0) { return 1; }
+  var k0: DkBtKey = { data: &kb[0], len: kn };
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, k0);
+  if (rc < 0) {
+    println("FAIL {label}: seek {rc}");
+    return 1;
+  }
+  // The seek pins one leaf; nothing else may be pinned.
+  if (!dk_t_check_i64(b_pins(p), 1, "{label}: seek pins exactly one frame")) {
+    dk_bt_close(p, &c);
+    return 1;
+  }
+  var seen: int32 = 0;
+  var want_buf: uint8[B_WIDE];
+  while (rc == 0) {
+    var want: int64 = first + (int64)seen;
+    var wn: int32 = b_make_key(&want_buf[0], want, klen);
+    if (!dk_t_check_i64((int64)b_cursor_key_len(&c), (int64)wn,
+        "{label}: row {seen} key length")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    if (!dk_t_check_bytes(b_cursor_key(&c), &want_buf[0], (int64)wn,
+        "{label}: row {seen} ascending key")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    if (rowid_base >= 0) {
+      var rid: uint64 = 0;
+      if (!dk_t_check_i64(dk_bt_rowid(p, &c, &rid), DK_OK,
+          "{label}: row {seen} rowid read")) {
+        dk_bt_close(p, &c);
+        return 1;
+      }
+      if (!dk_t_check_i64((int64)rid, (int64)rowid_base + (int64)seen,
+          "{label}: row {seen} rowid")) {
+        dk_bt_close(p, &c);
+        return 1;
+      }
+    }
+    if (!dk_t_check_i64(b_pins(p), 1, "{label}: next pins exactly one frame")) {
+      dk_bt_close(p, &c);
+      return 1;
+    }
+    seen += 1;
+    rc = dk_bt_next(p, &c);
+    if (rc < 0) {
+      println("FAIL {label}: next {rc} after {seen} rows");
+      dk_bt_close(p, &c);
+      return 1;
+    }
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64(b_pins(p), 0, "{label}: close releases the frame")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)seen, (int64)expect,
+      "{label}: the scan saw every row")) {
+    return 1;
+  }
+  return 0;
+}
+
+// Insert one key of a tree of integer keys: the encoding is types/key.mettle's,
+// the ordering the tree uses is dk_key_compare, passed in as a parameter
+// because btree/ must not import types/ (PHASE2.md 2D).
+fn b_insert(p: DkPager*, root: uint32*, v: int64, rowid: uint64,
+    klen: int32, label: string) -> int32 {
+  var kb: uint8[B_WIDE];
+  var kn: int32 = b_make_key(&kb[0], v, klen);
+  if (kn < 0) { return 1; }
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var rc: int32 = dk_bt_insert(p, root, &dk_key_compare, kk, rowid);
+  if (rc != DK_OK) {
+    println("FAIL {label}: insert {v} answered {rc}");
+    return 1;
+  }
+  return 0;
+}
+
+fn b_lookup(p: DkPager*, root: uint32, v: int64, klen: int32,
+    label: string) -> int32 {
+  var kb: uint8[B_WIDE];
+  var kn: int32 = b_make_key(&kb[0], v, klen);
+  if (kn < 0) { return -1; }
+  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var rid: uint64 = 0;
+  var rc: int32 = dk_bt_lookup(p, root, &dk_key_compare, kk, &rid);
+  if (rc != DK_OK) {
+    println("FAIL {label}: lookup {v} answered {rc}");
+    return -1;
+  }
+  if (!dk_t_check_i64((int64)rid, (int64)B_ROWID_BASE + v,
+      "{label}: lookup {v} rowid")) {
+    return -1;
+  }
+  return 0;
+}
+
+// --- b1: the single-leaf case ---------------------------------------------
+
+fn b1_leaf() -> int32 {
+  var rc: int32 = b_reset(B_LEAF);
+  if (!dk_t_check_i64(rc, DK_OK, "b1: reset file")) { return 1; }
+  var p: DkPager* = dk_pager_open(B_LEAF, 16, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "b1: open")) { return 1; }
+  defer dk_pager_free(p);
+
+  var root: uint32 = 0;
+  // Out of order on purpose: a leaf that appends instead of inserting in key
+  // order answers the lookups wrong and the scan out of order.
+  if (b_insert(p, &root, 30, B_ROWID_BASE + 30, B_KEY, "b1") != 0) { return 1; }
+  if (b_insert(p, &root, 10, B_ROWID_BASE + 10, B_KEY, "b1") != 0) { return 1; }
+  if (b_insert(p, &root, 50, B_ROWID_BASE + 50, B_KEY, "b1") != 0) { return 1; }
+  if (b_insert(p, &root, 20, B_ROWID_BASE + 20, B_KEY, "b1") != 0) { return 1; }
+  if (b_insert(p, &root, 40, B_ROWID_BASE + 40, B_KEY, "b1") != 0) { return 1; }
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b1: inserts leave no frame pinned")) {
+    return 1;
+  }
+  if (!dk_t_check(root != 0, "b1: the first insert creates a root")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)dk_pager_page_count(p), 2,
+      "b1: five keys still fit one leaf")) {
+    return 1;
+  }
+  // The tree was created by the first insert, so seek answers 0 from key 10 and
+  // 1 past 50. 15 is absent and must answer 20: the lower bound, not the
+  // largest key below.
+  if (b_lookup(p, root, 10, B_KEY, "b1") != 0) { return 1; }
+  if (b_lookup(p, root, 30, B_KEY, "b1") != 0) { return 1; }
+  if (b_lookup(p, root, 50, B_KEY, "b1") != 0) { return 1; }
+  var kb: uint8[16];
+  var kk: DkBtKey = { data: &kb[0], len: dk_key_int(&kb[0], 16, 15) };
+  var rid: uint64 = 0;
+  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid), 1,
+      "b1: an absent key answers 1, not an error")) {
+    return 1;
+  }
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  rc = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  if (!dk_t_check_i64(rc, DK_OK, "b1: seek 15 finds a row")) { return 1; }
+  if (!dk_t_check_i64((int64)dk_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf),
+      (int64)B_ROWID_BASE + 20, "b1: seek 15 lands on key 20")) {
+    dk_bt_close(p, &c);
+    return 1;
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b1: close after seek")) {
+    return 1;
+  }
+  kk.len = dk_key_int(&kb[0], 16, 51);
+  rc = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  if (!dk_t_check_i64(rc, 1, "b1: seek past the last key answers 1")) {
+    return 1;
+  }
+  dk_bt_close(p, &c);
+
+  // A duplicate key replaces the rowid and answers DK_OK.
+  if (b_insert(p, &root, 20, (uint64)7777, B_KEY, "b1") != 0) { return 1; }
+  var rid20: uint64 = 0;
+  kk.len = dk_key_int(&kb[0], 16, 20);
+  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid20),
+      DK_OK, "b1: the replaced key is present")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)rid20, 7777, "b1: the rowid was replaced")) {
+    return 1;
+  }
+
+  // Keys 10..50 do not form the contiguous run the scan helper wants, so the
+  // scan of this case is spelled out: ascending and exactly five rows.
+  kk.len = dk_key_int(&kb[0], 16, 10);
+  rc = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  if (!dk_t_check_i64(rc, DK_OK, "b1: scan start")) { return 1; }
+  var seen: int32 = 0;
+  var prev_buf: uint8[16];
+  var prev_len: int32 = 0;
+  while (rc == 0) {
+    if (seen > 0) {
+      var order: int32 = dk_key_compare(&prev_buf[0], prev_len,
+        b_cursor_key(&c), b_cursor_key_len(&c));
+      if (!dk_t_check(order < 0, "b1: the scan is strictly ascending")) {
+        dk_bt_close(p, &c);
+        return 1;
+      }
+    }
+    prev_len = b_cursor_key_len(&c);
+    dk_bytes_copy(&prev_buf[0], b_cursor_key(&c), (int64)prev_len);
+    seen += 1;
+    rc = dk_bt_next(p, &c);
+    if (rc < 0) { break; }
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64((int64)seen, 5, "b1: the scan saw all five keys")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b1: no frame left pinned")) {
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b1: close")) { return 1; }
+  b_pass("b1_leaf");
+  return 0;
+}
+
+// --- b2: leaves split, then the root ---------------------------------------
+
+fn b2_root_split() -> int32 {
+  var rc: int32 = b_reset(B_SPLIT);
+  if (!dk_t_check_i64(rc, DK_OK, "b2: reset file")) { return 1; }
+  var p: DkPager* = dk_pager_open(B_SPLIT, 64, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "b2: open")) { return 1; }
+  defer dk_pager_free(p);
+
+  var root: uint32 = 0;
+  // 500 nine-byte keys: a leaf holds ~194 of them, so this splits leaves and
+  // then the root, and root* must move at least once -- that is the contract
+  // about a root split, so b2 records the root the first insert produced.
+  if (b_insert(p, &root, 0, B_ROWID_BASE, B_KEY, "b2") != 0) { return 1; }
+  var first_root: uint32 = root;
+  var i: int32 = 1;
+  while (i < 500) {
+    if (b_insert(p, &root, (int64)i, B_ROWID_BASE + (uint64)i, B_KEY, "b2") != 0) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (!dk_t_check(root != first_root,
+      "b2: a root split answers the new root through root*")) {
+    return 1;
+  }
+  if (!dk_t_check((int64)dk_pager_page_count(p) >= 4,
+      "b2: the tree has more than one leaf")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b2: inserts leave no frame pinned")) {
+    return 1;
+  }
+  i = 0;
+  while (i < 500) {
+    if (b_lookup(p, root, (int64)i, B_KEY, "b2") != 0) { return 1; }
+    i += 1;
+  }
+  if (b_scan(p, root, 0, 500, (int64)B_ROWID_BASE, B_KEY, "b2") != 0) { return 1; }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b2: close")) { return 1; }
+  b_pass("b2_root_split");
+  return 0;
+}
+
+// --- pseudo-random insert order -------------------------------------------
+
+// Deterministic LCG. A fixed seed means the same order in debug and release,
+// so a failure is reproducible; the multiplier is the Numerical Recipes one.
+fn b_rand(state: uint32*) -> uint32 {
+  var s: uint32 = state[0] * (uint32)1664525 + (uint32)1013904223;
+  state[0] = s;
+  return s;
+}
+
+// Fill `order` with 0..n-1 shuffled by the LCG. Fisher-Yates, so every key
+// appears exactly once: the test needs 1000 insertions of 1000 distinct keys,
+// not 1000 draws with collisions.
+fn b_shuffle(order: int32*, n: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) {
+    order[i] = i;
+    i += 1;
+  }
+  var state: uint32[1];
+  state[0] = B_SEED;
+  i = n - 1;
+  while (i > 0) {
+    var r: uint32 = b_rand(&state[0]);
+    var j: int32 = (int32)(r % (uint32)(i + 1));
+    var t: int32 = order[i];
+    order[i] = order[j];
+    order[j] = t;
+    i -= 1;
+  }
+  return 0;
+}
+
+// --- b3: E5 -- 1000 keys, every lookup, the whole scan --------------------
+
+fn b3_e5() -> int32 {
+  var rc: int32 = b_reset(B_E5);
+  if (!dk_t_check_i64(rc, DK_OK, "b3: reset file")) { return 1; }
+  var p: DkPager* = dk_pager_open(B_E5, 256, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "b3: open")) { return 1; }
+  defer dk_pager_free(p);
+
+  var order: int32[] = new int32[B_E5_KEYS];
+  if (!dk_t_check(order.data != 0, "b3: order buffer")) { return 1; }
+  defer free(order.data);
+  b_shuffle(order.data, B_E5_KEYS);
+
+  var root: uint32 = 0;
+  var i: int32 = 0;
+  while (i < B_E5_KEYS) {
+    var v: int64 = (int64)order[i];
+    if (b_insert(p, &root, v, B_ROWID_BASE + (uint64)v, B_KEY, "b3") != 0) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b3: inserts leave no frame pinned")) {
+    return 1;
+  }
+  if (!dk_t_check((int64)dk_pager_page_count(p) > 3,
+      "b3: 1000 keys made a multi-page tree")) {
+    return 1;
+  }
+  i = 0;
+  while (i < B_E5_KEYS) {
+    if (b_lookup(p, root, (int64)i, B_KEY, "b3") != 0) { return 1; }
+    i += 1;
+  }
+  // Absent keys on both sides of the key space answer 1, not an error.
+  var kb: uint8[16];
+  var kk: DkBtKey = { data: &kb[0], len: dk_key_int(&kb[0], 16, -1) };
+  var rid: uint64 = 0;
+  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid), 1,
+      "b3: a key below the smallest answers 1")) {
+    return 1;
+  }
+  kk.len = dk_key_int(&kb[0], 16, (int64)B_E5_KEYS);
+  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid), 1,
+      "b3: a key above the largest answers 1")) {
+    return 1;
+  }
+  if (!dk_t_check((int64)b_depth(p, root, 0, B_KEY) >= 2,
+      "b3: a split moved the root off the leaf level")) {
+    return 1;
+  }
+  if (b_scan(p, root, 0, B_E5_KEYS, (int64)B_ROWID_BASE, B_KEY, "b3") != 0) {
+    return 1;
+  }
+  // Uniqueness (PHASE2.md 2D): a second insert of an existing key replaces its
+  // rowid and adds no row. Some of these keys are inner separators, so this is
+  // the assertion that catches a descent taking the LEFT child on a key equal
+  // to the separator: that writes the duplicate into the left subtree while the
+  // original stays in the right, and the repeated key shows up in the walk.
+  i = 0;
+  while (i < B_E5_KEYS) {
+    var v: int64 = (int64)i;
+    if (b_insert(p, &root, v, B_ROWID_BASE + (uint64)v, B_KEY, "b3") != 0) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (b_scan(p, root, 0, B_E5_KEYS, (int64)B_ROWID_BASE, B_KEY,
+      "b3 rewrite") != 0) {
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b3: close")) { return 1; }
+  b_pass("b3_e5");
+  return 0;
+}
+
+// --- b4: E6 -- 1000 inserts at n_frames = 8, close, reopen, walk ----------
+
+fn b4_e6() -> int32 {
+  var rc: int32 = b_reset(B_E6);
+  if (!dk_t_check_i64(rc, DK_OK, "b4: reset file")) { return 1; }
+  // Eight frames, the pager's minimum, and B_WIDE-byte keys: a leaf holds 36 of
+  // them, so 1000 keys make ~30 pages against an 8-frame cache and every split
+  // forces evictions and write-backs. With E5's nine-byte keys the same 1000
+  // keys make 7 pages, which fit in the cache and would prove nothing: a split
+  // whose write is lost to an eviction only loses data once the cache is
+  // smaller than the tree.
+  var p: DkPager* = dk_pager_open(B_E6, 8, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "b4: open")) { return 1; }
+
+  var order: int32[] = new int32[B_E5_KEYS];
+  if (!dk_t_check(order.data != 0, "b4: order buffer")) {
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  b_shuffle(order.data, B_E5_KEYS);
+
+  var root: uint32 = 0;
+  var i: int32 = 0;
+  while (i < B_E5_KEYS) {
+    var v: int64 = (int64)order[i];
+    var kb: uint8[B_WIDE];
+    var kn: int32 = b_make_key(&kb[0], v, B_WIDE);
+    var kk: DkBtKey = { data: &kb[0], len: kn };
+    rc = dk_bt_insert(p, &root, &dk_key_compare, kk, B_ROWID_BASE + (uint64)v);
+    if (rc != DK_OK) {
+      println("FAIL b4: insert {v} answered {rc}");
+      free(order.data);
+      dk_pager_close(p);
+      dk_pager_free(p);
+      return 1;
+    }
+    i += 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b4: inserts leave no frame pinned")) {
+    free(order.data);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  // E6's premise, not just its decoration: the tree must be larger than the
+  // frame table, or this case is E5 with a smaller cache and no eviction. With
+  // B_WIDE keys it is 45 pages today (build/btree_self_e6.dat is 184320 bytes);
+  // a leaf-capacity or key-width change that brought it to 8 or fewer makes
+  // E6 stop testing write-back, so it must fail here instead of staying green.
+  if (!dk_t_check((int64)dk_pager_page_count(p) > 8,
+      "b4: the tree is larger than the 8-frame cache")) {
+    free(order.data);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  // The root the caller must persist: insert answered it through root*, and the
+  // meta is the only durable place for it.
+  if (!dk_t_check_i64(dk_pager_set_root(p, DK_ROOT_BTREE, root), DK_OK,
+      "b4: store the root")) {
+    free(order.data);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_flush(p), DK_OK, "b4: flush")) {
+    free(order.data);
+    dk_pager_close(p);
+    dk_pager_free(p);
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b4: close")) {
+    free(order.data);
+    dk_pager_free(p);
+    return 1;
+  }
+  dk_pager_free(p);
+
+  // Reopen read-only: the walk must not need to write, and every key must have
+  // survived the flush and the close/reopen.
+  var ro: DkPager* = dk_pager_open(B_E6, 8, DK_PAGER_READONLY);
+  if (!dk_t_check(ro != 0, "b4: reopen")) {
+    free(order.data);
+    return 1;
+  }
+  defer dk_pager_free(ro);
+  var root2: uint32 = dk_pager_root(ro, DK_ROOT_BTREE);
+  if (!dk_t_check_i64((int64)root2, (int64)root,
+      "b4: the root survived the reopen")) {
+    free(order.data);
+    return 1;
+  }
+  i = 0;
+  while (i < B_E5_KEYS) {
+    var v: int64 = (int64)i;
+    var kb: uint8[B_WIDE];
+    var kn: int32 = b_make_key(&kb[0], v, B_WIDE);
+    var kk: DkBtKey = { data: &kb[0], len: kn };
+    var rid: uint64 = 0;
+    rc = dk_bt_lookup(ro, root2, &dk_key_compare, kk, &rid);
+    if (rc != DK_OK) {
+      println("FAIL b4: lookup {v} after reopen answered {rc}");
+      free(order.data);
+      return 1;
+    }
+    if (!dk_t_check_i64((int64)rid, (int64)(B_ROWID_BASE + (uint64)v),
+        "b4: rowid {v} after reopen")) {
+      free(order.data);
+      return 1;
+    }
+    i += 1;
+  }
+  if (b_scan(ro, root2, 0, B_E5_KEYS, (int64)B_ROWID_BASE, B_WIDE, "b4") != 0) {
+    free(order.data);
+    return 1;
+  }
+  free(order.data);
+  if (!dk_t_check_i64(dk_pager_close(ro), DK_OK, "b4: close reopened")) {
+    return 1;
+  }
+  b_pass("b4_e6");
+  return 0;
+}
+
+// --- b6: three levels, so an inner node splits -----------------------------
+//
+// 2000 B_WIDE-byte keys put only 36 cells in a leaf and 37 children in an inner
+// node, so the root fills and splits long before 2000 keys: the tree becomes
+// three levels deep and btree/node.mettle's inner split -- the one whose
+// separator LEAVES both halves, unlike a leaf split's copied-up key -- runs.
+// E5's 1000 nine-byte keys never reach it (that root has room for 240 children),
+// so this case is what proves the inner split. Catches an inner split that keeps
+// the moved key in a half (a subtree then answers a range it does not own), one
+// that drops a child pointer, and an outer separator that no longer names its
+// subtree's smallest key.
+fn b6_wide() -> int32 {
+  var rc: int32 = b_reset(B_WIDE_PATH);
+  if (!dk_t_check_i64(rc, DK_OK, "b6: reset file")) { return 1; }
+  var p: DkPager* = dk_pager_open(B_WIDE_PATH, 16, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "b6: open")) { return 1; }
+  defer dk_pager_free(p);
+
+  var order: int32[] = new int32[B_WIDE_KEYS];
+  if (!dk_t_check(order.data != 0, "b6: order buffer")) { return 1; }
+  defer free(order.data);
+  b_shuffle(order.data, B_WIDE_KEYS);
+
+  var root: uint32 = 0;
+  var i: int32 = 0;
+  while (i < B_WIDE_KEYS) {
+    var v: int64 = (int64)order[i];
+    if (b_insert(p, &root, v, B_ROWID_BASE + (uint64)v, B_WIDE, "b6") != 0) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0, "b6: inserts leave no frame pinned")) {
+    return 1;
+  }
+  var d: int32 = b_depth(p, root, 0, B_WIDE);
+  if (!dk_t_check((int64)d >= 3, "b6: the tree is three levels deep")) {
+    println("FAIL b6: depth {d}");
+    return 1;
+  }
+  i = 0;
+  while (i < B_WIDE_KEYS) {
+    if (b_lookup(p, root, (int64)i, B_WIDE, "b6") != 0) { return 1; }
+    i += 1;
+  }
+  if (b_scan(p, root, 0, B_WIDE_KEYS, (int64)B_ROWID_BASE, B_WIDE, "b6") != 0) {
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b6: close")) { return 1; }
+  b_pass("b6_wide");
+  return 0;
+}
+
+// --- b5: E7 -- the depth cap ----------------------------------------------
+
+// Build a root-to-leaf chain of `inner_levels` single-child inner nodes over a
+// leaf that holds key 5. Every inner node has one cell: the bare right-child
+// pointer, so every descent takes it and the chain is the tree.
+fn b_chain(p: DkPager*, inner_levels: int32) -> uint32 {
+  var ids: uint32[] = new uint32[inner_levels];
+  if (ids.data == 0) { return 0; }
+  defer free(ids.data);
+  var i: int32 = 0;
+  while (i < inner_levels) {
+    var f: DkFrame* = dk_pager_alloc(p);
+    if (f == 0) { return 0; }
+    ids[i] = f->page_no;
+    dk_pager_release(p, f, false);
+    i += 1;
+  }
+  var lf: DkFrame* = dk_pager_alloc(p);
+  if (lf == 0) { return 0; }
+  var leaf_no: uint32 = lf->page_no;
+  var kb: uint8[16];
+  var kn: int32 = dk_key_int(&kb[0], 16, 5);
+  var rc: int32 = dk_page_init(lf->data, DK_PAGE_BTREE_LEAF);
+  if (rc == DK_OK) {
+    rc = dk_btn_leaf_append(lf->data, &kb[0], kn, (uint64)55);
+  }
+  dk_pager_release(p, lf, rc == DK_OK);
+  if (rc != DK_OK) { return 0; }
+  i = inner_levels - 1;
+  while (i >= 0) {
+    var child: uint32 = leaf_no;
+    if (i < inner_levels - 1) { child = ids[i + 1]; }
+    var f: DkFrame* = dk_pager_get(p, ids[i], true);
+    if (f == 0) { return 0; }
+    rc = dk_page_init(f->data, DK_PAGE_BTREE_INNER);
+    if (rc == DK_OK) { rc = dk_btn_inner_append_right(f->data, child); }
+    dk_pager_release(p, f, rc == DK_OK);
+    if (rc != DK_OK) { return 0; }
+    i -= 1;
+  }
+  return ids[0];
+}
+
+// Build a FULL 16-level chain: `inner_levels` (15) inner nodes, each holding
+// B_FULL_INNER_KEYS keyed cells plus the bare right child, over a full leaf.
+// Every separator is below B_FULL_ABOVE, so a descent for that key takes the
+// right child at every level; every node is too full to take one more cell, so
+// an insert must carry a split all the way to the root. That is the only shape
+// that reaches dk_bt_insert's root-split branch while the chain is already at
+// DK_BT_MAX_DEPTH.
+fn b_full_chain(p: DkPager*, inner_levels: int32) -> uint32 {
+  var ids: uint32[] = new uint32[inner_levels];
+  if (ids.data == 0) { return 0; }
+  defer free(ids.data);
+  var i: int32 = 0;
+  while (i < inner_levels) {
+    var f: DkFrame* = dk_pager_alloc(p);
+    if (f == 0) { return 0; }
+    ids[i] = f->page_no;
+    dk_pager_release(p, f, false);
+    i += 1;
+  }
+  var lf: DkFrame* = dk_pager_alloc(p);
+  if (lf == 0) { return 0; }
+  var leaf_no: uint32 = lf->page_no;
+  var rc: int32 = dk_page_init(lf->data, DK_PAGE_BTREE_LEAF);
+  var j: int32 = 0;
+  while (rc == DK_OK && j < B_FULL_LEAF_KEYS) {
+    var kb: uint8[B_WIDE];
+    var v: int64 = (int64)(B_FULL_INNER_KEYS + j);
+    var kn: int32 = b_make_key(&kb[0], v, B_WIDE);
+    rc = dk_btn_leaf_append(lf->data, &kb[0], kn, (uint64)v);
+    j += 1;
+  }
+  // "full" is the premise of the whole case: a leaf with room takes the new
+  // cell without splitting, the separator never travels, and the tree never
+  // reaches the root-split branch at the depth cap. A key-width or capacity
+  // change must fail here rather than leave the chain half-empty and E7's
+  // second half testing nothing.
+  if (rc == DK_OK && !dk_t_check_false(
+      dk_btn_leaf_room(lf->data, B_WIDE),
+      "b5: the full chain's leaf refuses one more cell")) {
+    rc = -DK_ERR_CORRUPT;
+  }
+  dk_pager_release(p, lf, rc == DK_OK);
+  if (rc != DK_OK) { return 0; }
+  i = inner_levels - 1;
+  while (i >= 0) {
+    var child: uint32 = leaf_no;
+    if (i < inner_levels - 1) { child = ids[i + 1]; }
+    var f: DkFrame* = dk_pager_get(p, ids[i], true);
+    if (f == 0) { return 0; }
+    rc = dk_page_init(f->data, DK_PAGE_BTREE_INNER);
+    j = 0;
+    while (rc == DK_OK && j < B_FULL_INNER_KEYS) {
+      var kb: uint8[B_WIDE];
+      var kn: int32 = b_make_key(&kb[0], (int64)j, B_WIDE);
+      rc = dk_btn_inner_append(f->data, child, &kb[0], kn);
+      j += 1;
+    }
+    if (rc == DK_OK) { rc = dk_btn_inner_append_right(f->data, child); }
+    // Same premise one level up: every inner node on the chain must be full,
+    // or the insert's split stops at the first node with room and never
+    // reaches the root branch the case exists to exercise.
+    if (rc == DK_OK && !dk_t_check_false(
+        dk_btn_inner_room(f->data, B_WIDE),
+        "b5: a full chain inner node refuses one more cell")) {
+      rc = -DK_ERR_CORRUPT;
+    }
+    dk_pager_release(p, f, rc == DK_OK);
+    if (rc != DK_OK) { return 0; }
+    i -= 1;
+  }
+  return ids[0];
+}
+
+fn b5_e7() -> int32 {
+  var rc: int32 = b_reset(B_E7);
+  if (!dk_t_check_i64(rc, DK_OK, "b5: reset file")) { return 1; }
+  var p: DkPager* = dk_pager_open(B_E7, 32, DK_PAGER_CREATE);
+  if (!dk_t_check(p != 0, "b5: open")) { return 1; }
+  defer dk_pager_free(p);
+
+  var kb: uint8[16];
+  var kk: DkBtKey = { data: &kb[0], len: dk_key_int(&kb[0], 16, 5) };
+  var rid: uint64 = 0;
+
+  // The depths here are the literals PHASE2.md 2D names, not the constant: a
+  // test written in terms of DK_BT_MAX_DEPTH would move with it, so a cap of 15
+  // would still pass. The cursor's path array holds 16 page numbers and 16 is
+  // the number the contract names, so 16 levels must work and 17 must not.
+  //
+  // At the cap: 15 inner levels plus the leaf is 16 levels, the deepest chain
+  // the cursor can describe, and the walk must find the row. This is the half
+  // that catches a cap that refuses one level too early.
+  var root_ok: uint32 = b_chain(p, 15);
+  if (!dk_t_check(root_ok != 0, "b5: chain at the depth cap")) { return 1; }
+  rc = dk_bt_lookup(p, root_ok, &dk_key_compare, kk, &rid);
+  if (!dk_t_check_i64(rc, DK_OK, "b5: a chain at the cap is readable")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)rid, 55, "b5: the deepest leaf's rowid")) {
+    return 1;
+  }
+
+  // The depth guard must not refuse a legitimate insert. It sits AFTER the
+  // room fast path, and this chain is one bare right-child cell per level over
+  // a leaf that holds only key 5, so key 6 fits without a split: the insert
+  // must answer DK_OK, the row must be readable, and no frame may be left
+  // pinned. Without this row, moving the guard above the room check -- turning
+  // every insert into a capped tree into -DK_ERR_CORRUPT -- would keep this
+  // suite green, which is the same "a rule that refused everything would pass"
+  // hole the pinned-refusal case in freelist_self closes.
+  var fit_root: uint32 = root_ok;
+  var kb_fit: uint8[16];
+  var kk_fit: DkBtKey = {
+    data: &kb_fit[0], len: dk_key_int(&kb_fit[0], 16, 6) };
+  rc = dk_bt_insert(p, &fit_root, &dk_key_compare, kk_fit, (uint64)66);
+  if (!dk_t_check_i64(rc, DK_OK,
+      "b5: an insert that fits in a capped deep tree is DK_OK")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)fit_root, (int64)root_ok,
+      "b5: a fit-in-place insert does not move the root")) {
+    return 1;
+  }
+  rc = dk_bt_lookup(p, fit_root, &dk_key_compare, kk_fit, &rid);
+  if (!dk_t_check_i64(rc, DK_OK, "b5: the inserted row is readable")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)rid, 66, "b5: the inserted row's rowid")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0,
+      "b5: a fit-in-place insert leaves nothing pinned")) {
+    return 1;
+  }
+
+  // One level deeper than the cap: 16 inner levels plus the leaf is 17 levels.
+  // -DK_ERR_CORRUPT from every entry point, not a crash, not a write past
+  // path[15], not an answer from a tree the cursor cannot describe.
+  var root_deep: uint32 = b_chain(p, 16);
+  if (!dk_t_check(root_deep != 0, "b5: chain past the depth cap")) { return 1; }
+  rc = dk_bt_lookup(p, root_deep, &dk_key_compare, kk, &rid);
+  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+      "b5: lookup past the cap is CORRUPT")) {
+    return 1;
+  }
+  var c: DkBtCursor;
+  dk_bt_cursor_init(&c);
+  rc = dk_bt_seek(p, &c, root_deep, &dk_key_compare, kk);
+  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT, "b5: seek past the cap is CORRUPT")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)c.err, (int64)DK_ERR_CORRUPT,
+      "b5: the cursor records the code")) {
+    return 1;
+  }
+  dk_bt_close(p, &c);
+  if (!dk_t_check_i64((int64)b_pins(p), 0,
+      "b5: a refused descent leaves nothing pinned")) {
+    return 1;
+  }
+  var deep_root: uint32 = root_deep;
+  var kb2: uint8[16];
+  var kk2: DkBtKey = { data: &kb2[0], len: dk_key_int(&kb2[0], 16, 6) };
+  rc = dk_bt_insert(p, &deep_root, &dk_key_compare, kk2, (uint64)66);
+  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+      "b5: insert past the cap is CORRUPT")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)deep_root, (int64)root_deep,
+      "b5: a refused insert does not move the root")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0,
+      "b5: a refused insert leaves nothing pinned")) {
+    return 1;
+  }
+
+  // The insert that would make the seventeenth level the slow way: a FULL
+  // 16-level chain, so the split cannot stop at any inner node -- every one is
+  // too full -- and reaches dk_bt_insert's root-split branch. Without the depth
+  // guard there, the insert answers DK_OK, root* names a 17-level tree, and
+  // every later lookup/seek answers -DK_ERR_CORRUPT: success plus silent
+  // corruption. The refusal must also burn no page and move no root.
+  var full_root: uint32 = b_full_chain(p, 15);
+  if (!dk_t_check(full_root != 0, "b5: full chain at the depth cap")) { return 1; }
+  var full_pages: uint32 = dk_pager_page_count(p);
+  var kb3: uint8[B_WIDE];
+  var kk3: DkBtKey = {
+    data: &kb3[0], len: b_make_key(&kb3[0], B_FULL_ABOVE, B_WIDE) };
+  var full_root_out: uint32 = full_root;
+  rc = dk_bt_insert(p, &full_root_out, &dk_key_compare, kk3, (uint64)77);
+  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+      "b5: a split at the depth cap is CORRUPT")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)full_root_out, (int64)full_root,
+      "b5: a refused root split does not move the root")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)b_pins(p), 0,
+      "b5: a refused root split leaves nothing pinned")) {
+    return 1;
+  }
+  if (!dk_t_check_i64((int64)dk_pager_page_count(p), (int64)full_pages,
+      "b5: a refused root split allocates no page")) {
+    return 1;
+  }
+  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b5: close")) { return 1; }
+  b_pass("b5_e7");
+  return 0;
+}
+
+fn main() -> int32 {
+  if (b1_leaf() != 0) { return 1; }
+  if (b2_root_split() != 0) { return 1; }
+  if (b3_e5() != 0) { return 1; }
+  if (b4_e6() != 0) { return 1; }
+  if (b6_wide() != 0) { return 1; }
+  if (b5_e7() != 0) { return 1; }
+  return dk_t_report();
+}
