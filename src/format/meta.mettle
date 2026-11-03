@@ -1,9 +1,18 @@
 // format/meta: page 0's body — magic, version, page size, page count, roots,
-// and the transaction/write-version counters.
+// and the transaction/write-version/commit counters.
 //
 // PHASE1.md sections 4 and 5.8. The body starts at offset 16 and the free area
 // of the meta page starts at MEO_META_BODY (128). As everywhere in format/, the
 // page is explicit encode/decode at fixed offsets; no struct is overlaid.
+//
+// Nothing here allocates. Invariant: every byte of [META_OFF_RESERVED,
+// MEO_META_BODY) is zero after meo_meta_write, so a field carved out of the
+// reserved area later reads 0 from every file written before it existed.
+//
+// commit_seq (offset 56, u64) is such a field: the change feed's persisted
+// commit counter. Files written before it existed carry zeros there and
+// therefore read commit_seq = 0, which is a valid starting value, so adding it
+// needed no format-version bump. The reserved area now starts at 64.
 
 import "../error/status.mettle";
 import "bytes.mettle";
@@ -24,7 +33,8 @@ const META_OFF_CATALOG_ROOT: int64 = 32;
 const META_OFF_BTREE_ROOT: int64 = 36;
 const META_OFF_TXN_ID: int64 = 40;
 const META_OFF_WRITE_VERSION: int64 = 48;
-const META_OFF_RESERVED: int64 = 56;
+const META_OFF_COMMIT_SEQ: int64 = 56;
+const META_OFF_RESERVED: int64 = 64;
 const META_RESERVED_BYTES: int64 = (int64)MEO_META_BODY - META_OFF_RESERVED;
 
 export struct MeoMeta {
@@ -38,6 +48,7 @@ export struct MeoMeta {
   btree_root: uint32;
   txn_id: uint64;
   write_version: uint64;
+  commit_seq: uint64;  // successful commits (and counted autocommit flushes)
 }
 
 // Decode the meta body. A bad magic, version or page size returns a zeroed
@@ -63,6 +74,7 @@ export fn meo_meta_read(p: uint8*) -> MeoMeta {
   m.btree_root = meo_get_u32le(p, META_OFF_BTREE_ROOT);
   m.txn_id = meo_get_u64le(p, META_OFF_TXN_ID);
   m.write_version = meo_get_u64le(p, META_OFF_WRITE_VERSION);
+  m.commit_seq = meo_get_u64le(p, META_OFF_COMMIT_SEQ);
   return m;
 }
 
@@ -98,9 +110,20 @@ export fn meo_meta_write(p: uint8*, m: MeoMeta) -> int32 {
   meo_put_u32le(p, META_OFF_BTREE_ROOT, m.btree_root);
   meo_put_u64le(p, META_OFF_TXN_ID, m.txn_id);
   meo_put_u64le(p, META_OFF_WRITE_VERSION, m.write_version);
+  meo_put_u64le(p, META_OFF_COMMIT_SEQ, m.commit_seq);
+  // Only the bytes after commit_seq are reserved now; zeroing from 56 would
+  // erase the counter on every write.
   meo_bytes_zero(p + META_OFF_RESERVED, META_RESERVED_BYTES);
   meo_page_seal(p);
   return MEO_OK;
+}
+
+// Set commit_seq in an encoded meta page and reseal, touching no other byte.
+// The pager uses it when page 0's frame may carry bytes a caller wrote through
+// the frame, which a full meo_meta_write from the pager's copy would clobber.
+export fn meo_meta_put_commit_seq(p: uint8*, v: uint64) {
+  meo_put_u64le(p, META_OFF_COMMIT_SEQ, v);
+  meo_page_seal(p);
 }
 
 // Root page number for a MEO_ROOT_* slot; 0 means "none". An unknown slot also

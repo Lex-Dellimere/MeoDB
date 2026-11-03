@@ -1,0 +1,23 @@
+// platform/clock_linux: the wall clock, for the change feed's commit
+// timestamps. One raw syscall, clock_gettime(228) with CLOCK_REALTIME (0), on
+// Linux x86-64, the same mechanism file_linux.mettle uses for I/O.
+//
+// Allocates nothing. Invariant: the answer is microseconds since the Unix
+// epoch, or 0 when the kernel refuses (which it does not for CLOCK_REALTIME
+// with a valid buffer). The wall clock can step backwards (NTP, an operator);
+// this module reports what the kernel says, and a caller that needs a
+// nondecreasing sequence clamps (src/feed/feed.mettle does).
+
+const MEO_SYS_CLOCK_GETTIME: int64 = 228;
+const MEO_CLOCK_REALTIME: int64 = 0;
+
+export fn meo_clock_realtime_us() -> int64 {
+  // struct timespec { tv_sec: int64; tv_nsec: int64; }, filled by the kernel.
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  var rc: int64 = syscall(MEO_SYS_CLOCK_GETTIME, MEO_CLOCK_REALTIME,
+    (int64)&ts[0]);
+  if (rc < 0) { return 0; }
+  return ts[0] * (int64)1000000 + ts[1] / (int64)1000;
+}

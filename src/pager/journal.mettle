@@ -359,6 +359,21 @@ export fn meo_jrn_destroy(j: MeoJournal*) {
   free(j);
 }
 
+// Is there a journal file beside `db_path`? 1 = yes, 0 = no, negative on
+// failure. It does not parse or validate the file: a present journal means a
+// transaction is open, is committing, or died hot, so whatever page 0 says
+// right now may belong to a state that is not (or not yet) committed. Used by
+// meo_peek_commit_seq, which reads page 0 without a pager and must say so.
+export fn meo_jrn_present(db_path: string) -> int32 {
+  var jpath: string = jrn_path(db_path);
+  if (jpath.chars == 0) { return -MEO_ERR_NOMEM; }
+  var f: MeoFile = meo_file_open(jpath, MEO_OPEN_READ);
+  free(jpath.chars);
+  if (!f.is_open) { return 0; }
+  meo_file_close(f);
+  return 1;
+}
+
 // --- append ----------------------------------------------------------------
 
 // Does `page_no` still need a before-image in this transaction? False for a

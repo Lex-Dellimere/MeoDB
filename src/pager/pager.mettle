@@ -66,6 +66,39 @@
 //   enough. A MEO_PAGER_CREATE|MEO_PAGER_READONLY open is treated as "no create"
 //   for the same reason it is refused nothing else: a read-only pager could not
 //   initialise the file, so a zero-byte one is NOT_A_DB.
+//
+// COMMIT COUNTER AND COMMIT HOOK (the change feed, src/feed/feed.mettle).
+//
+// * meta.commit_seq is bumped by exactly 1 inside every successful commit:
+//   meo_pager_commit_prepare raises it and re-encodes page 0 BEFORE the flush,
+//   so page 0 gets a before-image in the journal like any other page and a
+//   rollback or a crash before the journal is removed puts the old value back.
+//   A failed flush/sync restores the in-memory value, so a retried commit still
+//   bumps by exactly 1.
+// * Autocommit rule: a successful meo_pager_flush with no transaction open that
+//   writes modifications made outside a transaction (tracked by `unflushed`,
+//   set by every dirtying path while no journal is attached) also bumps
+//   commit_seq and fires the commit hook. meo_pager_close's flush is the same
+//   call. This is NOT atomic -- an autocommit flush is the phase-1 in-place
+//   write, an eviction may already have written some of the pages, and a crash
+//   can leave any mix -- it only makes autocommit writers visible to
+//   meo_peek_commit_seq and to an attached feed. Internal flushes (commit, the
+//   new-file init) use meo_pager_flush_raw and never count.
+// * The hook is three fields (ctx and two function pointers), not an import of
+//   the feed: feed/ imports pager/ and btree/, so the pager calling feed/ by
+//   name would close a cycle. The pager calls hook_commit(ctx, commit_seq,
+//   time_us) after the journal is gone (the commit is durable), with a
+//   CLOCK_REALTIME timestamp from platform/clock_linux.mettle, and calls
+//   hook_rollback(ctx, ok) on every rollback path (explicit, close and free
+//   with an open transaction; free with unflushed autocommit changes). ok =
+//   false means the outcome is uncertain (the rollback itself failed, or
+//   pages may have reached the disk), so the feed reports a gap instead of
+//   silently dropping. Recovery at open calls nothing: there is no hook before
+//   open returns, and a recovered transaction was never committed, so it was
+//   never published by anyone.
+// * One writer thread per pager. The pager is not thread-safe; the hook runs on
+//   the writer's thread. Only the feed's reader side is meant for other
+//   threads.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -74,6 +107,7 @@ import "../format/page.mettle";
 import "../format/meta.mettle";
 import "../platform/file.mettle";
 import "../platform/file_linux.mettle" if linux;
+import "../platform/clock_linux.mettle" if linux;
 import "freelist.mettle";
 import "journal.mettle";
 
@@ -116,6 +150,12 @@ export struct MeoPager {
   journal: rawptr;   // MeoJournal* while a transaction is open, else 0
   journal_cap: int32; // meo_pager_set_journal_cap; default MEO_JRN_MAX_RECORDS
   lock: rawptr;      // phase 9; always 0 in phase 1
+  // Commit hook (see the header note). 0 = none.
+  hook_ctx: rawptr;
+  hook_commit: fn(rawptr, uint64, int64) -> void;
+  hook_rollback: fn(rawptr, bool) -> void;
+  prepared: bool;    // commit_prepare has bumped commit_seq for this txn
+  unflushed: bool;   // modified with no transaction open since the last flush
 }
 
 // The open-failure channel. meo_pager_open answers 0, so there is no pager to
@@ -275,6 +315,7 @@ fn meo_pager_index_remove(p: MeoPager*, page_no: uint32) {
 // --- dirty accounting ------------------------------------------------------
 
 fn meo_pager_mark_dirty(p: MeoPager*, f: MeoFrame*) {
+  if (p->journal == 0) { p->unflushed = true; }
   if (!f->dirty) {
     f->dirty = true;
     p->n_dirty += 1;
@@ -309,6 +350,7 @@ fn meo_pager_meta_refresh(p: MeoPager*, f: MeoFrame*) -> int32 {
 // back a body that disagrees with the pager's own copy.
 fn meo_pager_meta_touch(p: MeoPager*) {
   p->meta_dirty = true;
+  if (p->journal == 0) { p->unflushed = true; }
   var fi: int32 = meo_pager_find(p, 0);
   if (fi < 0) { return; }
   meo_pager_meta_refresh(p, meo_pager_frame_at(p, fi));
@@ -526,6 +568,13 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
   p->n_frames = 0;
   p->n_dirty = 0;
   p->meta_dirty = false;
+  // The hook's ctx may outlive the pager (a feed is freed separately); a closed
+  // pager never calls it again.
+  p->hook_ctx = 0;
+  p->hook_commit = 0;
+  p->hook_rollback = 0;
+  p->prepared = false;
+  p->unflushed = false;
   p->closed = true;
   return rc;
 }
@@ -580,6 +629,7 @@ fn meo_pager_init_new(p: MeoPager*) -> int32 {
   m.btree_root = 0;
   m.txn_id = 0;
   m.write_version = 1;
+  m.commit_seq = 0;
   p->meta = m;
   p->page_count = 1;
 
@@ -594,7 +644,8 @@ fn meo_pager_init_new(p: MeoPager*) -> int32 {
   p->n_dirty = 1;
   p->meta_dirty = true;
 
-  rc = meo_pager_flush(p);
+  // Creating the file is not a commit: the raw flush never counts.
+  rc = meo_pager_flush_raw(p);
   if (rc != MEO_OK) { return rc; }
   f->pin = 0;
   return MEO_OK;
@@ -653,6 +704,11 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
   p->journal = 0;
   p->journal_cap = MEO_JRN_MAX_RECORDS;
   p->lock = 0;
+  p->hook_ctx = 0;
+  p->hook_commit = 0;
+  p->hook_rollback = 0;
+  p->prepared = false;
+  p->unflushed = false;
   p->meta_dirty = false;
   p->path = meo_pager_copy_string(path);
   if (p->path.chars == 0) {
@@ -755,7 +811,10 @@ export fn meo_pager_close(p: MeoPager*) -> int32 {
     var rrc: int32 = meo_pager_rollback(p);
     if (rrc != MEO_OK) { first = rrc; }
   }
+  // The public flush: unflushed autocommit changes are counted and published
+  // here, exactly as an explicit flush would.
   var rc: int32 = meo_pager_flush(p);
+  if (rc != MEO_OK && p->unflushed) { meo_pager_notify_rollback(p, false); }
   if (rc != MEO_OK && first == MEO_OK) { first = rc; }
   rc = meo_pager_sync(p);
   if (rc != MEO_OK && first == MEO_OK) { first = rc; }
@@ -776,7 +835,13 @@ export fn meo_pager_free(p: MeoPager*) {
   if (!p->closed) {
     // Freeing without closing is a caller error, but it must not leave a hot
     // journal that would undo the next open. Roll back first, then release.
-    if (p->journal != 0) { meo_pager_rollback(p); }
+    if (p->journal != 0) {
+      meo_pager_rollback(p);
+    } else if (p->unflushed) {
+      // Changes made outside a transaction are dropped here, but an eviction
+      // may already have written some of them: the outcome is uncertain.
+      meo_pager_notify_rollback(p, false);
+    }
     meo_pager_release_all(p);
   }
   free(p);
@@ -1218,8 +1283,9 @@ export fn meo_pager_flush_plan(p: MeoPager*, out: uint32*, cap: int32) -> int32 
   return n;
 }
 
-export fn meo_pager_flush(p: MeoPager*) -> int32 {
-  if (p == 0) { return -MEO_ERR_USAGE; }
+// The flush itself: write every dirty page, page 0 last, then fsync. It never
+// touches commit_seq or the hook; commit and the new-file init call it.
+fn meo_pager_flush_raw(p: MeoPager*) -> int32 {
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   var need: int32 = meo_pager_plan_count(p);
@@ -1268,6 +1334,35 @@ export fn meo_pager_flush(p: MeoPager*) -> int32 {
   return MEO_OK;
 }
 
+// The public flush. Inside a transaction it is a plain write-out (a commit is
+// what counts). Outside one, with modifications made since the last flush
+// (`unflushed`), it is an autocommit: commit_seq is bumped into page 0 before
+// the write and the commit hook fires after the fsync. NOT atomic -- see the
+// header note. A failed flush restores the in-memory commit_seq.
+export fn meo_pager_flush(p: MeoPager*) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->journal != 0 || p->read_only || !p->unflushed) {
+    return meo_pager_flush_raw(p);
+  }
+  var old_seq: uint64 = p->meta.commit_seq;
+  var rc: int32 = meo_pager_meta_set_commit_seq(p, old_seq + 1);
+  if (rc != MEO_OK) {
+    p->meta.commit_seq = old_seq;
+    return meo_pager_fail(p, rc, 0);
+  }
+  rc = meo_pager_flush_raw(p);
+  if (rc != MEO_OK) {
+    var err_arg: int64 = p->err_arg;
+    meo_pager_meta_set_commit_seq(p, old_seq);
+    return meo_pager_fail(p, rc, err_arg);
+  }
+  p->unflushed = false;
+  meo_pager_notify_commit(p);
+  return MEO_OK;
+}
+
 export fn meo_pager_sync(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
@@ -1310,6 +1405,42 @@ export fn meo_pager_begin(p: MeoPager*) -> int32 {
   return MEO_OK;
 }
 
+// The first half of a commit: bump commit_seq into page 0, write every dirty
+// page (each before-image is appended by the chokepoint before its page, page
+// 0 included), and fsync the database. The journal is NOT removed, so the
+// transaction is still undoable: a rollback or a crash from here restores the
+// pre-transaction pages and commit_seq. meo_pager_commit is prepare + the
+// journal removal; prepare is exported for two-phase coordination and so a
+// test can crash a process between the two halves. Calling it twice bumps
+// once. A failure restores the in-memory commit_seq; the transaction stays
+// open.
+export fn meo_pager_commit_prepare(p: MeoPager*) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->journal == 0) {
+    return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
+  }
+  var bumped: bool = false;
+  var old_seq: uint64 = p->meta.commit_seq;
+  if (!p->prepared) {
+    var brc: int32 = meo_pager_meta_set_commit_seq(p, old_seq + 1);
+    if (brc != MEO_OK) {
+      p->meta.commit_seq = old_seq;
+      return meo_pager_fail(p, brc, 0);
+    }
+    bumped = true;
+  }
+  var rc: int32 = meo_pager_flush_raw(p);
+  if (rc == MEO_OK) { rc = meo_pager_sync(p); }
+  if (rc != MEO_OK) {
+    if (bumped) { meo_pager_meta_set_commit_seq(p, old_seq); }
+    return meo_pager_fail(p, rc, 0);
+  }
+  p->prepared = true;
+  return MEO_OK;
+}
+
 export fn meo_pager_commit(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
@@ -1317,16 +1448,17 @@ export fn meo_pager_commit(p: MeoPager*) -> int32 {
   if (p->journal == 0) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
   }
-  // Write every dirty page (each before-image is appended by the chokepoint
-  // before its page), then fsync the database. Only after that is the journal
+  // Write and fsync every dirty page first. Only after that is the journal
   // removed: a commit that deleted the journal first would lose the undo log
   // for pages that were not yet durable.
-  var rc: int32 = meo_pager_flush(p);
-  if (rc != MEO_OK) { return meo_pager_fail(p, rc, 0); }
-  rc = meo_pager_sync(p);
-  if (rc != MEO_OK) { return meo_pager_fail(p, rc, 0); }
+  var rc: int32 = meo_pager_commit_prepare(p);
+  if (rc != MEO_OK) { return rc; }
   meo_jrn_destroy((MeoJournal*)p->journal);
   p->journal = 0;
+  p->prepared = false;
+  p->unflushed = false;
+  // Durable now: the journal is gone. Only now may anyone hear about it.
+  meo_pager_notify_commit(p);
   return MEO_OK;
 }
 
@@ -1348,9 +1480,17 @@ export fn meo_pager_rollback(p: MeoPager*) -> int32 {
   }
   var j: MeoJournal* = (MeoJournal*)p->journal;
   var rc: int32 = meo_jrn_rollback(j, p->file);
-  if (rc != MEO_OK) { return meo_pager_fail(p, rc, 0); }
+  if (rc != MEO_OK) {
+    // The file may be half restored and the transaction is still open: the
+    // feed must not trust anything it captured, so the outcome is uncertain.
+    meo_pager_notify_rollback(p, false);
+    return meo_pager_fail(p, rc, 0);
+  }
   meo_jrn_destroy(j);
   p->journal = 0;
+  p->prepared = false;
+  p->unflushed = false;
+  meo_pager_notify_rollback(p, true);
   // The cache still holds the new content. Drop every frame and reload page 0
   // from the restored file, which also restores p->meta and p->page_count.
   i = 0;
@@ -1394,6 +1534,139 @@ export fn meo_pager_set_journal_cap(p: MeoPager*, records: int32) -> int32 {
     return meo_pager_fail(p, -MEO_ERR_USAGE, (int64)records);
   }
   p->journal_cap = records;
+  return MEO_OK;
+}
+
+// Store `value` as commit_seq in p->meta AND in page 0, without re-encoding
+// the rest of page 0 from p->meta when nothing else asked for that. A caller
+// may write page 0 through its frame (meo_meta_write into get(0)); a full
+// re-encode here would silently undo those bytes. So: when a re-encode is
+// already pending (meta_dirty), p->meta is the authority and the counter rides
+// along; otherwise only the eight counter bytes of the frame are patched,
+// faulting page 0 in when it is not resident.
+fn meo_pager_meta_set_commit_seq(p: MeoPager*, value: uint64) -> int32 {
+  p->meta.commit_seq = value;
+  if (p->meta_dirty) {
+    meo_pager_meta_touch(p);
+    return MEO_OK;
+  }
+  var f: MeoFrame* = meo_pager_get(p, 0, true);
+  if (f == 0) { return 0 - p->err; }
+  meo_meta_put_commit_seq(f->data, value);
+  return meo_pager_release(p, f, true);
+}
+
+// --- commit hook -----------------------------------------------------------
+
+fn meo_pager_notify_commit(p: MeoPager*) {
+  if (p->hook_commit == 0) { return; }
+  var now_us: int64 = meo_clock_realtime_us();
+  p->hook_commit(p->hook_ctx, p->meta.commit_seq, now_us);
+}
+
+fn meo_pager_notify_rollback(p: MeoPager*, ok: bool) {
+  if (p->hook_rollback == 0) { return; }
+  p->hook_rollback(p->hook_ctx, ok);
+}
+
+// Install (or, with all three 0, remove) the commit hook. Refused with
+// -MEO_ERR_USAGE while a transaction is open: a hook attached halfway through
+// would publish a transaction it saw only part of. Answers MEO_OK, or 1 when
+// the pager already holds modifications made outside a transaction that the
+// next flush will count -- the new hook did not see them, so its owner should
+// treat the next commit as a gap. Removing the hook is always allowed.
+export fn meo_pager_set_hook(p: MeoPager*, ctx: rawptr,
+    meo_commit_cb: fn(rawptr, uint64, int64) -> void,
+    meo_rollback_cb: fn(rawptr, bool) -> void) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  var removing: bool = ctx == 0 && meo_commit_cb == 0 && meo_rollback_cb == 0;
+  if (removing) {
+    p->hook_ctx = 0;
+    p->hook_commit = 0;
+    p->hook_rollback = 0;
+    return MEO_OK;
+  }
+  if (p->journal != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  p->hook_ctx = ctx;
+  p->hook_commit = meo_commit_cb;
+  p->hook_rollback = meo_rollback_cb;
+  if (p->unflushed) { return 1; }
+  return MEO_OK;
+}
+
+// The ctx of the installed hook, or 0. A hook owner uses it to prove a pager
+// is attached to it before capturing changes for it.
+export fn meo_pager_hook_ctx(p: MeoPager*) -> rawptr {
+  if (p == 0) { return 0; }
+  return p->hook_ctx;
+}
+
+// The persisted commit counter as this pager sees it: the value the last
+// successful commit (or counted autocommit flush) made durable, or the value
+// read at open. 0 for a file that predates the field.
+export fn meo_pager_commit_seq(p: MeoPager*) -> uint64 {
+  if (p == 0) { return 0; }
+  return p->meta.commit_seq;
+}
+
+// Read commit_seq straight from page 0 on disk, with no pager: the cheap "did
+// anything commit?" probe for another handle or another process. Page 0 is
+// validated exactly as an open validates it (magic, version, page size, page
+// structure, CRC). No recovery is attempted and nothing is written.
+//
+// MEO_OK: out[0] is the committed value. 1: out[0] was read, but a journal
+// sits beside the database (a transaction is open, is committing, or died
+// hot), so the value may belong to a state that is not committed yet and may
+// still be rolled back; poll again. Page 0 is read BEFORE the journal is
+// looked for: a commit writes page 0, fsyncs, then removes the journal, so a
+// new value seen with no journal after it is committed.
+//
+// Failures: the open's codes for a missing file, -MEO_ERR_NOT_A_DB /
+// -MEO_ERR_VERSION for a foreign file, -MEO_ERR_CORRUPT for a page 0 that fails
+// its checks. A page 0 that fails its checks while a journal is present is
+// -MEO_ERR_BUSY instead: that is a writer caught mid-write (retry), not damage.
+// An autocommit flush has no journal, so a reader racing one can see a
+// transient -MEO_ERR_CORRUPT; retry before believing it.
+export fn meo_peek_commit_seq(path: string, out: uint64*) -> int32 {
+  if (out == 0) { return -MEO_ERR_USAGE; }
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return (int32)f.handle; }
+  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (buf == 0) {
+    meo_file_close(f);
+    return -MEO_ERR_NOMEM;
+  }
+  var rc: int32 = meo_file_read_at(f, 0, buf, (int64)MEO_PAGE_SIZE);
+  meo_file_close(f);
+  var status: int32 = MEO_OK;
+  if (rc < 0) {
+    status = rc;
+  } else if (rc != MEO_PAGE_SIZE) {
+    status = -MEO_ERR_CORRUPT;
+  } else {
+    status = meo_meta_check(buf);
+    if (status == MEO_OK && meo_page_verify(buf) != MEO_OK) {
+      status = -MEO_ERR_CORRUPT;
+    }
+  }
+  var seq: uint64 = 0;
+  if (status == MEO_OK) {
+    var m: MeoMeta = meo_meta_read(buf);
+    if (!m.valid) {
+      status = -MEO_ERR_CORRUPT;
+    } else {
+      seq = m.commit_seq;
+    }
+  }
+  free(buf);
+  var hot: int32 = meo_jrn_present(path);
+  if (hot < 0) { return hot; }
+  if (status == -MEO_ERR_CORRUPT && hot == 1) { return -MEO_ERR_BUSY; }
+  if (status != MEO_OK) { return status; }
+  out[0] = seq;
+  if (hot == 1) { return 1; }
   return MEO_OK;
 }
 
