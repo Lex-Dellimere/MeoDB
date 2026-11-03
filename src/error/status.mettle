@@ -1,8 +1,10 @@
 // error/status: the single status-code contract.
 //
-// Values are fixed by PHASE1.md section 2. Do not add, remove, renumber or
-// reorder them; later stages and on-disk/API compatibility depend on the
-// numbers. Every meo_* function returns MEO_OK (0) or a positive count on
+// Codes 1..12 are fixed by PHASE1.md section 2; 13..18 were appended for the
+// SQL layer (.apex/DECISIONS.md D8). The set is APPEND-ONLY: a new code takes
+// the next free number, and no existing code is ever removed, renumbered or
+// reordered, because on-disk/API compatibility and the flux_orm RC mapping
+// depend on the numbers. Every meo_* function returns MEO_OK (0) or a positive count on
 // success and -MEO_ERR_* on failure; the status helpers accept either the
 // positive constant or the negative form a function returned.
 
@@ -21,6 +23,15 @@ export const MEO_ERR_RANGE: int32 = 9;        // page number out of range
 export const MEO_ERR_USAGE: int32 = 10;       // bad argument / bad state
 export const MEO_ERR_UNSUPPORTED: int32 = 11; // not in this phase
 export const MEO_ERR_READONLY: int32 = 12;
+export const MEO_ERR_CONFLICT: int32 = 13;    // duplicate PRIMARY KEY / UNIQUE
+export const MEO_ERR_CONSTRAINT: int32 = 14;  // NOT NULL violation
+export const MEO_ERR_TX: int32 = 15;          // nested begin, none open, wrong thread
+export const MEO_ERR_SQL: int32 = 16;         // bad SQL, unknown table or column
+export const MEO_ERR_TOOBIG: int32 = 17;      // row or key over the size limit
+export const MEO_ERR_MISMATCH: int32 = 18;    // value type does not fit the request
+
+// The highest defined code. Raise it with every appended code.
+const MEO_ERR_LAST: int32 = MEO_ERR_MISMATCH;
 
 export struct MeoStatus {
   code: int32;
@@ -38,7 +49,7 @@ fn meo_status_magnitude(code: int32) -> int32 {
 
 fn meo_status_known(code: int32) -> bool {
   var c: int32 = meo_status_magnitude(code);
-  return (c >= MEO_OK) && (c <= MEO_ERR_READONLY);
+  return (c >= MEO_OK) && (c <= MEO_ERR_LAST);
 }
 
 // Return the static, uppercase name of a status code. NEVER allocates, for any
@@ -65,6 +76,12 @@ export fn meo_status_name(code: int32) -> string {
     case 10: { return "USAGE"; }
     case 11: { return "UNSUPPORTED"; }
     case 12: { return "READONLY"; }
+    case 13: { return "CONFLICT"; }
+    case 14: { return "CONSTRAINT"; }
+    case 15: { return "TX"; }
+    case 16: { return "SQL"; }
+    case 17: { return "TOOBIG"; }
+    case 18: { return "MISMATCH"; }
   }
   return "UNKNOWN";
 }
@@ -105,6 +122,12 @@ fn meo_status_lname(code: int32) -> string {
     case 10: { return "usage"; }
     case 11: { return "unsupported"; }
     case 12: { return "readonly"; }
+    case 13: { return "conflict"; }
+    case 14: { return "constraint"; }
+    case 15: { return "tx"; }
+    case 16: { return "sql"; }
+    case 17: { return "toobig"; }
+    case 18: { return "mismatch"; }
   }
   return "unknown{c}";
 }

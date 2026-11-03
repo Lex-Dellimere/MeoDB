@@ -1,0 +1,26 @@
+// db/flags: the public flag and step-result constants (DECISIONS.md D8).
+//
+// They sit in their own module so that db/, sql/ and every consumer can name
+// them without pulling in the engine. The open and transaction values equal
+// flux_orm's RC_MEOSQL_* and RC_TX_*, so an adapter passes them through
+// unchanged; never renumber them.
+//
+// meo_db_open flags: MEO_OPEN_READ 1, MEO_OPEN_WRITE 2, MEO_OPEN_CREATE 4 are
+// NOT defined here. platform/file already exports them with exactly these
+// values (PHASE1.md 5.3), and Mettle rejects a second export of the same name
+// anywhere in one import graph (E0003). platform/file holds only a struct and
+// constants and imports nothing, so importing it re-exports the flags to every
+// importer of db/flags at no cost. db/db passes them straight to the pager.
+// (MEO_OPEN_EXCL 8 comes along too; it is not a meo_db_open flag.)
+
+import "../platform/file.mettle";
+
+// meo_db_begin modes. All three behave the same in v1 (one writer at a time).
+export const MEO_TX_DEFAULT: int32 = 0;
+export const MEO_TX_DEFERRED: int32 = 1;
+export const MEO_TX_IMMEDIATE: int32 = 2;
+
+// meo_sql_step results. Positive, so they read as success under the
+// negative-on-failure convention, and far above any status code.
+export const MEO_ROW: int32 = 100;
+export const MEO_DONE: int32 = 101;

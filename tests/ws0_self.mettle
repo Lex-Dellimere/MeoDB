@@ -1,0 +1,265 @@
+// ws0_self: the WS0 shared contract -- status codes, f64 bytes, frozen constants.
+//
+// Every later workstream compiles against these numbers and types, so this bin
+// pins them: a renumbered code or a changed tag breaks the on-disk format or
+// the flux_orm mapping silently, and only an exact-value test notices.
+//
+//   w_status_old   codes 1..12 keep their numbers and names (append-only)
+//   w_status_new   codes 13..18 (D8): value, name, known, str
+//   w_f64          meo_put_f64le / meo_get_f64le copy bits: 0.0, -0.0, 1.5,
+//                  max finite, min subnormal, +inf, two NaNs with payloads;
+//                  compared as uint64, plus the little-endian byte layout
+//   w_consts       MEO_T_*, MEO_OPEN_*, MEO_TX_*, MEO_ROW/DONE, MEO_COL_*,
+//                  MEO_MAX_COLS, MEO_REC_MAX, MEO_AST_* values
+//   w_value        MeoValue setters write every field; meo_value_check
+//   w_ast          meo_ast_init defaults; a hand-built INSERT AST
+//
+// Run: mbuild run ws0_self. Every case prints PASS; a failure prints
+// FAIL <label> and the exit status is non-zero.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/record/value.mettle";
+import "../src/db/flags.mettle";
+import "../src/catalog/schema.mettle";
+import "../src/sql/ast.mettle";
+
+var w_failures: int32 = 0;
+
+fn w_ok(cond: bool, label: string) -> bool {
+  if (cond) { return true; }
+  println("FAIL {label}");
+  w_failures += 1;
+  return false;
+}
+
+fn w_i32(got: int32, want: int32, label: string) -> bool {
+  if (got == want) { return true; }
+  println("FAIL {label}: expected {want}, got {got}");
+  w_failures += 1;
+  return false;
+}
+
+fn w_u64(got: uint64, want: uint64, label: string) -> bool {
+  if (got == want) { return true; }
+  println("FAIL {label}: expected {want}, got {got}");
+  w_failures += 1;
+  return false;
+}
+
+fn w_str(got: string, want: string, label: string) -> bool {
+  var same: bool = got.length == want.length;
+  var i: int64 = 0;
+  while (same && i < (int64)got.length) {
+    if (got[i] != want[i]) { same = false; }
+    i += 1;
+  }
+  if (same) { return true; }
+  println("FAIL {label}: expected {want}, got {got}");
+  w_failures += 1;
+  return false;
+}
+
+fn w_case(name: string, before: int32) {
+  if (w_failures == before) { println("PASS {name}"); }
+}
+
+fn w_status_old() {
+  var f0: int32 = w_failures;
+  w_i32(MEO_OK, 0, "OK"); w_i32(MEO_ERR_IO, 1, "IO"); w_i32(MEO_ERR_NOMEM, 2, "NOMEM");
+  w_i32(MEO_ERR_NOSPC, 3, "NOSPC"); w_i32(MEO_ERR_CORRUPT, 4, "CORRUPT");
+  w_i32(MEO_ERR_NOT_A_DB, 5, "NOT_A_DB"); w_i32(MEO_ERR_VERSION, 6, "VERSION");
+  w_i32(MEO_ERR_BUSY, 7, "BUSY"); w_i32(MEO_ERR_FULL, 8, "FULL");
+  w_i32(MEO_ERR_RANGE, 9, "RANGE"); w_i32(MEO_ERR_USAGE, 10, "USAGE");
+  w_i32(MEO_ERR_UNSUPPORTED, 11, "UNSUPPORTED"); w_i32(MEO_ERR_READONLY, 12, "READONLY");
+  w_str(meo_status_name(0), "OK", "name 0");
+  w_str(meo_status_name(1), "IO", "name 1");
+  w_str(meo_status_name(2), "NOMEM", "name 2");
+  w_str(meo_status_name(3), "NOSPC", "name 3");
+  w_str(meo_status_name(-4), "CORRUPT", "name -4");
+  w_str(meo_status_name(5), "NOT_A_DB", "name 5");
+  w_str(meo_status_name(6), "VERSION", "name 6");
+  w_str(meo_status_name(7), "BUSY", "name 7");
+  w_str(meo_status_name(8), "FULL", "name 8");
+  w_str(meo_status_name(9), "RANGE", "name 9");
+  w_str(meo_status_name(10), "USAGE", "name 10");
+  w_str(meo_status_name(11), "UNSUPPORTED", "name 11");
+  w_str(meo_status_name(-12), "READONLY", "name -12");
+  w_case("w_status_old", f0);
+}
+
+fn w_status_new() {
+  var f0: int32 = w_failures;
+  w_i32(MEO_ERR_CONFLICT, 13, "CONFLICT");
+  w_i32(MEO_ERR_CONSTRAINT, 14, "CONSTRAINT");
+  w_i32(MEO_ERR_TX, 15, "TX");
+  w_i32(MEO_ERR_SQL, 16, "SQL");
+  w_i32(MEO_ERR_TOOBIG, 17, "TOOBIG");
+  w_i32(MEO_ERR_MISMATCH, 18, "MISMATCH");
+  w_str(meo_status_name(13), "CONFLICT", "name 13");
+  w_str(meo_status_name(-14), "CONSTRAINT", "name -14");
+  w_str(meo_status_name(15), "TX", "name 15");
+  w_str(meo_status_name(-16), "SQL", "name -16");
+  w_str(meo_status_name(17), "TOOBIG", "name 17");
+  w_str(meo_status_name(-18), "MISMATCH", "name -18");
+  w_str(meo_status_name(19), "UNKNOWN", "name 19 unknown");
+  w_str(meo_status_name(-19), "UNKNOWN", "name -19 unknown");
+  // meo_status_str goes through the known check: a known code formats
+  // without the unknown path, and 19 still takes it.
+  var s1: MeoStatus = { code: -MEO_ERR_TX, arg: 3 };
+  var t1: string = meo_status_str(s1);
+  w_str(t1, "tx(15) arg=3", "str 15");
+  free(t1.chars);
+  var s2: MeoStatus = { code: MEO_ERR_MISMATCH, arg: 0 };
+  var t2: string = meo_status_str(s2);
+  w_str(t2, "mismatch(18) arg=0", "str 18");
+  free(t2.chars);
+  var s3: MeoStatus = { code: 19, arg: 0 };
+  var t3: string = meo_status_str(s3);
+  w_str(t3, "unknown19(19) arg=0", "str 19");
+  free(t3.chars);
+  w_case("w_status_new", f0);
+}
+
+fn w_bits(hi: uint32, lo: uint32) -> uint64 {
+  return (((uint64)hi) << 32) | (uint64)lo;
+}
+
+// bits -> float through the helper under test, then float -> bytes again:
+// both directions must be a pure bit copy.
+fn w_f64_bits(buf: uint8*, bits: uint64, label: string) {
+  meo_put_u64le(buf, 0, bits);
+  var v: float64 = meo_get_f64le(buf, 0);
+  meo_bytes_zero(buf, 16);
+  meo_put_f64le(buf, 3, v);          // unaligned on purpose
+  w_u64(meo_get_u64le(buf, 3), bits, label);
+  var w: float64 = meo_get_f64le(buf, 3);
+  meo_put_f64le(buf, 8, w);
+  w_u64(meo_get_u64le(buf, 8), bits, label);
+}
+
+// A float64 the compiler produced (literal) encodes to the IEEE bits.
+fn w_f64_val(buf: uint8*, v: float64, bits: uint64, label: string) {
+  meo_put_f64le(buf, 0, v);
+  w_u64(meo_get_u64le(buf, 0), bits, label);
+  var r: float64 = meo_get_f64le(buf, 0);
+  w_ok(r == v, label);
+}
+
+fn w_f64() {
+  var f0: int32 = w_failures;
+  var buf: uint8[16];
+  var b: uint8* = &buf[0];
+  w_f64_val(b, 0.0, 0, "lit 0.0");
+  w_f64_val(b, 1.5, w_bits(0x3FF80000, 0), "lit 1.5");
+  w_f64_val(b, -2.0, w_bits(0xC0000000, 0), "lit -2.0");
+  w_f64_bits(b, 0, "0.0");
+  w_f64_bits(b, w_bits(0x80000000, 0), "-0.0");
+  w_f64_bits(b, w_bits(0x3FF80000, 0), "1.5");
+  w_f64_bits(b, w_bits(0x7FEFFFFF, 0xFFFFFFFF), "max");
+  w_f64_bits(b, 1, "min subnormal");
+  w_f64_bits(b, w_bits(0x7FF00000, 0), "+inf");
+  w_f64_bits(b, w_bits(0xFFF00000, 0), "-inf");
+  w_f64_bits(b, w_bits(0x7FF40000, 0x00000123), "snan payload");
+  w_f64_bits(b, w_bits(0xFFF80000, 0x00ABCDEF), "-qnan payload");
+  // Byte layout: 1.5 = 0x3FF8000000000000, little-endian -> byte 7 0x3F.
+  meo_put_f64le(b, 0, 1.5);
+  w_ok(buf[7] == 0x3F && buf[6] == 0xF8 && buf[0] == 0, "1.5 LE bytes");
+  w_case("w_f64", f0);
+}
+
+fn w_consts() {
+  var f0: int32 = w_failures;
+  w_i32(MEO_T_NULL, 0, "T_NULL"); w_i32(MEO_T_INT, 1, "T_INT");
+  w_i32(MEO_T_REAL, 2, "T_REAL"); w_i32(MEO_T_TEXT, 3, "T_TEXT");
+  w_i32(MEO_T_BLOB, 4, "T_BLOB");
+  w_i32(MEO_OPEN_READ, 1, "OPEN_READ"); w_i32(MEO_OPEN_WRITE, 2, "OPEN_WRITE");
+  w_i32(MEO_OPEN_CREATE, 4, "OPEN_CREATE");
+  w_i32(MEO_TX_DEFAULT, 0, "TX_DEFAULT"); w_i32(MEO_TX_DEFERRED, 1, "TX_DEFERRED");
+  w_i32(MEO_TX_IMMEDIATE, 2, "TX_IMMEDIATE");
+  w_i32(MEO_ROW, 100, "ROW"); w_i32(MEO_DONE, 101, "DONE");
+  w_i32(MEO_COL_PK, 1, "COL_PK"); w_i32(MEO_COL_NOT_NULL, 2, "COL_NOT_NULL");
+  w_i32(MEO_COL_UNIQUE, 4, "COL_UNIQUE"); w_i32(MEO_COL_ROWID_ALIAS, 8, "COL_ROWID_ALIAS");
+  w_i32(MEO_MAX_COLS, 64, "MAX_COLS"); w_i32(MEO_REC_MAX, 1280, "REC_MAX");
+  w_i32(MEO_AST_C_PK, MEO_COL_PK, "AST_C_PK");
+  w_i32(MEO_AST_C_NOT_NULL, MEO_COL_NOT_NULL, "AST_C_NOT_NULL");
+  w_i32(MEO_AST_C_UNIQUE, MEO_COL_UNIQUE, "AST_C_UNIQUE");
+  w_i32(MEO_AST_CREATE, 1, "AST_CREATE"); w_i32(MEO_AST_INSERT, 2, "AST_INSERT");
+  w_i32(MEO_AST_SELECT, 3, "AST_SELECT"); w_i32(MEO_AST_UPDATE, 4, "AST_UPDATE");
+  w_i32(MEO_AST_DELETE, 5, "AST_DELETE");
+  w_ok(meo_schema_affinity_ok(MEO_T_BLOB) && !meo_schema_affinity_ok(MEO_T_NULL)
+       && !meo_schema_affinity_ok(5), "affinity_ok");
+  w_case("w_consts", f0);
+}
+
+fn w_value() {
+  var f0: int32 = w_failures;
+  var bytes: uint8[4];
+  var v: MeoValue = { type: 9, i: 7, f: 2.0, p: &bytes[0], n: 4 };
+  w_i32(meo_value_check(&v), -MEO_ERR_MISMATCH, "check bad tag");
+  w_i32(meo_value_check(0), -MEO_ERR_USAGE, "check null");
+  meo_value_set_text(&v, &bytes[0], 4);
+  w_ok(v.type == MEO_T_TEXT && v.n == 4 && v.i == 0 && v.f == 0.0, "set_text");
+  w_i32(meo_value_check(&v), MEO_OK, "check text");
+  meo_value_set_int(&v, -5);
+  w_ok(v.type == MEO_T_INT && v.i == -5 && v.p == 0 && v.n == 0, "set_int clears view");
+  meo_value_set_real(&v, 1.5);
+  w_ok(v.type == MEO_T_REAL && v.f == 1.5 && v.i == 0, "set_real");
+  meo_value_set_blob(&v, 0, 0);
+  w_ok(v.type == MEO_T_BLOB && v.n == 0, "set_blob empty");
+  w_i32(meo_value_check(&v), MEO_OK, "check empty blob");
+  v.n = 3;
+  w_i32(meo_value_check(&v), -MEO_ERR_MISMATCH, "check blob no bytes");
+  v.n = -1;
+  w_i32(meo_value_check(&v), -MEO_ERR_MISMATCH, "check negative len");
+  meo_value_set_null(&v);
+  w_ok(v.type == MEO_T_NULL && v.p == 0 && v.n == 0, "set_null");
+  w_case("w_value", f0);
+}
+
+fn w_ast() {
+  var f0: int32 = w_failures;
+  var a: MeoAst;
+  a.limit = 99;
+  a.n_where = 3;
+  meo_ast_init(&a);
+  w_ok(a.limit == -1 && a.offset == 0 && a.n_where == 0 && a.where_terms == 0
+       && !a.select_star && !a.if_not_exists && a.kind == 0, "ast_init");
+  // INSERT INTO "t" VALUES (?, 'x'), (NULL, 2): 2 rows x 2, row-major.
+  var sql: string = "INSERT INTO \"t\" VALUES (?, 'x'), (NULL, 2)";
+  var ops: MeoAstOperand[4];
+  ops[0].kind = MEO_AST_OPND_PARAM; ops[0].param = 1;
+  ops[1].kind = MEO_AST_OPND_LITERAL;
+  meo_value_set_text(&ops[1].val, (uint8*)sql.chars + 28, 1);
+  ops[2].kind = MEO_AST_OPND_LITERAL; meo_value_set_null(&ops[2].val);
+  ops[3].kind = MEO_AST_OPND_LITERAL; meo_value_set_int(&ops[3].val, 2);
+  a.kind = MEO_AST_INSERT;
+  a.table.p = (uint8*)sql.chars + 13;
+  a.table.n = 1;
+  a.values = &ops[0];
+  a.n_rows = 2;
+  a.row_width = 2;
+  a.n_params = 1;
+  w_ok(a.table.p[0] == 't', "table view");
+  var c: MeoAstOperand* = &a.values[1 * a.row_width + 1];
+  w_ok(c->kind == MEO_AST_OPND_LITERAL && c->val.type == MEO_T_INT && c->val.i == 2, "row 1 col 1");
+  w_ok(a.values[1].val.p[0] == 'x', "text view");
+  w_case("w_ast", f0);
+}
+
+fn main() -> int32 {
+  w_status_old();
+  w_status_new();
+  w_f64();
+  w_consts();
+  w_value();
+  w_ast();
+  if (w_failures != 0) {
+    println("FAIL ws0_self: {w_failures} failure(s)");
+    return 1;
+  }
+  println("PASS ws0_self");
+  return 0;
+}

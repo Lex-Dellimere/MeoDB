@@ -1,0 +1,53 @@
+// catalog/schema: the in-memory shape of a table, and nothing else.
+//
+// Types and constants only, no functions that touch the pager: sql/plan reads
+// schemas without depending on storage (DECISIONS.md D1), while
+// catalog/catalog loads and saves them. The fields mirror the catalog row of
+// D4 one to one:
+//
+//   [name TEXT, root INT, n_cols INT, tflags INT,
+//    then per column: name TEXT, affinity INT, cflags INT, index_root INT]
+//
+// Names are (pointer, byte length), stored as written and compared ASCII
+// case-insensitively. The catalog owns every name buffer and the columns
+// array. A MeoTable is never freed while the db is open (D4): after a
+// rollback the catalog reloads in place and a table that vanished gets
+// live = false, so a statement holding its id fails with -MEO_ERR_SQL instead
+// of reading freed memory.
+
+import "../record/value.mettle";
+
+// Column constraint flags (MeoColumn.cflags), OR-able. On-disk values.
+export const MEO_COL_PK: int32 = 1;
+export const MEO_COL_NOT_NULL: int32 = 2;
+export const MEO_COL_UNIQUE: int32 = 4;
+export const MEO_COL_ROWID_ALIAS: int32 = 8;   // INTEGER PRIMARY KEY: value is the rowid
+
+// Limits (D2, D3): columns per table, and encoded record / index key bytes.
+export const MEO_MAX_COLS: int32 = 64;
+export const MEO_REC_MAX: int32 = 1280;
+
+export struct MeoColumn {
+  name: uint8*;          // owned by the catalog; not NUL-terminated
+  name_len: int32;
+  affinity: int32;       // MEO_T_INT | MEO_T_REAL | MEO_T_TEXT | MEO_T_BLOB
+  cflags: int32;         // MEO_COL_* bits
+  index_root: uint32;    // root page of the secondary index, 0 = none
+}
+
+export struct MeoTable {
+  id: int64;             // catalog rowid, >= 1; stable for the db's lifetime
+  name: uint8*;          // owned by the catalog; not NUL-terminated
+  name_len: int32;
+  root: uint32;          // root page of the table b-tree
+  n_cols: int32;         // 1..MEO_MAX_COLS
+  columns: MeoColumn*;   // n_cols entries, in declaration order
+  tflags: int32;         // reserved, 0 in v1
+  live: bool;            // false once the table is gone (rollback or drop)
+}
+
+// The affinity a CREATE TABLE type name maps to is one of these four tags;
+// MEO_T_NULL is never a column affinity.
+export fn meo_schema_affinity_ok(t: int32) -> bool {
+  return t == MEO_T_INT || t == MEO_T_REAL || t == MEO_T_TEXT || t == MEO_T_BLOB;
+}

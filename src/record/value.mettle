@@ -1,0 +1,86 @@
+// record/value: the one in-memory value type every layer above storage shares.
+//
+// A MeoValue is a tagged scalar: `type` is a MEO_T_* tag and says which field
+// is meaningful. The tags are also the on-disk record tags (DECISIONS.md D3)
+// and the public column types (D8), so their numbers are frozen.
+//
+//   MEO_T_NULL  nothing else is read
+//   MEO_T_INT   i
+//   MEO_T_REAL  f
+//   MEO_T_TEXT  p, n   UTF-8 bytes, n = byte length, not NUL-counted
+//   MEO_T_BLOB  p, n   raw bytes
+//
+// A MeoValue never owns `p`: it is a view, and whoever filled it says how long
+// the bytes live (bind copies, column results live until the next step). The
+// setters below write every field, so a reused value carries no stale view.
+// Nothing here allocates.
+
+import "../error/status.mettle";
+
+export const MEO_T_NULL: int32 = 0;
+export const MEO_T_INT: int32 = 1;
+export const MEO_T_REAL: int32 = 2;
+export const MEO_T_TEXT: int32 = 3;
+export const MEO_T_BLOB: int32 = 4;
+
+export struct MeoValue {
+  type: int32;
+  i: int64;
+  f: float64;
+  p: uint8*;
+  n: int32;
+}
+
+// Reset every field, then the setters fill only the active one.
+fn meo_value_clear(v: MeoValue*) {
+  v->type = MEO_T_NULL;
+  v->i = 0;
+  v->f = 0.0;
+  v->p = 0;
+  v->n = 0;
+}
+
+export fn meo_value_set_null(v: MeoValue*) {
+  meo_value_clear(v);
+}
+
+export fn meo_value_set_int(v: MeoValue*, x: int64) {
+  meo_value_clear(v);
+  v->type = MEO_T_INT;
+  v->i = x;
+}
+
+export fn meo_value_set_real(v: MeoValue*, x: float64) {
+  meo_value_clear(v);
+  v->type = MEO_T_REAL;
+  v->f = x;
+}
+
+// Borrow `n` bytes of text at `p`; nothing is copied.
+export fn meo_value_set_text(v: MeoValue*, p: uint8*, n: int32) {
+  meo_value_clear(v);
+  v->type = MEO_T_TEXT;
+  v->p = p;
+  v->n = n;
+}
+
+// Borrow `n` bytes of blob at `p`; nothing is copied.
+export fn meo_value_set_blob(v: MeoValue*, p: uint8*, n: int32) {
+  meo_value_clear(v);
+  v->type = MEO_T_BLOB;
+  v->p = p;
+  v->n = n;
+}
+
+// Validate a value someone else filled: MEO_OK, -MEO_ERR_USAGE for a null
+// pointer, -MEO_ERR_MISMATCH for an unknown tag, a negative length, or a
+// non-empty TEXT/BLOB with no bytes.
+export fn meo_value_check(v: MeoValue*) -> int32 {
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  if (v->type < MEO_T_NULL || v->type > MEO_T_BLOB) { return -MEO_ERR_MISMATCH; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) {
+    if (v->n < 0) { return -MEO_ERR_MISMATCH; }
+    if (v->n > 0 && v->p == 0) { return -MEO_ERR_MISMATCH; }
+  }
+  return MEO_OK;
+}

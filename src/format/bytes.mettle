@@ -55,6 +55,24 @@
   p[off + 7] = (uint8)((v >> 56) & 0xFF);
 }
 
+// Write a float64 as its 8 IEEE-754 bits, little-endian, at byte offset
+// `off`. A bit copy, not a numeric conversion: -0.0 keeps its sign bit and a
+// NaN keeps its payload, so a REAL column round-trips exactly.
+@inline export fn meo_put_f64le(p: uint8*, off: int64, v: float64) {
+  var x: float64 = v;
+  var pf: float64* = &x;
+  var pu: uint64* = (uint64*)pf;
+  meo_put_u64le(p, off, *pu);
+}
+
+// Read 8 little-endian bytes at `off` back into a float64, bit for bit.
+@inline export fn meo_get_f64le(p: uint8*, off: int64) -> float64 {
+  var u: uint64 = meo_get_u64le(p, off);
+  var pu: uint64* = &u;
+  var pf: float64* = (float64*)pu;
+  return *pf;
+}
+
 // Zero `n` bytes starting at `p`.
 @inline export fn meo_bytes_zero(p: uint8*, n: int64) {
   var i: int64 = 0;

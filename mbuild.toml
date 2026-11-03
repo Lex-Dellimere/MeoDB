@@ -64,3 +64,8 @@ main = "tests/journal_self.mettle"
 # The change feed and the persisted commit counter (src/feed/, meta.commit_seq).
 [bin.feed_self]
 main = "tests/feed_self.mettle"
+
+# Run 1, WS0: shared types and status codes (record/value, db/flags,
+# catalog/schema, sql/ast, the f64 byte helpers, codes 13-18).
+[bin.ws0_self]
+main = "tests/ws0_self.mettle"
