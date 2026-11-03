@@ -1,21 +1,21 @@
 // platform/file: the file-handle data contract. No functions live here; the
 // Linux backend (file_linux.mettle) and any future portable backend implement
-// the dk_file_* API over this type, so its layout is a shared contract.
+// the meo_file_* API over this type, so its layout is a shared contract.
 //
-// Failure convention: dk_file_open returns a struct by value and therefore has
-// no int32 return channel. A failed open returns handle = -DK_ERR_* with
+// Failure convention: meo_file_open returns a struct by value and therefore has
+// no int32 return channel. A failed open returns handle = -MEO_ERR_* with
 // is_open = false (never a bare -1, never an errno). A successful open returns
-// handle >= 0 with is_open = true. Every other dk_file_* function takes the
+// handle >= 0 with is_open = true. Every other meo_file_* function takes the
 // handle by value and reports in its own int32/int64 return.
 
-export struct DkFile {
-  handle: int64;  // host descriptor, or -DK_ERR_* when is_open is false
+export struct MeoFile {
+  handle: int64;  // host descriptor, or -MEO_ERR_* when is_open is false
   is_open: bool;
 }
 
 // PHASE1.md section 5.3: 1/2/4/8, defined here and not in error/. These are
 // API bits, not the host's O_* values; the backend translates them.
-export const DK_OPEN_READ: int32 = 1;
-export const DK_OPEN_WRITE: int32 = 2;
-export const DK_OPEN_CREATE: int32 = 4;
-export const DK_OPEN_EXCL: int32 = 8;
+export const MEO_OPEN_READ: int32 = 1;
+export const MEO_OPEN_WRITE: int32 = 2;
+export const MEO_OPEN_CREATE: int32 = 4;
+export const MEO_OPEN_EXCL: int32 = 8;

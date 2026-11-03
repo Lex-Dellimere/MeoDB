@@ -19,7 +19,7 @@
 //   c_alloc       every alloc'd page is 4096 zeroed bytes; page_count / size
 //   c_flush_plan  non-zero pages ascending, meta last, FULL, dirty_count
 //   c_boundaries  the pager-reachable rows of the PHASE1.md section 7 table
-//   c_max_pages   the DK_MAX_PAGES cap is NOSPC and does not move page_count
+//   c_max_pages   the MEO_MAX_PAGES cap is NOSPC and does not move page_count
 
 import "std/io";
 import "std/mem";
@@ -58,45 +58,45 @@ fn c_ok(cond: bool, label: string) -> bool {
 // --- file helpers ----------------------------------------------------------
 
 // Make `path` a zero-byte file: there is no unlink in the phase-1 platform
-// surface, and a zero-byte file is exactly the state DK_PAGER_CREATE is defined
+// surface, and a zero-byte file is exactly the state MEO_PAGER_CREATE is defined
 // against, so this makes a run repeatable.
 fn c_reset(path: string) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, 0);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
   return rc;
 }
 
 fn c_truncate(path: string, size: int64) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, size);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, size);
+  meo_file_close(f);
   return rc;
 }
 
 fn c_file_size(path: string) -> int64 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
   if (!f.is_open) { return -1; }
-  var n: int64 = dk_file_size(f);
-  dk_file_close(f);
+  var n: int64 = meo_file_size(f);
+  meo_file_close(f);
   return n;
 }
 
 fn c_write_bytes(path: string, off: int64, buf: uint8*, n: int64) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_write_at(f, off, buf, n);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_write_at(f, off, buf, n);
+  meo_file_close(f);
   return rc;
 }
 
 fn c_read_bytes(path: string, off: int64, buf: uint8*, n: int64) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_read_at(f, off, buf, n);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_read_at(f, off, buf, n);
+  meo_file_close(f);
   return rc;
 }
 
@@ -105,7 +105,7 @@ fn c_read_bytes(path: string, off: int64, buf: uint8*, n: int64) -> int32 {
 fn c_flip_byte(path: string, off: int64) -> int32 {
   var one: uint8[1];
   var rc: int32 = c_read_bytes(path, off, &one[0], 1);
-  if (rc != 1) { return -DK_ERR_IO; }
+  if (rc != 1) { return -MEO_ERR_IO; }
   one[0] = (uint8)(one[0] ^ 0xFF);
   return c_write_bytes(path, off, &one[0], 1);
 }
@@ -115,14 +115,14 @@ fn c_flip_byte(path: string, off: int64) -> int32 {
 // leaves the structure legal and the checksum wrong.
 fn c_craft_page0(path: string, page_count: uint32, magic: uint32,
   version: int32, page_size: int32, break_crc: bool) -> int32 {
-  var buf: uint8[] = new uint8[DK_PAGE_SIZE];
-  if (buf.data == 0) { return -DK_ERR_NOMEM; }
-  var rc: int32 = dk_page_init(buf.data, DK_PAGE_META);
-  if (rc != DK_OK) {
+  var buf: uint8[] = new uint8[MEO_PAGE_SIZE];
+  if (buf.data == 0) { return -MEO_ERR_NOMEM; }
+  var rc: int32 = meo_page_init(buf.data, MEO_PAGE_META);
+  if (rc != MEO_OK) {
     free(buf.data);
     return rc;
   }
-  var m: DkMeta;
+  var m: MeoMeta;
   m.valid = true;
   m.magic = magic;
   m.version = version;
@@ -133,12 +133,12 @@ fn c_craft_page0(path: string, page_count: uint32, magic: uint32,
   m.btree_root = 0;
   m.txn_id = 0;
   m.write_version = 1;
-  rc = dk_meta_write(buf.data, m);
-  if (rc == DK_OK && break_crc) {
+  rc = meo_meta_write(buf.data, m);
+  if (rc == MEO_OK && break_crc) {
     buf.data[100] = (uint8)(buf.data[100] ^ 0xFF);
   }
-  if (rc == DK_OK) {
-    rc = c_write_bytes(path, 0, buf.data, (int64)DK_PAGE_SIZE);
+  if (rc == MEO_OK) {
+    rc = c_write_bytes(path, 0, buf.data, (int64)MEO_PAGE_SIZE);
   }
   free(buf.data);
   return rc;
@@ -166,133 +166,133 @@ fn c_all_are_from(data: uint8*, from: int64, n: int64, value: uint8) -> bool {
 
 // Offsets inside a page, as absolute file offsets.
 fn c_page_off(page_no: uint32) -> int64 {
-  return (int64)page_no * (int64)DK_PAGE_SIZE;
+  return (int64)page_no * (int64)MEO_PAGE_SIZE;
 }
 
 // --- create, reopen, page 0 durability -------------------------------------
 
 fn c_lifecycle() -> int32 {
-  if (!c_ok(c_reset(C_MAIN) == DK_OK, "lifecycle: reset")) { return 1; }
+  if (!c_ok(c_reset(C_MAIN) == MEO_OK, "lifecycle: reset")) { return 1; }
 
-  // zero-byte file + DK_PAGER_CREATE: page 0 only, on disk before open returns
-  var p: DkPager* = dk_pager_open(C_MAIN, 32, DK_PAGER_CREATE);
+  // zero-byte file + MEO_PAGER_CREATE: page 0 only, on disk before open returns
+  var p: MeoPager* = meo_pager_open(C_MAIN, 32, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "lifecycle: create")) { return 1; }
-  if (!c_ok(dk_pager_page_count(p) == 1, "lifecycle: new db is one page")) {
+  if (!c_ok(meo_pager_page_count(p) == 1, "lifecycle: new db is one page")) {
     return 1;
   }
-  if (!c_ok(dk_pager_frames(p) == 32, "lifecycle: frame count is what open was asked for")) {
+  if (!c_ok(meo_pager_frames(p) == 32, "lifecycle: frame count is what open was asked for")) {
     return 1;
   }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "lifecycle: create already flushed")) {
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "lifecycle: create already flushed")) {
     return 1;
   }
   if (!c_ok(c_file_size(C_MAIN) == 4096, "lifecycle: create wrote exactly one page")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_OK, "lifecycle: a good open records no error")) {
+  if (!c_ok(meo_pager_err(p) == MEO_OK, "lifecycle: a good open records no error")) {
     return 1;
   }
 
   // three allocated pages, each carrying its own number in byte 20
   var i: int32 = 0;
   while (i < 3) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (!c_ok(f != 0, "lifecycle: alloc")) { return 1; }
     if (!c_ok(f->page_no == (uint32)(i + 1), "lifecycle: alloc hands out page_count")) {
       return 1;
     }
     if (!c_ok(f->pin == 1, "lifecycle: alloc pins once")) { return 1; }
-    if (!c_ok(c_all_are(f->data, (int64)DK_PAGE_SIZE, 0), "lifecycle: a fresh page is zeroed")) {
+    if (!c_ok(c_all_are(f->data, (int64)MEO_PAGE_SIZE, 0), "lifecycle: a fresh page is zeroed")) {
       return 1;
     }
     f->data[20] = (uint8)(i + 1);
-    if (!c_ok(dk_pager_release(p, f, true) == DK_OK, "lifecycle: release alloc'd page")) {
+    if (!c_ok(meo_pager_release(p, f, true) == MEO_OK, "lifecycle: release alloc'd page")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_page_count(p) == 4, "lifecycle: three allocs, page_count 4")) {
+  if (!c_ok(meo_pager_page_count(p) == 4, "lifecycle: three allocs, page_count 4")) {
     return 1;
   }
   // page 0 is still resident, so it carries the new page_count itself
-  if (!c_ok(dk_pager_dirty_count(p) == 4, "lifecycle: meta + three pages are dirty")) {
+  if (!c_ok(meo_pager_dirty_count(p) == 4, "lifecycle: meta + three pages are dirty")) {
     return 1;
   }
 
   // p->meta and the meta frame are one thing: page 0 must already carry the
   // new page_count, not the one the file was opened with.
-  var mf: DkFrame* = dk_pager_get(p, 0, false);
+  var mf: MeoFrame* = meo_pager_get(p, 0, false);
   if (!c_ok(mf != 0, "lifecycle: get the meta frame")) { return 1; }
-  var mm: DkMeta = dk_meta_read(mf->data);
+  var mm: MeoMeta = meo_meta_read(mf->data);
   if (!c_ok(mm.valid, "lifecycle: the meta frame decodes")) { return 1; }
   if (!c_ok(mm.page_count == 4, "lifecycle: the meta frame carries the new page_count")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(p, mf, false) == DK_OK, "lifecycle: release the meta frame")) {
+  if (!c_ok(meo_pager_release(p, mf, false) == MEO_OK, "lifecycle: release the meta frame")) {
     return 1;
   }
 
   // the meta body
-  if (!c_ok(dk_pager_root(p, DK_ROOT_CATALOG) == 0, "lifecycle: no root yet")) {
+  if (!c_ok(meo_pager_root(p, MEO_ROOT_CATALOG) == 0, "lifecycle: no root yet")) {
     return 1;
   }
-  if (!c_ok(dk_pager_set_root(p, DK_ROOT_CATALOG, 2) == DK_OK, "lifecycle: set catalog root")) {
+  if (!c_ok(meo_pager_set_root(p, MEO_ROOT_CATALOG, 2) == MEO_OK, "lifecycle: set catalog root")) {
     return 1;
   }
-  if (!c_ok(dk_pager_root(p, DK_ROOT_CATALOG) == 2, "lifecycle: root reads back")) {
+  if (!c_ok(meo_pager_root(p, MEO_ROOT_CATALOG) == 2, "lifecycle: root reads back")) {
     return 1;
   }
-  if (!c_ok(dk_pager_set_root(p, 9, 1) == -DK_ERR_RANGE, "lifecycle: unknown root slot is RANGE")) {
+  if (!c_ok(meo_pager_set_root(p, 9, 1) == -MEO_ERR_RANGE, "lifecycle: unknown root slot is RANGE")) {
     return 1;
   }
-  dk_pager_set_txn_id(p, (uint64)7);
-  if (!c_ok(dk_pager_txn_id(p) == (uint64)7, "lifecycle: txn id reads back")) {
+  meo_pager_set_txn_id(p, (uint64)7);
+  if (!c_ok(meo_pager_txn_id(p) == (uint64)7, "lifecycle: txn id reads back")) {
     return 1;
   }
 
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "lifecycle: flush")) { return 1; }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "lifecycle: flush leaves nothing dirty")) {
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "lifecycle: flush")) { return 1; }
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "lifecycle: flush leaves nothing dirty")) {
     return 1;
   }
   if (!c_ok(c_file_size(C_MAIN) == 4 * 4096, "lifecycle: flush made the file page_count pages")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "lifecycle: close")) { return 1; }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "lifecycle: second close is DK_OK")) {
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "lifecycle: close")) { return 1; }
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "lifecycle: second close is MEO_OK")) {
     return 1;
   }
-  // A closed pager is not live: the second close is DK_OK because `closed`
+  // A closed pager is not live: the second close is MEO_OK because `closed`
   // says so, and nothing else may be done with the handle (PHASE1.md 6b.12).
-  if (!c_ok(dk_pager_get(p, 0, false) == 0, "lifecycle: get on a closed pager is null")) {
+  if (!c_ok(meo_pager_get(p, 0, false) == 0, "lifecycle: get on a closed pager is null")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_USAGE, "lifecycle: get on a closed pager is USAGE")) {
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_USAGE, "lifecycle: get on a closed pager is USAGE")) {
     return 1;
   }
-  if (!c_ok(dk_pager_alloc(p) == 0, "lifecycle: alloc on a closed pager is null")) {
+  if (!c_ok(meo_pager_alloc(p) == 0, "lifecycle: alloc on a closed pager is null")) {
     return 1;
   }
-  dk_pager_free(p);
+  meo_pager_free(p);
 
   // reopen read-only: page_count, roots, txn id and page bodies are durable
-  var r: DkPager* = dk_pager_open(C_MAIN, 32, DK_PAGER_READONLY);
+  var r: MeoPager* = meo_pager_open(C_MAIN, 32, MEO_PAGER_READONLY);
   if (!c_ok(r != 0, "lifecycle: reopen read-only")) { return 1; }
-  if (!c_ok(dk_pager_page_count(r) == 4, "lifecycle: reopen sees page_count 4")) {
+  if (!c_ok(meo_pager_page_count(r) == 4, "lifecycle: reopen sees page_count 4")) {
     return 1;
   }
-  if (!c_ok(dk_pager_dirty_count(r) == 0, "lifecycle: a reopened pager is clean")) {
+  if (!c_ok(meo_pager_dirty_count(r) == 0, "lifecycle: a reopened pager is clean")) {
     return 1;
   }
-  if (!c_ok(dk_pager_root(r, DK_ROOT_CATALOG) == 2, "lifecycle: catalog root is durable")) {
+  if (!c_ok(meo_pager_root(r, MEO_ROOT_CATALOG) == 2, "lifecycle: catalog root is durable")) {
     return 1;
   }
-  if (!c_ok(dk_pager_txn_id(r) == (uint64)7, "lifecycle: txn id is durable")) {
+  if (!c_ok(meo_pager_txn_id(r) == (uint64)7, "lifecycle: txn id is durable")) {
     return 1;
   }
 
   var pg: uint32 = 1;
   while (pg <= 3) {
-    var f: DkFrame* = dk_pager_get(r, pg, false);
+    var f: MeoFrame* = meo_pager_get(r, pg, false);
     if (!c_ok(f != 0, "lifecycle: read back an allocated page")) { return 1; }
     if (!c_ok(f->page_no == pg, "lifecycle: the frame holds the page asked for")) {
       return 1;
@@ -301,65 +301,65 @@ fn c_lifecycle() -> int32 {
     if (!c_ok(f->data[20] == (uint8)pg, "lifecycle: the page body survived close")) {
       return 1;
     }
-    if (!c_ok(dk_page_verify(f->data) == DK_OK, "lifecycle: the page on disk verifies")) {
+    if (!c_ok(meo_page_verify(f->data) == MEO_OK, "lifecycle: the page on disk verifies")) {
       return 1;
     }
-    if (!c_ok(dk_pager_release(r, f, false) == DK_OK, "lifecycle: release")) {
+    if (!c_ok(meo_pager_release(r, f, false) == MEO_OK, "lifecycle: release")) {
       return 1;
     }
     pg += 1;
   }
 
-  var m0: DkFrame* = dk_pager_get(r, 0, false);
+  var m0: MeoFrame* = meo_pager_get(r, 0, false);
   if (!c_ok(m0 != 0, "lifecycle: get(0) returns the meta frame")) { return 1; }
   if (!c_ok(m0->page_no == 0, "lifecycle: the meta frame holds page 0")) {
     return 1;
   }
-  if (!c_ok(dk_page_verify(m0->data) == DK_OK, "lifecycle: the meta page verifies")) {
+  if (!c_ok(meo_page_verify(m0->data) == MEO_OK, "lifecycle: the meta page verifies")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(r, m0, false) == DK_OK, "lifecycle: release the meta")) {
+  if (!c_ok(meo_pager_release(r, m0, false) == MEO_OK, "lifecycle: release the meta")) {
     return 1;
   }
 
   // a read-only pager refuses every write intent
-  if (!c_ok(dk_pager_get(r, 1, true) == 0, "lifecycle: read-only get(write) is null")) {
+  if (!c_ok(meo_pager_get(r, 1, true) == 0, "lifecycle: read-only get(write) is null")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(r) == DK_ERR_READONLY, "lifecycle: read-only get is READONLY")) {
+  if (!c_ok(meo_pager_err(r) == MEO_ERR_READONLY, "lifecycle: read-only get is READONLY")) {
     return 1;
   }
-  if (!c_ok(dk_pager_alloc(r) == 0, "lifecycle: read-only alloc is null")) {
+  if (!c_ok(meo_pager_alloc(r) == 0, "lifecycle: read-only alloc is null")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(r) == DK_ERR_READONLY, "lifecycle: read-only alloc is READONLY")) {
+  if (!c_ok(meo_pager_err(r) == MEO_ERR_READONLY, "lifecycle: read-only alloc is READONLY")) {
     return 1;
   }
-  if (!c_ok(dk_pager_set_root(r, DK_ROOT_BTREE, 1) == -DK_ERR_READONLY, "lifecycle: read-only set_root is READONLY")) {
+  if (!c_ok(meo_pager_set_root(r, MEO_ROOT_BTREE, 1) == -MEO_ERR_READONLY, "lifecycle: read-only set_root is READONLY")) {
     return 1;
   }
-  if (!c_ok(dk_pager_page_count(r) == 4, "lifecycle: a refused alloc did not move page_count")) {
+  if (!c_ok(meo_pager_page_count(r) == 4, "lifecycle: a refused alloc did not move page_count")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(r) == DK_OK, "lifecycle: close a read-only pager")) {
+  if (!c_ok(meo_pager_close(r) == MEO_OK, "lifecycle: close a read-only pager")) {
     return 1;
   }
-  dk_pager_free(r);
+  meo_pager_free(r);
 
   // opening again changes nothing: open is not a repair and not a rewrite
-  var q: DkPager* = dk_pager_open(C_MAIN, 32, 0);
+  var q: MeoPager* = meo_pager_open(C_MAIN, 32, 0);
   if (!c_ok(q != 0, "lifecycle: reopen read-write")) { return 1; }
-  if (!c_ok(dk_pager_page_count(q) == 4, "lifecycle: idempotent reopen keeps page_count")) {
+  if (!c_ok(meo_pager_page_count(q) == 4, "lifecycle: idempotent reopen keeps page_count")) {
     return 1;
   }
-  if (!c_ok(dk_pager_dirty_count(q) == 0, "lifecycle: idempotent reopen stays clean")) {
+  if (!c_ok(meo_pager_dirty_count(q) == 0, "lifecycle: idempotent reopen stays clean")) {
     return 1;
   }
   if (!c_ok(c_file_size(C_MAIN) == 4 * 4096, "lifecycle: idempotent reopen keeps the size")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(q) == DK_OK, "lifecycle: close again")) { return 1; }
-  dk_pager_free(q);
+  if (!c_ok(meo_pager_close(q) == MEO_OK, "lifecycle: close again")) { return 1; }
+  meo_pager_free(q);
   return 0;
 }
 
@@ -376,26 +376,26 @@ fn c_lifecycle() -> int32 {
 // to the ones on disk. The BUSY probe confirms page 0 is really out of the
 // cache; without it the case could pass without ever evicting page 0 at all.
 fn c_page0_after_eviction() -> int32 {
-  if (!c_ok(c_reset(C_PAGE0) == DK_OK, "page0: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(C_PAGE0, 8, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_PAGE0) == MEO_OK, "page0: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(C_PAGE0, 8, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "page0: create an 8-frame pager")) { return 1; }
 
   // Meta fields other than page_count: the root and the txn id are set here,
   // so a refresh that restored the page_count but not the whole meta would
   // still be caught.
-  if (!c_ok(dk_pager_set_root(p, DK_ROOT_CATALOG, 2) == DK_OK,
+  if (!c_ok(meo_pager_set_root(p, MEO_ROOT_CATALOG, 2) == MEO_OK,
       "page0: set a root")) {
     return 1;
   }
-  dk_pager_set_txn_id(p, (uint64)7);
+  meo_pager_set_txn_id(p, (uint64)7);
 
   // Eight allocated pages, all held pinned until they exist: every frame other
   // than page 0's is pinned, so the allocation that finds no free frame has
   // exactly one candidate, and that candidate is page 0.
-  var held: DkFrame*[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+  var held: MeoFrame*[8] = [0, 0, 0, 0, 0, 0, 0, 0];
   var i: int32 = 0;
   while (i < 8) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (!c_ok(f != 0, "page0: alloc eight pages")) { return 1; }
     if (!c_ok(f->page_no == (uint32)(i + 1),
         "page0: alloc hands out page_count")) {
@@ -405,12 +405,12 @@ fn c_page0_after_eviction() -> int32 {
     held[i] = f;
     i += 1;
   }
-  if (!c_ok(dk_pager_page_count(p) == 9, "page0: eight allocs, page_count 9")) {
+  if (!c_ok(meo_pager_page_count(p) == 9, "page0: eight allocs, page_count 9")) {
     return 1;
   }
   i = 0;
   while (i < 8) {
-    if (!c_ok(dk_pager_release(p, held[i], true) == DK_OK,
+    if (!c_ok(meo_pager_release(p, held[i], true) == MEO_OK,
         "page0: release a data page")) {
       return 1;
     }
@@ -423,21 +423,21 @@ fn c_page0_after_eviction() -> int32 {
   // nothing.
   i = 0;
   while (i < 8) {
-    var f: DkFrame* = dk_pager_get(p, (uint32)(i + 1), false);
+    var f: MeoFrame* = meo_pager_get(p, (uint32)(i + 1), false);
     if (!c_ok(f != 0, "page0: re-pin every data page")) { return 1; }
     held[i] = f;
     i += 1;
   }
-  if (!c_ok(dk_pager_get(p, 0, false) == 0, "page0: page 0 is not resident")) {
+  if (!c_ok(meo_pager_get(p, 0, false) == 0, "page0: page 0 is not resident")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_BUSY,
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_BUSY,
       "page0: get(0) is BUSY, so page 0 was evicted")) {
     return 1;
   }
   i = 0;
   while (i < 8) {
-    if (!c_ok(dk_pager_release(p, held[i], false) == DK_OK,
+    if (!c_ok(meo_pager_release(p, held[i], false) == MEO_OK,
         "page0: release the re-pinned page")) {
       return 1;
     }
@@ -450,40 +450,40 @@ fn c_page0_after_eviction() -> int32 {
   // is not resident: the disk copy still carries the pre-eviction values, so a
   // refresh that re-encoded only page_count would hand back the old ones and
   // fail below.
-  if (!c_ok(dk_pager_set_root(p, DK_ROOT_CATALOG, 5) == DK_OK,
+  if (!c_ok(meo_pager_set_root(p, MEO_ROOT_CATALOG, 5) == MEO_OK,
       "page0: set a new root after the eviction")) {
     return 1;
   }
-  dk_pager_set_txn_id(p, (uint64)91);
-  if (!c_ok(dk_pager_err(p) == DK_OK,
+  meo_pager_set_txn_id(p, (uint64)91);
+  if (!c_ok(meo_pager_err(p) == MEO_OK,
       "page0: the post-eviction txn id is accepted")) {
     return 1;
   }
 
-  var m0: DkFrame* = dk_pager_get(p, 0, false);
+  var m0: MeoFrame* = meo_pager_get(p, 0, false);
   if (!c_ok(m0 != 0, "page0: get(0) after the eviction")) { return 1; }
-  var m: DkMeta = dk_meta_read(m0->data);
+  var m: MeoMeta = meo_meta_read(m0->data);
   if (!c_ok(m.valid, "page0: the reloaded meta decodes")) { return 1; }
-  if (!c_ok(dk_pager_page_count(p) == 9, "page0: the pager really has nine pages")) {
+  if (!c_ok(meo_pager_page_count(p) == 9, "page0: the pager really has nine pages")) {
     return 1;
   }
-  if (!c_ok(m.page_count == dk_pager_page_count(p),
+  if (!c_ok(m.page_count == meo_pager_page_count(p),
       "page0: the meta frame's page_count agrees with the pager")) {
     return 1;
   }
-  if (!c_ok(m.freelist_root == dk_pager_root(p, DK_ROOT_FREELIST),
+  if (!c_ok(m.freelist_root == meo_pager_root(p, MEO_ROOT_FREELIST),
       "page0: the freelist root agrees")) {
     return 1;
   }
-  if (!c_ok(m.catalog_root == dk_pager_root(p, DK_ROOT_CATALOG),
+  if (!c_ok(m.catalog_root == meo_pager_root(p, MEO_ROOT_CATALOG),
       "page0: the catalog root agrees")) {
     return 1;
   }
-  if (!c_ok(m.btree_root == dk_pager_root(p, DK_ROOT_BTREE),
+  if (!c_ok(m.btree_root == meo_pager_root(p, MEO_ROOT_BTREE),
       "page0: the btree root agrees")) {
     return 1;
   }
-  if (!c_ok(m.txn_id == dk_pager_txn_id(p), "page0: the txn id agrees")) {
+  if (!c_ok(m.txn_id == meo_pager_txn_id(p), "page0: the txn id agrees")) {
     return 1;
   }
   if (!c_ok(m.catalog_root == 5, "page0: the post-eviction root is there")) {
@@ -492,112 +492,112 @@ fn c_page0_after_eviction() -> int32 {
   if (!c_ok(m.txn_id == (uint64)91, "page0: the post-eviction txn id is there")) {
     return 1;
   }
-  if (!c_ok(dk_page_verify(m0->data) == DK_OK,
+  if (!c_ok(meo_page_verify(m0->data) == MEO_OK,
       "page0: the refreshed page 0 verifies")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(p, m0, false) == DK_OK, "page0: release get(0)")) {
+  if (!c_ok(meo_pager_release(p, m0, false) == MEO_OK, "page0: release get(0)")) {
     return 1;
   }
 
   // And the refreshed page is the one that becomes durable.
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "page0: flush")) { return 1; }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "page0: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "page0: flush")) { return 1; }
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "page0: close")) { return 1; }
+  meo_pager_free(p);
 
-  var r: DkPager* = dk_pager_open(C_PAGE0, 8, DK_PAGER_READONLY);
+  var r: MeoPager* = meo_pager_open(C_PAGE0, 8, MEO_PAGER_READONLY);
   if (!c_ok(r != 0, "page0: reopen read-only")) { return 1; }
-  if (!c_ok(dk_pager_page_count(r) == 9, "page0: page_count 9 is durable")) {
+  if (!c_ok(meo_pager_page_count(r) == 9, "page0: page_count 9 is durable")) {
     return 1;
   }
-  if (!c_ok(dk_pager_root(r, DK_ROOT_CATALOG) == 5,
+  if (!c_ok(meo_pager_root(r, MEO_ROOT_CATALOG) == 5,
       "page0: the post-eviction catalog root is durable")) {
     return 1;
   }
-  if (!c_ok(dk_pager_txn_id(r) == (uint64)91,
+  if (!c_ok(meo_pager_txn_id(r) == (uint64)91,
       "page0: the post-eviction txn id is durable")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(r) == DK_OK, "page0: close the read-only pager")) {
+  if (!c_ok(meo_pager_close(r) == MEO_OK, "page0: close the read-only pager")) {
     return 1;
   }
-  dk_pager_free(r);
+  meo_pager_free(r);
   return 0;
 }
 
 // --- cache identity and pin counting ---------------------------------------
 
 fn c_cache() -> int32 {
-  if (!c_ok(c_reset(C_CACHE) == DK_OK, "cache: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(C_CACHE, 16, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_CACHE) == MEO_OK, "cache: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(C_CACHE, 16, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "cache: create")) { return 1; }
-  var f: DkFrame* = dk_pager_alloc(p);
+  var f: MeoFrame* = meo_pager_alloc(p);
   if (!c_ok(f != 0, "cache: alloc page 1")) { return 1; }
-  if (!c_ok(dk_pager_release(p, f, true) == DK_OK, "cache: release page 1")) {
+  if (!c_ok(meo_pager_release(p, f, true) == MEO_OK, "cache: release page 1")) {
     return 1;
   }
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "cache: flush page 1")) { return 1; }
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "cache: flush page 1")) { return 1; }
 
-  // one buffer per page, always: two gets of one page number are one DkFrame*
-  var a: DkFrame* = dk_pager_get(p, 1, false);
+  // one buffer per page, always: two gets of one page number are one MeoFrame*
+  var a: MeoFrame* = meo_pager_get(p, 1, false);
   if (!c_ok(a != 0, "cache: get page 1")) { return 1; }
-  var b: DkFrame* = dk_pager_get(p, 1, false);
+  var b: MeoFrame* = meo_pager_get(p, 1, false);
   if (!c_ok(b == a, "cache: two gets return the same frame")) { return 1; }
   if (!c_ok(a->pin == 2, "cache: two gets pin twice")) { return 1; }
-  if (!c_ok(dk_pager_release(p, a, false) == DK_OK, "cache: release once")) {
+  if (!c_ok(meo_pager_release(p, a, false) == MEO_OK, "cache: release once")) {
     return 1;
   }
   if (!c_ok(a->pin == 1, "cache: one pin left")) { return 1; }
-  if (!c_ok(dk_pager_release(p, b, false) == DK_OK, "cache: release twice")) {
+  if (!c_ok(meo_pager_release(p, b, false) == MEO_OK, "cache: release twice")) {
     return 1;
   }
   if (!c_ok(a->pin == 0, "cache: no pin left")) { return 1; }
   // releasing a page the caller does not hold is USAGE, not an underflow
-  if (!c_ok(dk_pager_release(p, a, false) == -DK_ERR_USAGE, "cache: release with pin 0 is USAGE")) {
+  if (!c_ok(meo_pager_release(p, a, false) == -MEO_ERR_USAGE, "cache: release with pin 0 is USAGE")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_USAGE, "cache: the USAGE is recorded")) {
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_USAGE, "cache: the USAGE is recorded")) {
     return 1;
   }
 
   // a write through the frame is visible to the next get, and stays dirty
-  var w: DkFrame* = dk_pager_get(p, 1, true);
+  var w: MeoFrame* = meo_pager_get(p, 1, true);
   if (!c_ok(w != 0, "cache: get for write")) { return 1; }
   w->data[24] = (uint8)0xAB;
-  if (!c_ok(dk_pager_release(p, w, true) == DK_OK, "cache: release dirty")) {
+  if (!c_ok(meo_pager_release(p, w, true) == MEO_OK, "cache: release dirty")) {
     return 1;
   }
-  var v: DkFrame* = dk_pager_get(p, 1, false);
+  var v: MeoFrame* = meo_pager_get(p, 1, false);
   if (!c_ok(v == a, "cache: the same frame comes back")) { return 1; }
   if (!c_ok(v->data[24] == (uint8)0xAB, "cache: the write is still visible")) {
     return 1;
   }
   if (!c_ok(v->dirty, "cache: the frame is still dirty")) { return 1; }
-  if (!c_ok(dk_pager_dirty_count(p) == 1, "cache: dirty_count counts the frame")) {
+  if (!c_ok(meo_pager_dirty_count(p) == 1, "cache: dirty_count counts the frame")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(p, v, false) == DK_OK, "cache: release after the re-get")) {
+  if (!c_ok(meo_pager_release(p, v, false) == MEO_OK, "cache: release after the re-get")) {
     return 1;
   }
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "cache: flush the write")) { return 1; }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "cache: dirty_count is 0 after flush")) {
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "cache: flush the write")) { return 1; }
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "cache: dirty_count is 0 after flush")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "cache: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "cache: close")) { return 1; }
+  meo_pager_free(p);
 
-  var r: DkPager* = dk_pager_open(C_CACHE, 16, DK_PAGER_READONLY);
+  var r: MeoPager* = meo_pager_open(C_CACHE, 16, MEO_PAGER_READONLY);
   if (!c_ok(r != 0, "cache: reopen")) { return 1; }
-  var s: DkFrame* = dk_pager_get(r, 1, false);
+  var s: MeoFrame* = meo_pager_get(r, 1, false);
   if (!c_ok(s != 0, "cache: get after reopen")) { return 1; }
   if (!c_ok(s->data[24] == (uint8)0xAB, "cache: the write survived close")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(r, s, false) == DK_OK, "cache: release after reopen")) {
+  if (!c_ok(meo_pager_release(r, s, false) == MEO_OK, "cache: release after reopen")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(r) == DK_OK, "cache: close after reopen")) { return 1; }
-  dk_pager_free(r);
+  if (!c_ok(meo_pager_close(r) == MEO_OK, "cache: close after reopen")) { return 1; }
+  meo_pager_free(r);
   return 0;
 }
 
@@ -606,50 +606,50 @@ fn c_cache() -> int32 {
 // Hold 7 pages pinned in an 8-frame pager, fill the last frame, and prove that
 // the next miss is refused rather than served by evicting a held page.
 fn c_eviction_pinned() -> int32 {
-  if (!c_ok(c_reset(C_EVICT) == DK_OK, "evict: reset")) { return 1; }
+  if (!c_ok(c_reset(C_EVICT) == MEO_OK, "evict: reset")) { return 1; }
   // seed a file with nine pages
-  var seed: DkPager* = dk_pager_open(C_EVICT, 16, DK_PAGER_CREATE);
+  var seed: MeoPager* = meo_pager_open(C_EVICT, 16, MEO_PAGER_CREATE);
   if (!c_ok(seed != 0, "evict: seed create")) { return 1; }
   var i: int32 = 0;
   while (i < 9) {
-    var sf: DkFrame* = dk_pager_alloc(seed);
+    var sf: MeoFrame* = meo_pager_alloc(seed);
     if (!c_ok(sf != 0, "evict: seed alloc")) { return 1; }
     sf->data[20] = (uint8)(i + 1);
-    if (!c_ok(dk_pager_release(seed, sf, true) == DK_OK, "evict: seed release")) {
+    if (!c_ok(meo_pager_release(seed, sf, true) == MEO_OK, "evict: seed release")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_flush(seed) == DK_OK, "evict: seed flush")) { return 1; }
-  if (!c_ok(dk_pager_close(seed) == DK_OK, "evict: seed close")) { return 1; }
-  dk_pager_free(seed);
+  if (!c_ok(meo_pager_flush(seed) == MEO_OK, "evict: seed flush")) { return 1; }
+  if (!c_ok(meo_pager_close(seed) == MEO_OK, "evict: seed close")) { return 1; }
+  meo_pager_free(seed);
 
-  var p: DkPager* = dk_pager_open(C_EVICT, 8, 0);
+  var p: MeoPager* = meo_pager_open(C_EVICT, 8, 0);
   if (!c_ok(p != 0, "evict: open with 8 frames")) { return 1; }
-  var held: DkFrame*[7] = [0, 0, 0, 0, 0, 0, 0];
+  var held: MeoFrame*[7] = [0, 0, 0, 0, 0, 0, 0];
   i = 0;
   while (i < 7) {
-    var f: DkFrame* = dk_pager_get(p, (uint32)(i + 1), false);
+    var f: MeoFrame* = meo_pager_get(p, (uint32)(i + 1), false);
     if (!c_ok(f != 0, "evict: pin pages 1..7")) { return 1; }
     held[i] = f;
     i += 1;
   }
   // the 8th get fills the last frame; that frame may evict the unpinned meta
-  var eighth: DkFrame* = dk_pager_get(p, 8, false);
+  var eighth: MeoFrame* = meo_pager_get(p, 8, false);
   if (!c_ok(eighth != 0, "evict: the 8th page takes the last frame")) { return 1; }
   if (!c_ok(eighth->page_no == 8, "evict: the last frame holds page 8")) {
     return 1;
   }
 
   // every frame is pinned now, so a 9th page has nowhere to go
-  var ninth: DkFrame* = dk_pager_get(p, 9, false);
+  var ninth: MeoFrame* = meo_pager_get(p, 9, false);
   if (!c_ok(ninth == 0, "evict: a miss with every frame pinned is null")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_BUSY, "evict: that miss is BUSY")) {
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_BUSY, "evict: that miss is BUSY")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err_arg(p) == 9, "evict: BUSY names the page")) { return 1; }
+  if (!c_ok(meo_pager_err_arg(p) == 9, "evict: BUSY names the page")) { return 1; }
 
   // the point of the test: no pinned page was dropped or rewritten
   i = 0;
@@ -668,10 +668,10 @@ fn c_eviction_pinned() -> int32 {
   if (!c_ok(eighth->pin == 1, "evict: the 8th frame is pinned too")) { return 1; }
 
   // release one and the clock finds it
-  if (!c_ok(dk_pager_release(p, held[0], false) == DK_OK, "evict: release one page")) {
+  if (!c_ok(meo_pager_release(p, held[0], false) == MEO_OK, "evict: release one page")) {
     return 1;
   }
-  var again: DkFrame* = dk_pager_get(p, 9, false);
+  var again: MeoFrame* = meo_pager_get(p, 9, false);
   if (!c_ok(again != 0, "evict: after a release the 9th page loads")) { return 1; }
   if (!c_ok(again->page_no == 9, "evict: it is page 9")) { return 1; }
   if (!c_ok(again->data[20] == (uint8)9, "evict: page 9's body came off the disk")) {
@@ -681,68 +681,68 @@ fn c_eviction_pinned() -> int32 {
   // release the rest; the pages that are still held are still correct
   i = 1;
   while (i < 7) {
-    if (!c_ok(dk_pager_release(p, held[i], false) == DK_OK, "evict: release held")) {
+    if (!c_ok(meo_pager_release(p, held[i], false) == MEO_OK, "evict: release held")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_release(p, eighth, false) == DK_OK, "evict: release the 8th")) {
+  if (!c_ok(meo_pager_release(p, eighth, false) == MEO_OK, "evict: release the 8th")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(p, again, false) == DK_OK, "evict: release page 9")) {
+  if (!c_ok(meo_pager_release(p, again, false) == MEO_OK, "evict: release page 9")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "evict: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "evict: close")) { return 1; }
+  meo_pager_free(p);
   return 0;
 }
 
 // A dirty page that is evicted is written back before the frame is reused,
 // even though nothing flushed it.
 fn c_eviction_writeback() -> int32 {
-  if (!c_ok(c_reset(C_EVICT_RAW) == DK_OK, "writeback: reset")) { return 1; }
-  var seed: DkPager* = dk_pager_open(C_EVICT_RAW, 16, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_EVICT_RAW) == MEO_OK, "writeback: reset")) { return 1; }
+  var seed: MeoPager* = meo_pager_open(C_EVICT_RAW, 16, MEO_PAGER_CREATE);
   if (!c_ok(seed != 0, "writeback: create")) { return 1; }
   var i: int32 = 0;
   while (i < 12) {
-    var sf: DkFrame* = dk_pager_alloc(seed);
+    var sf: MeoFrame* = meo_pager_alloc(seed);
     if (!c_ok(sf != 0, "writeback: seed alloc")) { return 1; }
-    if (!c_ok(dk_pager_release(seed, sf, true) == DK_OK, "writeback: seed release")) {
+    if (!c_ok(meo_pager_release(seed, sf, true) == MEO_OK, "writeback: seed release")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_flush(seed) == DK_OK, "writeback: seed flush")) { return 1; }
-  if (!c_ok(dk_pager_close(seed) == DK_OK, "writeback: seed close")) { return 1; }
-  dk_pager_free(seed);
+  if (!c_ok(meo_pager_flush(seed) == MEO_OK, "writeback: seed flush")) { return 1; }
+  if (!c_ok(meo_pager_close(seed) == MEO_OK, "writeback: seed close")) { return 1; }
+  meo_pager_free(seed);
 
-  var p: DkPager* = dk_pager_open(C_EVICT_RAW, 8, 0);
+  var p: MeoPager* = meo_pager_open(C_EVICT_RAW, 8, 0);
   if (!c_ok(p != 0, "writeback: open")) { return 1; }
-  var d: DkFrame* = dk_pager_get(p, 1, true);
+  var d: MeoFrame* = meo_pager_get(p, 1, true);
   if (!c_ok(d != 0, "writeback: get page 1 for write")) { return 1; }
   d->data[30] = (uint8)0x5A;
-  if (!c_ok(dk_pager_release(p, d, true) == DK_OK, "writeback: release dirty")) {
+  if (!c_ok(meo_pager_release(p, d, true) == MEO_OK, "writeback: release dirty")) {
     return 1;
   }
   // churn the cache so page 1 is evicted: no flush anywhere in this section
   var pg: uint32 = 2;
   while (pg <= 12) {
-    var f: DkFrame* = dk_pager_get(p, pg, false);
+    var f: MeoFrame* = meo_pager_get(p, pg, false);
     if (!c_ok(f != 0, "writeback: churn")) { return 1; }
-    if (!c_ok(dk_pager_release(p, f, false) == DK_OK, "writeback: churn release")) {
+    if (!c_ok(meo_pager_release(p, f, false) == MEO_OK, "writeback: churn release")) {
       return 1;
     }
     pg += 1;
   }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "writeback: the eviction cleared the dirty page")) {
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "writeback: the eviction cleared the dirty page")) {
     return 1;
   }
 
   // read page 1 straight off the file: the byte is there and the page verifies
-  var buf: uint8[] = new uint8[DK_PAGE_SIZE];
+  var buf: uint8[] = new uint8[MEO_PAGE_SIZE];
   if (!c_ok(buf.data != 0, "writeback: buffer")) { return 1; }
-  var n: int32 = c_read_bytes(C_EVICT_RAW, c_page_off(1), buf.data, (int64)DK_PAGE_SIZE);
-  if (!c_ok(n == DK_PAGE_SIZE, "writeback: read page 1 off the disk")) {
+  var n: int32 = c_read_bytes(C_EVICT_RAW, c_page_off(1), buf.data, (int64)MEO_PAGE_SIZE);
+  if (!c_ok(n == MEO_PAGE_SIZE, "writeback: read page 1 off the disk")) {
     free(buf.data);
     return 1;
   }
@@ -750,205 +750,205 @@ fn c_eviction_writeback() -> int32 {
     free(buf.data);
     return 1;
   }
-  if (!c_ok(dk_page_verify(buf.data) == DK_OK, "writeback: the written page verifies")) {
+  if (!c_ok(meo_page_verify(buf.data) == MEO_OK, "writeback: the written page verifies")) {
     free(buf.data);
     return 1;
   }
   free(buf.data);
-  if (!c_ok(dk_pager_close(p) == DK_OK, "writeback: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "writeback: close")) { return 1; }
+  meo_pager_free(p);
   return 0;
 }
 
 // --- allocation ------------------------------------------------------------
 
 fn c_alloc() -> int32 {
-  if (!c_ok(c_reset(C_ALLOC) == DK_OK, "alloc: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(C_ALLOC, 8, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_ALLOC) == MEO_OK, "alloc: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(C_ALLOC, 8, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "alloc: create")) { return 1; }
 
   // 64 pages, every byte 0xFF, released so the 8 frames keep recycling
   var i: int32 = 0;
   while (i < 64) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (!c_ok(f != 0, "alloc: alloc")) { return 1; }
     if (!c_ok(f->page_no == (uint32)(i + 1), "alloc: pages are handed out in order")) {
       return 1;
     }
     var k: int64 = 0;
-    while (k < (int64)DK_PAGE_SIZE) {
+    while (k < (int64)MEO_PAGE_SIZE) {
       f->data[k] = (uint8)0xFF;
       k += 1;
     }
-    if (!c_ok(dk_pager_release(p, f, true) == DK_OK, "alloc: release")) { return 1; }
+    if (!c_ok(meo_pager_release(p, f, true) == MEO_OK, "alloc: release")) { return 1; }
     i += 1;
   }
-  if (!c_ok(dk_pager_page_count(p) == 65, "alloc: 64 allocs give page_count 65")) {
+  if (!c_ok(meo_pager_page_count(p) == 65, "alloc: 64 allocs give page_count 65")) {
     return 1;
   }
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "alloc: flush")) { return 1; }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "alloc: dirty_count is 0 after flush")) {
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "alloc: flush")) { return 1; }
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "alloc: dirty_count is 0 after flush")) {
     return 1;
   }
   if (!c_ok(c_file_size(C_ALLOC) == 65 * 4096, "alloc: file is page_count * 4096")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "alloc: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "alloc: close")) { return 1; }
+  meo_pager_free(p);
 
   // the 0xFF pattern is what is on the disk, and every page verifies
-  var r: DkPager* = dk_pager_open(C_ALLOC, 8, DK_PAGER_READONLY);
+  var r: MeoPager* = meo_pager_open(C_ALLOC, 8, MEO_PAGER_READONLY);
   if (!c_ok(r != 0, "alloc: reopen")) { return 1; }
   var pg: uint32 = 1;
   while (pg <= 64) {
-    var f: DkFrame* = dk_pager_get(r, pg, false);
+    var f: MeoFrame* = meo_pager_get(r, pg, false);
     if (!c_ok(f != 0, "alloc: read back a page")) { return 1; }
     // Every byte the caller wrote is still there. The four bytes at [12,16)
     // are the page's checksum, written by the seal that precedes a write, so
     // the comparison starts at the first byte after the header.
-    if (!c_ok(c_all_are_from(f->data, (int64)DK_PAGE_HDR, (int64)DK_PAGE_SIZE, (uint8)0xFF), "alloc: the pattern survived")) {
+    if (!c_ok(c_all_are_from(f->data, (int64)MEO_PAGE_HDR, (int64)MEO_PAGE_SIZE, (uint8)0xFF), "alloc: the pattern survived")) {
       return 1;
     }
-    if (!c_ok(dk_page_verify(f->data) == DK_OK, "alloc: the page on disk verifies")) {
+    if (!c_ok(meo_page_verify(f->data) == MEO_OK, "alloc: the page on disk verifies")) {
       return 1;
     }
-    if (!c_ok(dk_pager_release(r, f, false) == DK_OK, "alloc: release")) { return 1; }
+    if (!c_ok(meo_pager_release(r, f, false) == MEO_OK, "alloc: release")) { return 1; }
     pg += 1;
   }
-  if (!c_ok(dk_pager_close(r) == DK_OK, "alloc: close after reading")) { return 1; }
-  dk_pager_free(r);
+  if (!c_ok(meo_pager_close(r) == MEO_OK, "alloc: close after reading")) { return 1; }
+  meo_pager_free(r);
 
   // now the frame-reuse case: fill all 8 frames with 0xFF pages, then alloc
   // over them. Every one of the 4096 bytes must be zero, not just the header.
-  var q: DkPager* = dk_pager_open(C_ALLOC, 8, 0);
+  var q: MeoPager* = meo_pager_open(C_ALLOC, 8, 0);
   if (!c_ok(q != 0, "alloc: reopen for reuse")) { return 1; }
   pg = 1;
   while (pg <= 8) {
-    var f: DkFrame* = dk_pager_get(q, pg, false);
+    var f: MeoFrame* = meo_pager_get(q, pg, false);
     if (!c_ok(f != 0, "alloc: fill the cache")) { return 1; }
-    if (!c_ok(dk_pager_release(q, f, false) == DK_OK, "alloc: unfill it")) {
+    if (!c_ok(meo_pager_release(q, f, false) == MEO_OK, "alloc: unfill it")) {
       return 1;
     }
     pg += 1;
   }
   i = 0;
   while (i < 8) {
-    var f: DkFrame* = dk_pager_alloc(q);
+    var f: MeoFrame* = meo_pager_alloc(q);
     if (!c_ok(f != 0, "alloc: alloc over a used frame")) { return 1; }
     if (!c_ok(f->page_no == (uint32)(65 + i), "alloc: page numbers continue at page_count")) {
       return 1;
     }
-    if (!c_ok(c_all_are(f->data, (int64)DK_PAGE_SIZE, 0), "alloc: all 4096 bytes are zero")) {
+    if (!c_ok(c_all_are(f->data, (int64)MEO_PAGE_SIZE, 0), "alloc: all 4096 bytes are zero")) {
       return 1;
     }
-    if (!c_ok(dk_pager_release(q, f, true) == DK_OK, "alloc: release the new page")) {
+    if (!c_ok(meo_pager_release(q, f, true) == MEO_OK, "alloc: release the new page")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_page_count(q) == 73, "alloc: page_count advanced by exactly 8")) {
+  if (!c_ok(meo_pager_page_count(q) == 73, "alloc: page_count advanced by exactly 8")) {
     return 1;
   }
-  if (!c_ok(dk_pager_flush(q) == DK_OK, "alloc: flush the new pages")) { return 1; }
+  if (!c_ok(meo_pager_flush(q) == MEO_OK, "alloc: flush the new pages")) { return 1; }
   if (!c_ok(c_file_size(C_ALLOC) == 73 * 4096, "alloc: the file grew to page_count * 4096")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(q) == DK_OK, "alloc: close the reuse pager")) { return 1; }
-  dk_pager_free(q);
+  if (!c_ok(meo_pager_close(q) == MEO_OK, "alloc: close the reuse pager")) { return 1; }
+  meo_pager_free(q);
   return 0;
 }
 
 // --- flush order -----------------------------------------------------------
 
 fn c_flush_plan() -> int32 {
-  if (!c_ok(c_reset(C_PLAN) == DK_OK, "plan: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(C_PLAN, 8, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_PLAN) == MEO_OK, "plan: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(C_PLAN, 8, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "plan: create")) { return 1; }
   var i: int32 = 0;
   while (i < 5) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (!c_ok(f != 0, "plan: seed alloc")) { return 1; }
-    if (!c_ok(dk_pager_release(p, f, true) == DK_OK, "plan: seed release")) {
+    if (!c_ok(meo_pager_release(p, f, true) == MEO_OK, "plan: seed release")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "plan: seed flush")) { return 1; }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "plan: clean after the seed flush")) {
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "plan: seed flush")) { return 1; }
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "plan: clean after the seed flush")) {
     return 1;
   }
 
   // dirty pages 5, 1, 3 -- deliberately not in cache order
-  var f5: DkFrame* = dk_pager_get(p, 5, true);
+  var f5: MeoFrame* = meo_pager_get(p, 5, true);
   if (!c_ok(f5 != 0, "plan: get page 5")) { return 1; }
   f5->data[40] = (uint8)5;
-  if (!c_ok(dk_pager_release(p, f5, true) == DK_OK, "plan: dirty page 5")) {
+  if (!c_ok(meo_pager_release(p, f5, true) == MEO_OK, "plan: dirty page 5")) {
     return 1;
   }
-  var f1: DkFrame* = dk_pager_get(p, 1, true);
+  var f1: MeoFrame* = meo_pager_get(p, 1, true);
   if (!c_ok(f1 != 0, "plan: get page 1")) { return 1; }
   f1->data[40] = (uint8)1;
-  if (!c_ok(dk_pager_release(p, f1, true) == DK_OK, "plan: dirty page 1")) {
+  if (!c_ok(meo_pager_release(p, f1, true) == MEO_OK, "plan: dirty page 1")) {
     return 1;
   }
-  var f3: DkFrame* = dk_pager_get(p, 3, true);
+  var f3: MeoFrame* = meo_pager_get(p, 3, true);
   if (!c_ok(f3 != 0, "plan: get page 3")) { return 1; }
   f3->data[40] = (uint8)3;
-  if (!c_ok(dk_pager_release(p, f3, true) == DK_OK, "plan: dirty page 3")) {
+  if (!c_ok(meo_pager_release(p, f3, true) == MEO_OK, "plan: dirty page 3")) {
     return 1;
   }
-  if (!c_ok(dk_pager_dirty_count(p) == 3, "plan: three dirty pages")) {
+  if (!c_ok(meo_pager_dirty_count(p) == 3, "plan: three dirty pages")) {
     return 1;
   }
 
   // dirty the meta too, without touching a page
-  dk_pager_set_txn_id(p, (uint64)42);
-  if (!c_ok(dk_pager_err(p) == DK_OK, "plan: set_txn_id is accepted")) { return 1; }
+  meo_pager_set_txn_id(p, (uint64)42);
+  if (!c_ok(meo_pager_err(p) == MEO_OK, "plan: set_txn_id is accepted")) { return 1; }
 
   var out: uint32[16];
-  var n: int32 = dk_pager_flush_plan(p, &out[0], 16);
+  var n: int32 = meo_pager_flush_plan(p, &out[0], 16);
   if (!c_ok(n == 4, "plan: four pages to write")) { return 1; }
   if (!c_ok(out[0] == 1, "plan: first is 1")) { return 1; }
   if (!c_ok(out[1] == 3, "plan: second is 3")) { return 1; }
   if (!c_ok(out[2] == 5, "plan: third is 5")) { return 1; }
   if (!c_ok(out[3] == 0, "plan: the meta is last")) { return 1; }
-  if (!c_ok(dk_pager_flush_plan(p, &out[0], 3) == -DK_ERR_FULL, "plan: a small cap is FULL")) {
+  if (!c_ok(meo_pager_flush_plan(p, &out[0], 3) == -MEO_ERR_FULL, "plan: a small cap is FULL")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_FULL, "plan: FULL is recorded")) { return 1; }
-  if (!c_ok(dk_pager_flush_plan(p, &out[0], 4) == 4, "plan: an exact cap fits")) {
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_FULL, "plan: FULL is recorded")) { return 1; }
+  if (!c_ok(meo_pager_flush_plan(p, &out[0], 4) == 4, "plan: an exact cap fits")) {
     return 1;
   }
 
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "plan: flush")) { return 1; }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "plan: dirty_count is 0 after flush")) {
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "plan: flush")) { return 1; }
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "plan: dirty_count is 0 after flush")) {
     return 1;
   }
-  if (!c_ok(dk_pager_flush_plan(p, &out[0], 16) == 0, "plan: nothing left to write")) {
+  if (!c_ok(meo_pager_flush_plan(p, &out[0], 16) == 0, "plan: nothing left to write")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "plan: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "plan: close")) { return 1; }
+  meo_pager_free(p);
 
   // what the plan wrote is what a reopen sees
-  var r: DkPager* = dk_pager_open(C_PLAN, 8, DK_PAGER_READONLY);
+  var r: MeoPager* = meo_pager_open(C_PLAN, 8, MEO_PAGER_READONLY);
   if (!c_ok(r != 0, "plan: reopen")) { return 1; }
-  if (!c_ok(dk_pager_page_count(r) == 6, "plan: page_count is durable")) { return 1; }
-  if (!c_ok(dk_pager_txn_id(r) == (uint64)42, "plan: the meta arrived with the last write")) {
+  if (!c_ok(meo_pager_page_count(r) == 6, "plan: page_count is durable")) { return 1; }
+  if (!c_ok(meo_pager_txn_id(r) == (uint64)42, "plan: the meta arrived with the last write")) {
     return 1;
   }
-  var f: DkFrame* = dk_pager_get(r, 5, false);
+  var f: MeoFrame* = meo_pager_get(r, 5, false);
   if (!c_ok(f != 0, "plan: read page 5")) {
     return 1;
   }
   if (!c_ok(f->data[40] == (uint8)5, "plan: page 5 kept its byte")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(r, f, false) == DK_OK, "plan: release page 5")) {
+  if (!c_ok(meo_pager_release(r, f, false) == MEO_OK, "plan: release page 5")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(r) == DK_OK, "plan: close after reopen")) { return 1; }
-  dk_pager_free(r);
+  if (!c_ok(meo_pager_close(r) == MEO_OK, "plan: close after reopen")) { return 1; }
+  meo_pager_free(r);
   return 0;
 }
 
@@ -962,7 +962,7 @@ fn c_flush_plan() -> int32 {
 // loads a second copy into another frame while the caller still holds the
 // first. Page 17 is held pinned across the eviction so the clock cannot cover
 // the loss by reusing its frame.
-fn c_page_in_two_frames(p: DkPager*) -> bool {
+fn c_page_in_two_frames(p: MeoPager*) -> bool {
   var i: int32 = 0;
   while (i < p->n_frames) {
     if (p->frames[i].in_use) {
@@ -980,24 +980,24 @@ fn c_page_in_two_frames(p: DkPager*) -> bool {
 }
 
 fn c_hash_cluster() -> int32 {
-  if (!c_ok(c_reset(C_HASH) == DK_OK, "hash: reset")) { return 1; }
-  var seed: DkPager* = dk_pager_open(C_HASH, 8, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_HASH) == MEO_OK, "hash: reset")) { return 1; }
+  var seed: MeoPager* = meo_pager_open(C_HASH, 8, MEO_PAGER_CREATE);
   if (!c_ok(seed != 0, "hash: create")) { return 1; }
   var i: int32 = 0;
   while (i < 20) {
-    var sf: DkFrame* = dk_pager_alloc(seed);
+    var sf: MeoFrame* = meo_pager_alloc(seed);
     if (!c_ok(sf != 0, "hash: seed alloc")) { return 1; }
     sf->data[200] = (uint8)(i + 1);
-    if (!c_ok(dk_pager_release(seed, sf, true) == DK_OK, "hash: seed release")) {
+    if (!c_ok(meo_pager_release(seed, sf, true) == MEO_OK, "hash: seed release")) {
       return 1;
     }
     i += 1;
   }
-  if (!c_ok(dk_pager_flush(seed) == DK_OK, "hash: seed flush")) { return 1; }
-  if (!c_ok(dk_pager_close(seed) == DK_OK, "hash: seed close")) { return 1; }
-  dk_pager_free(seed);
+  if (!c_ok(meo_pager_flush(seed) == MEO_OK, "hash: seed flush")) { return 1; }
+  if (!c_ok(meo_pager_close(seed) == MEO_OK, "hash: seed close")) { return 1; }
+  meo_pager_free(seed);
 
-  var p: DkPager* = dk_pager_open(C_HASH, 8, 0);
+  var p: MeoPager* = meo_pager_open(C_HASH, 8, 0);
   if (!c_ok(p != 0, "hash: open 8 frames")) { return 1; }
 
   // page 1 and page 2 first: with index_cap 16 the multiplier is 1 mod 16, so
@@ -1005,17 +1005,17 @@ fn c_hash_cluster() -> int32 {
   // and page 17 (home slot 1) is pushed two probes out. Deleting page 1 then
   // leaves a hole whose cluster has both an entry that must stay and an entry
   // that must be re-seated behind it.
-  var head: DkFrame* = dk_pager_get(p, 1, false);
+  var head: MeoFrame* = meo_pager_get(p, 1, false);
   if (!c_ok(head != 0, "hash: get the head of the cluster")) { return 1; }
-  if (!c_ok(dk_pager_release(p, head, false) == DK_OK, "hash: release it")) {
+  if (!c_ok(meo_pager_release(p, head, false) == MEO_OK, "hash: release it")) {
     return 1;
   }
-  var mid: DkFrame* = dk_pager_get(p, 2, false);
+  var mid: MeoFrame* = meo_pager_get(p, 2, false);
   if (!c_ok(mid != 0, "hash: get the next slot")) { return 1; }
-  if (!c_ok(dk_pager_release(p, mid, false) == DK_OK, "hash: release it too")) {
+  if (!c_ok(meo_pager_release(p, mid, false) == MEO_OK, "hash: release it too")) {
     return 1;
   }
-  var keep: DkFrame* = dk_pager_get(p, 17, false);
+  var keep: MeoFrame* = meo_pager_get(p, 17, false);
   if (!c_ok(keep != 0, "hash: get the tail of the cluster")) { return 1; }
   if (!c_ok(keep->page_no == 17, "hash: it is page 17")) { return 1; }
   if (!c_ok(keep->data[200] == (uint8)17, "hash: page 17's body")) { return 1; }
@@ -1024,9 +1024,9 @@ fn c_hash_cluster() -> int32 {
   // fill the free frames so the cache is under pressure
   var pg: uint32 = 4;
   while (pg <= 7) {
-    var f: DkFrame* = dk_pager_get(p, pg, false);
+    var f: MeoFrame* = meo_pager_get(p, pg, false);
     if (!c_ok(f != 0, "hash: fill the cache")) { return 1; }
-    if (!c_ok(dk_pager_release(p, f, false) == DK_OK, "hash: release the filler")) {
+    if (!c_ok(meo_pager_release(p, f, false) == MEO_OK, "hash: release the filler")) {
       return 1;
     }
     pg += 1;
@@ -1035,17 +1035,17 @@ fn c_hash_cluster() -> int32 {
   // Two clock passes: the first drops page 0 (the other unpinned page with a
   // second chance), the second drops page 1 -- the head of the cluster -- while
   // page 17 is pinned and page 2 sits between them.
-  var ev: DkFrame* = dk_pager_get(p, 8, false);
+  var ev: MeoFrame* = meo_pager_get(p, 8, false);
   if (!c_ok(ev != 0, "hash: a page under pressure still loads")) { return 1; }
-  if (!c_ok(dk_pager_release(p, ev, false) == DK_OK, "hash: release the new page")) {
+  if (!c_ok(meo_pager_release(p, ev, false) == MEO_OK, "hash: release the new page")) {
     return 1;
   }
-  var ev2: DkFrame* = dk_pager_get(p, 9, false);
+  var ev2: MeoFrame* = meo_pager_get(p, 9, false);
   if (!c_ok(ev2 != 0, "hash: a second page under pressure loads")) { return 1; }
-  if (!c_ok(dk_pager_release(p, ev2, false) == DK_OK, "hash: release it")) {
+  if (!c_ok(meo_pager_release(p, ev2, false) == MEO_OK, "hash: release it")) {
     return 1;
   }
-  var again: DkFrame* = dk_pager_get(p, 17, false);
+  var again: MeoFrame* = meo_pager_get(p, 17, false);
   if (!c_ok(again != 0, "hash: page 17 is still findable after its neighbour went")) {
     return 1;
   }
@@ -1056,10 +1056,10 @@ fn c_hash_cluster() -> int32 {
   if (!c_ok(!c_page_in_two_frames(p), "hash: one page never lives in two frames")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(p, again, false) == DK_OK, "hash: release the re-get")) {
+  if (!c_ok(meo_pager_release(p, again, false) == MEO_OK, "hash: release the re-get")) {
     return 1;
   }
-  if (!c_ok(dk_pager_release(p, keep, false) == DK_OK, "hash: release the held page")) {
+  if (!c_ok(meo_pager_release(p, keep, false) == MEO_OK, "hash: release the held page")) {
     return 1;
   }
 
@@ -1069,7 +1069,7 @@ fn c_hash_cluster() -> int32 {
   while (pass < 2) {
     pg = 1;
     while (pg <= 20) {
-      var f: DkFrame* = dk_pager_get(p, pg, false);
+      var f: MeoFrame* = meo_pager_get(p, pg, false);
       if (!c_ok(f != 0, "hash: get through a churn pass")) { return 1; }
       if (!c_ok(f->page_no == pg, "hash: the frame holds the page asked for")) {
         return 1;
@@ -1077,7 +1077,7 @@ fn c_hash_cluster() -> int32 {
       if (!c_ok(f->data[200] == (uint8)pg, "hash: the body is the one on disk")) {
         return 1;
       }
-      if (!c_ok(dk_pager_release(p, f, false) == DK_OK, "hash: release in the churn")) {
+      if (!c_ok(meo_pager_release(p, f, false) == MEO_OK, "hash: release in the churn")) {
         return 1;
       }
       if (!c_ok(!c_page_in_two_frames(p), "hash: no page in two frames")) {
@@ -1087,232 +1087,232 @@ fn c_hash_cluster() -> int32 {
     }
     pass += 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "hash: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "hash: close")) { return 1; }
+  meo_pager_free(p);
   return 0;
 }
 
 // --- the PHASE1.md section 7 boundary table --------------------------------
 
 fn c_boundaries() -> int32 {
-  // n_frames < DK_MIN_FRAMES
-  if (!c_ok(c_reset(C_ZERO) == DK_OK, "boundary: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(C_ZERO, 7, DK_PAGER_CREATE);
+  // n_frames < MEO_MIN_FRAMES
+  if (!c_ok(c_reset(C_ZERO) == MEO_OK, "boundary: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(C_ZERO, 7, MEO_PAGER_CREATE);
   if (!c_ok(p == 0, "boundary: 7 frames is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_USAGE, "boundary: 7 frames is USAGE")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_USAGE, "boundary: 7 frames is USAGE")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err_arg(0) == 7, "boundary: USAGE names the frame count")) {
+  if (!c_ok(meo_pager_err_arg(0) == 7, "boundary: USAGE names the frame count")) {
     return 1;
   }
 
-  // a zero-byte file without DK_PAGER_CREATE is not a database
-  if (!c_ok(c_reset(C_ZERO) == DK_OK, "boundary: reset zero")) { return 1; }
-  p = dk_pager_open(C_ZERO, 8, 0);
+  // a zero-byte file without MEO_PAGER_CREATE is not a database
+  if (!c_ok(c_reset(C_ZERO) == MEO_OK, "boundary: reset zero")) { return 1; }
+  p = meo_pager_open(C_ZERO, 8, 0);
   if (!c_ok(p == 0, "boundary: zero-byte without create is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_NOT_A_DB, "boundary: zero-byte without create is NOT_A_DB")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_NOT_A_DB, "boundary: zero-byte without create is NOT_A_DB")) {
     return 1;
   }
   // ... and neither is it to a read-only pager, which could never initialise it
-  p = dk_pager_open(C_ZERO, 8, DK_PAGER_READONLY);
+  p = meo_pager_open(C_ZERO, 8, MEO_PAGER_READONLY);
   if (!c_ok(p == 0, "boundary: zero-byte read-only is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_NOT_A_DB, "boundary: zero-byte read-only is NOT_A_DB")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_NOT_A_DB, "boundary: zero-byte read-only is NOT_A_DB")) {
     return 1;
   }
 
-  // size not a multiple of DK_PAGE_SIZE
-  if (!c_ok(c_reset(C_CORRUPT) == DK_OK, "boundary: reset corrupt")) { return 1; }
-  if (!c_ok(c_craft_page0(C_CORRUPT, 1, DK_MAGIC, DK_FORMAT_VERSION, DK_PAGE_SIZE, false) == DK_OK, "boundary: craft page 0")) {
+  // size not a multiple of MEO_PAGE_SIZE
+  if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset corrupt")) { return 1; }
+  if (!c_ok(c_craft_page0(C_CORRUPT, 1, MEO_MAGIC, MEO_FORMAT_VERSION, MEO_PAGE_SIZE, false) == MEO_OK, "boundary: craft page 0")) {
     return 1;
   }
-  if (!c_ok(c_truncate(C_CORRUPT, 4096 + 7) == DK_OK, "boundary: append a partial page")) {
+  if (!c_ok(c_truncate(C_CORRUPT, 4096 + 7) == MEO_OK, "boundary: append a partial page")) {
     return 1;
   }
-  p = dk_pager_open(C_CORRUPT, 8, 0);
+  p = meo_pager_open(C_CORRUPT, 8, 0);
   if (!c_ok(p == 0, "boundary: a partial page is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_CORRUPT, "boundary: a partial page is CORRUPT")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_CORRUPT, "boundary: a partial page is CORRUPT")) {
     return 1;
   }
 
-  // size / DK_PAGE_SIZE != meta.page_count
-  if (!c_ok(c_reset(C_CORRUPT) == DK_OK, "boundary: reset count")) { return 1; }
-  if (!c_ok(c_craft_page0(C_CORRUPT, 9999, DK_MAGIC, DK_FORMAT_VERSION, DK_PAGE_SIZE, false) == DK_OK, "boundary: craft page_count 9999")) {
+  // size / MEO_PAGE_SIZE != meta.page_count
+  if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset count")) { return 1; }
+  if (!c_ok(c_craft_page0(C_CORRUPT, 9999, MEO_MAGIC, MEO_FORMAT_VERSION, MEO_PAGE_SIZE, false) == MEO_OK, "boundary: craft page_count 9999")) {
     return 1;
   }
-  if (!c_ok(c_truncate(C_CORRUPT, 8192) == DK_OK, "boundary: two pages on disk")) {
+  if (!c_ok(c_truncate(C_CORRUPT, 8192) == MEO_OK, "boundary: two pages on disk")) {
     return 1;
   }
-  p = dk_pager_open(C_CORRUPT, 8, 0);
+  p = meo_pager_open(C_CORRUPT, 8, 0);
   if (!c_ok(p == 0, "boundary: page_count vs size is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_CORRUPT, "boundary: page_count vs size is CORRUPT")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_CORRUPT, "boundary: page_count vs size is CORRUPT")) {
     return 1;
   }
 
   // bad magic. The CRC is broken in the same file on purpose: a foreign file
   // and a flipped byte at offset 16 both fail the checksum too, and both must
   // still be reported as NOT_A_DB (PHASE1.md section 7, T6).
-  if (!c_ok(c_reset(C_CORRUPT) == DK_OK, "boundary: reset magic")) { return 1; }
-  if (!c_ok(c_craft_page0(C_CORRUPT, 1, (uint32)0, DK_FORMAT_VERSION, DK_PAGE_SIZE, true) == DK_OK, "boundary: craft bad magic")) {
+  if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset magic")) { return 1; }
+  if (!c_ok(c_craft_page0(C_CORRUPT, 1, (uint32)0, MEO_FORMAT_VERSION, MEO_PAGE_SIZE, true) == MEO_OK, "boundary: craft bad magic")) {
     return 1;
   }
-  p = dk_pager_open(C_CORRUPT, 8, 0);
+  p = meo_pager_open(C_CORRUPT, 8, 0);
   if (!c_ok(p == 0, "boundary: bad magic is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_NOT_A_DB, "boundary: bad magic is NOT_A_DB")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_NOT_A_DB, "boundary: bad magic is NOT_A_DB")) {
     return 1;
   }
 
   // a version we do not speak
-  if (!c_ok(c_reset(C_CORRUPT) == DK_OK, "boundary: reset version")) { return 1; }
-  if (!c_ok(c_craft_page0(C_CORRUPT, 1, DK_MAGIC, 99, DK_PAGE_SIZE, false) == DK_OK, "boundary: craft version 99")) {
+  if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset version")) { return 1; }
+  if (!c_ok(c_craft_page0(C_CORRUPT, 1, MEO_MAGIC, 99, MEO_PAGE_SIZE, false) == MEO_OK, "boundary: craft version 99")) {
     return 1;
   }
-  p = dk_pager_open(C_CORRUPT, 8, 0);
+  p = meo_pager_open(C_CORRUPT, 8, 0);
   if (!c_ok(p == 0, "boundary: a new version is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_VERSION, "boundary: a new version is VERSION")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_VERSION, "boundary: a new version is VERSION")) {
     return 1;
   }
 
-  // a page size that is not DK_PAGE_SIZE
-  if (!c_ok(c_reset(C_CORRUPT) == DK_OK, "boundary: reset page size")) { return 1; }
-  if (!c_ok(c_craft_page0(C_CORRUPT, 1, DK_MAGIC, DK_FORMAT_VERSION, 8192, false) == DK_OK, "boundary: craft page size 8192")) {
+  // a page size that is not MEO_PAGE_SIZE
+  if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset page size")) { return 1; }
+  if (!c_ok(c_craft_page0(C_CORRUPT, 1, MEO_MAGIC, MEO_FORMAT_VERSION, 8192, false) == MEO_OK, "boundary: craft page size 8192")) {
     return 1;
   }
-  p = dk_pager_open(C_CORRUPT, 8, 0);
+  p = meo_pager_open(C_CORRUPT, 8, 0);
   if (!c_ok(p == 0, "boundary: a foreign page size is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_VERSION, "boundary: a foreign page size is VERSION")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_VERSION, "boundary: a foreign page size is VERSION")) {
     return 1;
   }
 
   // a structurally sound page 0 with a bad checksum
-  if (!c_ok(c_reset(C_CORRUPT) == DK_OK, "boundary: reset crc")) { return 1; }
-  if (!c_ok(c_craft_page0(C_CORRUPT, 1, DK_MAGIC, DK_FORMAT_VERSION, DK_PAGE_SIZE, true) == DK_OK, "boundary: craft a bad checksum")) {
+  if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset crc")) { return 1; }
+  if (!c_ok(c_craft_page0(C_CORRUPT, 1, MEO_MAGIC, MEO_FORMAT_VERSION, MEO_PAGE_SIZE, true) == MEO_OK, "boundary: craft a bad checksum")) {
     return 1;
   }
-  p = dk_pager_open(C_CORRUPT, 8, 0);
+  p = meo_pager_open(C_CORRUPT, 8, 0);
   if (!c_ok(p == 0, "boundary: a bad checksum is refused")) { return 1; }
-  if (!c_ok(dk_pager_err(0) == DK_ERR_CORRUPT, "boundary: a bad checksum is CORRUPT")) {
+  if (!c_ok(meo_pager_err(0) == MEO_ERR_CORRUPT, "boundary: a bad checksum is CORRUPT")) {
     return 1;
   }
 
   // get(0) is the meta frame; get(page_no >= page_count) is RANGE
-  if (!c_ok(c_reset(C_RO) == DK_OK, "boundary: reset ro")) { return 1; }
-  p = dk_pager_open(C_RO, 8, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_RO) == MEO_OK, "boundary: reset ro")) { return 1; }
+  p = meo_pager_open(C_RO, 8, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "boundary: create for get")) { return 1; }
-  var m0: DkFrame* = dk_pager_get(p, 0, false);
+  var m0: MeoFrame* = meo_pager_get(p, 0, false);
   if (!c_ok(m0 != 0, "boundary: get(0) is allowed")) { return 1; }
   if (!c_ok(m0->page_no == 0, "boundary: get(0) is the meta frame")) { return 1; }
-  if (!c_ok(dk_pager_release(p, m0, false) == DK_OK, "boundary: release get(0)")) {
+  if (!c_ok(meo_pager_release(p, m0, false) == MEO_OK, "boundary: release get(0)")) {
     return 1;
   }
-  if (!c_ok(dk_pager_get(p, 1, false) == 0, "boundary: get past page_count is null")) {
+  if (!c_ok(meo_pager_get(p, 1, false) == 0, "boundary: get past page_count is null")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_RANGE, "boundary: get past page_count is RANGE")) {
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_RANGE, "boundary: get past page_count is RANGE")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err_arg(p) == 1, "boundary: RANGE names the page")) {
+  if (!c_ok(meo_pager_err_arg(p) == 1, "boundary: RANGE names the page")) {
     return 1;
   }
   // free_page is real since PHASE2.md 2C: page 1 is not in this file yet
   // (page_count is 1), so it is out of range rather than unsupported.
-  if (!c_ok(dk_pager_free_page(p, 1) == -DK_ERR_RANGE, "boundary: freeing a page the file does not have is RANGE")) {
+  if (!c_ok(meo_pager_free_page(p, 1) == -MEO_ERR_RANGE, "boundary: freeing a page the file does not have is RANGE")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_RANGE, "boundary: RANGE is recorded")) {
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_RANGE, "boundary: RANGE is recorded")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "boundary: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "boundary: close")) { return 1; }
+  meo_pager_free(p);
 
   // a corrupt data page is caught when it enters the cache
-  if (!c_ok(c_reset(C_PAGE1) == DK_OK, "boundary: reset page1")) { return 1; }
-  p = dk_pager_open(C_PAGE1, 8, DK_PAGER_CREATE);
+  if (!c_ok(c_reset(C_PAGE1) == MEO_OK, "boundary: reset page1")) { return 1; }
+  p = meo_pager_open(C_PAGE1, 8, MEO_PAGER_CREATE);
   if (!c_ok(p != 0, "boundary: create page1")) { return 1; }
-  var f: DkFrame* = dk_pager_alloc(p);
+  var f: MeoFrame* = meo_pager_alloc(p);
   if (!c_ok(f != 0, "boundary: alloc page 1")) { return 1; }
   f->data[200] = (uint8)0x11;
-  if (!c_ok(dk_pager_release(p, f, true) == DK_OK, "boundary: release page 1")) {
+  if (!c_ok(meo_pager_release(p, f, true) == MEO_OK, "boundary: release page 1")) {
     return 1;
   }
-  if (!c_ok(dk_pager_flush(p) == DK_OK, "boundary: flush page 1")) { return 1; }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "boundary: close page1")) { return 1; }
-  dk_pager_free(p);
-  if (!c_ok(c_flip_byte(C_PAGE1, c_page_off(1) + 200) == DK_OK, "boundary: corrupt page 1 on the disk")) {
+  if (!c_ok(meo_pager_flush(p) == MEO_OK, "boundary: flush page 1")) { return 1; }
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "boundary: close page1")) { return 1; }
+  meo_pager_free(p);
+  if (!c_ok(c_flip_byte(C_PAGE1, c_page_off(1) + 200) == MEO_OK, "boundary: corrupt page 1 on the disk")) {
     return 1;
   }
-  var q: DkPager* = dk_pager_open(C_PAGE1, 8, 0);
+  var q: MeoPager* = meo_pager_open(C_PAGE1, 8, 0);
   if (!c_ok(q != 0, "boundary: a corrupt data page does not stop the open")) {
     return 1;
   }
-  if (!c_ok(dk_pager_get(q, 1, false) == 0, "boundary: reading the corrupt page is null")) {
+  if (!c_ok(meo_pager_get(q, 1, false) == 0, "boundary: reading the corrupt page is null")) {
     return 1;
   }
-  if (!c_ok(dk_pager_err(q) == DK_ERR_CORRUPT, "boundary: reading the corrupt page is CORRUPT")) {
+  if (!c_ok(meo_pager_err(q) == MEO_ERR_CORRUPT, "boundary: reading the corrupt page is CORRUPT")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(q) == DK_OK, "boundary: close the corrupt pager")) {
+  if (!c_ok(meo_pager_close(q) == MEO_OK, "boundary: close the corrupt pager")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
   return 0;
 }
 
-// --- the DK_MAX_PAGES cap --------------------------------------------------
+// --- the MEO_MAX_PAGES cap --------------------------------------------------
 
 fn c_max_pages() -> int32 {
-  var want: int64 = (int64)DK_MAX_PAGES * (int64)DK_PAGE_SIZE;
-  if (!c_ok(c_reset(C_MAX) == DK_OK, "max: reset")) { return 1; }
+  var want: int64 = (int64)MEO_MAX_PAGES * (int64)MEO_PAGE_SIZE;
+  if (!c_ok(c_reset(C_MAX) == MEO_OK, "max: reset")) { return 1; }
   // A sparse file: page_count lives only in page 0, so a full-size database is
   // the only way to reach the cap without allocating four gigabytes.
-  if (!c_ok(c_truncate(C_MAX, want) == DK_OK, "max: truncate to the phase-1 ceiling")) {
+  if (!c_ok(c_truncate(C_MAX, want) == MEO_OK, "max: truncate to the phase-1 ceiling")) {
     return 1;
   }
-  if (!c_ok(c_craft_page0(C_MAX, DK_MAX_PAGES, DK_MAGIC, DK_FORMAT_VERSION, DK_PAGE_SIZE, false) == DK_OK, "max: craft a full metablock")) {
+  if (!c_ok(c_craft_page0(C_MAX, MEO_MAX_PAGES, MEO_MAGIC, MEO_FORMAT_VERSION, MEO_PAGE_SIZE, false) == MEO_OK, "max: craft a full metablock")) {
     return 1;
   }
-  var p: DkPager* = dk_pager_open(C_MAX, 8, 0);
+  var p: MeoPager* = meo_pager_open(C_MAX, 8, 0);
   if (!c_ok(p != 0, "max: open a database at the cap")) { return 1; }
-  if (!c_ok(dk_pager_page_count(p) == DK_MAX_PAGES, "max: page_count is the cap")) {
+  if (!c_ok(meo_pager_page_count(p) == MEO_MAX_PAGES, "max: page_count is the cap")) {
     return 1;
   }
-  if (!c_ok(dk_pager_alloc(p) == 0, "max: alloc at the cap is null")) { return 1; }
-  if (!c_ok(dk_pager_err(p) == DK_ERR_NOSPC, "max: alloc at the cap is NOSPC")) {
+  if (!c_ok(meo_pager_alloc(p) == 0, "max: alloc at the cap is null")) { return 1; }
+  if (!c_ok(meo_pager_err(p) == MEO_ERR_NOSPC, "max: alloc at the cap is NOSPC")) {
     return 1;
   }
-  if (!c_ok(dk_pager_page_count(p) == DK_MAX_PAGES, "max: page_count did not move")) {
+  if (!c_ok(meo_pager_page_count(p) == MEO_MAX_PAGES, "max: page_count did not move")) {
     return 1;
   }
-  if (!c_ok(dk_pager_dirty_count(p) == 0, "max: a refused alloc dirties nothing")) {
+  if (!c_ok(meo_pager_dirty_count(p) == 0, "max: a refused alloc dirties nothing")) {
     return 1;
   }
-  if (!c_ok(dk_pager_close(p) == DK_OK, "max: close")) { return 1; }
-  dk_pager_free(p);
+  if (!c_ok(meo_pager_close(p) == MEO_OK, "max: close")) { return 1; }
+  meo_pager_free(p);
   if (!c_ok(c_file_size(C_MAX) == want, "max: close did not truncate the file")) {
     return 1;
   }
   // give the sparse blocks back
-  if (!c_ok(c_truncate(C_MAX, 0) == DK_OK, "max: release the file")) { return 1; }
+  if (!c_ok(c_truncate(C_MAX, 0) == MEO_OK, "max: release the file")) { return 1; }
   return 0;
 }
 
 // --- pure checks the interpreter can also run ------------------------------
 
 @test fn c_constants_match_the_contract() -> int64 {
-  assert_eq(DK_PAGER_CREATE, 1);
-  assert_eq(DK_PAGER_READONLY, 2);
-  assert_eq(DK_MIN_FRAMES, 8);
-  assert_eq((int64)DK_MAX_PAGES, 1048576);
-  assert_eq((int64)DK_PAGE_SIZE, 4096);
+  assert_eq(MEO_PAGER_CREATE, 1);
+  assert_eq(MEO_PAGER_READONLY, 2);
+  assert_eq(MEO_MIN_FRAMES, 8);
+  assert_eq((int64)MEO_MAX_PAGES, 1048576);
+  assert_eq((int64)MEO_PAGE_SIZE, 4096);
   // the phase-1 ceiling: 4 GiB
-  assert_eq((int64)DK_MAX_PAGES * (int64)DK_PAGE_SIZE, (int64)4294967296);
+  assert_eq((int64)MEO_MAX_PAGES * (int64)MEO_PAGE_SIZE, (int64)4294967296);
   return 0;
 }
 
 @test fn c_open_failure_channel_starts_clean() -> int64 {
-  // dk_pager_err(0) is the channel for a failed open; before any open has
-  // failed it must read DK_OK, not a leftover code.
-  assert_eq(dk_pager_err(0), DK_OK);
-  assert_eq(dk_pager_err_arg(0), 0);
+  // meo_pager_err(0) is the channel for a failed open; before any open has
+  // failed it must read MEO_OK, not a leftover code.
+  assert_eq(meo_pager_err(0), MEO_OK);
+  assert_eq(meo_pager_err_arg(0), 0);
   return 0;
 }
 

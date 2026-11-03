@@ -1,4 +1,4 @@
-// main: the dacor smoke entry. Phase 1 wires the modules together here so one
+// main: the MeoSQL smoke entry. Phase 1 wires the modules together here so one
 // binary proves the whole stack: status codes, the file surface, the page
 // format, the arena. It grows a stage at a time; the phase-1 gate runs it in
 // both debug and release and requires identical output.
@@ -23,109 +23,109 @@ fn main() -> int32 {
   var failures: int32 = 0;
 
   // status
-  if (!dk_status_ok(DK_OK)) { println("FAIL status: OK is not ok"); failures = failures + 1; }
-  if (dk_status_name(DK_ERR_CORRUPT) != "CORRUPT") { println("FAIL status name"); return 1; }
+  if (!meo_status_ok(MEO_OK)) { println("FAIL status: OK is not ok"); failures = failures + 1; }
+  if (meo_status_name(MEO_ERR_CORRUPT) != "CORRUPT") { println("FAIL status name"); return 1; }
 
   // crc32 check vector
   var v: string = "123456789";
-  if (dk_crc32(v.chars, (int64)v.length) != (uint32)3421780262) {
-    println("FAIL crc32 vector {(int64)dk_crc32(v.chars, (int64)v.length)}");
+  if (meo_crc32(v.chars, (int64)v.length) != (uint32)3421780262) {
+    println("FAIL crc32 vector {(int64)meo_crc32(v.chars, (int64)v.length)}");
     failures = failures + 1;
   }
 
   // varint round-trip
   var buf: uint8[16];
-  var n: int32 = dk_varint_put(&buf[0], 16, (uint64)300);
+  var n: int32 = meo_varint_put(&buf[0], 16, (uint64)300);
   var out: uint64 = 0;
-  var used: int32 = dk_varint_get(&buf[0], (int64)n, &out);
+  var used: int32 = meo_varint_get(&buf[0], (int64)n, &out);
   if (n != used || out != (uint64)300) { println("FAIL varint round-trip"); failures = failures + 1; }
 
   // page
   var page: uint8[] = new uint8[4096];
   defer free(page.data);
-  if (dk_page_init(page.data, DK_PAGE_BTREE_LEAF) != DK_OK) { println("FAIL page init"); return 1; }
-  var off: int32 = dk_page_alloc(page.data, 32);
+  if (meo_page_init(page.data, MEO_PAGE_BTREE_LEAF) != MEO_OK) { println("FAIL page init"); return 1; }
+  var off: int32 = meo_page_alloc(page.data, 32);
   if (off != 4096 - 32) { println("FAIL page alloc offset {off}"); failures = failures + 1; }
-  dk_page_seal(page.data);
-  if (dk_page_verify(page.data) != DK_OK) { println("FAIL page verify"); failures = failures + 1; }
+  meo_page_seal(page.data);
+  if (meo_page_verify(page.data) != MEO_OK) { println("FAIL page verify"); failures = failures + 1; }
 
   // file surface
-  var f: DkFile = dk_file_open("build/smoke.dat", DK_OPEN_WRITE | DK_OPEN_CREATE);
+  var f: MeoFile = meo_file_open("build/smoke.dat", MEO_OPEN_WRITE | MEO_OPEN_CREATE);
   if (!f.is_open) { println("FAIL file open"); return 1; }
-  if (dk_file_write_at(f, 0, page.data, 4096) != DK_OK) { println("FAIL file write"); failures = failures + 1; }
-  if (dk_file_sync(f) != DK_OK) { println("FAIL file sync"); failures = failures + 1; }
-  if (dk_file_size(f) != 4096) { println("FAIL file size"); failures = failures + 1; }
-  dk_file_close(f);
+  if (meo_file_write_at(f, 0, page.data, 4096) != MEO_OK) { println("FAIL file write"); failures = failures + 1; }
+  if (meo_file_sync(f) != MEO_OK) { println("FAIL file sync"); failures = failures + 1; }
+  if (meo_file_size(f) != 4096) { println("FAIL file size"); failures = failures + 1; }
+  meo_file_close(f);
 
   // arena
-  var a: DkArena* = dk_arena_new(256);
+  var a: MeoArena* = meo_arena_new(256);
   if (a == 0) { println("FAIL arena new"); return 1; }
-  defer dk_arena_free(a);
-  var p: uint8* = dk_arena_alloc(a, 64);
+  defer meo_arena_free(a);
+  var p: uint8* = meo_arena_alloc(a, 64);
   if (p == 0) { println("FAIL arena alloc"); return 1; }
   p[0] = 65;
 
   // pager: create a database, allocate pages, write patterns, flush, close,
   // reopen and read back. This is the phase-1 shape the whole stack serves.
   var db_path: string = "build/smoke_pager.dat";
-  var reset: DkFile = dk_file_open(db_path,
-    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  var reset: MeoFile = meo_file_open(db_path,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
   if (!reset.is_open) { println("FAIL pager reset open"); return 1; }
-  if (dk_file_truncate(reset, 0) != DK_OK) {
+  if (meo_file_truncate(reset, 0) != MEO_OK) {
     println("FAIL pager reset truncate"); failures = failures + 1;
   }
-  dk_file_close(reset);
+  meo_file_close(reset);
 
-  var db: DkPager* = dk_pager_open(db_path, 16, DK_PAGER_CREATE);
+  var db: MeoPager* = meo_pager_open(db_path, 16, MEO_PAGER_CREATE);
   if (db == 0) { println("FAIL pager create"); return 1; }
   var i: int32 = 0;
   while (i < 4) {
-    var fr: DkFrame* = dk_pager_alloc(db);
+    var fr: MeoFrame* = meo_pager_alloc(db);
     if (fr == 0) {
       println("FAIL pager alloc");
-      dk_pager_close(db);
-      dk_pager_free(db);
+      meo_pager_close(db);
+      meo_pager_free(db);
       return 1;
     }
     fr->data[20] = (uint8)(i + 1);
     fr->data[21] = (uint8)0xA5;
-    if (dk_pager_release(db, fr, true) != DK_OK) {
+    if (meo_pager_release(db, fr, true) != MEO_OK) {
       println("FAIL pager release"); failures = failures + 1;
     }
     i += 1;
   }
-  if (dk_pager_page_count(db) != 5) {
+  if (meo_pager_page_count(db) != 5) {
     println("FAIL pager page_count"); failures = failures + 1;
   }
-  if (dk_pager_flush(db) != DK_OK) {
+  if (meo_pager_flush(db) != MEO_OK) {
     println("FAIL pager flush"); failures = failures + 1;
   }
-  if (dk_pager_dirty_count(db) != 0) {
+  if (meo_pager_dirty_count(db) != 0) {
     println("FAIL pager dirty after flush"); failures = failures + 1;
   }
-  if (dk_pager_close(db) != DK_OK) {
+  if (meo_pager_close(db) != MEO_OK) {
     println("FAIL pager close"); failures = failures + 1;
   }
-  dk_pager_free(db);
+  meo_pager_free(db);
 
-  var size_file: DkFile = dk_file_open(db_path, DK_OPEN_READ);
+  var size_file: MeoFile = meo_file_open(db_path, MEO_OPEN_READ);
   if (!size_file.is_open) {
     println("FAIL pager size open"); failures = failures + 1;
   } else {
-    if (dk_file_size(size_file) != (int64)5 * (int64)DK_PAGE_SIZE) {
+    if (meo_file_size(size_file) != (int64)5 * (int64)MEO_PAGE_SIZE) {
       println("FAIL pager file size"); failures = failures + 1;
     }
-    dk_file_close(size_file);
+    meo_file_close(size_file);
   }
 
-  var ro: DkPager* = dk_pager_open(db_path, 16, DK_PAGER_READONLY);
+  var ro: MeoPager* = meo_pager_open(db_path, 16, MEO_PAGER_READONLY);
   if (ro == 0) { println("FAIL pager reopen"); return 1; }
-  if (dk_pager_page_count(ro) != 5) {
+  if (meo_pager_page_count(ro) != 5) {
     println("FAIL pager reopen page_count"); failures = failures + 1;
   }
   i = 1;
   while (i <= 4) {
-    var fr: DkFrame* = dk_pager_get(ro, (uint32)i, false);
+    var fr: MeoFrame* = meo_pager_get(ro, (uint32)i, false);
     if (fr == 0) {
       println("FAIL pager read page {i}"); failures = failures + 1;
     } else {
@@ -135,19 +135,19 @@ fn main() -> int32 {
       if (fr->data[21] != (uint8)0xA5) {
         println("FAIL pager marker page {i}"); failures = failures + 1;
       }
-      if (dk_page_verify(fr->data) != DK_OK) {
+      if (meo_page_verify(fr->data) != MEO_OK) {
         println("FAIL pager verify page {i}"); failures = failures + 1;
       }
-      if (dk_pager_release(ro, fr, false) != DK_OK) {
+      if (meo_pager_release(ro, fr, false) != MEO_OK) {
         println("FAIL pager release page {i}"); failures = failures + 1;
       }
     }
     i += 1;
   }
-  if (dk_pager_close(ro) != DK_OK) {
+  if (meo_pager_close(ro) != MEO_OK) {
     println("FAIL pager close readonly"); failures = failures + 1;
   }
-  dk_pager_free(ro);
+  meo_pager_free(ro);
 
   // b-tree: 1000 keys inserted through the pager, the root stored in the meta,
   // closed, reopened and walked ascending. This is the phase-2D shape the
@@ -155,25 +155,25 @@ fn main() -> int32 {
   // (meta.btree_root) and takes its ordering from the caller's comparator --
   // btree/ does not import types/key.mettle, this entry does.
   var bt_path: string = "build/smoke_btree.dat";
-  var bt_reset: DkFile = dk_file_open(bt_path,
-    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  var bt_reset: MeoFile = meo_file_open(bt_path,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
   if (!bt_reset.is_open) { println("FAIL btree reset open"); return 1; }
-  if (dk_file_truncate(bt_reset, 0) != DK_OK) {
+  if (meo_file_truncate(bt_reset, 0) != MEO_OK) {
     println("FAIL btree reset truncate");
     failures = failures + 1;
   }
-  dk_file_close(bt_reset);
+  meo_file_close(bt_reset);
 
   var kb: uint8[16];
-  var bt: DkPager* = dk_pager_open(bt_path, 16, DK_PAGER_CREATE);
+  var bt: MeoPager* = meo_pager_open(bt_path, 16, MEO_PAGER_CREATE);
   if (bt == 0) { println("FAIL btree create"); return 1; }
   var bt_root: uint32 = 0;
   var inserted: int32 = 0;
   while (inserted < 1000) {
-    var kn: int32 = dk_key_int(&kb[0], 16, (int64)inserted);
-    var bk: DkBtKey = { data: &kb[0], len: kn };
-    if (dk_bt_insert(bt, &bt_root, &dk_key_compare, bk,
-        (uint64)inserted) != DK_OK) {
+    var kn: int32 = meo_key_int(&kb[0], 16, (int64)inserted);
+    var bk: MeoBtKey = { data: &kb[0], len: kn };
+    if (meo_bt_insert(bt, &bt_root, &meo_key_compare, bk,
+        (uint64)inserted) != MEO_OK) {
       println("FAIL btree insert {inserted}");
       failures = failures + 1;
       break;
@@ -181,69 +181,69 @@ fn main() -> int32 {
     inserted = inserted + 1;
   }
   if (inserted == 1000) {
-    if (dk_pager_set_root(bt, DK_ROOT_BTREE, bt_root) != DK_OK) {
+    if (meo_pager_set_root(bt, MEO_ROOT_BTREE, bt_root) != MEO_OK) {
       println("FAIL btree set root");
       failures = failures + 1;
     }
-    if (dk_pager_flush(bt) != DK_OK) {
+    if (meo_pager_flush(bt) != MEO_OK) {
       println("FAIL btree flush");
       failures = failures + 1;
     }
   }
-  if (dk_pager_close(bt) != DK_OK) {
+  if (meo_pager_close(bt) != MEO_OK) {
     println("FAIL btree close");
     failures = failures + 1;
   }
-  dk_pager_free(bt);
+  meo_pager_free(bt);
 
-  var bt_ro: DkPager* = dk_pager_open(bt_path, 16, DK_PAGER_READONLY);
+  var bt_ro: MeoPager* = meo_pager_open(bt_path, 16, MEO_PAGER_READONLY);
   if (bt_ro == 0) {
     println("FAIL btree reopen");
     failures = failures + 1;
   } else {
-    var root2: uint32 = dk_pager_root(bt_ro, DK_ROOT_BTREE);
-    var c: DkBtCursor;
-    dk_bt_cursor_init(&c);
-    var kn0: int32 = dk_key_int(&kb[0], 16, 0);
-    var k0: DkBtKey = { data: &kb[0], len: kn0 };
-    var wrc: int32 = dk_bt_seek(bt_ro, &c, root2, &dk_key_compare, k0);
+    var root2: uint32 = meo_pager_root(bt_ro, MEO_ROOT_BTREE);
+    var c: MeoBtCursor;
+    meo_bt_cursor_init(&c);
+    var kn0: int32 = meo_key_int(&kb[0], 16, 0);
+    var k0: MeoBtKey = { data: &kb[0], len: kn0 };
+    var wrc: int32 = meo_bt_seek(bt_ro, &c, root2, &meo_key_compare, k0);
     var walked: int32 = 0;
     var want_buf: uint8[16];
     while (wrc == 0) {
       var want: int64 = (int64)walked;
-      var wn: int32 = dk_key_int(&want_buf[0], 16, want);
-      var got_len: int32 = dk_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
-      var got_ptr: uint8* = dk_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
+      var wn: int32 = meo_key_int(&want_buf[0], 16, want);
+      var got_len: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+      var got_ptr: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
       if (got_len != wn
-          || !dk_bytes_equal(got_ptr, &want_buf[0], (int64)wn)) {
+          || !meo_bytes_equal(got_ptr, &want_buf[0], (int64)wn)) {
         println("FAIL btree walk order at {walked}");
         failures = failures + 1;
         break;
       }
       var rid: uint64 = 0;
-      if (dk_bt_rowid(bt_ro, &c, &rid) != DK_OK || rid != (uint64)want) {
+      if (meo_bt_rowid(bt_ro, &c, &rid) != MEO_OK || rid != (uint64)want) {
         println("FAIL btree walk rowid at {walked}");
         failures = failures + 1;
         break;
       }
       walked = walked + 1;
-      wrc = dk_bt_next(bt_ro, &c);
+      wrc = meo_bt_next(bt_ro, &c);
       if (wrc < 0) {
         println("FAIL btree walk next {wrc}");
         failures = failures + 1;
         break;
       }
     }
-    dk_bt_close(bt_ro, &c);
+    meo_bt_close(bt_ro, &c);
     if (walked != 1000) {
       println("FAIL btree walk count {walked}");
       failures = failures + 1;
     }
-    if (dk_pager_close(bt_ro) != DK_OK) {
+    if (meo_pager_close(bt_ro) != MEO_OK) {
       println("FAIL btree close reopened");
       failures = failures + 1;
     }
-    dk_pager_free(bt_ro);
+    meo_pager_free(bt_ro);
   }
 
   if (failures != 0) { println("FAILED {failures}"); return 1; }

@@ -12,15 +12,15 @@
 //
 // Cases, each with the bug it exists to catch:
 //   j1_eviction_writeback  a dirty page evicted by cache pressure grows
-//                          dk_pager_write_count. Catches an eviction path that
-//                          still calls dk_file_write_at directly, which a
+//                          meo_pager_write_count. Catches an eviction path that
+//                          still calls meo_file_write_at directly, which a
 //                          journal added in 3B would never see.
-//   j2_flush               a flush grows dk_pager_write_count, and a flush with
+//   j2_flush               a flush grows meo_pager_write_count, and a flush with
 //                          nothing dirty does not. Catches a flush that bypasses
 //                          the chokepoint, and a counter that counts syncs
 //                          rather than page writes.
 //
-// The other half of J1 -- `grep -c dk_file_write_at src/pager/pager.mettle` is
+// The other half of J1 -- `grep -c meo_file_write_at src/pager/pager.mettle` is
 // exactly 1 -- is a property of the source, not of a running pager, so the gate
 // checks it with grep rather than from here.
 
@@ -37,86 +37,86 @@ const J_EVICT: string = "build/j_self_evict.dat";
 const J_FLUSH: string = "build/j_self_flush.dat";
 
 // Make `path` a zero-byte file: there is no unlink in the platform surface, and
-// a zero-byte file is exactly the state DK_PAGER_CREATE is defined against, so
+// a zero-byte file is exactly the state MEO_PAGER_CREATE is defined against, so
 // this makes a run repeatable.
 fn j_reset(path: string) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, 0);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
   return rc;
 }
 
 // Seed a file with `n` allocated pages, each carrying its page number in byte
 // 20, and leave it closed and durable.
 fn j_seed(path: string, n: int32) -> int32 {
-  var p: DkPager* = dk_pager_open(path, 16, DK_PAGER_CREATE);
-  if (p == 0) { return -DK_ERR_IO; }
+  var p: MeoPager* = meo_pager_open(path, 16, MEO_PAGER_CREATE);
+  if (p == 0) { return -MEO_ERR_IO; }
   var i: int32 = 0;
   while (i < n) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (f == 0) {
-      dk_pager_close(p);
-      dk_pager_free(p);
-      return -DK_ERR_NOMEM;
+      meo_pager_close(p);
+      meo_pager_free(p);
+      return -MEO_ERR_NOMEM;
     }
     f->data[20] = (uint8)(i + 1);
-    if (dk_pager_release(p, f, true) != DK_OK) {
-      dk_pager_close(p);
-      dk_pager_free(p);
-      return -DK_ERR_IO;
+    if (meo_pager_release(p, f, true) != MEO_OK) {
+      meo_pager_close(p);
+      meo_pager_free(p);
+      return -MEO_ERR_IO;
     }
     i += 1;
   }
-  var rc: int32 = dk_pager_flush(p);
-  if (rc == DK_OK) { rc = dk_pager_close(p); }
-  dk_pager_free(p);
+  var rc: int32 = meo_pager_flush(p);
+  if (rc == MEO_OK) { rc = meo_pager_close(p); }
+  meo_pager_free(p);
   return rc;
 }
 
 // A dirty page evicted by cache pressure must reach the disk through the
 // chokepoint, so the counter grows even though nothing flushed.
 fn j1_eviction_writeback() -> int32 {
-  if (!dk_t_check(j_reset(J_EVICT) == DK_OK, "j1: reset")) { return 1; }
-  if (!dk_t_check(j_seed(J_EVICT, 12) == DK_OK, "j1: seed twelve pages")) {
+  if (!meo_t_check(j_reset(J_EVICT) == MEO_OK, "j1: reset")) { return 1; }
+  if (!meo_t_check(j_seed(J_EVICT, 12) == MEO_OK, "j1: seed twelve pages")) {
     return 1;
   }
 
-  var p: DkPager* = dk_pager_open(J_EVICT, 8, 0);
-  if (!dk_t_check(p != 0, "j1: open with 8 frames")) { return 1; }
+  var p: MeoPager* = meo_pager_open(J_EVICT, 8, 0);
+  if (!meo_t_check(p != 0, "j1: open with 8 frames")) { return 1; }
   // A reopen writes nothing, so the counter starts at zero.
-  if (!dk_t_check_i64(dk_pager_write_count(p), 0, "j1: a fresh pager has written nothing")) {
+  if (!meo_t_check_i64(meo_pager_write_count(p), 0, "j1: a fresh pager has written nothing")) {
     return 1;
   }
 
-  var d: DkFrame* = dk_pager_get(p, 1, true);
-  if (!dk_t_check(d != 0, "j1: get page 1 for write")) { return 1; }
+  var d: MeoFrame* = meo_pager_get(p, 1, true);
+  if (!meo_t_check(d != 0, "j1: get page 1 for write")) { return 1; }
   d->data[30] = (uint8)0x5A;
-  if (!dk_t_check(dk_pager_release(p, d, true) == DK_OK, "j1: release page 1 dirty")) {
+  if (!meo_t_check(meo_pager_release(p, d, true) == MEO_OK, "j1: release page 1 dirty")) {
     return 1;
   }
 
   // Churn the cache so page 1 is evicted. No flush anywhere in this case.
   var pg: uint32 = 2;
   while (pg <= 12) {
-    var f: DkFrame* = dk_pager_get(p, pg, false);
-    if (!dk_t_check(f != 0, "j1: churn the cache")) { return 1; }
-    if (!dk_t_check(dk_pager_release(p, f, false) == DK_OK, "j1: release the churn")) {
+    var f: MeoFrame* = meo_pager_get(p, pg, false);
+    if (!meo_t_check(f != 0, "j1: churn the cache")) { return 1; }
+    if (!meo_t_check(meo_pager_release(p, f, false) == MEO_OK, "j1: release the churn")) {
       return 1;
     }
     pg += 1;
   }
 
-  if (!dk_t_check(dk_pager_dirty_count(p) == 0, "j1: the eviction wrote the dirty page")) {
+  if (!meo_t_check(meo_pager_dirty_count(p) == 0, "j1: the eviction wrote the dirty page")) {
     return 1;
   }
   // The regression: an eviction that writes the page itself leaves the counter
   // at zero, and 3B's journal would never see the before-image.
-  if (!dk_t_check(dk_pager_write_count(p) > 0, "j1: the eviction write-back took the chokepoint")) {
+  if (!meo_t_check(meo_pager_write_count(p) > 0, "j1: the eviction write-back took the chokepoint")) {
     return 1;
   }
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j1: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j1: close")) { return 1; }
+  meo_pager_free(p);
   println("PASS j1_eviction_writeback");
   return 0;
 }
@@ -124,45 +124,45 @@ fn j1_eviction_writeback() -> int32 {
 // A flush must reach the disk through the chokepoint too, and a flush with
 // nothing to write must not pretend it did.
 fn j2_flush() -> int32 {
-  if (!dk_t_check(j_reset(J_FLUSH) == DK_OK, "j2: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(J_FLUSH, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "j2: create")) { return 1; }
+  if (!meo_t_check(j_reset(J_FLUSH) == MEO_OK, "j2: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(J_FLUSH, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "j2: create")) { return 1; }
   // Creating the database flushed page 0, so the counter is already above zero;
   // the baseline is what the next flush has to beat.
-  var base: int64 = dk_pager_write_count(p);
-  if (!dk_t_check(base > 0, "j2: create wrote page 0 through the chokepoint")) {
+  var base: int64 = meo_pager_write_count(p);
+  if (!meo_t_check(base > 0, "j2: create wrote page 0 through the chokepoint")) {
     return 1;
   }
 
-  var f: DkFrame* = dk_pager_alloc(p);
-  if (!dk_t_check(f != 0, "j2: alloc a page")) { return 1; }
+  var f: MeoFrame* = meo_pager_alloc(p);
+  if (!meo_t_check(f != 0, "j2: alloc a page")) { return 1; }
   f->data[40] = (uint8)0x77;
-  if (!dk_t_check(dk_pager_release(p, f, true) == DK_OK, "j2: release it dirty")) {
+  if (!meo_t_check(meo_pager_release(p, f, true) == MEO_OK, "j2: release it dirty")) {
     return 1;
   }
-  if (!dk_t_check(dk_pager_flush(p) == DK_OK, "j2: flush")) { return 1; }
-  if (!dk_t_check(dk_pager_dirty_count(p) == 0, "j2: the flush left nothing dirty")) {
+  if (!meo_t_check(meo_pager_flush(p) == MEO_OK, "j2: flush")) { return 1; }
+  if (!meo_t_check(meo_pager_dirty_count(p) == 0, "j2: the flush left nothing dirty")) {
     return 1;
   }
-  var after: int64 = dk_pager_write_count(p);
-  if (!dk_t_check(after > base, "j2: the flush took the chokepoint")) { return 1; }
+  var after: int64 = meo_pager_write_count(p);
+  if (!meo_t_check(after > base, "j2: the flush took the chokepoint")) { return 1; }
 
   // Nothing dirty: a flush syncs but writes no page, so the counter holds.
-  if (!dk_t_check(dk_pager_flush(p) == DK_OK, "j2: an empty flush")) { return 1; }
-  if (!dk_t_check_i64(dk_pager_write_count(p), after, "j2: an empty flush writes no page")) {
+  if (!meo_t_check(meo_pager_flush(p) == MEO_OK, "j2: an empty flush")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_write_count(p), after, "j2: an empty flush writes no page")) {
     return 1;
   }
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j2: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j2: close")) { return 1; }
+  meo_pager_free(p);
   println("PASS j2_flush");
   return 0;
 }
 
 fn main() -> int32 {
   var rc: int32 = j1_eviction_writeback();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j2_flush();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   println("PASS j_self");
-  return dk_t_report();
+  return meo_t_report();
 }

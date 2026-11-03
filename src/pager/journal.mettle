@@ -15,7 +15,7 @@
 // Layout (PHASE3.md 3B), little-endian through format/bytes.mettle:
 //
 //   header, 64 bytes used:
-//     0   u32  magic        0x4A4B4444
+//     0   u32  magic        0x4A4F454D
 //     4   u16  version      1
 //     6   u16  reserved     0
 //     8   u32  page_size
@@ -37,8 +37,8 @@
 //
 // Capacity (PHASE3.md 3B): the file grows on demand. begin sets the record cap
 // to min(db_size_pages + 64, cap); each append truncates the file to one more
-// record and writes it. The hard cap is DK_JRN_MAX_RECORDS = 65536 (256 MiB at
-// 4100 bytes a record). Exceeding it is -DK_ERR_NOSPC, never a dropped
+// record and writes it. The hard cap is MEO_JRN_MAX_RECORDS = 65536 (256 MiB at
+// 4100 bytes a record). Exceeding it is -MEO_ERR_NOSPC, never a dropped
 // before-image.
 //
 // "First touch only" is tracked by a bitmap of the pages that existed when the
@@ -58,11 +58,11 @@ import "../platform/file_linux.mettle" if linux;
 
 // --- constants (PHASE3.md 3B) ----------------------------------------------
 
-export const DK_JRN_MAGIC: uint32 = 0x4A4B4444; // on disk the bytes read "DDKJ"
-export const DK_JRN_VERSION: int32 = 1;
-export const DK_JRN_HDR: int32 = 64;
-export const DK_JRN_RECORD: int32 = 4 + DK_PAGE_SIZE; // 4100
-export const DK_JRN_MAX_RECORDS: int32 = 65536; // 256 MiB of journal
+export const MEO_JRN_MAGIC: uint32 = 0x4A4F454D; // on disk the bytes read "MEOJ"
+export const MEO_JRN_VERSION: int32 = 1;
+export const MEO_JRN_HDR: int32 = 64;
+export const MEO_JRN_RECORD: int32 = 4 + MEO_PAGE_SIZE; // 4100
+export const MEO_JRN_MAX_RECORDS: int32 = 65536; // 256 MiB of journal
 
 // Header field offsets. Named once; never write a bare number for a field.
 const JRN_OFF_MAGIC: int64 = 0;
@@ -78,8 +78,8 @@ const JRN_CHECKSUM_HDR_BYTES: int64 = 28;
 
 // --- types -----------------------------------------------------------------
 
-export struct DkJournal {
-  file: DkFile;
+export struct MeoJournal {
+  file: MeoFile;
   path: string;          // owned copy of "<db>-journal"
   n_records: int32;
   cap: int32;            // min(db_size_pages + 64, the pager's cap)
@@ -89,16 +89,16 @@ export struct DkJournal {
   seen: uint8*;          // bitmap: page numbers already journaled
 }
 
-// The create/open failure channel. dk_jrn_create answers 0, so the pager reads
-// the specific code here, exactly as dk_pager_open does for its own failures.
-var dk_jrn_last_err: int32 = DK_OK;
+// The create/open failure channel. meo_jrn_create answers 0, so the pager reads
+// the specific code here, exactly as meo_pager_open does for its own failures.
+var meo_jrn_last_err: int32 = MEO_OK;
 
-export fn dk_jrn_last_error() -> int32 {
-  return dk_jrn_last_err;
+export fn meo_jrn_last_error() -> int32 {
+  return meo_jrn_last_err;
 }
 
 fn jrn_fail(code: int32) -> int32 {
-  dk_jrn_last_err = code;
+  meo_jrn_last_err = code;
   return code;
 }
 
@@ -184,10 +184,10 @@ fn jrn_crc_combine(crc1: uint32, crc2: uint32, len2: int64) -> uint32 {
     b[i] = (uint8)(i * 11 + 5);
     i += 1;
   }
-  var ca: uint32 = dk_crc32(&a[0], 10);
-  var cb: uint32 = dk_crc32(&b[0], 20);
+  var ca: uint32 = meo_crc32(&a[0], 10);
+  var cb: uint32 = meo_crc32(&b[0], 20);
   var combined: uint32 = jrn_crc_combine(ca, cb, 20);
-  var direct: uint32 = dk_crc32_update(ca, &b[0], 20);
+  var direct: uint32 = meo_crc32_update(ca, &b[0], 20);
   if (combined != direct) { return 1; }
   return 0;
 }
@@ -196,86 +196,86 @@ fn jrn_crc_combine(crc1: uint32, crc2: uint32, len2: int64) -> uint32 {
 
 // Write the 64-byte header for the journal's current n_records and rec_crc.
 // The caller fsyncs; this only makes the bytes reach the file.
-fn jrn_write_header(j: DkJournal*) -> int32 {
+fn jrn_write_header(j: MeoJournal*) -> int32 {
   var hdr: uint8[64];
-  dk_bytes_zero(&hdr[0], 64);
-  dk_put_u32le(&hdr[0], JRN_OFF_MAGIC, DK_JRN_MAGIC);
-  dk_put_u16le(&hdr[0], JRN_OFF_VERSION, (uint16)DK_JRN_VERSION);
-  dk_put_u16le(&hdr[0], JRN_OFF_RESERVED, 0);
-  dk_put_u32le(&hdr[0], JRN_OFF_PAGE_SIZE, (uint32)DK_PAGE_SIZE);
-  dk_put_u32le(&hdr[0], JRN_OFF_N_RECORDS, (uint32)j->n_records);
-  dk_put_u64le(&hdr[0], JRN_OFF_DB_PAGES, (uint64)j->db_size_pages);
-  dk_put_u32le(&hdr[0], JRN_OFF_DB_WV, j->db_write_version);
-  var hcrc: uint32 = dk_crc32(&hdr[0], JRN_CHECKSUM_HDR_BYTES);
+  meo_bytes_zero(&hdr[0], 64);
+  meo_put_u32le(&hdr[0], JRN_OFF_MAGIC, MEO_JRN_MAGIC);
+  meo_put_u16le(&hdr[0], JRN_OFF_VERSION, (uint16)MEO_JRN_VERSION);
+  meo_put_u16le(&hdr[0], JRN_OFF_RESERVED, 0);
+  meo_put_u32le(&hdr[0], JRN_OFF_PAGE_SIZE, (uint32)MEO_PAGE_SIZE);
+  meo_put_u32le(&hdr[0], JRN_OFF_N_RECORDS, (uint32)j->n_records);
+  meo_put_u64le(&hdr[0], JRN_OFF_DB_PAGES, (uint64)j->db_size_pages);
+  meo_put_u32le(&hdr[0], JRN_OFF_DB_WV, j->db_write_version);
+  var hcrc: uint32 = meo_crc32(&hdr[0], JRN_CHECKSUM_HDR_BYTES);
   var full: uint32 = jrn_crc_combine(hcrc, j->rec_crc,
-    (int64)j->n_records * (int64)DK_JRN_RECORD);
-  dk_put_u32le(&hdr[0], JRN_OFF_CHECKSUM, full);
-  return dk_file_write_at(j->file, 0, &hdr[0], (int64)DK_JRN_HDR);
+    (int64)j->n_records * (int64)MEO_JRN_RECORD);
+  meo_put_u32le(&hdr[0], JRN_OFF_CHECKSUM, full);
+  return meo_file_write_at(j->file, 0, &hdr[0], (int64)MEO_JRN_HDR);
 }
 
 // Read and structurally validate the header of an open journal file. Answers
 // the record count through `out_n`; the checksum is validated separately by
 // jrn_validate_checksum, because that needs the record region.
-fn jrn_read_header(f: DkFile, hdr: uint8*, out_n: int32*) -> int32 {
-  var rc: int32 = dk_file_read_at(f, 0, hdr, (int64)DK_JRN_HDR);
-  if (rc != DK_JRN_HDR) { return -DK_ERR_CORRUPT; }
-  if (dk_get_u32le(hdr, JRN_OFF_MAGIC) != DK_JRN_MAGIC) {
-    return -DK_ERR_CORRUPT;
+fn jrn_read_header(f: MeoFile, hdr: uint8*, out_n: int32*) -> int32 {
+  var rc: int32 = meo_file_read_at(f, 0, hdr, (int64)MEO_JRN_HDR);
+  if (rc != MEO_JRN_HDR) { return -MEO_ERR_CORRUPT; }
+  if (meo_get_u32le(hdr, JRN_OFF_MAGIC) != MEO_JRN_MAGIC) {
+    return -MEO_ERR_CORRUPT;
   }
-  if ((int32)dk_get_u16le(hdr, JRN_OFF_VERSION) != DK_JRN_VERSION) {
-    return -DK_ERR_CORRUPT;
+  if ((int32)meo_get_u16le(hdr, JRN_OFF_VERSION) != MEO_JRN_VERSION) {
+    return -MEO_ERR_CORRUPT;
   }
-  if (dk_get_u32le(hdr, JRN_OFF_PAGE_SIZE) != (uint32)DK_PAGE_SIZE) {
-    return -DK_ERR_CORRUPT;
+  if (meo_get_u32le(hdr, JRN_OFF_PAGE_SIZE) != (uint32)MEO_PAGE_SIZE) {
+    return -MEO_ERR_CORRUPT;
   }
-  var n: int32 = (int32)dk_get_u32le(hdr, JRN_OFF_N_RECORDS);
-  if (n < 0 || n > DK_JRN_MAX_RECORDS) { return -DK_ERR_CORRUPT; }
+  var n: int32 = (int32)meo_get_u32le(hdr, JRN_OFF_N_RECORDS);
+  if (n < 0 || n > MEO_JRN_MAX_RECORDS) { return -MEO_ERR_CORRUPT; }
   out_n[0] = n;
-  return DK_OK;
+  return MEO_OK;
 }
 
 // Validate the checksum over [0,28) and the record region. Reads the record
 // region in chunks, so a 256 MiB journal does not need a 256 MiB buffer. A
 // short file (a torn commit) is CORRUPT: replay must not trust n_records past
 // what the file holds.
-fn jrn_validate_checksum(f: DkFile, hdr: uint8*, n: int32) -> int32 {
-  var need: int64 = (int64)n * (int64)DK_JRN_RECORD;
-  var size: int64 = dk_file_size(f);
+fn jrn_validate_checksum(f: MeoFile, hdr: uint8*, n: int32) -> int32 {
+  var need: int64 = (int64)n * (int64)MEO_JRN_RECORD;
+  var size: int64 = meo_file_size(f);
   if (size < 0) { return (int32)size; }
-  if (size < (int64)DK_JRN_HDR + need) { return -DK_ERR_CORRUPT; }
-  var hcrc: uint32 = dk_crc32(hdr, JRN_CHECKSUM_HDR_BYTES);
+  if (size < (int64)MEO_JRN_HDR + need) { return -MEO_ERR_CORRUPT; }
+  var hcrc: uint32 = meo_crc32(hdr, JRN_CHECKSUM_HDR_BYTES);
   var rec_crc: uint32 = 0;
-  var buf: uint8* = malloc((int64)DK_PAGE_SIZE);
-  if (buf == 0) { return -DK_ERR_NOMEM; }
+  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (buf == 0) { return -MEO_ERR_NOMEM; }
   var got: int64 = 0;
   while (got < need) {
     var chunk: int64 = need - got;
-    if (chunk > (int64)DK_PAGE_SIZE) { chunk = (int64)DK_PAGE_SIZE; }
-    var rc: int32 = dk_file_read_at(f, (int64)DK_JRN_HDR + got, buf, chunk);
+    if (chunk > (int64)MEO_PAGE_SIZE) { chunk = (int64)MEO_PAGE_SIZE; }
+    var rc: int32 = meo_file_read_at(f, (int64)MEO_JRN_HDR + got, buf, chunk);
     if (rc != (int32)chunk) {
       free(buf);
-      return -DK_ERR_CORRUPT;
+      return -MEO_ERR_CORRUPT;
     }
-    rec_crc = dk_crc32_update(rec_crc, buf, chunk);
+    rec_crc = meo_crc32_update(rec_crc, buf, chunk);
     got += chunk;
   }
   free(buf);
   var full: uint32 = jrn_crc_combine(hcrc, rec_crc, need);
-  if (full != dk_get_u32le(hdr, JRN_OFF_CHECKSUM)) {
-    return -DK_ERR_CORRUPT;
+  if (full != meo_get_u32le(hdr, JRN_OFF_CHECKSUM)) {
+    return -MEO_ERR_CORRUPT;
   }
-  return DK_OK;
+  return MEO_OK;
 }
 
 // --- bitmap ----------------------------------------------------------------
 
-fn jrn_seen(j: DkJournal*, page_no: uint32) -> bool {
+fn jrn_seen(j: MeoJournal*, page_no: uint32) -> bool {
   var byte: int64 = (int64)page_no / 8;
   var bit: int32 = (int32)((int64)page_no % 8);
   return (j->seen[byte] & (uint8)((uint32)1 << bit)) != 0;
 }
 
-fn jrn_mark_seen(j: DkJournal*, page_no: uint32) {
+fn jrn_mark_seen(j: MeoJournal*, page_no: uint32) {
   var byte: int64 = (int64)page_no / 8;
   var bit: int32 = (int32)((int64)page_no % 8);
   j->seen[byte] = j->seen[byte] | (uint8)((uint32)1 << bit);
@@ -285,27 +285,27 @@ fn jrn_mark_seen(j: DkJournal*, page_no: uint32) {
 
 // Start a journal for `db_path`. The file is truncated to its 64-byte header
 // and fsynced before this returns, so the header is durable before any data
-// page can be written. Answers 0 on failure; dk_jrn_last_error has the code.
-export fn dk_jrn_create(db_path: string, db_size_pages: uint32,
-  db_write_version: uint32, cap: int32) -> DkJournal* {
-  dk_jrn_last_err = DK_OK;
+// page can be written. Answers 0 on failure; meo_jrn_last_error has the code.
+export fn meo_jrn_create(db_path: string, db_size_pages: uint32,
+  db_write_version: uint32, cap: int32) -> MeoJournal* {
+  meo_jrn_last_err = MEO_OK;
   var jpath: string = jrn_path(db_path);
   if (jpath.chars == 0) {
-    jrn_fail(-DK_ERR_NOMEM);
+    jrn_fail(-MEO_ERR_NOMEM);
     return 0;
   }
-  var f: DkFile = dk_file_open(jpath,
-    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  var f: MeoFile = meo_file_open(jpath,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
   if (!f.is_open) {
     jrn_fail((int32)(0 - f.handle));
     free(jpath.chars);
     return 0;
   }
-  var j: DkJournal* = new DkJournal;
+  var j: MeoJournal* = new MeoJournal;
   if (j == 0) {
-    dk_file_close(f);
+    meo_file_close(f);
     free(jpath.chars);
-    jrn_fail(-DK_ERR_NOMEM);
+    jrn_fail(-MEO_ERR_NOMEM);
     return 0;
   }
   j->file = f;
@@ -325,18 +325,18 @@ export fn dk_jrn_create(db_path: string, db_size_pages: uint32,
   if (bits < 1) { bits = 1; }
   j->seen = malloc(bits);
   if (j->seen == 0) {
-    dk_file_close(f);
+    meo_file_close(f);
     free(jpath.chars);
     free(j);
-    jrn_fail(-DK_ERR_NOMEM);
+    jrn_fail(-MEO_ERR_NOMEM);
     return 0;
   }
-  dk_bytes_zero(j->seen, bits);
-  var rc: int32 = dk_file_truncate(f, (int64)DK_JRN_HDR);
-  if (rc == DK_OK) { rc = jrn_write_header(j); }
-  if (rc == DK_OK) { rc = dk_file_sync(f); }
-  if (rc != DK_OK) {
-    dk_file_close(f);
+  meo_bytes_zero(j->seen, bits);
+  var rc: int32 = meo_file_truncate(f, (int64)MEO_JRN_HDR);
+  if (rc == MEO_OK) { rc = jrn_write_header(j); }
+  if (rc == MEO_OK) { rc = meo_file_sync(f); }
+  if (rc != MEO_OK) {
+    meo_file_close(f);
     free(j->seen);
     free(jpath.chars);
     free(j);
@@ -350,10 +350,10 @@ export fn dk_jrn_create(db_path: string, db_size_pages: uint32,
 // successful commit, after a rollback, and as the last-resort cleanup in the
 // pager's destructor. A missing file is not an error here: the journal is
 // already gone, which is the state the caller wanted.
-export fn dk_jrn_destroy(j: DkJournal*) {
+export fn meo_jrn_destroy(j: MeoJournal*) {
   if (j == 0) { return; }
-  dk_file_close(j->file);
-  dk_file_unlink(j->path);
+  meo_file_close(j->file);
+  meo_file_unlink(j->path);
   if (j->seen != 0) { free(j->seen); }
   free(j->path.chars);
   free(j);
@@ -365,7 +365,7 @@ export fn dk_jrn_destroy(j: DkJournal*) {
 // page allocated after begin (it did not exist, so rollback removes it) and
 // false for a page already journaled (the first before-image is the state to
 // restore). The pager asks this before reading the old page from disk.
-export fn dk_jrn_needs(j: DkJournal*, page_no: uint32) -> bool {
+export fn meo_jrn_needs(j: MeoJournal*, page_no: uint32) -> bool {
   if (j == 0) { return false; }
   if (page_no >= j->db_size_pages) { return false; }
   return !jrn_seen(j, page_no);
@@ -374,29 +374,29 @@ export fn dk_jrn_needs(j: DkJournal*, page_no: uint32) -> bool {
 // Append the before-image of `page_no` and fsync the journal. The record is
 // written first, then the header that counts it, then the sync: a crash before
 // the sync leaves a header that does not count the record, and replay ignores
-// it. -DK_ERR_NOSPC when the cap is reached; the before-image is never dropped.
-export fn dk_jrn_append(j: DkJournal*, page_no: uint32, before: uint8*) -> int32 {
-  if (j == 0 || before == 0) { return -DK_ERR_USAGE; }
-  if (page_no >= j->db_size_pages) { return DK_OK; }
-  if (jrn_seen(j, page_no)) { return DK_OK; }
-  if (j->n_records >= j->cap) { return -DK_ERR_NOSPC; }
-  var off: int64 = (int64)DK_JRN_HDR
-    + (int64)j->n_records * (int64)DK_JRN_RECORD;
-  var rc: int32 = dk_file_truncate(j->file, off + (int64)DK_JRN_RECORD);
-  if (rc != DK_OK) { return rc; }
+// it. -MEO_ERR_NOSPC when the cap is reached; the before-image is never dropped.
+export fn meo_jrn_append(j: MeoJournal*, page_no: uint32, before: uint8*) -> int32 {
+  if (j == 0 || before == 0) { return -MEO_ERR_USAGE; }
+  if (page_no >= j->db_size_pages) { return MEO_OK; }
+  if (jrn_seen(j, page_no)) { return MEO_OK; }
+  if (j->n_records >= j->cap) { return -MEO_ERR_NOSPC; }
+  var off: int64 = (int64)MEO_JRN_HDR
+    + (int64)j->n_records * (int64)MEO_JRN_RECORD;
+  var rc: int32 = meo_file_truncate(j->file, off + (int64)MEO_JRN_RECORD);
+  if (rc != MEO_OK) { return rc; }
   var pn: uint8[4];
-  dk_put_u32le(&pn[0], 0, page_no);
-  rc = dk_file_write_at(j->file, off, &pn[0], 4);
-  if (rc != DK_OK) { return rc; }
-  rc = dk_file_write_at(j->file, off + 4, before, (int64)DK_PAGE_SIZE);
-  if (rc != DK_OK) { return rc; }
-  j->rec_crc = dk_crc32_update(j->rec_crc, &pn[0], 4);
-  j->rec_crc = dk_crc32_update(j->rec_crc, before, (int64)DK_PAGE_SIZE);
+  meo_put_u32le(&pn[0], 0, page_no);
+  rc = meo_file_write_at(j->file, off, &pn[0], 4);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_file_write_at(j->file, off + 4, before, (int64)MEO_PAGE_SIZE);
+  if (rc != MEO_OK) { return rc; }
+  j->rec_crc = meo_crc32_update(j->rec_crc, &pn[0], 4);
+  j->rec_crc = meo_crc32_update(j->rec_crc, before, (int64)MEO_PAGE_SIZE);
   j->n_records += 1;
   jrn_mark_seen(j, page_no);
   rc = jrn_write_header(j);
-  if (rc != DK_OK) { return rc; }
-  return dk_file_sync(j->file);
+  if (rc != MEO_OK) { return rc; }
+  return meo_file_sync(j->file);
 }
 
 // --- replay ----------------------------------------------------------------
@@ -404,146 +404,146 @@ export fn dk_jrn_append(j: DkJournal*, page_no: uint32, before: uint8*) -> int32
 // Write every before-image back to `db_file`, then truncate it to the page
 // count the journal restores. The caller fsyncs and removes the journal. The
 // write is idempotent: replaying the same records twice writes the same bytes.
-fn jrn_replay_records(f: DkFile, db_file: DkFile, n: int32,
+fn jrn_replay_records(f: MeoFile, db_file: MeoFile, n: int32,
   db_size_pages: uint32) -> int32 {
-  var buf: uint8* = malloc((int64)DK_PAGE_SIZE);
-  if (buf == 0) { return -DK_ERR_NOMEM; }
+  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (buf == 0) { return -MEO_ERR_NOMEM; }
   var i: int32 = 0;
   while (i < n) {
-    var off: int64 = (int64)DK_JRN_HDR + (int64)i * (int64)DK_JRN_RECORD;
+    var off: int64 = (int64)MEO_JRN_HDR + (int64)i * (int64)MEO_JRN_RECORD;
     var pn: uint8[4];
-    var rc: int32 = dk_file_read_at(f, off, &pn[0], 4);
+    var rc: int32 = meo_file_read_at(f, off, &pn[0], 4);
     if (rc != 4) {
       free(buf);
-      return -DK_ERR_CORRUPT;
+      return -MEO_ERR_CORRUPT;
     }
-    var page_no: uint32 = dk_get_u32le(&pn[0], 0);
+    var page_no: uint32 = meo_get_u32le(&pn[0], 0);
     // A record for a page the restored database does not have is corruption,
     // not something to write past the end of the file.
     if (page_no >= db_size_pages) {
       free(buf);
-      return -DK_ERR_CORRUPT;
+      return -MEO_ERR_CORRUPT;
     }
-    rc = dk_file_read_at(f, off + 4, buf, (int64)DK_PAGE_SIZE);
-    if (rc != DK_PAGE_SIZE) {
+    rc = meo_file_read_at(f, off + 4, buf, (int64)MEO_PAGE_SIZE);
+    if (rc != MEO_PAGE_SIZE) {
       free(buf);
-      return -DK_ERR_CORRUPT;
+      return -MEO_ERR_CORRUPT;
     }
-    rc = dk_file_write_at(db_file,
-      (int64)page_no * (int64)DK_PAGE_SIZE, buf, (int64)DK_PAGE_SIZE);
-    if (rc != DK_OK) {
+    rc = meo_file_write_at(db_file,
+      (int64)page_no * (int64)MEO_PAGE_SIZE, buf, (int64)MEO_PAGE_SIZE);
+    if (rc != MEO_OK) {
       free(buf);
       return rc;
     }
     i += 1;
   }
   free(buf);
-  return DK_OK;
+  return MEO_OK;
 }
 
 // Undo a live transaction: write every before-image back, truncate the db to
 // the page count the journal restores, and fsync. The journal is left in place
 // for the caller to destroy, so a crash during rollback is replayed again at
 // the next open (idempotent).
-export fn dk_jrn_rollback(j: DkJournal*, db_file: DkFile) -> int32 {
-  if (j == 0) { return -DK_ERR_USAGE; }
+export fn meo_jrn_rollback(j: MeoJournal*, db_file: MeoFile) -> int32 {
+  if (j == 0) { return -MEO_ERR_USAGE; }
   var rc: int32 = jrn_replay_records(j->file, db_file, j->n_records,
     j->db_size_pages);
-  if (rc != DK_OK) { return rc; }
-  rc = dk_file_truncate(db_file,
-    (int64)j->db_size_pages * (int64)DK_PAGE_SIZE);
-  if (rc != DK_OK) { return rc; }
-  return dk_file_sync(db_file);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_file_truncate(db_file,
+    (int64)j->db_size_pages * (int64)MEO_PAGE_SIZE);
+  if (rc != MEO_OK) { return rc; }
+  return meo_file_sync(db_file);
 }
 
 // --- recovery at open ------------------------------------------------------
 
 // Replay a hot journal for `db_path` into `db_file`, before the pager reads
-// page 0. No journal is DK_OK. A journal with n_records = 0 is a begin that
+// page 0. No journal is MEO_OK. A journal with n_records = 0 is a begin that
 // never modified anything: it is removed and ignored. A checksum failure, a
-// torn record region, or a hot journal with no database is -DK_ERR_CORRUPT;
+// torn record region, or a hot journal with no database is -MEO_ERR_CORRUPT;
 // nothing is written in those cases. A read-only pager cannot replay and
-// answers -DK_ERR_READONLY.
-export fn dk_jrn_recover(db_path: string, db_file: DkFile,
+// answers -MEO_ERR_READONLY.
+export fn meo_jrn_recover(db_path: string, db_file: MeoFile,
   read_only: bool, max_pages: uint32) -> int32 {
   var jpath: string = jrn_path(db_path);
-  if (jpath.chars == 0) { return -DK_ERR_NOMEM; }
-  var f: DkFile = dk_file_open(jpath, DK_OPEN_READ);
+  if (jpath.chars == 0) { return -MEO_ERR_NOMEM; }
+  var f: MeoFile = meo_file_open(jpath, MEO_OPEN_READ);
   if (!f.is_open) {
     // No journal file: the common case.
     free(jpath.chars);
-    return DK_OK;
+    return MEO_OK;
   }
-  var size: int64 = dk_file_size(f);
+  var size: int64 = meo_file_size(f);
   if (size < 0) {
-    dk_file_close(f);
+    meo_file_close(f);
     free(jpath.chars);
     return (int32)size;
   }
   if (size == 0) {
     // begin did not finish writing its header, so no data page was written.
-    dk_file_close(f);
-    var zrc: int32 = dk_file_unlink(jpath);
+    meo_file_close(f);
+    var zrc: int32 = meo_file_unlink(jpath);
     free(jpath.chars);
     return zrc;
   }
-  if (size < (int64)DK_JRN_HDR) {
-    dk_file_close(f);
+  if (size < (int64)MEO_JRN_HDR) {
+    meo_file_close(f);
     free(jpath.chars);
-    return -DK_ERR_CORRUPT;
+    return -MEO_ERR_CORRUPT;
   }
   var hdr: uint8[64];
   var n: int32 = 0;
   var rc: int32 = jrn_read_header(f, &hdr[0], &n);
-  if (rc != DK_OK) {
-    dk_file_close(f);
+  if (rc != MEO_OK) {
+    meo_file_close(f);
     free(jpath.chars);
     return rc;
   }
   rc = jrn_validate_checksum(f, &hdr[0], n);
-  if (rc != DK_OK) {
-    dk_file_close(f);
+  if (rc != MEO_OK) {
+    meo_file_close(f);
     free(jpath.chars);
     return rc;
   }
   if (n == 0) {
     // Not hot: a begin that changed nothing. Remove it and open normally.
-    dk_file_close(f);
-    var nrc: int32 = dk_file_unlink(jpath);
+    meo_file_close(f);
+    var nrc: int32 = meo_file_unlink(jpath);
     free(jpath.chars);
     return nrc;
   }
   if (read_only) {
-    dk_file_close(f);
+    meo_file_close(f);
     free(jpath.chars);
-    return -DK_ERR_READONLY;
+    return -MEO_ERR_READONLY;
   }
-  var db_pages: uint32 = (uint32)dk_get_u64le(&hdr[0], JRN_OFF_DB_PAGES);
+  var db_pages: uint32 = (uint32)meo_get_u64le(&hdr[0], JRN_OFF_DB_PAGES);
   if (db_pages == 0 || db_pages > max_pages) {
-    dk_file_close(f);
+    meo_file_close(f);
     free(jpath.chars);
-    return -DK_ERR_CORRUPT;
+    return -MEO_ERR_CORRUPT;
   }
-  var dsize: int64 = dk_file_size(db_file);
+  var dsize: int64 = meo_file_size(db_file);
   if (dsize <= 0) {
     // A hot journal with no database is not something to guess about.
-    dk_file_close(f);
+    meo_file_close(f);
     free(jpath.chars);
-    return -DK_ERR_CORRUPT;
+    return -MEO_ERR_CORRUPT;
   }
   rc = jrn_replay_records(f, db_file, n, db_pages);
-  if (rc == DK_OK) {
-    rc = dk_file_truncate(db_file,
-      (int64)db_pages * (int64)DK_PAGE_SIZE);
+  if (rc == MEO_OK) {
+    rc = meo_file_truncate(db_file,
+      (int64)db_pages * (int64)MEO_PAGE_SIZE);
   }
-  if (rc == DK_OK) { rc = dk_file_sync(db_file); }
-  dk_file_close(f);
-  if (rc != DK_OK) {
+  if (rc == MEO_OK) { rc = meo_file_sync(db_file); }
+  meo_file_close(f);
+  if (rc != MEO_OK) {
     free(jpath.chars);
     return rc;
   }
   // The journal is removed last, after the restored database is durable.
-  rc = dk_file_unlink(jpath);
+  rc = meo_file_unlink(jpath);
   free(jpath.chars);
   return rc;
 }

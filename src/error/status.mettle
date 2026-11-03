@@ -2,43 +2,43 @@
 //
 // Values are fixed by PHASE1.md section 2. Do not add, remove, renumber or
 // reorder them; later stages and on-disk/API compatibility depend on the
-// numbers. Every dk_* function returns DK_OK (0) or a positive count on
-// success and -DK_ERR_* on failure; the status helpers accept either the
+// numbers. Every meo_* function returns MEO_OK (0) or a positive count on
+// success and -MEO_ERR_* on failure; the status helpers accept either the
 // positive constant or the negative form a function returned.
 
 import "std/mem";
 
-export const DK_OK: int32 = 0;
-export const DK_ERR_IO: int32 = 1;           // read/write/sync/close failed
-export const DK_ERR_NOMEM: int32 = 2;        // allocation failed
-export const DK_ERR_NOSPC: int32 = 3;        // ran out of pages / file space
-export const DK_ERR_CORRUPT: int32 = 4;      // checksum, structure, bad size
-export const DK_ERR_NOT_A_DB: int32 = 5;     // magic mismatch
-export const DK_ERR_VERSION: int32 = 6;      // format version / page size
-export const DK_ERR_BUSY: int32 = 7;         // no evictable frame
-export const DK_ERR_FULL: int32 = 8;         // page/array has no room
-export const DK_ERR_RANGE: int32 = 9;        // page number out of range
-export const DK_ERR_USAGE: int32 = 10;       // bad argument / bad state
-export const DK_ERR_UNSUPPORTED: int32 = 11; // not in this phase
-export const DK_ERR_READONLY: int32 = 12;
+export const MEO_OK: int32 = 0;
+export const MEO_ERR_IO: int32 = 1;           // read/write/sync/close failed
+export const MEO_ERR_NOMEM: int32 = 2;        // allocation failed
+export const MEO_ERR_NOSPC: int32 = 3;        // ran out of pages / file space
+export const MEO_ERR_CORRUPT: int32 = 4;      // checksum, structure, bad size
+export const MEO_ERR_NOT_A_DB: int32 = 5;     // magic mismatch
+export const MEO_ERR_VERSION: int32 = 6;      // format version / page size
+export const MEO_ERR_BUSY: int32 = 7;         // no evictable frame
+export const MEO_ERR_FULL: int32 = 8;         // page/array has no room
+export const MEO_ERR_RANGE: int32 = 9;        // page number out of range
+export const MEO_ERR_USAGE: int32 = 10;       // bad argument / bad state
+export const MEO_ERR_UNSUPPORTED: int32 = 11; // not in this phase
+export const MEO_ERR_READONLY: int32 = 12;
 
-export struct DkStatus {
+export struct MeoStatus {
   code: int32;
   arg: int64;
 }
 
 // Reduce a return value to the magnitude of its status code. A negative
-// value is the failure form of the same code, so -DK_ERR_CORRUPT and
-// DK_ERR_CORRUPT name the same status. INT32_MIN stays negative and is
+// value is the failure form of the same code, so -MEO_ERR_CORRUPT and
+// MEO_ERR_CORRUPT name the same status. INT32_MIN stays negative and is
 // therefore unknown, which is correct: it is not a code we define.
-fn dk_status_magnitude(code: int32) -> int32 {
+fn meo_status_magnitude(code: int32) -> int32 {
   if (code < 0) { return -code; }
   return code;
 }
 
-fn dk_status_known(code: int32) -> bool {
-  var c: int32 = dk_status_magnitude(code);
-  return (c >= DK_OK) && (c <= DK_ERR_READONLY);
+fn meo_status_known(code: int32) -> bool {
+  var c: int32 = meo_status_magnitude(code);
+  return (c >= MEO_OK) && (c <= MEO_ERR_READONLY);
 }
 
 // Return the static, uppercase name of a status code. NEVER allocates, for any
@@ -47,10 +47,10 @@ fn dk_status_known(code: int32) -> bool {
 // An unknown code is reported as "UNKNOWN" -- the code itself is dropped,
 // because building "UNKNOWN{code}" would allocate and make this function's
 // ownership depend on its argument, which is a leak-or-free-a-literal trap for
-// every caller. When the number matters, use dk_status_str, which is documented
+// every caller. When the number matters, use meo_status_str, which is documented
 // as allocating.
-export fn dk_status_name(code: int32) -> string {
-  var c: int32 = dk_status_magnitude(code);
+export fn meo_status_name(code: int32) -> string {
+  var c: int32 = meo_status_magnitude(code);
   switch (c) {
     case 0: { return "OK"; }
     case 1: { return "IO"; }
@@ -70,27 +70,27 @@ export fn dk_status_name(code: int32) -> string {
 }
 
 // Success in the UNIVERSAL return convention of PHASE1.md section 1: any
-// non-negative return is a success, whether it is DK_OK (0), a byte count from
-// a read, a page count, or the cell offset dk_page_alloc returns. A failure is
-// the negative form, -DK_ERR_*.
+// non-negative return is a success, whether it is MEO_OK (0), a byte count from
+// a read, a page count, or the cell offset meo_page_alloc returns. A failure is
+// the negative form, -MEO_ERR_*.
 //
-// The consequence worth reading twice: dk_status_ok(DK_ERR_CORRUPT) is TRUE,
+// The consequence worth reading twice: meo_status_ok(MEO_ERR_CORRUPT) is TRUE,
 // because the positive constant is not a failure return. Only a negative value
-// is. Use dk_status_failed for the error test.
-export fn dk_status_ok(code: int32) -> bool {
+// is. Use meo_status_failed for the error test.
+export fn meo_status_ok(code: int32) -> bool {
   return code >= 0;
 }
 
-export fn dk_status_failed(code: int32) -> bool {
+export fn meo_status_failed(code: int32) -> bool {
   return code < 0;
 }
 
-// Lowercase counterpart of dk_status_name, kept as literals rather than
+// Lowercase counterpart of meo_status_name, kept as literals rather than
 // derived by rewriting a string: an interpolated buffer must not be mutated
 // (it traps under --safe), and copying the name only to lowercase it would
 // add an allocation for no reason.
-fn dk_status_lname(code: int32) -> string {
-  var c: int32 = dk_status_magnitude(code);
+fn meo_status_lname(code: int32) -> string {
+  var c: int32 = meo_status_magnitude(code);
   switch (c) {
     case 0: { return "ok"; }
     case 1: { return "io"; }
@@ -113,10 +113,10 @@ fn dk_status_lname(code: int32) -> string {
 // magnitude, and the argument. Allocates; the caller owns the result and
 // must free(s.chars). For an unknown code this also allocates the temporary
 // lowercase name, which is freed here before returning.
-export fn dk_status_str(s: DkStatus) -> string {
-  var c: int32 = dk_status_magnitude(s.code);
-  var name: string = dk_status_lname(c);
-  if (dk_status_known(c)) {
+export fn meo_status_str(s: MeoStatus) -> string {
+  var c: int32 = meo_status_magnitude(s.code);
+  var name: string = meo_status_lname(c);
+  if (meo_status_known(c)) {
     return "{name}({c}) arg={s.arg}";
   }
   var out: string = "{name}({c}) arg={s.arg}";

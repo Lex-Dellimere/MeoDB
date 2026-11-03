@@ -51,13 +51,13 @@ fn b_same(a: uint8*, b: uint8*, n: int64) -> bool {
 // ---- file.mettle ------------------------------------------------------------
 
 fn b_flags_contract() -> int32 {
-  if (DK_OPEN_READ != 1) { return 1; }
-  if (DK_OPEN_WRITE != 2) { return 2; }
-  if (DK_OPEN_CREATE != 4) { return 3; }
-  if (DK_OPEN_EXCL != 8) { return 4; }
-  var all: int32 = DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE | DK_OPEN_EXCL;
+  if (MEO_OPEN_READ != 1) { return 1; }
+  if (MEO_OPEN_WRITE != 2) { return 2; }
+  if (MEO_OPEN_CREATE != 4) { return 3; }
+  if (MEO_OPEN_EXCL != 8) { return 4; }
+  var all: int32 = MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_EXCL;
   if (all != 15) { return 5; }  // disjoint bits: a backend translates by mask
-  var h: DkFile = { handle: (int64)(0 - DK_ERR_USAGE), is_open: false };
+  var h: MeoFile = { handle: (int64)(0 - MEO_ERR_USAGE), is_open: false };
   if (h.is_open) { return 6; }
   h.is_open = true;
   h.handle = 3;
@@ -68,27 +68,27 @@ fn b_flags_contract() -> int32 {
 // ---- platform/file_linux ----------------------------------------------------
 
 fn b_file_io() -> int32 {
-  var f: DkFile = dk_file_open(B_DB, DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
+  var f: MeoFile = meo_file_open(B_DB, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
   if (!b_ok(f.is_open, "open create rw")) { return 1; }
   if (!b_ok(f.handle >= 0, "open returns a descriptor")) { return 1; }
   // CREATE alone must not truncate; make the file empty explicitly so a
   // second run starts from the same state.
-  if (!b_ok(dk_file_truncate(f, 0) == DK_OK, "truncate to empty")) { return 1; }
-  if (!b_ok(dk_file_size(f) == 0, "size is 0 after truncate")) { return 1; }
+  if (!b_ok(meo_file_truncate(f, 0) == MEO_OK, "truncate to empty")) { return 1; }
+  if (!b_ok(meo_file_size(f) == 0, "size is 0 after truncate")) { return 1; }
 
-  if (!b_ok(dk_file_write_at(f, 0, 0, 8) == -DK_ERR_USAGE, "write with null buf is USAGE")) {
+  if (!b_ok(meo_file_write_at(f, 0, 0, 8) == -MEO_ERR_USAGE, "write with null buf is USAGE")) {
     return 1;
   }
-  if (!b_ok(dk_file_read_at(f, 0, 0, 8) == -DK_ERR_USAGE, "read with null buf is USAGE")) {
+  if (!b_ok(meo_file_read_at(f, 0, 0, 8) == -MEO_ERR_USAGE, "read with null buf is USAGE")) {
     return 1;
   }
-  if (!b_ok(dk_file_write_at(f, -1, 0, 1) == -DK_ERR_USAGE, "write at negative offset is USAGE")) {
+  if (!b_ok(meo_file_write_at(f, -1, 0, 1) == -MEO_ERR_USAGE, "write at negative offset is USAGE")) {
     return 1;
   }
-  if (!b_ok(dk_file_read_at(f, 0, 0, -1) == -DK_ERR_USAGE, "read with negative len is USAGE")) {
+  if (!b_ok(meo_file_read_at(f, 0, 0, -1) == -MEO_ERR_USAGE, "read with negative len is USAGE")) {
     return 1;
   }
-  if (!b_ok(dk_file_truncate(f, -1) == -DK_ERR_USAGE, "truncate negative is USAGE")) { return 1; }
+  if (!b_ok(meo_file_truncate(f, -1) == -MEO_ERR_USAGE, "truncate negative is USAGE")) { return 1; }
 
   var a: uint8[] = new uint8[8192];
   var b: uint8[] = new uint8[4096];
@@ -96,92 +96,92 @@ fn b_file_io() -> int32 {
   b_fill(a.data, 8192, 1);
   b_fill(b.data, 4096, 99);
 
-  if (!b_ok(dk_file_write_at(f, 0, a.data, 8192) == DK_OK, "write 8192 at 0")) { return 1; }
-  if (!b_ok(dk_file_write_at(f, 8192, b.data, 4096) == DK_OK, "write 4096 at 8192")) { return 1; }
-  if (!b_ok(dk_file_write_at(f, 12288, b.data, 0) == DK_OK, "zero-length write is DK_OK")) {
+  if (!b_ok(meo_file_write_at(f, 0, a.data, 8192) == MEO_OK, "write 8192 at 0")) { return 1; }
+  if (!b_ok(meo_file_write_at(f, 8192, b.data, 4096) == MEO_OK, "write 4096 at 8192")) { return 1; }
+  if (!b_ok(meo_file_write_at(f, 12288, b.data, 0) == MEO_OK, "zero-length write is MEO_OK")) {
     return 1;
   }
-  if (!b_ok(dk_file_sync(f) == DK_OK, "fsync returns 0")) { return 1; }
-  if (!b_ok(dk_file_size(f) == 12288, "size is 12288")) { return 1; }
+  if (!b_ok(meo_file_sync(f) == MEO_OK, "fsync returns 0")) { return 1; }
+  if (!b_ok(meo_file_size(f) == 12288, "size is 12288")) { return 1; }
 
   var ra: uint8[] = new uint8[8192];
   var rb: uint8[] = new uint8[4096];
   b_fill(ra.data, 8192, 200);
   b_fill(rb.data, 4096, 201);
-  if (!b_ok(dk_file_read_at(f, 0, ra.data, 8192) == 8192, "read 8192 at 0 returns 8192")) {
+  if (!b_ok(meo_file_read_at(f, 0, ra.data, 8192) == 8192, "read 8192 at 0 returns 8192")) {
     return 1;
   }
-  if (!b_ok(dk_file_read_at(f, 8192, rb.data, 4096) == 4096, "read 4096 at 8192 returns 4096")) {
+  if (!b_ok(meo_file_read_at(f, 8192, rb.data, 4096) == 4096, "read 4096 at 8192 returns 4096")) {
     return 1;
   }
   if (!b_ok(b_same(ra.data, a.data, 8192), "first 8192 bytes read back")) { return 1; }
   if (!b_ok(b_same(rb.data, b.data, 4096), "next 4096 bytes read back")) { return 1; }
 
   // read_at reports what the file has: a count, 0 at EOF, never a padded len.
-  if (!b_ok(dk_file_read_at(f, 12288, rb.data, 16) == 0, "read at EOF returns 0")) { return 1; }
-  if (!b_ok(dk_file_read_at(f, 20000, rb.data, 16) == 0, "read past EOF returns 0")) { return 1; }
-  if (!b_ok(dk_file_read_at(f, 12280, rb.data, 16) == 8, "short read returns what exists")) {
+  if (!b_ok(meo_file_read_at(f, 12288, rb.data, 16) == 0, "read at EOF returns 0")) { return 1; }
+  if (!b_ok(meo_file_read_at(f, 20000, rb.data, 16) == 0, "read past EOF returns 0")) { return 1; }
+  if (!b_ok(meo_file_read_at(f, 12280, rb.data, 16) == 8, "short read returns what exists")) {
     return 1;
   }
   if (!b_ok(b_same(rb.data, b.data + 4088, 8), "short read has the tail bytes")) { return 1; }
-  if (!b_ok(dk_file_read_at(f, 0, ra.data, 0) == 0, "zero-length read is 0")) { return 1; }
+  if (!b_ok(meo_file_read_at(f, 0, ra.data, 0) == 0, "zero-length read is 0")) { return 1; }
   // The count is an int32, so a request that cannot be reported is refused
   // instead of being truncated into a bogus count.
-  if (!b_ok(dk_file_read_at(f, 0, ra.data, (int64)1 << 31) == -DK_ERR_USAGE,
+  if (!b_ok(meo_file_read_at(f, 0, ra.data, (int64)1 << 31) == -MEO_ERR_USAGE,
             "read longer than INT32_MAX is USAGE")) { return 1; }
 
   // close is idempotent and a closed handle is a usage error for every op.
-  if (!b_ok(dk_file_close(f) == DK_OK, "close returns DK_OK")) { return 1; }
-  if (!b_ok(dk_file_close(f) == DK_OK, "close twice is DK_OK")) { return 1; }
-  if (!b_ok(dk_file_sync(f) == -DK_ERR_USAGE, "sync on a closed handle is USAGE")) { return 1; }
-  if (!b_ok(dk_file_read_at(f, 0, ra.data, 8) == -DK_ERR_USAGE, "read on closed is USAGE")) {
+  if (!b_ok(meo_file_close(f) == MEO_OK, "close returns MEO_OK")) { return 1; }
+  if (!b_ok(meo_file_close(f) == MEO_OK, "close twice is MEO_OK")) { return 1; }
+  if (!b_ok(meo_file_sync(f) == -MEO_ERR_USAGE, "sync on a closed handle is USAGE")) { return 1; }
+  if (!b_ok(meo_file_read_at(f, 0, ra.data, 8) == -MEO_ERR_USAGE, "read on closed is USAGE")) {
     return 1;
   }
-  if (!b_ok(dk_file_write_at(f, 0, ra.data, 8) == -DK_ERR_USAGE, "write on closed is USAGE")) {
+  if (!b_ok(meo_file_write_at(f, 0, ra.data, 8) == -MEO_ERR_USAGE, "write on closed is USAGE")) {
     return 1;
   }
-  if (!b_ok(dk_file_size(f) == (int64)(0 - DK_ERR_USAGE), "size on closed is USAGE")) { return 1; }
-  var zero_handle: DkFile = { handle: 0, is_open: false };
-  if (!b_ok(dk_file_close(zero_handle) == DK_OK, "close of a zeroed handle is DK_OK")) { return 1; }
+  if (!b_ok(meo_file_size(f) == (int64)(0 - MEO_ERR_USAGE), "size on closed is USAGE")) { return 1; }
+  var zero_handle: MeoFile = { handle: 0, is_open: false };
+  if (!b_ok(meo_file_close(zero_handle) == MEO_OK, "close of a zeroed handle is MEO_OK")) { return 1; }
 
   // Reopen read-only: the bytes are durable and the mode is honoured.
-  var r: DkFile = dk_file_open(B_DB, DK_OPEN_READ);
+  var r: MeoFile = meo_file_open(B_DB, MEO_OPEN_READ);
   if (!b_ok(r.is_open, "reopen read-only")) { return 1; }
-  if (!b_ok(dk_file_size(r) == 12288, "size survives close")) { return 1; }
+  if (!b_ok(meo_file_size(r) == 12288, "size survives close")) { return 1; }
   var rc: uint8[] = new uint8[8192];
-  if (!b_ok(dk_file_read_at(r, 0, rc.data, 8192) == 8192, "read after reopen")) { return 1; }
+  if (!b_ok(meo_file_read_at(r, 0, rc.data, 8192) == 8192, "read after reopen")) { return 1; }
   if (!b_ok(b_same(rc.data, a.data, 8192), "content survives close")) { return 1; }
   // EBADF (a write on an O_RDONLY descriptor) is a bad state, so USAGE; the
   // platform layer has no READONLY code, the pager owns that decision.
-  if (!b_ok(dk_file_write_at(r, 0, a.data, 1) == -DK_ERR_USAGE,
+  if (!b_ok(meo_file_write_at(r, 0, a.data, 1) == -MEO_ERR_USAGE,
             "write on a read-only fd is USAGE")) { return 1; }
-  if (!b_ok(dk_file_close(r) == DK_OK, "close read-only")) { return 1; }
+  if (!b_ok(meo_file_close(r) == MEO_OK, "close read-only")) { return 1; }
   return 0;
 }
 
 fn b_file_errors() -> int32 {
-  var missing: DkFile = dk_file_open("build/tmp_b_self_missing.dat", DK_OPEN_READ);
+  var missing: MeoFile = meo_file_open("build/tmp_b_self_missing.dat", MEO_OPEN_READ);
   if (!b_ok(!missing.is_open, "open of a missing file fails")) { return 1; }
-  if (!b_ok(missing.handle == (int64)(0 - DK_ERR_IO), "missing file maps to IO")) { return 1; }
+  if (!b_ok(missing.handle == (int64)(0 - MEO_ERR_IO), "missing file maps to IO")) { return 1; }
 
-  var nodir: DkFile = dk_file_open("build/tmp_b_self_no_dir/x.dat", DK_OPEN_WRITE | DK_OPEN_CREATE);
+  var nodir: MeoFile = meo_file_open("build/tmp_b_self_no_dir/x.dat", MEO_OPEN_WRITE | MEO_OPEN_CREATE);
   if (!b_ok(!nodir.is_open, "open in a missing directory fails")) { return 1; }
-  if (!b_ok(nodir.handle == (int64)(0 - DK_ERR_IO), "missing directory maps to IO")) { return 1; }
+  if (!b_ok(nodir.handle == (int64)(0 - MEO_ERR_IO), "missing directory maps to IO")) { return 1; }
 
-  var noflags: DkFile = dk_file_open(B_DB, 0);
+  var noflags: MeoFile = meo_file_open(B_DB, 0);
   if (!b_ok(!noflags.is_open, "open with no read/write fails")) { return 1; }
-  if (!b_ok(noflags.handle == (int64)(0 - DK_ERR_USAGE), "no access mode is USAGE")) { return 1; }
+  if (!b_ok(noflags.handle == (int64)(0 - MEO_ERR_USAGE), "no access mode is USAGE")) { return 1; }
 
-  var nopath: DkFile = dk_file_open("", DK_OPEN_READ);
+  var nopath: MeoFile = meo_file_open("", MEO_OPEN_READ);
   if (!b_ok(!nopath.is_open, "open of an empty path fails")) { return 1; }
-  if (!b_ok(nopath.handle == (int64)(0 - DK_ERR_USAGE), "empty path is USAGE")) { return 1; }
+  if (!b_ok(nopath.handle == (int64)(0 - MEO_ERR_USAGE), "empty path is USAGE")) { return 1; }
 
-  var excl: DkFile = dk_file_open(B_DB, DK_OPEN_WRITE | DK_OPEN_CREATE | DK_OPEN_EXCL);
+  var excl: MeoFile = meo_file_open(B_DB, MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_EXCL);
   if (!b_ok(!excl.is_open, "exclusive create of an existing file fails")) { return 1; }
 
   // A closed struct is a value; every op on it is USAGE, not a crash.
-  var closed: DkFile = { handle: (int64)(0 - DK_ERR_IO), is_open: false };
-  if (!b_ok(dk_file_truncate(closed, 0) == -DK_ERR_USAGE, "truncate on a failed open is USAGE")) {
+  var closed: MeoFile = { handle: (int64)(0 - MEO_ERR_IO), is_open: false };
+  if (!b_ok(meo_file_truncate(closed, 0) == -MEO_ERR_USAGE, "truncate on a failed open is USAGE")) {
     return 1;
   }
   return 0;
@@ -190,31 +190,31 @@ fn b_file_errors() -> int32 {
 fn b_file_rename() -> int32 {
   // rename replaces its destination, so clearing the endpoints this way is
   // idempotent across runs; a missing source is an expected IO failure.
-  var _c1: int32 = dk_file_rename(B_EXCL, B_SCRATCH);
-  var _c2: int32 = dk_file_rename(B_RENAMED, B_SCRATCH);
+  var _c1: int32 = meo_file_rename(B_EXCL, B_SCRATCH);
+  var _c2: int32 = meo_file_rename(B_RENAMED, B_SCRATCH);
 
-  var fresh: DkFile = dk_file_open(B_EXCL, DK_OPEN_WRITE | DK_OPEN_CREATE | DK_OPEN_EXCL);
+  var fresh: MeoFile = meo_file_open(B_EXCL, MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_EXCL);
   if (!b_ok(fresh.is_open, "exclusive create of a new file")) { return 1; }
   var one: uint8[] = new uint8[1];
   one[0] = 42;
-  if (!b_ok(dk_file_write_at(fresh, 0, one.data, 1) == DK_OK, "write one byte")) { return 1; }
-  if (!b_ok(dk_file_close(fresh) == DK_OK, "close before rename")) { return 1; }
+  if (!b_ok(meo_file_write_at(fresh, 0, one.data, 1) == MEO_OK, "write one byte")) { return 1; }
+  if (!b_ok(meo_file_close(fresh) == MEO_OK, "close before rename")) { return 1; }
 
-  if (!b_ok(dk_file_rename(B_EXCL, B_RENAMED) == DK_OK, "rename returns DK_OK")) { return 1; }
-  var gone: DkFile = dk_file_open(B_EXCL, DK_OPEN_READ);
+  if (!b_ok(meo_file_rename(B_EXCL, B_RENAMED) == MEO_OK, "rename returns MEO_OK")) { return 1; }
+  var gone: MeoFile = meo_file_open(B_EXCL, MEO_OPEN_READ);
   if (!b_ok(!gone.is_open, "rename removed the old name")) { return 1; }
-  var moved: DkFile = dk_file_open(B_RENAMED, DK_OPEN_READ);
+  var moved: MeoFile = meo_file_open(B_RENAMED, MEO_OPEN_READ);
   if (!b_ok(moved.is_open, "rename created the new name")) { return 1; }
   var back: uint8[] = new uint8[1];
-  if (!b_ok(dk_file_read_at(moved, 0, back.data, 1) == 1, "renamed file keeps its bytes")) {
+  if (!b_ok(meo_file_read_at(moved, 0, back.data, 1) == 1, "renamed file keeps its bytes")) {
     return 1;
   }
   if (!b_ok(back[0] == 42, "renamed file content")) { return 1; }
-  if (!b_ok(dk_file_close(moved) == DK_OK, "close after rename")) { return 1; }
+  if (!b_ok(meo_file_close(moved) == MEO_OK, "close after rename")) { return 1; }
 
-  if (!b_ok(dk_file_rename("build/tmp_b_self_missing.dat", B_SCRATCH) == -DK_ERR_IO,
+  if (!b_ok(meo_file_rename("build/tmp_b_self_missing.dat", B_SCRATCH) == -MEO_ERR_IO,
             "rename of a missing file is IO")) { return 1; }
-  if (!b_ok(dk_file_rename(B_RENAMED, "") == -DK_ERR_USAGE, "rename to an empty path is USAGE")) {
+  if (!b_ok(meo_file_rename(B_RENAMED, "") == -MEO_ERR_USAGE, "rename to an empty path is USAGE")) {
     return 1;
   }
   return 0;
@@ -225,26 +225,26 @@ fn b_file_rename() -> int32 {
 // Shared by main() and the interpreter @test: pure arena behaviour, no files.
 // Codes identify the case that failed.
 fn b_arena_contract() -> int32 {
-  var a: DkArena* = dk_arena_new(256);
+  var a: MeoArena* = meo_arena_new(256);
   if (a == 0) { return 1; }
   if (a->chunk != 256) { return 2; }
 
   // Bad sizes are refused, not truncated into a bogus pointer.
-  if (dk_arena_alloc(a, 0) != 0) { return 3; }
-  if (dk_arena_alloc(a, -8) != 0) { return 4; }
-  if (dk_arena_alloc(a, (int64)1 << 42) != 0) { return 5; }
-  if (dk_arena_new(0) != 0) { return 6; }
-  if (dk_arena_new(-1) != 0) { return 7; }
-  if (dk_arena_alloc(0, 8) != 0) { return 8; }
+  if (meo_arena_alloc(a, 0) != 0) { return 3; }
+  if (meo_arena_alloc(a, -8) != 0) { return 4; }
+  if (meo_arena_alloc(a, (int64)1 << 42) != 0) { return 5; }
+  if (meo_arena_new(0) != 0) { return 6; }
+  if (meo_arena_new(-1) != 0) { return 7; }
+  if (meo_arena_alloc(0, 8) != 0) { return 8; }
 
-  var p1: uint8* = dk_arena_alloc(a, 16);
+  var p1: uint8* = meo_arena_alloc(a, 16);
   if (p1 == 0) { return 9; }
   var i: int64 = 0;
   while (i < 16) {
     p1[i] = (uint8)171;
     i = i + 1;
   }
-  var p2: uint8* = dk_arena_alloc(a, 16);
+  var p2: uint8* = meo_arena_alloc(a, 16);
   if (p2 == 0) { return 10; }
   if ((int64)p2 - (int64)p1 != 16) { return 11; }  // bump, no overlap
 
@@ -253,7 +253,7 @@ fn b_arena_contract() -> int32 {
   var slots: uint8*[8];
   var k: int32 = 0;
   while (k < 8) {
-    var p: uint8* = dk_arena_alloc(a, 200);
+    var p: uint8* = meo_arena_alloc(a, 200);
     if (p == 0) { return 12; }
     slots[k] = p;
     p[0] = (uint8)k;
@@ -268,7 +268,7 @@ fn b_arena_contract() -> int32 {
   }
 
   // Larger than the chunk: a dedicated chunk, fully usable.
-  var huge: uint8* = dk_arena_alloc(a, 4096);
+  var huge: uint8* = meo_arena_alloc(a, 4096);
   if (huge == 0) { return 15; }
   huge[0] = 1;
   huge[4095] = 2;
@@ -277,9 +277,9 @@ fn b_arena_contract() -> int32 {
 
   // reset keeps the first chunk: the first allocation lands where it did the
   // first time, and the stale bytes it holds must not leak through alloc_zeroed.
-  dk_arena_reset(a);
+  meo_arena_reset(a);
   if (a->owns != 16 + 256) { return 18; }
-  var z: uint8* = dk_arena_alloc_zeroed(a, 16);
+  var z: uint8* = meo_arena_alloc_zeroed(a, 16);
   if (z == 0) { return 19; }
   if (z != p1) { return 20; }
   i = 0;
@@ -287,18 +287,18 @@ fn b_arena_contract() -> int32 {
     if (z[i] != 0) { return 21; }
     i = i + 1;
   }
-  var p3: uint8* = dk_arena_alloc(a, 16);
+  var p3: uint8* = meo_arena_alloc(a, 16);
   if (p3 == 0) { return 22; }
   if ((int64)p3 - (int64)z != 16) { return 23; }
 
   // A chunk that was freed by reset is gone, but allocating still works.
-  var big: uint8* = dk_arena_alloc(a, 1000);
+  var big: uint8* = meo_arena_alloc(a, 1000);
   if (big == 0) { return 24; }
   big[999] = 5;
   if (big[999] != 5) { return 25; }
 
-  dk_arena_free(a);
-  dk_arena_free(0);  // a null arena is a no-op
+  meo_arena_free(a);
+  meo_arena_free(0);  // a null arena is a no-op
   return 0;
 }
 

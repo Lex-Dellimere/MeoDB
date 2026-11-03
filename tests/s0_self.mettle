@@ -1,8 +1,8 @@
 // s0 self-test: the error-code contract. Pure, no files.
 //
 // Every code in PHASE1.md section 2 must map to its fixed name and be
-// non-ok except DK_OK, including through the negative form dk_* functions
-// return. dk_status_str must produce the documented lowercase form and
+// non-ok except MEO_OK, including through the negative form meo_* functions
+// return. meo_status_str must produce the documented lowercase form and
 // allocate exactly one string per call.
 
 import "../src/error/status.mettle";
@@ -33,35 +33,35 @@ fn s0_str_eq(a: string, b: string) -> bool {
 fn s0_scan_cases() -> int32 {
   var failures: int32 = 0;
   var cases: S0Case[13] = [
-    { code: DK_OK, name: "OK" },
-    { code: DK_ERR_IO, name: "IO" },
-    { code: DK_ERR_NOMEM, name: "NOMEM" },
-    { code: DK_ERR_NOSPC, name: "NOSPC" },
-    { code: DK_ERR_CORRUPT, name: "CORRUPT" },
-    { code: DK_ERR_NOT_A_DB, name: "NOT_A_DB" },
-    { code: DK_ERR_VERSION, name: "VERSION" },
-    { code: DK_ERR_BUSY, name: "BUSY" },
-    { code: DK_ERR_FULL, name: "FULL" },
-    { code: DK_ERR_RANGE, name: "RANGE" },
-    { code: DK_ERR_USAGE, name: "USAGE" },
-    { code: DK_ERR_UNSUPPORTED, name: "UNSUPPORTED" },
-    { code: DK_ERR_READONLY, name: "READONLY" },
+    { code: MEO_OK, name: "OK" },
+    { code: MEO_ERR_IO, name: "IO" },
+    { code: MEO_ERR_NOMEM, name: "NOMEM" },
+    { code: MEO_ERR_NOSPC, name: "NOSPC" },
+    { code: MEO_ERR_CORRUPT, name: "CORRUPT" },
+    { code: MEO_ERR_NOT_A_DB, name: "NOT_A_DB" },
+    { code: MEO_ERR_VERSION, name: "VERSION" },
+    { code: MEO_ERR_BUSY, name: "BUSY" },
+    { code: MEO_ERR_FULL, name: "FULL" },
+    { code: MEO_ERR_RANGE, name: "RANGE" },
+    { code: MEO_ERR_USAGE, name: "USAGE" },
+    { code: MEO_ERR_UNSUPPORTED, name: "UNSUPPORTED" },
+    { code: MEO_ERR_READONLY, name: "READONLY" },
   ];
   for i in 0..13 {
     var c: int32 = cases[i].code;
     // Values are pinned by PHASE1.md; this is what later stages rely on.
     if (c != i) { failures += 1; }
-    if (!s0_str_eq(dk_status_name(c), cases[i].name)) { failures += 1; }
-    if (c == DK_OK) {
-      if (!dk_status_ok(c)) { failures += 1; }
+    if (!s0_str_eq(meo_status_name(c), cases[i].name)) { failures += 1; }
+    if (c == MEO_OK) {
+      if (!meo_status_ok(c)) { failures += 1; }
     } else {
       // A positive constant is not a failure return; the negated form is.
-      if (!dk_status_ok(c)) { failures += 1; }
-      if (dk_status_ok(-c)) { failures += 1; }
-      if (!dk_status_failed(-c)) { failures += 1; }
-      // A function returns -DK_ERR_*, so the negative form must name the
+      if (!meo_status_ok(c)) { failures += 1; }
+      if (meo_status_ok(-c)) { failures += 1; }
+      if (!meo_status_failed(-c)) { failures += 1; }
+      // A function returns -MEO_ERR_*, so the negative form must name the
       // same status.
-      if (!s0_str_eq(dk_status_name(-c), cases[i].name)) { failures += 1; }
+      if (!s0_str_eq(meo_status_name(-c), cases[i].name)) { failures += 1; }
     }
   }
   return failures;
@@ -69,7 +69,7 @@ fn s0_scan_cases() -> int32 {
 
 @test fn s0_status_contract() -> int64 {
   if (s0_scan_cases() != 0) { return 1; }
-  var s: string = dk_status_str({ code: DK_ERR_CORRUPT, arg: 12 });
+  var s: string = meo_status_str({ code: MEO_ERR_CORRUPT, arg: 12 });
   var equal: bool = s0_str_eq(s, "corrupt(4) arg=12");
   free(s.chars);
   if (!equal) { return 2; }
@@ -79,48 +79,48 @@ fn s0_scan_cases() -> int32 {
 fn main() -> int32 {
   s0_check(s0_scan_cases() == 0, "status table");
 
-  // dk_status_str: lowercase name, magnitude, argument, and it allocates.
-  var corrupt: DkStatus = { code: DK_ERR_CORRUPT, arg: 12 };
-  var s_corrupt: string = dk_status_str(corrupt);
+  // meo_status_str: lowercase name, magnitude, argument, and it allocates.
+  var corrupt: MeoStatus = { code: MEO_ERR_CORRUPT, arg: 12 };
+  var s_corrupt: string = meo_status_str(corrupt);
   s0_check(s0_str_eq(s_corrupt, "corrupt(4) arg=12"), "str corrupt");
   free(s_corrupt.chars);
 
-  var ok: DkStatus = { code: DK_OK, arg: 0 };
-  var s_ok: string = dk_status_str(ok);
+  var ok: MeoStatus = { code: MEO_OK, arg: 0 };
+  var s_ok: string = meo_status_str(ok);
   s0_check(s0_str_eq(s_ok, "ok(0) arg=0"), "str ok");
   free(s_ok.chars);
 
-  var io_neg: DkStatus = { code: -DK_ERR_IO, arg: -5 };
-  var s_io: string = dk_status_str(io_neg);
+  var io_neg: MeoStatus = { code: -MEO_ERR_IO, arg: -5 };
+  var s_io: string = meo_status_str(io_neg);
   s0_check(s0_str_eq(s_io, "io(1) arg=-5"), "str io negative");
   free(s_io.chars);
 
-  // An unknown code is named by a static literal: dk_status_name never
-  // allocates, so its result is never freed. The number is dk_status_str's job.
-  var un: string = dk_status_name(99);
+  // An unknown code is named by a static literal: meo_status_name never
+  // allocates, so its result is never freed. The number is meo_status_str's job.
+  var un: string = meo_status_name(99);
   s0_check(s0_str_eq(un, "UNKNOWN"), "unknown name");
-  var un_neg: string = dk_status_name(-99);
+  var un_neg: string = meo_status_name(-99);
   s0_check(s0_str_eq(un_neg, "UNKNOWN"), "unknown name negative");
 
   // The universal success convention: a count is a success, a negative is not.
-  s0_check(dk_status_ok(4096), "a count is a success");
-  s0_check(dk_status_ok(0), "zero is a success");
-  s0_check(!dk_status_ok(-1), "a negative is a failure");
-  s0_check(dk_status_failed(-DK_ERR_IO), "failed() sees the negative form");
-  s0_check(!dk_status_failed(DK_ERR_IO), "a positive constant is not a failure");
+  s0_check(meo_status_ok(4096), "a count is a success");
+  s0_check(meo_status_ok(0), "zero is a success");
+  s0_check(!meo_status_ok(-1), "a negative is a failure");
+  s0_check(meo_status_failed(-MEO_ERR_IO), "failed() sees the negative form");
+  s0_check(!meo_status_failed(MEO_ERR_IO), "a positive constant is not a failure");
 
-  var unknown: DkStatus = { code: 99, arg: 3 };
-  var s_unknown: string = dk_status_str(unknown);
+  var unknown: MeoStatus = { code: 99, arg: 3 };
+  var s_unknown: string = meo_status_str(unknown);
   s0_check(s0_str_eq(s_unknown, "unknown99(99) arg=3"), "str unknown");
   free(s_unknown.chars);
 
   // Known names are literals, never allocations. That is a property of the
-  // body (no interpolation anywhere in dk_status_name), not of pointer
+  // body (no interpolation anywhere in meo_status_name), not of pointer
   // identity: a release build is free to emit two copies of the same literal,
   // so comparing .chars across calls fails under -O and proves nothing. Assert
   // content instead, and do not free the result.
-  var n1: string = dk_status_name(DK_ERR_CORRUPT);
-  var n2: string = dk_status_name(DK_ERR_CORRUPT);
+  var n1: string = meo_status_name(MEO_ERR_CORRUPT);
+  var n2: string = meo_status_name(MEO_ERR_CORRUPT);
   s0_check(s0_str_eq(n1, n2), "known name repeats");
   s0_check(n1.length == (uint64)7, "known name length");
 

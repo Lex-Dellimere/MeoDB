@@ -16,7 +16,7 @@
 //                      cells are not 4-byte page numbers. Catches a push that
 //                      appends at the wrong index, a pop that returns the
 //                      oldest entry, a count that counts the link, a fullness
-//                      check that disagrees with dk_page_alloc, and a churned
+//                      check that disagrees with meo_page_alloc, and a churned
 //                      page that strands its own popped bytes and answers FULL
 //                      with ~3054 of them still reclaimable.
 //   f2_alloc_reuse     alloc takes from the freelist before extending, zeroes
@@ -36,7 +36,7 @@
 //                      dropped from the chain without being reused, and a head
 //                      page that leaks the bytes of its own popped cells.
 //   f5_e4_reopen       PHASE2.md 2E E4: take 5, free 3, close, reopen,
-//                      dk_free_count == 3, then the three pages come back LIFO.
+//                      meo_free_count == 3, then the three pages come back LIFO.
 //                      Catches a freelist that is in-memory only or that loses
 //                      its root across close/reopen.
 //
@@ -65,36 +65,36 @@ const F_CORRUPT: string = "build/freelist_self_corrupt.dat";
 
 // One 4096-byte page on the heap: never a stack local (ARCHITECTURE.md 0.5).
 fn f_page() -> uint8* {
-  var buf: uint8[] = new uint8[DK_PAGE_SIZE];
+  var buf: uint8[] = new uint8[MEO_PAGE_SIZE];
   return buf.data;
 }
 
-// Make `path` a zero-byte file, which is the state DK_PAGER_CREATE is defined
+// Make `path` a zero-byte file, which is the state MEO_PAGER_CREATE is defined
 // against; there is no unlink in the phase-1 platform surface.
 fn f_reset(path: string) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, 0);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
   return rc;
 }
 
 // Allocate and format one data page, leaving `mark` in its body so a reused
 // page can prove it was zeroed.
-fn f_alloc_data(p: DkPager*, mark: uint8) -> uint32 {
-  var f: DkFrame* = dk_pager_alloc(p);
+fn f_alloc_data(p: MeoPager*, mark: uint8) -> uint32 {
+  var f: MeoFrame* = meo_pager_alloc(p);
   if (f == 0) { return 0; }
-  dk_page_init(f->data, DK_PAGE_BTREE_LEAF);
+  meo_page_init(f->data, MEO_PAGE_BTREE_LEAF);
   f->data[200] = mark;
   var page_no: uint32 = f->page_no;
-  dk_pager_release(p, f, true);
+  meo_pager_release(p, f, true);
   return page_no;
 }
 
-// True when all DK_PAGE_SIZE bytes of the frame are zero.
-fn f_all_zero(f: DkFrame*) -> bool {
+// True when all MEO_PAGE_SIZE bytes of the frame are zero.
+fn f_all_zero(f: MeoFrame*) -> bool {
   var i: int32 = 0;
-  while (i < DK_PAGE_SIZE) {
+  while (i < MEO_PAGE_SIZE) {
     if (f->data[i] != 0) { return false; }
     i += 1;
   }
@@ -105,14 +105,14 @@ fn f_all_zero(f: DkFrame*) -> bool {
 // publishes the root and the chain, not a page count, and the chain's length is
 // what decides whether a push bought the file another page. -1 on a chain that
 // cannot be read.
-fn f_chain_pages(p: DkPager*) -> int32 {
+fn f_chain_pages(p: MeoPager*) -> int32 {
   var n: int32 = 0;
-  var root: uint32 = dk_pager_root(p, DK_ROOT_FREELIST);
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_FREELIST);
   while (root != 0) {
-    var f: DkFrame* = dk_pager_get(p, root, false);
+    var f: MeoFrame* = meo_pager_get(p, root, false);
     if (f == 0) { return -1; }
-    var next: uint32 = dk_free_page_next(f->data);
-    dk_pager_release(p, f, false);
+    var next: uint32 = meo_free_page_next(f->data);
+    meo_pager_release(p, f, false);
     n += 1;
     root = next;
     if (n > 4096) { return -1; }
@@ -128,103 +128,103 @@ fn f_pass(name: string) {
 
 fn f1_page_format() -> int32 {
   var buf: uint8* = f_page();
-  if (!dk_t_check(buf != 0, "f1: page buffer")) { return 1; }
+  if (!meo_t_check(buf != 0, "f1: page buffer")) { return 1; }
   defer free(buf);
 
-  if (!dk_t_check_i64(dk_free_page_init(buf, 0), DK_OK, "f1: init")) {
+  if (!meo_t_check_i64(meo_free_page_init(buf, 0), MEO_OK, "f1: init")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_type(buf), DK_PAGE_FREELIST,
-      "f1: the page type is DK_PAGE_FREELIST")) {
+  if (!meo_t_check_i64(meo_page_type(buf), MEO_PAGE_FREELIST,
+      "f1: the page type is MEO_PAGE_FREELIST")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_check(buf), DK_OK,
+  if (!meo_t_check_i64(meo_page_check(buf), MEO_OK,
       "f1: an initialised freelist page is structurally legal")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_next(buf), 0, "f1: no successor")) {
+  if (!meo_t_check_i64((int64)meo_free_page_next(buf), 0, "f1: no successor")) {
     return 1;
   }
   // The bug: a count that includes the link cell, so an empty page reads 1.
-  if (!dk_t_check_i64((int64)dk_free_page_count(buf), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_count(buf), 0,
       "f1: an empty page holds no free numbers")) {
     return 1;
   }
-  if (!dk_t_check_false(dk_free_page_has(buf, 9), "f1: has() on an empty page")) {
+  if (!meo_t_check_false(meo_free_page_has(buf, 9), "f1: has() on an empty page")) {
     return 1;
   }
   // The bug: pop returning the link cell's value instead of 0.
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 0,
       "f1: pop on an empty page")) {
     return 1;
   }
 
   // Push order 9, 4, 7; pop order must be 7, 4, 9 (PHASE2.md 2E E4's LIFO).
-  if (!dk_t_check_i64(dk_free_page_push(buf, 9), DK_OK, "f1: push 9")) {
+  if (!meo_t_check_i64(meo_free_page_push(buf, 9), MEO_OK, "f1: push 9")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(buf, 4), DK_OK, "f1: push 4")) {
+  if (!meo_t_check_i64(meo_free_page_push(buf, 4), MEO_OK, "f1: push 4")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(buf, 7), DK_OK, "f1: push 7")) {
+  if (!meo_t_check_i64(meo_free_page_push(buf, 7), MEO_OK, "f1: push 7")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_count(buf), 3, "f1: count is 3")) {
+  if (!meo_t_check_i64((int64)meo_free_page_count(buf), 3, "f1: count is 3")) {
     return 1;
   }
-  if (!dk_t_check(dk_free_page_has(buf, 4), "f1: has(4)")) { return 1; }
-  if (!dk_t_check_false(dk_free_page_has(buf, 5), "f1: has(5) is false")) {
+  if (!meo_t_check(meo_free_page_has(buf, 4), "f1: has(4)")) { return 1; }
+  if (!meo_t_check_false(meo_free_page_has(buf, 5), "f1: has(5) is false")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_at(buf, 1), 9,
+  if (!meo_t_check_i64((int64)meo_free_page_at(buf, 1), 9,
       "f1: at(1) is the first pushed")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_at(buf, 3), 7,
+  if (!meo_t_check_i64((int64)meo_free_page_at(buf, 3), 7,
       "f1: at(3) is the last pushed")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_at(buf, 4), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_at(buf, 4), 0,
       "f1: at() past the last cell is 0")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_check(buf), DK_OK,
+  if (!meo_t_check_i64(meo_page_check(buf), MEO_OK,
       "f1: the page stays legal after three pushes")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 7,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 7,
       "f1: pop returns the newest")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 4,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 4,
       "f1: pop returns the second newest")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 9,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 9,
       "f1: pop returns the oldest")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_count(buf), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_count(buf), 0,
       "f1: the page is empty again")) {
     return 1;
   }
 
   // The link cell is untouched by pushes and pops.
-  if (!dk_t_check_i64(dk_free_page_init(buf, 42), DK_OK,
+  if (!meo_t_check_i64(meo_free_page_init(buf, 42), MEO_OK,
       "f1: re-init with a successor")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_next(buf), 42,
+  if (!meo_t_check_i64((int64)meo_free_page_next(buf), 42,
       "f1: the link names the successor")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(buf, 11), DK_OK, "f1: push onto a linked page")) {
+  if (!meo_t_check_i64(meo_free_page_push(buf, 11), MEO_OK, "f1: push onto a linked page")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 11, "f1: pop from a linked page")) {
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 11, "f1: pop from a linked page")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_next(buf), 42,
+  if (!meo_t_check_i64((int64)meo_free_page_next(buf), 42,
       "f1: the link survives a push and a pop")) {
     return 1;
   }
@@ -232,56 +232,56 @@ fn f1_page_format() -> int32 {
   // Fill to refusal. The capacity is derived from the page constants, never
   // written down: a cell costs its 4-byte body + the 2-byte length prefix +
   // its 2-byte pointer, and one cell is the link.
-  if (!dk_t_check_i64(dk_free_page_init(buf, 0), DK_OK, "f1: re-init empty")) {
+  if (!meo_t_check_i64(meo_free_page_init(buf, 0), MEO_OK, "f1: re-init empty")) {
     return 1;
   }
   var pushed: int32 = 0;
-  var rc: int32 = DK_OK;
+  var rc: int32 = MEO_OK;
   while (true) {
-    rc = dk_free_page_push(buf, (uint32)(pushed + 1));
-    if (rc != DK_OK) { break; }
+    rc = meo_free_page_push(buf, (uint32)(pushed + 1));
+    if (rc != MEO_OK) { break; }
     pushed += 1;
   }
-  if (!dk_t_check_i64((int64)rc, (int64)(0 - DK_ERR_FULL),
+  if (!meo_t_check_i64((int64)rc, (int64)(0 - MEO_ERR_FULL),
       "f1: a full page answers FULL, not USAGE or CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)pushed, (int64)(DK_FREE_PAGE_CAP - 1),
+  if (!meo_t_check_i64((int64)pushed, (int64)(MEO_FREE_PAGE_CAP - 1),
       "f1: capacity is the derived 510 - 1 free pages")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_count(buf),
-      (int64)(DK_FREE_PAGE_CAP - 1), "f1: a full page's count")) {
+  if (!meo_t_check_i64((int64)meo_free_page_count(buf),
+      (int64)(MEO_FREE_PAGE_CAP - 1), "f1: a full page's count")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_check(buf), DK_OK,
+  if (!meo_t_check_i64(meo_page_check(buf), MEO_OK,
       "f1: a full page is still structurally legal")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), (int64)pushed,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), (int64)pushed,
       "f1: a full page pops the newest")) {
     return 1;
   }
   var left: int32 = pushed - 1;
   var ok: bool = true;
   while (left > 0) {
-    if ((int32)dk_free_page_pop(buf) != left) { ok = false; }
+    if ((int32)meo_free_page_pop(buf) != left) { ok = false; }
     left -= 1;
   }
-  if (!dk_t_check(ok, "f1: a full page drains LIFO")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 0,
+  if (!meo_t_check(ok, "f1: a full page drains LIFO")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 0,
       "f1: a drained page answers 0")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_check(buf), DK_OK,
+  if (!meo_t_check_i64(meo_page_check(buf), MEO_OK,
       "f1: a drained page is still structurally legal")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(buf, 5), DK_OK,
+  if (!meo_t_check_i64(meo_free_page_push(buf, 5), MEO_OK,
       "f1: a drained page takes a push again")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 5,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 5,
       "f1: pop the refill's page")) {
     return 1;
   }
@@ -293,74 +293,74 @@ fn f1_page_format() -> int32 {
   // uses, so a refill must reach the same capacity as the first fill instead of
   // stranding the page after 127 pushes.
   pushed = 0;
-  rc = DK_OK;
+  rc = MEO_OK;
   while (true) {
-    rc = dk_free_page_push(buf, (uint32)(pushed + 1));
-    if (rc != DK_OK) { break; }
+    rc = meo_free_page_push(buf, (uint32)(pushed + 1));
+    if (rc != MEO_OK) { break; }
     pushed += 1;
   }
-  if (!dk_t_check_i64((int64)rc, (int64)(0 - DK_ERR_FULL),
+  if (!meo_t_check_i64((int64)rc, (int64)(0 - MEO_ERR_FULL),
       "f1: a refilled page answers FULL at the same capacity")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)pushed, (int64)(DK_FREE_PAGE_CAP - 1),
+  if (!meo_t_check_i64((int64)pushed, (int64)(MEO_FREE_PAGE_CAP - 1),
       "f1: a refill reuses the holes a drain left behind")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_check(buf), DK_OK,
+  if (!meo_t_check_i64(meo_page_check(buf), MEO_OK,
       "f1: a refilled page is structurally legal")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_reclaimable(buf), 0,
+  if (!meo_t_check_i64(meo_page_reclaimable(buf), 0,
       "f1: a full refilled page has nothing left to reclaim")) {
     return 1;
   }
 
   // A page of another type is a caller error, not a freelist page.
-  if (!dk_t_check_i64(dk_page_init(buf, DK_PAGE_BTREE_LEAF), DK_OK,
+  if (!meo_t_check_i64(meo_page_init(buf, MEO_PAGE_BTREE_LEAF), MEO_OK,
       "f1: a leaf page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(buf, 5), (int64)(0 - DK_ERR_USAGE),
+  if (!meo_t_check_i64(meo_free_page_push(buf, 5), (int64)(0 - MEO_ERR_USAGE),
       "f1: push on a leaf page is USAGE")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_pop(buf), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_pop(buf), 0,
       "f1: pop on a leaf page is 0")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_count(buf), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_count(buf), 0,
       "f1: count on a leaf page is 0")) {
     return 1;
   }
-  if (!dk_t_check_false(dk_free_page_has(buf, 5), "f1: has() on a leaf page")) {
+  if (!meo_t_check_false(meo_free_page_has(buf, 5), "f1: has() on a leaf page")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_page_next(buf), 0,
+  if (!meo_t_check_i64((int64)meo_free_page_next(buf), 0,
       "f1: next on a leaf page is 0")) {
     return 1;
   }
   // The bug: a freelist page whose cells are not 4-byte page numbers. It is
   // structurally legal, so only the cell-width guard can reject it.
-  if (!dk_t_check_i64(dk_free_page_init(buf, 0), DK_OK,
+  if (!meo_t_check_i64(meo_free_page_init(buf, 0), MEO_OK,
       "f1: a page for the width check")) {
     return 1;
   }
-  var wide: int32 = dk_page_alloc(buf, 5);
-  if (!dk_t_check(wide > 0, "f1: allocate a 5-byte body")) { return 1; }
-  if (!dk_t_check_i64(dk_page_insert_cell(buf, wide, dk_page_n_cells(buf)), DK_OK,
+  var wide: int32 = meo_page_alloc(buf, 5);
+  if (!meo_t_check(wide > 0, "f1: allocate a 5-byte body")) { return 1; }
+  if (!meo_t_check_i64(meo_page_insert_cell(buf, wide, meo_page_n_cells(buf)), MEO_OK,
       "f1: record the 5-byte body")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_page_check(buf), DK_OK,
+  if (!meo_t_check_i64(meo_page_check(buf), MEO_OK,
       "f1: the 5-byte cell is structurally legal")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(buf, 6), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_free_page_push(buf, 6), (int64)(0 - MEO_ERR_CORRUPT),
       "f1: a cell that is not a u32 page number is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_init(0, 0), (int64)(0 - DK_ERR_USAGE),
+  if (!meo_t_check_i64(meo_free_page_init(0, 0), (int64)(0 - MEO_ERR_USAGE),
       "f1: init with no buffer is USAGE")) {
     return 1;
   }
@@ -371,21 +371,21 @@ fn f1_page_format() -> int32 {
 // --- f2: alloc reuses before extending ------------------------------------
 
 fn f2_alloc_reuse() -> int32 {
-  if (!dk_t_check_i64(f_reset(F_REUSE), DK_OK, "f2: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(F_REUSE, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "f2: create")) { return 1; }
+  if (!meo_t_check_i64(f_reset(F_REUSE), MEO_OK, "f2: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(F_REUSE, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "f2: create")) { return 1; }
 
   var pages: uint32[5];
   var i: int32 = 0;
   while (i < 5) {
     pages[i] = f_alloc_data(p, (uint8)(0x40 + i));
-    if (!dk_t_check_i64((int64)pages[i], (int64)(i + 1),
+    if (!meo_t_check_i64((int64)pages[i], (int64)(i + 1),
         "f2: alloc extends the file in order")) {
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), 6,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), 6,
       "f2: five allocs make six pages")) {
     return 1;
   }
@@ -394,20 +394,20 @@ fn f2_alloc_reuse() -> int32 {
   // more page: seven.
   i = 2;
   while (i < 5) {
-    if (!dk_t_check_i64(dk_pager_free_page(p, pages[i]), DK_OK,
+    if (!meo_t_check_i64(meo_pager_free_page(p, pages[i]), MEO_OK,
         "f2: free a data page")) {
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 3, "f2: three pages are free")) {
+  if (!meo_t_check_i64(meo_free_count(p), 3, "f2: three pages are free")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), 7,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), 7,
       "f2: the freelist head is one new page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_root(p, DK_ROOT_FREELIST), 6,
+  if (!meo_t_check_i64(meo_pager_root(p, MEO_ROOT_FREELIST), 6,
       "f2: the freelist root is the new head")) {
     return 1;
   }
@@ -419,36 +419,36 @@ fn f2_alloc_reuse() -> int32 {
   want[2] = 3;
   i = 0;
   while (i < 3) {
-    var f: DkFrame* = dk_pager_alloc(p);
-    if (!dk_t_check(f != 0, "f2: alloc reuses a free page")) { return 1; }
-    if (!dk_t_check_i64((int64)f->page_no, (int64)want[i],
+    var f: MeoFrame* = meo_pager_alloc(p);
+    if (!meo_t_check(f != 0, "f2: alloc reuses a free page")) { return 1; }
+    if (!meo_t_check_i64((int64)f->page_no, (int64)want[i],
         "f2: alloc hands back the pages LIFO")) {
       return 1;
     }
     // The bug: a reused page that keeps its last owner's bytes.
-    if (!dk_t_check(f_all_zero(f), "f2: a reused page is zeroed")) {
+    if (!meo_t_check(f_all_zero(f), "f2: a reused page is zeroed")) {
       return 1;
     }
-    if (!dk_t_check_i64((int64)dk_pager_page_count(p), 7,
+    if (!meo_t_check_i64((int64)meo_pager_page_count(p), 7,
         "f2: reuse does not move page_count")) {
       return 1;
     }
-    dk_page_init(f->data, DK_PAGE_BTREE_LEAF);
-    if (!dk_t_check_i64(dk_pager_release(p, f, true), DK_OK,
+    meo_page_init(f->data, MEO_PAGE_BTREE_LEAF);
+    if (!meo_t_check_i64(meo_pager_release(p, f, true), MEO_OK,
         "f2: release a reused page")) {
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 0, "f2: reuse drains the freelist")) {
+  if (!meo_t_check_i64(meo_free_count(p), 0, "f2: reuse drains the freelist")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(p), DK_OK,
+  if (!meo_t_check_i64(meo_free_init(p), MEO_OK,
       "f2: the chain validates after reuse")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "f2: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "f2: close")) { return 1; }
+  meo_pager_free(p);
   f_pass("f2_alloc_reuse");
   return 0;
 }
@@ -456,282 +456,282 @@ fn f2_alloc_reuse() -> int32 {
 // --- f3: the free_page error matrix ---------------------------------------
 
 fn f3_free_errors() -> int32 {
-  if (!dk_t_check_i64(f_reset(F_ERRORS), DK_OK, "f3: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(F_ERRORS, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "f3: create")) { return 1; }
-  if (!dk_t_check_i64((int64)f_alloc_data(p, (uint8)0xA1), 1,
+  if (!meo_t_check_i64(f_reset(F_ERRORS), MEO_OK, "f3: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(F_ERRORS, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "f3: create")) { return 1; }
+  if (!meo_t_check_i64((int64)f_alloc_data(p, (uint8)0xA1), 1,
       "f3: page 1")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)f_alloc_data(p, (uint8)0xA2), 2,
+  if (!meo_t_check_i64((int64)f_alloc_data(p, (uint8)0xA2), 2,
       "f3: page 2")) {
     return 1;
   }
 
   // An empty freelist validates.
-  if (!dk_t_check_i64(dk_free_init(p), DK_OK, "f3: init with no freelist")) {
+  if (!meo_t_check_i64(meo_free_init(p), MEO_OK, "f3: init with no freelist")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 0, "f3: count with no freelist")) {
+  if (!meo_t_check_i64(meo_free_count(p), 0, "f3: count with no freelist")) {
     return 1;
   }
 
-  if (!dk_t_check_i64(dk_pager_free_page(p, 0), (int64)(0 - DK_ERR_USAGE),
+  if (!meo_t_check_i64(meo_pager_free_page(p, 0), (int64)(0 - MEO_ERR_USAGE),
       "f3: freeing page 0 is USAGE")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_err(p), (int64)DK_ERR_USAGE,
+  if (!meo_t_check_i64((int64)meo_pager_err(p), (int64)MEO_ERR_USAGE,
       "f3: USAGE is recorded")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_free_page(p, 3), (int64)(0 - DK_ERR_RANGE),
+  if (!meo_t_check_i64(meo_pager_free_page(p, 3), (int64)(0 - MEO_ERR_RANGE),
       "f3: freeing a page the file does not have is RANGE")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_err(p), (int64)DK_ERR_RANGE,
+  if (!meo_t_check_i64((int64)meo_pager_err(p), (int64)MEO_ERR_RANGE,
       "f3: RANGE names the page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_err_arg(p), 3, "f3: RANGE arg")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_err_arg(p), 3, "f3: RANGE arg")) { return 1; }
 
-  if (!dk_t_check_i64(dk_pager_free_page(p, 1), DK_OK, "f3: free page 1")) {
+  if (!meo_t_check_i64(meo_pager_free_page(p, 1), MEO_OK, "f3: free page 1")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 1, "f3: one page is free")) {
+  if (!meo_t_check_i64(meo_free_count(p), 1, "f3: one page is free")) {
     return 1;
   }
   // The bug: a double free that grows the count.
-  if (!dk_t_check_i64(dk_pager_free_page(p, 1), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_pager_free_page(p, 1), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: freeing the same page twice is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 1,
+  if (!meo_t_check_i64(meo_free_count(p), 1,
       "f3: a refused double free does not grow the count")) {
     return 1;
   }
   // The bug: freeing a freelist page, which would make the chain contain a
   // page the allocator may also hand out as data.
-  var head: uint32 = dk_pager_root(p, DK_ROOT_FREELIST);
-  if (!dk_t_check_i64((int64)head, 3, "f3: the head is page 3")) { return 1; }
-  if (!dk_t_check_i64(dk_pager_free_page(p, head), (int64)(0 - DK_ERR_CORRUPT),
+  var head: uint32 = meo_pager_root(p, MEO_ROOT_FREELIST);
+  if (!meo_t_check_i64((int64)head, 3, "f3: the head is page 3")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_free_page(p, head), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: freeing a freelist page is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 1,
+  if (!meo_t_check_i64(meo_free_count(p), 1,
       "f3: a refused chain-page free does not grow the count")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_free_page(0, 1), (int64)(0 - DK_ERR_USAGE),
+  if (!meo_t_check_i64(meo_pager_free_page(0, 1), (int64)(0 - MEO_ERR_USAGE),
       "f3: a null pager is USAGE")) {
     return 1;
   }
 
   // The chain the errors left behind is still sound, and page 1 is still free.
-  if (!dk_t_check_i64(dk_free_init(p), DK_OK,
+  if (!meo_t_check_i64(meo_free_init(p), MEO_OK,
       "f3: the chain validates after the refusals")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "f3: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "f3: close")) { return 1; }
+  meo_pager_free(p);
 
   // Read-only: a free is refused, a count still reads.
-  var ro: DkPager* = dk_pager_open(F_ERRORS, 8, DK_PAGER_READONLY);
-  if (!dk_t_check(ro != 0, "f3: reopen read-only")) { return 1; }
-  if (!dk_t_check_i64(dk_free_count(ro), 1,
+  var ro: MeoPager* = meo_pager_open(F_ERRORS, 8, MEO_PAGER_READONLY);
+  if (!meo_t_check(ro != 0, "f3: reopen read-only")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(ro), 1,
       "f3: a read-only pager can count the freelist")) {
     return 1;
   }
   // The bug: a read-only pager that writes the meta root.
-  if (!dk_t_check_i64(dk_pager_free_page(ro, 2), (int64)(0 - DK_ERR_READONLY),
+  if (!meo_t_check_i64(meo_pager_free_page(ro, 2), (int64)(0 - MEO_ERR_READONLY),
       "f3: freeing on a read-only pager is READONLY")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_root(ro, DK_ROOT_FREELIST),
+  if (!meo_t_check_i64((int64)meo_pager_root(ro, MEO_ROOT_FREELIST),
       (int64)head, "f3: a refused free leaves the root alone")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(ro), 1,
+  if (!meo_t_check_i64(meo_free_count(ro), 1,
       "f3: a refused free leaves the count alone")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(ro), DK_OK, "f3: close read-only")) {
+  if (!meo_t_check_i64(meo_pager_close(ro), MEO_OK, "f3: close read-only")) {
     return 1;
   }
-  dk_pager_free(ro);
+  meo_pager_free(ro);
 
   // The refusals were not durable changes either.
-  var rw: DkPager* = dk_pager_open(F_ERRORS, 8, 0);
-  if (!dk_t_check(rw != 0, "f3: reopen read-write")) { return 1; }
-  if (!dk_t_check_i64(dk_free_count(rw), 1,
+  var rw: MeoPager* = meo_pager_open(F_ERRORS, 8, 0);
+  if (!meo_t_check(rw != 0, "f3: reopen read-write")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(rw), 1,
       "f3: exactly one free page survived")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(rw), DK_OK,
+  if (!meo_t_check_i64(meo_free_init(rw), MEO_OK,
       "f3: the reopened chain validates")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(rw), DK_OK, "f3: close read-write")) {
+  if (!meo_t_check_i64(meo_pager_close(rw), MEO_OK, "f3: close read-write")) {
     return 1;
   }
-  dk_pager_free(rw);
+  meo_pager_free(rw);
 
   // A chain that is not a chain. Each shape is written through the pager, so
-  // dk_free_init sees exactly what a reopened corrupt file would hold.
-  if (!dk_t_check_i64(f_reset(F_CORRUPT), DK_OK, "f3: reset the corrupt case")) {
+  // meo_free_init sees exactly what a reopened corrupt file would hold.
+  if (!meo_t_check_i64(f_reset(F_CORRUPT), MEO_OK, "f3: reset the corrupt case")) {
     return 1;
   }
-  var c: DkPager* = dk_pager_open(F_CORRUPT, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(c != 0, "f3: create the corrupt case")) { return 1; }
-  if (!dk_t_check_i64((int64)f_alloc_data(c, (uint8)0xC1), 1,
+  var c: MeoPager* = meo_pager_open(F_CORRUPT, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(c != 0, "f3: create the corrupt case")) { return 1; }
+  if (!meo_t_check_i64((int64)f_alloc_data(c, (uint8)0xC1), 1,
       "f3: data page 1")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)f_alloc_data(c, (uint8)0xC2), 2,
+  if (!meo_t_check_i64((int64)f_alloc_data(c, (uint8)0xC2), 2,
       "f3: data page 2")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_free_page(c, 1), DK_OK,
+  if (!meo_t_check_i64(meo_pager_free_page(c, 1), MEO_OK,
       "f3: build a one-page chain")) {
     return 1;
   }
-  var chain_head: uint32 = dk_pager_root(c, DK_ROOT_FREELIST);
-  if (!dk_t_check_i64((int64)chain_head, 3, "f3: the chain head is page 3")) {
+  var chain_head: uint32 = meo_pager_root(c, MEO_ROOT_FREELIST);
+  if (!meo_t_check_i64((int64)chain_head, 3, "f3: the chain head is page 3")) {
     return 1;
   }
 
   // A root that names a data page.
-  if (!dk_t_check_i64(dk_pager_set_root(c, DK_ROOT_FREELIST, 2), DK_OK,
+  if (!meo_t_check_i64(meo_pager_set_root(c, MEO_ROOT_FREELIST, 2), MEO_OK,
       "f3: point the root at a data page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(c), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_free_init(c), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: a chain that names a data page is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(c), 0,
+  if (!meo_t_check_i64(meo_free_count(c), 0,
       "f3: counting a corrupt chain answers 0")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_err(c), (int64)DK_ERR_CORRUPT,
+  if (!meo_t_check_i64((int64)meo_pager_err(c), (int64)MEO_ERR_CORRUPT,
       "f3: the corrupt count is CORRUPT")) {
     return 1;
   }
 
   // A chain page that lists page 0, which can never be free.
-  if (!dk_t_check_i64(dk_pager_set_root(c, DK_ROOT_FREELIST, chain_head),
-      DK_OK, "f3: restore the chain head")) {
+  if (!meo_t_check_i64(meo_pager_set_root(c, MEO_ROOT_FREELIST, chain_head),
+      MEO_OK, "f3: restore the chain head")) {
     return 1;
   }
-  var cf: DkFrame* = dk_pager_get(c, chain_head, true);
-  if (!dk_t_check(cf != 0, "f3: pin the chain head")) { return 1; }
-  if (!dk_t_check_i64(dk_free_page_init(cf->data, 0), DK_OK,
+  var cf: MeoFrame* = meo_pager_get(c, chain_head, true);
+  if (!meo_t_check(cf != 0, "f3: pin the chain head")) { return 1; }
+  if (!meo_t_check_i64(meo_free_page_init(cf->data, 0), MEO_OK,
       "f3: rewrite the chain page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_page_push(cf->data, 0), DK_OK,
+  if (!meo_t_check_i64(meo_free_page_push(cf->data, 0), MEO_OK,
       "f3: list page 0 as free")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_release(c, cf, true), DK_OK,
+  if (!meo_t_check_i64(meo_pager_release(c, cf, true), MEO_OK,
       "f3: write the page-0 chain page back")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(c), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_free_init(c), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: a free list holding page 0 is CORRUPT")) {
     return 1;
   }
 
   // A chain page whose cell is not a 4-byte page number.
-  cf = dk_pager_get(c, chain_head, true);
-  if (!dk_t_check(cf != 0, "f3: pin the chain head again")) { return 1; }
-  if (!dk_t_check_i64(dk_free_page_init(cf->data, 0), DK_OK,
+  cf = meo_pager_get(c, chain_head, true);
+  if (!meo_t_check(cf != 0, "f3: pin the chain head again")) { return 1; }
+  if (!meo_t_check_i64(meo_free_page_init(cf->data, 0), MEO_OK,
       "f3: rewrite the chain page again")) {
     return 1;
   }
-  var wide: int32 = dk_page_alloc(cf->data, 5);
-  if (!dk_t_check(wide > 0, "f3: carve a 5-byte cell")) { return 1; }
-  if (!dk_t_check_i64(dk_page_insert_cell(cf->data, wide,
-      dk_page_n_cells(cf->data)), DK_OK, "f3: record the 5-byte cell")) {
+  var wide: int32 = meo_page_alloc(cf->data, 5);
+  if (!meo_t_check(wide > 0, "f3: carve a 5-byte cell")) { return 1; }
+  if (!meo_t_check_i64(meo_page_insert_cell(cf->data, wide,
+      meo_page_n_cells(cf->data)), MEO_OK, "f3: record the 5-byte cell")) {
     return 1;
   }
   // A real page number in the 5-byte body, so the width is the only thing
   // wrong with this cell: the range check alone would let it through.
-  dk_put_u32le(cf->data, (int64)wide, (uint32)2);
-  if (!dk_t_check_i64(dk_pager_release(c, cf, true), DK_OK,
+  meo_put_u32le(cf->data, (int64)wide, (uint32)2);
+  if (!meo_t_check_i64(meo_pager_release(c, cf, true), MEO_OK,
       "f3: write the wide cell back")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(c), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_free_init(c), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: a cell that is not a u32 page number is CORRUPT")) {
     return 1;
   }
 
   // A chain page that links to itself: the walk must stop, not spin.
-  cf = dk_pager_get(c, chain_head, true);
-  if (!dk_t_check(cf != 0, "f3: pin the chain head a third time")) { return 1; }
-  if (!dk_t_check_i64(dk_free_page_init(cf->data, chain_head), DK_OK,
+  cf = meo_pager_get(c, chain_head, true);
+  if (!meo_t_check(cf != 0, "f3: pin the chain head a third time")) { return 1; }
+  if (!meo_t_check_i64(meo_free_page_init(cf->data, chain_head), MEO_OK,
       "f3: link the page to itself")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_release(c, cf, true), DK_OK,
+  if (!meo_t_check_i64(meo_pager_release(c, cf, true), MEO_OK,
       "f3: write the looping page back")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(c), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_free_init(c), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: a chain that loops is CORRUPT, not a hang")) {
     return 1;
   }
 
   // A root outside the file.
-  if (!dk_t_check_i64(dk_pager_set_root(c, DK_ROOT_FREELIST, 9), DK_OK,
+  if (!meo_t_check_i64(meo_pager_set_root(c, MEO_ROOT_FREELIST, 9), MEO_OK,
       "f3: point the root outside the file")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(c), (int64)(0 - DK_ERR_CORRUPT),
+  if (!meo_t_check_i64(meo_free_init(c), (int64)(0 - MEO_ERR_CORRUPT),
       "f3: a chain outside the file is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(c), DK_OK, "f3: close the corrupt case")) {
+  if (!meo_t_check_i64(meo_pager_close(c), MEO_OK, "f3: close the corrupt case")) {
     return 1;
   }
-  dk_pager_free(c);
+  meo_pager_free(c);
 
   // A page the caller still has pinned is refused: the alloc that reuses it
   // zeroes the buffer the stale frame pointer still names (PHASE2.md 2C).
-  if (!dk_t_check_i64(f_reset(F_CORRUPT), DK_OK, "f3: reset the pinned case")) {
+  if (!meo_t_check_i64(f_reset(F_CORRUPT), MEO_OK, "f3: reset the pinned case")) {
     return 1;
   }
-  var k: DkPager* = dk_pager_open(F_CORRUPT, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(k != 0, "f3: create the pinned case")) { return 1; }
-  if (!dk_t_check_i64((int64)f_alloc_data(k, (uint8)0xD1), 1,
+  var k: MeoPager* = meo_pager_open(F_CORRUPT, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(k != 0, "f3: create the pinned case")) { return 1; }
+  if (!meo_t_check_i64((int64)f_alloc_data(k, (uint8)0xD1), 1,
       "f3: the pinned data page")) {
     return 1;
   }
-  var pf: DkFrame* = dk_pager_get(k, 1, true);
-  if (!dk_t_check(pf != 0, "f3: pin the data page")) { return 1; }
-  if (!dk_t_check_i64(dk_pager_free_page(k, 1), (int64)(0 - DK_ERR_USAGE),
+  var pf: MeoFrame* = meo_pager_get(k, 1, true);
+  if (!meo_t_check(pf != 0, "f3: pin the data page")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_free_page(k, 1), (int64)(0 - MEO_ERR_USAGE),
       "f3: freeing a pinned page is USAGE")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(k), 0,
+  if (!meo_t_check_i64(meo_free_count(k), 0,
       "f3: a refused pinned free does not grow the count")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_release(k, pf, false), DK_OK,
+  if (!meo_t_check_i64(meo_pager_release(k, pf, false), MEO_OK,
       "f3: release the pinned page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_free_page(k, 1), DK_OK,
+  if (!meo_t_check_i64(meo_pager_free_page(k, 1), MEO_OK,
       "f3: the same page frees once it is released")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(k), 1, "f3: the released free took")) {
+  if (!meo_t_check_i64(meo_free_count(k), 1, "f3: the released free took")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(k), DK_OK, "f3: close the pinned case")) {
+  if (!meo_t_check_i64(meo_pager_close(k), MEO_OK, "f3: close the pinned case")) {
     return 1;
   }
-  dk_pager_free(k);
+  meo_pager_free(k);
   f_pass("f3_free_errors");
   return 0;
 }
@@ -740,145 +740,145 @@ fn f3_free_errors() -> int32 {
 
 fn f4_chain_growth() -> int32 {
   const N: int32 = 600;
-  if (!dk_t_check_i64(f_reset(F_CHAIN), DK_OK, "f4: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(F_CHAIN, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "f4: create")) { return 1; }
+  if (!meo_t_check_i64(f_reset(F_CHAIN), MEO_OK, "f4: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(F_CHAIN, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "f4: create")) { return 1; }
 
   var pg: int32 = 1;
   while (pg <= N) {
-    if (!dk_t_check_i64((int64)f_alloc_data(p, (uint8)0x5A), (int64)pg,
+    if (!meo_t_check_i64((int64)f_alloc_data(p, (uint8)0x5A), (int64)pg,
         "f4: allocate the pages to free")) {
       return 1;
     }
     pg += 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), (int64)(N + 1),
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)(N + 1),
       "f4: the data pages")) {
     return 1;
   }
   // Free every page. Every push after the first head page fills consumes one
   // free page as the next chain page, so the surviving count is N minus those.
-  var consumed: int32 = (N - 1) / DK_FREE_PAGE_CAP;
+  var consumed: int32 = (N - 1) / MEO_FREE_PAGE_CAP;
   var want_free: int64 = (int64)(N - consumed);
   pg = 1;
   while (pg <= N) {
-    if (!dk_t_check_i64(dk_pager_free_page(p, (uint32)pg), DK_OK,
+    if (!meo_t_check_i64(meo_pager_free_page(p, (uint32)pg), MEO_OK,
         "f4: free a page")) {
       return 1;
     }
     pg += 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), want_free,
+  if (!meo_t_check_i64(meo_free_count(p), want_free,
       "f4: the count spans the whole chain")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), (int64)(N + 1 + consumed),
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)(N + 1 + consumed),
       "f4: only the chain pages grew the file")) {
     return 1;
   }
   // The bug: a lost next pointer. A chain of one page would still validate
   // and still count, but only its own contents; the count above and this
   // validation both come from the link.
-  if (!dk_t_check_i64(dk_free_init(p), DK_OK,
+  if (!meo_t_check_i64(meo_free_init(p), MEO_OK,
       "f4: the grown chain validates")) {
     return 1;
   }
 
   // Newest first across the chain: 600, 599, 598.
-  if (!dk_t_check_i64((int64)dk_free_take(p), (int64)N,
+  if (!meo_t_check_i64((int64)meo_free_take(p), (int64)N,
       "f4: take the newest page")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_take(p), (int64)(N - 1),
+  if (!meo_t_check_i64((int64)meo_free_take(p), (int64)(N - 1),
       "f4: take the next newest")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_take(p), (int64)(N - 2),
+  if (!meo_t_check_i64((int64)meo_free_take(p), (int64)(N - 2),
       "f4: take the third newest")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), want_free - 3,
+  if (!meo_t_check_i64(meo_free_count(p), want_free - 3,
       "f4: three takes")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "f4: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "f4: close")) { return 1; }
+  meo_pager_free(p);
 
-  var r: DkPager* = dk_pager_open(F_CHAIN, 8, 0);
-  if (!dk_t_check(r != 0, "f4: reopen")) { return 1; }
-  if (!dk_t_check_i64(dk_free_init(r), DK_OK,
+  var r: MeoPager* = meo_pager_open(F_CHAIN, 8, 0);
+  if (!meo_t_check(r != 0, "f4: reopen")) { return 1; }
+  if (!meo_t_check_i64(meo_free_init(r), MEO_OK,
       "f4: the reopened chain validates")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(r), want_free - 3,
+  if (!meo_t_check_i64(meo_free_count(r), want_free - 3,
       "f4: the count survived the reopen")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(r),
+  if (!meo_t_check_i64((int64)meo_pager_page_count(r),
       (int64)(N + 1 + consumed), "f4: page_count survived the reopen")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_take(r), (int64)(N - 3),
+  if (!meo_t_check_i64((int64)meo_free_take(r), (int64)(N - 3),
       "f4: the reopened chain is still LIFO")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(r), DK_OK, "f4: close again")) { return 1; }
-  dk_pager_free(r);
+  if (!meo_t_check_i64(meo_pager_close(r), MEO_OK, "f4: close again")) { return 1; }
+  meo_pager_free(r);
 
   // An emptied head page is handed out, not dropped from the chain.
-  if (!dk_t_check_i64(f_reset(F_EMPTY), DK_OK, "f4: reset the empty case")) {
+  if (!meo_t_check_i64(f_reset(F_EMPTY), MEO_OK, "f4: reset the empty case")) {
     return 1;
   }
-  var q: DkPager* = dk_pager_open(F_EMPTY, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(q != 0, "f4: create the empty case")) { return 1; }
+  var q: MeoPager* = meo_pager_open(F_EMPTY, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(q != 0, "f4: create the empty case")) { return 1; }
   var one: uint32 = f_alloc_data(q, (uint8)0x11);
-  if (!dk_t_check_i64((int64)one, 1, "f4: one data page")) { return 1; }
-  if (!dk_t_check_i64(dk_pager_free_page(q, one), DK_OK,
+  if (!meo_t_check_i64((int64)one, 1, "f4: one data page")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_free_page(q, one), MEO_OK,
       "f4: free it into a new chain")) {
     return 1;
   }
-  var head: uint32 = dk_pager_root(q, DK_ROOT_FREELIST);
-  if (!dk_t_check_i64((int64)head, 2, "f4: the head is page 2")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_free_take(q), 1, "f4: take the free page")) {
+  var head: uint32 = meo_pager_root(q, MEO_ROOT_FREELIST);
+  if (!meo_t_check_i64((int64)head, 2, "f4: the head is page 2")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_free_take(q), 1, "f4: take the free page")) {
     return 1;
   }
   // The bug: an emptied head page is unlinked and leaked instead of reused.
-  if (!dk_t_check_i64((int64)dk_free_take(q), (int64)head,
+  if (!meo_t_check_i64((int64)meo_free_take(q), (int64)head,
       "f4: an emptied head page is handed out, not leaked")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_root(q, DK_ROOT_FREELIST), 0,
+  if (!meo_t_check_i64((int64)meo_pager_root(q, MEO_ROOT_FREELIST), 0,
       "f4: the chain is empty")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_free_take(q), 0,
+  if (!meo_t_check_i64((int64)meo_free_take(q), 0,
       "f4: an empty chain takes 0")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_err(q), (int64)DK_OK,
+  if (!meo_t_check_i64((int64)meo_pager_err(q), (int64)MEO_OK,
       "f4: an empty take is not an error")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(q), DK_OK, "f4: close the empty case")) {
+  if (!meo_t_check_i64(meo_pager_close(q), MEO_OK, "f4: close the empty case")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
 
   // Churn one page through a two-page chain far enough that the head page's
-  // popped extents would fill it. dk_page_free_cell leaves every popped
+  // popped extents would fill it. meo_page_free_cell leaves every popped
   // [len][body] where it is, so without the defrag-on-FULL in
-  // dk_free_page_push the push at cycle ~557 reports FULL with ~3054 of the
+  // meo_free_page_push the push at cycle ~557 reports FULL with ~3054 of the
   // head page's own bytes reclaimable, and the pager answers that by making a
   // third chain page out of a page the freelist could have reused. The chain's
   // length is the symptom; the stranded bytes are the cause.
-  if (!dk_t_check_i64(f_reset(F_EMPTY), DK_OK, "f4: reset the churn case")) {
+  if (!meo_t_check_i64(f_reset(F_EMPTY), MEO_OK, "f4: reset the churn case")) {
     return 1;
   }
-  var ch: DkPager* = dk_pager_open(F_EMPTY, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(ch != 0, "f4: create the churn case")) { return 1; }
+  var ch: MeoPager* = meo_pager_open(F_EMPTY, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(ch != 0, "f4: create the churn case")) { return 1; }
   pg = 1;
   while (pg <= N) {
-    if (!dk_t_check_i64((int64)f_alloc_data(ch, (uint8)0x66), (int64)pg,
+    if (!meo_t_check_i64((int64)f_alloc_data(ch, (uint8)0x66), (int64)pg,
         "f4: a churn data page")) {
       return 1;
     }
@@ -886,60 +886,60 @@ fn f4_chain_growth() -> int32 {
   }
   pg = 1;
   while (pg <= N) {
-    if (!dk_t_check_i64(dk_pager_free_page(ch, (uint32)pg), DK_OK,
+    if (!meo_t_check_i64(meo_pager_free_page(ch, (uint32)pg), MEO_OK,
         "f4: free a churn data page")) {
       return 1;
     }
     pg += 1;
   }
-  if (!dk_t_check_i64((int64)f_chain_pages(ch), 2,
+  if (!meo_t_check_i64((int64)f_chain_pages(ch), 2,
       "f4: the churn chain is two pages")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(ch), want_free,
+  if (!meo_t_check_i64(meo_free_count(ch), want_free,
       "f4: the churn chain's count")) {
     return 1;
   }
-  var pages_before: uint32 = dk_pager_page_count(ch);
+  var pages_before: uint32 = meo_pager_page_count(ch);
   var cycles: int32 = 800;
   var c_i: int32 = 0;
   var churn_page: uint32 = 0;
   var churn_ok: bool = true;
   while (c_i < cycles) {
-    var tf: DkFrame* = dk_pager_alloc(ch);
+    var tf: MeoFrame* = meo_pager_alloc(ch);
     if (tf == 0) { churn_ok = false; break; }
     if (c_i == 0) { churn_page = tf->page_no; }
     if (tf->page_no != churn_page) { churn_ok = false; break; }
-    dk_page_init(tf->data, DK_PAGE_BTREE_LEAF);
-    if (dk_pager_release(ch, tf, true) != DK_OK) { churn_ok = false; break; }
-    if (dk_pager_free_page(ch, churn_page) != DK_OK) { churn_ok = false; break; }
+    meo_page_init(tf->data, MEO_PAGE_BTREE_LEAF);
+    if (meo_pager_release(ch, tf, true) != MEO_OK) { churn_ok = false; break; }
+    if (meo_pager_free_page(ch, churn_page) != MEO_OK) { churn_ok = false; break; }
     c_i += 1;
   }
-  if (!dk_t_check(churn_ok, "f4: churn keeps handing back the same page")) {
+  if (!meo_t_check(churn_ok, "f4: churn keeps handing back the same page")) {
     return 1;
   }
   // The bug: a churned head page that strands its own bytes and answers FULL,
   // which makes the pager buy a chain page it does not need.
-  if (!dk_t_check_i64((int64)f_chain_pages(ch), 2,
+  if (!meo_t_check_i64((int64)f_chain_pages(ch), 2,
       "f4: churn added no chain page")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(ch), (int64)pages_before,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(ch), (int64)pages_before,
       "f4: churn did not grow the file")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(ch), want_free,
+  if (!meo_t_check_i64(meo_free_count(ch), want_free,
       "f4: churn kept every free page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(ch), DK_OK,
+  if (!meo_t_check_i64(meo_free_init(ch), MEO_OK,
       "f4: the churned chain validates")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(ch), DK_OK, "f4: close the churn case")) {
+  if (!meo_t_check_i64(meo_pager_close(ch), MEO_OK, "f4: close the churn case")) {
     return 1;
   }
-  dk_pager_free(ch);
+  meo_pager_free(ch);
   f_pass("f4_chain_growth");
   return 0;
 }
@@ -947,16 +947,16 @@ fn f4_chain_growth() -> int32 {
 // --- f5: PHASE2.md 2E E4 --------------------------------------------------
 
 fn f5_e4_reopen() -> int32 {
-  if (!dk_t_check_i64(f_reset(F_E4), DK_OK, "e4: reset")) { return 1; }
-  var p: DkPager* = dk_pager_open(F_E4, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "e4: create")) { return 1; }
+  if (!meo_t_check_i64(f_reset(F_E4), MEO_OK, "e4: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(F_E4, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "e4: create")) { return 1; }
 
   // take 5.
   var pages: uint32[5];
   var i: int32 = 0;
   while (i < 5) {
     pages[i] = f_alloc_data(p, (uint8)(0x70 + i));
-    if (!dk_t_check_i64((int64)pages[i], (int64)(i + 1),
+    if (!meo_t_check_i64((int64)pages[i], (int64)(i + 1),
         "e4: take five pages")) {
       return 1;
     }
@@ -965,31 +965,31 @@ fn f5_e4_reopen() -> int32 {
   // free 3: the last three, so the LIFO answer is 5, 4, 3.
   i = 2;
   while (i < 5) {
-    if (!dk_t_check_i64(dk_pager_free_page(p, pages[i]), DK_OK,
+    if (!meo_t_check_i64(meo_pager_free_page(p, pages[i]), MEO_OK,
         "e4: free three pages")) {
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64(dk_free_count(p), 3, "e4: three pages are free")) {
+  if (!meo_t_check_i64(meo_free_count(p), 3, "e4: three pages are free")) {
     return 1;
   }
-  var count_before: uint32 = dk_pager_page_count(p);
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "e4: close")) { return 1; }
-  dk_pager_free(p);
+  var count_before: uint32 = meo_pager_page_count(p);
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "e4: close")) { return 1; }
+  meo_pager_free(p);
 
-  var r: DkPager* = dk_pager_open(F_E4, 8, 0);
-  if (!dk_t_check(r != 0, "e4: reopen")) { return 1; }
+  var r: MeoPager* = meo_pager_open(F_E4, 8, 0);
+  if (!meo_t_check(r != 0, "e4: reopen")) { return 1; }
   // The bug: a freelist that is in-memory only, or that loses meta.freelist_root.
-  if (!dk_t_check_i64(dk_free_count(r), 3,
+  if (!meo_t_check_i64(meo_free_count(r), 3,
       "e4: the freelist survived close/reopen")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_init(r), DK_OK,
+  if (!meo_t_check_i64(meo_free_init(r), MEO_OK,
       "e4: the reopened chain validates")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(r), (int64)count_before,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(r), (int64)count_before,
       "e4: page_count survived")) {
     return 1;
   }
@@ -1000,54 +1000,54 @@ fn f5_e4_reopen() -> int32 {
   want[2] = 3;
   i = 0;
   while (i < 3) {
-    if (!dk_t_check_i64((int64)dk_free_take(r), (int64)want[i],
+    if (!meo_t_check_i64((int64)meo_free_take(r), (int64)want[i],
         "e4: the three pages come back LIFO")) {
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64(dk_free_count(r), 0, "e4: the freelist is empty")) {
+  if (!meo_t_check_i64(meo_free_count(r), 0, "e4: the freelist is empty")) {
     return 1;
   }
   // And the reopened allocator reuses pages instead of extending the file: free
   // two pages that are still data, then let alloc hand them back LIFO (2, 1).
-  if (!dk_t_check_i64(dk_pager_free_page(r, 1), DK_OK,
+  if (!meo_t_check_i64(meo_pager_free_page(r, 1), MEO_OK,
       "e4: free page 1 again")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_free_page(r, 2), DK_OK,
+  if (!meo_t_check_i64(meo_pager_free_page(r, 2), MEO_OK,
       "e4: free page 2 again")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_free_count(r), 2, "e4: two pages are free")) {
+  if (!meo_t_check_i64(meo_free_count(r), 2, "e4: two pages are free")) {
     return 1;
   }
   want[0] = 2;
   want[1] = 1;
   i = 0;
   while (i < 2) {
-    var f: DkFrame* = dk_pager_alloc(r);
-    if (!dk_t_check(f != 0, "e4: alloc reuses the freed pages")) { return 1; }
-    if (!dk_t_check_i64((int64)f->page_no, (int64)want[i],
+    var f: MeoFrame* = meo_pager_alloc(r);
+    if (!meo_t_check(f != 0, "e4: alloc reuses the freed pages")) { return 1; }
+    if (!meo_t_check_i64((int64)f->page_no, (int64)want[i],
         "e4: alloc returns the freed page numbers LIFO")) {
       return 1;
     }
-    if (!dk_t_check(f_all_zero(f), "e4: a reused page is zeroed")) {
+    if (!meo_t_check(f_all_zero(f), "e4: a reused page is zeroed")) {
       return 1;
     }
-    dk_page_init(f->data, DK_PAGE_BTREE_LEAF);
-    if (!dk_t_check_i64(dk_pager_release(r, f, true), DK_OK,
+    meo_page_init(f->data, MEO_PAGE_BTREE_LEAF);
+    if (!meo_t_check_i64(meo_pager_release(r, f, true), MEO_OK,
         "e4: release a reused page")) {
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(r), (int64)count_before,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(r), (int64)count_before,
       "e4: reuse did not extend the file")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(r), DK_OK, "e4: close again")) { return 1; }
-  dk_pager_free(r);
+  if (!meo_t_check_i64(meo_pager_close(r), MEO_OK, "e4: close again")) { return 1; }
+  meo_pager_free(r);
   f_pass("f5_e4_reopen");
   return 0;
 }
@@ -1058,15 +1058,15 @@ fn main() -> int32 {
   // One call per case; a non-zero return means a check already printed
   // "FAIL <case>: <detail>", and the suite stops at the first failure.
   var rc: int32 = f1_page_format();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = f2_alloc_reuse();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = f3_free_errors();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = f4_chain_growth();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = f5_e4_reopen();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   println("PASS freelist_self");
-  return dk_t_report();
+  return meo_t_report();
 }

@@ -1,19 +1,19 @@
-# dacor — a relational storage engine written in Mettle.
+# MeoSQL — a relational database written in Mettle, the storage backend for
+# flux_orm.
 #
-#   mbuild build         debug, target linux -> build/linux/debug/dacor
+#   mbuild build         debug, target linux -> build/linux/debug/meosql
 #   mbuild build -r      release
 #   mbuild check         type-check every src/ file on its own
 #   mbuild test          @test functions in the compile-time interpreter
-#   mbuild run dacor     build and run the smoke entry
+#   mbuild run meosql    build and run the smoke entry
 #   mbuild run b_self    build and run one test program
 #
-# Compiler: head, not the v0.17.0 release (dacor uses syscall() for
+# Compiler: head, not the v0.17.0 release (MeoSQL uses syscall() for
 # pread/pwrite/fsync). Point mbuild at it, or pass --mettle:
-#   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/raize/mettle-build/bin/mettle
-# See NOTES.md section 1.
+#   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
 
 [package]
-name = "dacor"
+name = "meosql"
 version = "0.1.0"
 
 [build]
@@ -22,7 +22,7 @@ targets = ["linux"]
 [profile.release]
 flags = ["--release"]
 
-[bin.dacor]
+[bin.meosql]
 main = "src/main.mettle"
 
 [bin.s0_self]

@@ -1,6 +1,6 @@
 // pager/freelist: the freelist PAGE, and the chain algorithm over its bytes.
 //
-// PHASE2.md section 2C. A freelist is a chain of DK_PAGE_FREELIST pages whose
+// PHASE2.md section 2C. A freelist is a chain of MEO_PAGE_FREELIST pages whose
 // cells are 4-byte page numbers. meta.freelist_root is the chain head and 0
 // means "none".
 //
@@ -16,10 +16,10 @@
 // chain as a whole hands pages back LIFO (newest first), which is what
 // PHASE2.md section 2E's E4 asserts.
 //
-// This module deliberately knows nothing about DkPager or about file I/O: it
-// takes a raw DK_PAGE_SIZE buffer and never allocates. pager/pager.mettle owns
+// This module deliberately knows nothing about MeoPager or about file I/O: it
+// takes a raw MEO_PAGE_SIZE buffer and never allocates. pager/pager.mettle owns
 // the frame pinning, the meta root, the error matrix and the walking of the
-// chain (dk_free_init/take/put/count and dk_pager_free_page live there). That
+// chain (meo_free_init/take/put/count and meo_pager_free_page live there). That
 // split is what keeps the import graph acyclic -- pager imports freelist, and
 // freelist imports only error/status and format/{bytes,page} -- and it is the
 // one place 2C departs from PHASE2.md's file list: the four contract entry
@@ -29,8 +29,8 @@
 // Capacity, derived from the page constants rather than written down: a cell
 // costs its 4-byte body, the u16 length prefix format/page.mettle puts in
 // front of it, and its 2-byte pointer in the dense array, so a page holds
-// (DK_PAGE_SIZE - DK_PAGE_HDR) / 8 = 510 cells: 1 link + 509 free page
-// numbers. The 510th free page number is the one dk_page_alloc refuses, and
+// (MEO_PAGE_SIZE - MEO_PAGE_HDR) / 8 = 510 cells: 1 link + 509 free page
+// numbers. The 510th free page number is the one meo_page_alloc refuses, and
 // the test fills a page to that refusal and asserts the count, so the constant
 // stays tied to the real page arithmetic.
 //
@@ -43,78 +43,78 @@ import "../format/bytes.mettle";
 import "../format/page.mettle";
 
 // A freelist cell body is one u32 page number (PHASE2.md section 2C).
-export const DK_FREE_CELL_BODY: int32 = 4;
+export const MEO_FREE_CELL_BODY: int32 = 4;
 
 // What one cell costs the page: the body, its u16 length prefix, and its two
 // bytes of pointer array.
-const DK_FREE_CELL_COST: int32 = DK_FREE_CELL_BODY + 2 + 2;
+const MEO_FREE_CELL_COST: int32 = MEO_FREE_CELL_BODY + 2 + 2;
 
 // Cells a freelist page holds when it is full, the link included.
-export const DK_FREE_PAGE_CAP: int32 =
-  (DK_PAGE_SIZE - DK_PAGE_HDR) / DK_FREE_CELL_COST;
+export const MEO_FREE_PAGE_CAP: int32 =
+  (MEO_PAGE_SIZE - MEO_PAGE_HDR) / MEO_FREE_CELL_COST;
 
 // The link cell's index. Cell 0 is always the chain link and is never popped.
-const DK_FREE_LINK_CELL: int32 = 0;
+const MEO_FREE_LINK_CELL: int32 = 0;
 
 // Offset of free-page cell i's body, or -1 when i is not a free-page index.
 // Index 0 is the link, so it is never a free-page index.
 fn free_cell_off(buf: uint8*, i: int32) -> int32 {
-  if (i < DK_FREE_LINK_CELL + 1) { return -1; }
-  if (i >= dk_page_n_cells(buf)) { return -1; }
-  return dk_page_cell_off(buf, i);
+  if (i < MEO_FREE_LINK_CELL + 1) { return -1; }
+  if (i >= meo_page_n_cells(buf)) { return -1; }
+  return meo_page_cell_off(buf, i);
 }
 
 // A page that carries the freelist header and a link cell, written by
-// dk_free_page_init. Anything else is a caller error, not a corrupt page: a
-// corrupt on-disk page is what dk_page_check answers, and the pager runs that
+// meo_free_page_init. Anything else is a caller error, not a corrupt page: a
+// corrupt on-disk page is what meo_page_check answers, and the pager runs that
 // when it loads one.
 fn free_page_is_ours(buf: uint8*) -> bool {
   if (buf == 0) { return false; }
-  if (dk_page_type(buf) != DK_PAGE_FREELIST) { return false; }
-  if (dk_page_n_cells(buf) < 1) { return false; }
-  return dk_page_cell_len(buf, DK_FREE_LINK_CELL) == DK_FREE_CELL_BODY;
+  if (meo_page_type(buf) != MEO_PAGE_FREELIST) { return false; }
+  if (meo_page_n_cells(buf) < 1) { return false; }
+  return meo_page_cell_len(buf, MEO_FREE_LINK_CELL) == MEO_FREE_CELL_BODY;
 }
 
 // Turn `buf` into a freelist page whose link is `next`: a fresh page header,
 // then a 4-byte link cell at the top of the page. An already-sealed buffer is
-// left sealed by dk_page_init; the following cell writes leave the checksum
+// left sealed by meo_page_init; the following cell writes leave the checksum
 // stale, so whoever writes the page back seals it first (format/page.mettle's
 // contract).
-export fn dk_free_page_init(buf: uint8*, next: uint32) -> int32 {
-  if (buf == 0) { return -DK_ERR_USAGE; }
-  var rc: int32 = dk_page_init(buf, DK_PAGE_FREELIST);
-  if (rc != DK_OK) { return rc; }
-  var off: int32 = dk_page_alloc(buf, DK_FREE_CELL_BODY);
+export fn meo_free_page_init(buf: uint8*, next: uint32) -> int32 {
+  if (buf == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = meo_page_init(buf, MEO_PAGE_FREELIST);
+  if (rc != MEO_OK) { return rc; }
+  var off: int32 = meo_page_alloc(buf, MEO_FREE_CELL_BODY);
   if (off < 0) { return off; }
-  dk_put_u32le(buf, (int64)off, next);
-  return dk_page_insert_cell(buf, off, DK_FREE_LINK_CELL);
+  meo_put_u32le(buf, (int64)off, next);
+  return meo_page_insert_cell(buf, off, MEO_FREE_LINK_CELL);
 }
 
 // One push attempt on a page the caller has already proved is a freelist page,
-// and the body of dk_free_page_push's retry. Kept separate so the retry runs
+// and the body of meo_free_page_push's retry. Kept separate so the retry runs
 // exactly the same code as the first attempt.
 fn free_push_cell(buf: uint8*, page_no: uint32) -> int32 {
-  var n: int32 = dk_page_n_cells(buf);
-  if (dk_page_cell_len(buf, n - 1) != DK_FREE_CELL_BODY) {
-    return -DK_ERR_CORRUPT;
+  var n: int32 = meo_page_n_cells(buf);
+  if (meo_page_cell_len(buf, n - 1) != MEO_FREE_CELL_BODY) {
+    return -MEO_ERR_CORRUPT;
   }
-  var off: int32 = dk_page_alloc(buf, DK_FREE_CELL_BODY);
+  var off: int32 = meo_page_alloc(buf, MEO_FREE_CELL_BODY);
   if (off < 0) { return off; }
-  dk_put_u32le(buf, (int64)off, page_no);
-  // dk_page_alloc has already proved 6 bytes fit above free_start, and the
+  meo_put_u32le(buf, (int64)off, page_no);
+  // meo_page_alloc has already proved 6 bytes fit above free_start, and the
   // pointer array only needs 2, so this cannot be FULL; report the code
   // rather than assume it.
-  return dk_page_insert_cell(buf, off, n);
+  return meo_page_insert_cell(buf, off, n);
 }
 
-// Append `page_no` to the free-page list of `buf`. DK_OK, or -DK_ERR_FULL when
+// Append `page_no` to the free-page list of `buf`. MEO_OK, or -MEO_ERR_FULL when
 // the page has no room left (the pager answers that by making a new head) and
-// -DK_ERR_CORRUPT when a cell is not a 4-byte page number. Fullness is decided
-// by dk_page_alloc and nowhere else: the gap runs out at exactly
-// DK_FREE_PAGE_CAP cells, so a second capacity check here would be a copy of
+// -MEO_ERR_CORRUPT when a cell is not a 4-byte page number. Fullness is decided
+// by meo_page_alloc and nowhere else: the gap runs out at exactly
+// MEO_FREE_PAGE_CAP cells, so a second capacity check here would be a copy of
 // that arithmetic that could only disagree with it.
 //
-// A FULL page is not necessarily out of bytes. dk_page_free_cell leaves a
+// A FULL page is not necessarily out of bytes. meo_page_free_cell leaves a
 // popped cell's [len][body] extent where it is, so a page that has been popped
 // from strands one cell's worth per pop -- ~3054 bytes on a filled-then-drained
 // page -- and a pop/push cycle never reuses them. PHASE2.md section 2A's rule
@@ -122,66 +122,66 @@ fn free_push_cell(buf: uint8*, page_no: uint32) -> int32 {
 // free_bytes already has, and retry once. Without it a churned page reports
 // FULL with its own bytes reclaimable, and the pager answers FULL by making a
 // new chain page: a page's worth of capacity strands every 509 pop/push cycles.
-export fn dk_free_page_push(buf: uint8*, page_no: uint32) -> int32 {
-  if (!free_page_is_ours(buf)) { return -DK_ERR_USAGE; }
+export fn meo_free_page_push(buf: uint8*, page_no: uint32) -> int32 {
+  if (!free_page_is_ours(buf)) { return -MEO_ERR_USAGE; }
   var rc: int32 = free_push_cell(buf, page_no);
-  if (rc != -DK_ERR_FULL) { return rc; }
-  if (dk_page_reclaimable(buf) < DK_FREE_CELL_COST) { return rc; }
-  if (dk_page_free_bytes(buf) >= DK_FREE_CELL_COST) { return rc; }
-  var drc: int32 = dk_page_defrag(buf);
-  if (drc != DK_OK) { return drc; }
+  if (rc != -MEO_ERR_FULL) { return rc; }
+  if (meo_page_reclaimable(buf) < MEO_FREE_CELL_COST) { return rc; }
+  if (meo_page_free_bytes(buf) >= MEO_FREE_CELL_COST) { return rc; }
+  var drc: int32 = meo_page_defrag(buf);
+  if (drc != MEO_OK) { return drc; }
   return free_push_cell(buf, page_no);
 }
 
 // Remove and return the newest free page number in `buf`, or 0 when the page
 // holds only its link. 0 is a safe sentinel because page 0 is never freed
-// (PHASE2.md section 2C: freeing page 0 is -DK_ERR_USAGE).
-export fn dk_free_page_pop(buf: uint8*) -> uint32 {
+// (PHASE2.md section 2C: freeing page 0 is -MEO_ERR_USAGE).
+export fn meo_free_page_pop(buf: uint8*) -> uint32 {
   if (!free_page_is_ours(buf)) { return 0; }
-  var n: int32 = dk_page_n_cells(buf);
+  var n: int32 = meo_page_n_cells(buf);
   if (n < 2) { return 0; }
-  var off: int32 = dk_page_cell_off(buf, n - 1);
+  var off: int32 = meo_page_cell_off(buf, n - 1);
   if (off < 0) { return 0; }
-  var v: uint32 = dk_get_u32le(buf, (int64)off);
-  if (dk_page_free_cell(buf, n - 1) != DK_OK) { return 0; }
+  var v: uint32 = meo_get_u32le(buf, (int64)off);
+  if (meo_page_free_cell(buf, n - 1) != MEO_OK) { return 0; }
   return v;
 }
 
 // The next page in the chain, 0 at the end. A page that is not a freelist page
 // answers 0, so a corrupt link is caught by the range check the pager does on
 // the number it walks to, not silently followed.
-export fn dk_free_page_next(buf: uint8*) -> uint32 {
+export fn meo_free_page_next(buf: uint8*) -> uint32 {
   if (!free_page_is_ours(buf)) { return 0; }
-  var off: int32 = dk_page_cell_off(buf, DK_FREE_LINK_CELL);
+  var off: int32 = meo_page_cell_off(buf, MEO_FREE_LINK_CELL);
   if (off < 0) { return 0; }
-  return dk_get_u32le(buf, (int64)off);
+  return meo_get_u32le(buf, (int64)off);
 }
 
 // Free page numbers on this page: the cells minus the link.
-export fn dk_free_page_count(buf: uint8*) -> int32 {
+export fn meo_free_page_count(buf: uint8*) -> int32 {
   if (!free_page_is_ours(buf)) { return 0; }
-  return dk_page_n_cells(buf) - 1;
+  return meo_page_n_cells(buf) - 1;
 }
 
 // The free page number at index i (1..count), or 0 when i is not one. Freeing
-// the same page twice is -DK_ERR_CORRUPT if the freelist can see it
+// the same page twice is -MEO_ERR_CORRUPT if the freelist can see it
 // (PHASE2.md section 2C), so the pager needs to read these values; keeping the
 // decode here is what lets the page format stay private to this module.
-export fn dk_free_page_at(buf: uint8*, i: int32) -> uint32 {
+export fn meo_free_page_at(buf: uint8*, i: int32) -> uint32 {
   if (!free_page_is_ours(buf)) { return 0; }
   var off: int32 = free_cell_off(buf, i);
   if (off < 0) { return 0; }
-  return dk_get_u32le(buf, (int64)off);
+  return meo_get_u32le(buf, (int64)off);
 }
 
 // Does this page already list `page_no`? Cells, not the link: the link names
 // another freelist page, never a free page.
-export fn dk_free_page_has(buf: uint8*, page_no: uint32) -> bool {
+export fn meo_free_page_has(buf: uint8*, page_no: uint32) -> bool {
   if (!free_page_is_ours(buf)) { return false; }
-  var n: int32 = dk_page_n_cells(buf);
-  var i: int32 = DK_FREE_LINK_CELL + 1;
+  var n: int32 = meo_page_n_cells(buf);
+  var i: int32 = MEO_FREE_LINK_CELL + 1;
   while (i < n) {
-    if (dk_free_page_at(buf, i) == page_no) { return true; }
+    if (meo_free_page_at(buf, i) == page_no) { return true; }
     i += 1;
   }
   return false;

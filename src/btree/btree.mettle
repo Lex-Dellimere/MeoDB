@@ -17,8 +17,8 @@
 //
 // PINNING. The pager's frame table is the only record of who owns a buffer, so
 // every frame this module holds is pinned, and a cursor pins exactly ONE leaf
-// frame at a time: dk_bt_next releases the current leaf before it pins the next
-// (PHASE2.md 2D), and dk_bt_close always releases. An insert never holds more
+// frame at a time: meo_bt_next releases the current leaf before it pins the next
+// (PHASE2.md 2D), and meo_bt_close always releases. An insert never holds more
 // than three frames (a node, its new sibling, and the parent it is inserting
 // into), so it works with n_frames = 8 while splits are forcing eviction and
 // write-back -- which is exactly what PHASE2.md 2E's E6 measures.
@@ -36,14 +36,14 @@
 // is the real fix; phase 2 only refuses the split at the depth cap before any
 // page is dirtied.
 //
-// DEPTH. A root-to-leaf chain may be at most DK_BT_MAX_DEPTH levels, the leaf
-// included, because DkBtCursor describes a position with a 16-entry path. A
-// seventeenth level is -DK_ERR_CORRUPT, never a write past the end of the path
+// DEPTH. A root-to-leaf chain may be at most MEO_BT_MAX_DEPTH levels, the leaf
+// included, because MeoBtCursor describes a position with a 16-entry path. A
+// seventeenth level is -MEO_ERR_CORRUPT, never a write past the end of the path
 // (PHASE2.md 2D; E7 is the test).
 //
-// Return convention: DK_OK / a count is success, -DK_ERR_* is failure.
-// dk_bt_lookup answers DK_OK (found, rowid written) or 1 (absent); dk_bt_seek
-// and dk_bt_next answer 0 (the cursor holds a row) or 1 (no such row / done).
+// Return convention: MEO_OK / a count is success, -MEO_ERR_* is failure.
+// meo_bt_lookup answers MEO_OK (found, rowid written) or 1 (absent); meo_bt_seek
+// and meo_bt_next answer 0 (the cursor holds a row) or 1 (no such row / done).
 // Those 1s are not failures: a missing key is an ordinary answer, not an error.
 
 import "std/mem";
@@ -56,37 +56,37 @@ import "node.mettle";
 // Deepest root-to-leaf chain the cursor can describe, the leaf included and
 // index 0 the root. The path/slot arrays below hold exactly 16 entries: a
 // struct field extent cannot be a constant on this compiler (it reports
-// "Unknown type 'uint32[DK_BT_MAX_DEPTH]'"), so the literal 16 is this value
+// "Unknown type 'uint32[MEO_BT_MAX_DEPTH]'"), so the literal 16 is this value
 // spelled where the language forces it to be spelled.
-export const DK_BT_MAX_DEPTH: int32 = 16;
+export const MEO_BT_MAX_DEPTH: int32 = 16;
 
 // A key and its length. Borrowed: the tree copies the bytes into its pages and
 // never keeps this pointer.
-export struct DkBtKey {
+export struct MeoBtKey {
   data: uint8*;
   len: int32;
 }
 
 // A position in one tree: the path from the root to one leaf, that leaf pinned,
 // and the cell inside it. Every field is meaningful only while the cursor is
-// open; dk_bt_close releases the frame and resets the position.
+// open; meo_bt_close releases the frame and resets the position.
 //
-// A cursor is initialised ONCE with dk_bt_cursor_init, then reused through
-// dk_bt_seek/dk_bt_next/dk_bt_close. dk_bt_seek and dk_bt_close release whatever
+// A cursor is initialised ONCE with meo_bt_cursor_init, then reused through
+// meo_bt_seek/meo_bt_next/meo_bt_close. meo_bt_seek and meo_bt_close release whatever
 // c->leaf holds, so a first-use cursor must not carry an uninitialised leaf.
 //
 // path[i] is the page number of the node at level i (0 = root), slot[i] the
 // child index taken there (-1 for the leaf), depth the number of levels and
-// therefore also the leaf's level + 1. err carries the positive DK_ERR_* of the
-// last failure, DK_OK otherwise.
-export struct DkBtCursor {
-  pager: DkPager*;
+// therefore also the leaf's level + 1. err carries the positive MEO_ERR_* of the
+// last failure, MEO_OK otherwise.
+export struct MeoBtCursor {
+  pager: MeoPager*;
   root: uint32;
   cmp: fn(uint8*, int32, uint8*, int32) -> int32;
   path: uint32[16];
   slot: int32[16];
   depth: int32;
-  leaf: DkFrame*;
+  leaf: MeoFrame*;
   slot_in_leaf: int32;
   err: int32;
 }
@@ -94,28 +94,28 @@ export struct DkBtCursor {
 // --- pager glue ------------------------------------------------------------
 
 // The negative code for a failed pager call. A tree that names a page the file
-// does not have (DK_ERR_RANGE) is a corrupt tree, not a caller error, so that
+// does not have (MEO_ERR_RANGE) is a corrupt tree, not a caller error, so that
 // code is translated; every other pager code is passed through.
-fn bt_pager_fail(p: DkPager*) -> int32 {
-  var e: int32 = dk_pager_err(p);
-  if (e == DK_OK || e == DK_ERR_RANGE) { e = DK_ERR_CORRUPT; }
+fn bt_pager_fail(p: MeoPager*) -> int32 {
+  var e: int32 = meo_pager_err(p);
+  if (e == MEO_OK || e == MEO_ERR_RANGE) { e = MEO_ERR_CORRUPT; }
   return 0 - e;
 }
 
 // Pin a node and prove it is one (the page-level structure, then the cell
 // geometry of btree/node.mettle). Answers 0 with err_out[0] set on failure and
 // nothing pinned.
-fn bt_pin(p: DkPager*, page_no: uint32, write: bool,
-    err_out: int32*) -> DkFrame* {
-  err_out[0] = DK_OK;
-  var f: DkFrame* = dk_pager_get(p, page_no, write);
+fn bt_pin(p: MeoPager*, page_no: uint32, write: bool,
+    err_out: int32*) -> MeoFrame* {
+  err_out[0] = MEO_OK;
+  var f: MeoFrame* = meo_pager_get(p, page_no, write);
   if (f == 0) {
     err_out[0] = bt_pager_fail(p);
     return 0;
   }
-  var rc: int32 = dk_btn_check(f->data);
-  if (rc != DK_OK) {
-    dk_pager_release(p, f, false);
+  var rc: int32 = meo_btn_check(f->data);
+  if (rc != MEO_OK) {
+    meo_pager_release(p, f, false);
     err_out[0] = rc;
     return 0;
   }
@@ -123,9 +123,9 @@ fn bt_pin(p: DkPager*, page_no: uint32, write: bool,
 }
 
 // Allocate a page, which the pager hands back pinned, zeroed and writable.
-fn bt_alloc(p: DkPager*, err_out: int32*) -> DkFrame* {
-  err_out[0] = DK_OK;
-  var f: DkFrame* = dk_pager_alloc(p);
+fn bt_alloc(p: MeoPager*, err_out: int32*) -> MeoFrame* {
+  err_out[0] = MEO_OK;
+  var f: MeoFrame* = meo_pager_alloc(p);
   if (f == 0) {
     err_out[0] = bt_pager_fail(p);
     return 0;
@@ -137,70 +137,70 @@ fn bt_alloc(p: DkPager*, err_out: int32*) -> DkFrame* {
 
 // Descend from `root` to the leaf a search for `key` belongs in and leave that
 // leaf pinned in the cursor. Nothing is pinned on failure.
-fn bt_seek_leaf(p: DkPager*, c: DkBtCursor*, root: uint32,
+fn bt_seek_leaf(p: MeoPager*, c: MeoBtCursor*, root: uint32,
     cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: uint8*,
     klen: int32) -> int32 {
   var page: uint32 = root;
   var level: int32 = 0;
   while (true) {
-    if (level >= DK_BT_MAX_DEPTH) {
+    if (level >= MEO_BT_MAX_DEPTH) {
       // A chain deeper than the cursor can describe. Refuse it; do not write
       // past path[15] and do not recurse into it (PHASE2.md 2D, E7).
-      return -DK_ERR_CORRUPT;
+      return -MEO_ERR_CORRUPT;
     }
-    var rc: int32 = DK_OK;
-    var f: DkFrame* = bt_pin(p, page, false, &rc);
+    var rc: int32 = MEO_OK;
+    var f: MeoFrame* = bt_pin(p, page, false, &rc);
     if (f == 0) { return rc; }
-    if (dk_btn_is_leaf(f->data)) {
+    if (meo_btn_is_leaf(f->data)) {
       c->path[level] = page;
       c->slot[level] = -1;
       c->depth = level + 1;
       c->leaf = f;
-      return DK_OK;
+      return MEO_OK;
     }
-    var ci: int32 = dk_btn_inner_child_index(f->data, key, klen, cmp_cb);
-    var child: uint32 = dk_btn_inner_child(f->data, ci);
+    var ci: int32 = meo_btn_inner_child_index(f->data, key, klen, cmp_cb);
+    var child: uint32 = meo_btn_inner_child(f->data, ci);
     c->path[level] = page;
     c->slot[level] = ci;
-    dk_pager_release(p, f, false);
+    meo_pager_release(p, f, false);
     page = child;
     level += 1;
   }
-  return -DK_ERR_CORRUPT;
+  return -MEO_ERR_CORRUPT;
 }
 
 // Pin the leftmost leaf of the subtree rooted at `page` (level `level`) and
 // record the path. Used when the scan has to move into a subtree it did not
 // descend into on its way down.
-fn bt_descend_left(p: DkPager*, c: DkBtCursor*, level: int32,
+fn bt_descend_left(p: MeoPager*, c: MeoBtCursor*, level: int32,
     page: uint32) -> int32 {
   var lv: int32 = level;
   var cur: uint32 = page;
   while (true) {
-    if (lv >= DK_BT_MAX_DEPTH) { return -DK_ERR_CORRUPT; }
-    var rc: int32 = DK_OK;
-    var f: DkFrame* = bt_pin(p, cur, false, &rc);
+    if (lv >= MEO_BT_MAX_DEPTH) { return -MEO_ERR_CORRUPT; }
+    var rc: int32 = MEO_OK;
+    var f: MeoFrame* = bt_pin(p, cur, false, &rc);
     if (f == 0) { return rc; }
     c->path[lv] = cur;
-    if (dk_btn_is_leaf(f->data)) {
+    if (meo_btn_is_leaf(f->data)) {
       c->slot[lv] = -1;
       c->depth = lv + 1;
       c->leaf = f;
       c->slot_in_leaf = 0;
-      return DK_OK;
+      return MEO_OK;
     }
     c->slot[lv] = 0;
-    var child: uint32 = dk_btn_inner_child(f->data, 0);
-    dk_pager_release(p, f, false);
+    var child: uint32 = meo_btn_inner_child(f->data, 0);
+    meo_pager_release(p, f, false);
     cur = child;
     lv += 1;
   }
-  return -DK_ERR_CORRUPT;
+  return -MEO_ERR_CORRUPT;
 }
 
 // The leaf after the cursor's in key order: walk up the recorded path until an
 // ancestor has a child after the one taken, and answer that child's page number
-// and its level. DK_OK when one exists, 1 when the cursor is on the tree's last
+// and its level. MEO_OK when one exists, 1 when the cursor is on the tree's last
 // leaf, negative on failure. The cursor's own leaf stays pinned, so this pins
 // ancestors only -- never a second leaf.
 //
@@ -208,25 +208,25 @@ fn bt_descend_left(p: DkPager*, c: DkBtCursor*, level: int32,
 // just chose: the ancestor is now the one the cursor hangs from, and the next
 // advance has to start from there rather than from the child it left. Leaving
 // the old index behind makes the scan re-enter the leaf it just finished.
-fn bt_successor(p: DkPager*, c: DkBtCursor*, level_out: int32*,
+fn bt_successor(p: MeoPager*, c: MeoBtCursor*, level_out: int32*,
     page_out: uint32*) -> int32 {
   var level: int32 = c->depth - 1;
   while (level > 0) {
     level -= 1;
-    var rc: int32 = DK_OK;
-    var f: DkFrame* = bt_pin(p, c->path[level], false, &rc);
+    var rc: int32 = MEO_OK;
+    var f: MeoFrame* = bt_pin(p, c->path[level], false, &rc);
     if (f == 0) { return rc; }
-    var n: int32 = dk_page_n_cells(f->data);
+    var n: int32 = meo_page_n_cells(f->data);
     var s: int32 = c->slot[level];
     if (s >= 0 && s + 1 <= n - 1) {
-      var child: uint32 = dk_btn_inner_child(f->data, s + 1);
-      dk_pager_release(p, f, false);
+      var child: uint32 = meo_btn_inner_child(f->data, s + 1);
+      meo_pager_release(p, f, false);
       c->slot[level] = s + 1;
       level_out[0] = level + 1;
       page_out[0] = child;
-      return DK_OK;
+      return MEO_OK;
     }
-    dk_pager_release(p, f, false);
+    meo_pager_release(p, f, false);
   }
   return 1;
 }
@@ -234,10 +234,10 @@ fn bt_successor(p: DkPager*, c: DkBtCursor*, level_out: int32*,
 // Release the cursor's leaf and position it on the leftmost leaf under `page`
 // at `level`. The release happens BEFORE the next pin: one leaf frame at a
 // time is the cursor's contract (PHASE2.md 2D).
-fn bt_move_to(p: DkPager*, c: DkBtCursor*, level: int32,
+fn bt_move_to(p: MeoPager*, c: MeoBtCursor*, level: int32,
     page: uint32) -> int32 {
   if (c->leaf != 0) {
-    dk_pager_release(p, c->leaf, false);
+    meo_pager_release(p, c->leaf, false);
     c->leaf = 0;
   }
   c->depth = 0;
@@ -246,13 +246,13 @@ fn bt_move_to(p: DkPager*, c: DkBtCursor*, level: int32,
 
 // Advance to the next leaf. 0 = a leaf is pinned with slot_in_leaf == 0,
 // 1 = the cursor is past the last leaf and pins nothing, negative on failure.
-fn bt_advance(p: DkPager*, c: DkBtCursor*) -> int32 {
+fn bt_advance(p: MeoPager*, c: MeoBtCursor*) -> int32 {
   var level: int32 = 0;
   var page: uint32 = 0;
   var rc: int32 = bt_successor(p, c, &level, &page);
-  if (rc != DK_OK) {
+  if (rc != MEO_OK) {
     if (c->leaf != 0) {
-      dk_pager_release(p, c->leaf, false);
+      meo_pager_release(p, c->leaf, false);
       c->leaf = 0;
     }
     c->depth = 0;
@@ -263,46 +263,46 @@ fn bt_advance(p: DkPager*, c: DkBtCursor*) -> int32 {
 
 // --- public API (PHASE2.md 2D) ---------------------------------------------
 
-// Reset a cursor to "holds nothing". Call this once on a fresh DkBtCursor
-// before its first dk_bt_seek; after that the cursor is reused through
-// dk_bt_seek/dk_bt_next/dk_bt_close. Without it dk_bt_seek/dk_bt_close would
+// Reset a cursor to "holds nothing". Call this once on a fresh MeoBtCursor
+// before its first meo_bt_seek; after that the cursor is reused through
+// meo_bt_seek/meo_bt_next/meo_bt_close. Without it meo_bt_seek/meo_bt_close would
 // read c->leaf from whatever was on the stack and release a garbage pointer.
-// pager/root/cmp are left alone: dk_bt_seek sets them for every descent.
-export fn dk_bt_cursor_init(c: DkBtCursor*) {
+// pager/root/cmp are left alone: meo_bt_seek sets them for every descent.
+export fn meo_bt_cursor_init(c: MeoBtCursor*) {
   if (c == 0) { return; }
   c->leaf = 0;
   c->depth = 0;
   c->slot_in_leaf = 0;
-  c->err = DK_OK;
+  c->err = MEO_OK;
 }
 
 // Point the cursor at the first row whose key is NOT LESS than `key`, i.e. the
 // lower bound. 0 = the cursor holds that row, 1 = every key in the tree is
 // smaller (or the tree does not exist yet), negative = failure. A cursor may be
 // reused: whatever it held is released first.
-export fn dk_bt_seek(p: DkPager*, c: DkBtCursor*, root: uint32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: DkBtKey) -> int32 {
+export fn meo_bt_seek(p: MeoPager*, c: MeoBtCursor*, root: uint32,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey) -> int32 {
   if (p == 0 || c == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
-    return -DK_ERR_USAGE;
+    return -MEO_ERR_USAGE;
   }
-  dk_bt_close(p, c);
+  meo_bt_close(p, c);
   c->pager = p;
   c->root = root;
   c->cmp = cmp_cb;
-  c->err = DK_OK;
+  c->err = MEO_OK;
   c->depth = 0;
   c->leaf = 0;
   c->slot_in_leaf = 0;
   if (root == 0) { return 1; }
   var rc: int32 = bt_seek_leaf(p, c, root, cmp_cb, key.data, key.len);
-  if (rc != DK_OK) {
+  if (rc != MEO_OK) {
     c->err = 0 - rc;
     return rc;
   }
-  var n: int32 = dk_page_n_cells(c->leaf->data);
-  c->slot_in_leaf = dk_btn_leaf_search(c->leaf->data, key.data, key.len,
+  var n: int32 = meo_page_n_cells(c->leaf->data);
+  c->slot_in_leaf = meo_btn_leaf_search(c->leaf->data, key.data, key.len,
     cmp_cb);
-  if (c->slot_in_leaf < n) { return DK_OK; }
+  if (c->slot_in_leaf < n) { return MEO_OK; }
   // The lower bound is past this leaf. Because a separator is the smallest key
   // of the subtree to its right, the row may be the next leaf's first cell --
   // or there may be no such row at all.
@@ -313,72 +313,72 @@ export fn dk_bt_seek(p: DkPager*, c: DkBtCursor*, root: uint32,
 
 // Move to the next row in key order. 0 = a row is available, 1 = done,
 // negative = failure. Repeated calls after 1 keep answering 1.
-export fn dk_bt_next(p: DkPager*, c: DkBtCursor*) -> int32 {
-  if (p == 0 || c == 0) { return -DK_ERR_USAGE; }
-  if (c->err != DK_OK) { return 0 - c->err; }
+export fn meo_bt_next(p: MeoPager*, c: MeoBtCursor*) -> int32 {
+  if (p == 0 || c == 0) { return -MEO_ERR_USAGE; }
+  if (c->err != MEO_OK) { return 0 - c->err; }
   if (c->leaf == 0) { return 1; }
-  var n: int32 = dk_page_n_cells(c->leaf->data);
+  var n: int32 = meo_page_n_cells(c->leaf->data);
   if (c->slot_in_leaf + 1 < n) {
     c->slot_in_leaf += 1;
-    return DK_OK;
+    return MEO_OK;
   }
   var rc: int32 = bt_advance(p, c);
   if (rc < 0) { c->err = 0 - rc; }
   return rc;
 }
 
-// The rowid of the row the cursor holds. DK_OK, or -DK_ERR_USAGE when the
+// The rowid of the row the cursor holds. MEO_OK, or -MEO_ERR_USAGE when the
 // cursor is not on a row.
-export fn dk_bt_rowid(p: DkPager*, c: DkBtCursor*, out: uint64*) -> int32 {
-  if (p == 0 || c == 0 || out == 0) { return -DK_ERR_USAGE; }
-  if (c->err != DK_OK) { return 0 - c->err; }
-  if (c->leaf == 0) { return -DK_ERR_USAGE; }
-  if (c->slot_in_leaf < 0) { return -DK_ERR_USAGE; }
-  if (c->slot_in_leaf >= dk_page_n_cells(c->leaf->data)) {
-    return -DK_ERR_USAGE;
+export fn meo_bt_rowid(p: MeoPager*, c: MeoBtCursor*, out: uint64*) -> int32 {
+  if (p == 0 || c == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  if (c->err != MEO_OK) { return 0 - c->err; }
+  if (c->leaf == 0) { return -MEO_ERR_USAGE; }
+  if (c->slot_in_leaf < 0) { return -MEO_ERR_USAGE; }
+  if (c->slot_in_leaf >= meo_page_n_cells(c->leaf->data)) {
+    return -MEO_ERR_USAGE;
   }
-  out[0] = dk_btn_leaf_rowid(c->leaf->data, c->slot_in_leaf);
-  return DK_OK;
+  out[0] = meo_btn_leaf_rowid(c->leaf->data, c->slot_in_leaf);
+  return MEO_OK;
 }
 
 // Release the cursor's leaf and forget the position. Always safe: a cursor that
 // holds nothing is left holding nothing.
-export fn dk_bt_close(p: DkPager*, c: DkBtCursor*) {
+export fn meo_bt_close(p: MeoPager*, c: MeoBtCursor*) {
   if (c == 0) { return; }
   if (p != 0 && c->leaf != 0) {
-    dk_pager_release(p, c->leaf, false);
+    meo_pager_release(p, c->leaf, false);
   }
   c->leaf = 0;
   c->depth = 0;
   c->slot_in_leaf = 0;
-  c->err = DK_OK;
+  c->err = MEO_OK;
 }
 
-// Look `key` up. DK_OK and the rowid written when the key is present, 1 when it
+// Look `key` up. MEO_OK and the rowid written when the key is present, 1 when it
 // is absent (rowid untouched), negative on failure.
-export fn dk_bt_lookup(p: DkPager*, root: uint32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: DkBtKey,
+export fn meo_bt_lookup(p: MeoPager*, root: uint32,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
     rowid: uint64*) -> int32 {
   if (p == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0 || rowid == 0) {
-    return -DK_ERR_USAGE;
+    return -MEO_ERR_USAGE;
   }
-  var c: DkBtCursor;
-  dk_bt_cursor_init(&c);
-  var rc: int32 = dk_bt_seek(p, &c, root, cmp_cb, key);
-  if (rc != DK_OK) { return rc; }
-  var hit: int32 = cmp_cb(dk_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf),
-    dk_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf), key.data, key.len);
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = meo_bt_seek(p, &c, root, cmp_cb, key);
+  if (rc != MEO_OK) { return rc; }
+  var hit: int32 = cmp_cb(meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf),
+    meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf), key.data, key.len);
   if (hit != 0) {
-    dk_bt_close(p, &c);
+    meo_bt_close(p, &c);
     return 1;
   }
-  rowid[0] = dk_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf);
-  dk_bt_close(p, &c);
-  return DK_OK;
+  rowid[0] = meo_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf);
+  meo_bt_close(p, &c);
+  return MEO_OK;
 }
 
 // Insert `key` with `rowid`. An existing key takes the new rowid and the call
-// still answers DK_OK (PHASE2.md 2D). When a split reaches the root, the new
+// still answers MEO_OK (PHASE2.md 2D). When a split reaches the root, the new
 // root page number is written through root* and the CALLER must store it in the
 // meta/catalog and flush: the tree cannot write a root it does not own.
 //
@@ -387,57 +387,57 @@ export fn dk_bt_lookup(p: DkPager*, root: uint32,
 // Space: a node that cannot take one more cell is split into two halves, and
 // the parent gains the separator (a leaf's first upper key, or an inner node's
 // middle key). No merge, no rebalance -- see the header note.
-export fn dk_bt_insert(p: DkPager*, root: uint32*,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: DkBtKey,
+export fn meo_bt_insert(p: MeoPager*, root: uint32*,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
     rowid: uint64) -> int32 {
   if (p == 0 || root == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
-    return -DK_ERR_USAGE;
+    return -MEO_ERR_USAGE;
   }
   // A key that cannot fit an empty leaf can never be stored anywhere: the cell
-  // area of a page is DK_PAGE_SIZE - DK_PAGE_HDR and a leaf cell is the key,
+  // area of a page is MEO_PAGE_SIZE - MEO_PAGE_HDR and a leaf cell is the key,
   // its rowid, the length prefix and the cell pointer.
-  if (key.len + DK_BTN_LEAF_ROWID + 4 > DK_PAGE_SIZE - DK_PAGE_HDR) {
-    return -DK_ERR_FULL;
+  if (key.len + MEO_BTN_LEAF_ROWID + 4 > MEO_PAGE_SIZE - MEO_PAGE_HDR) {
+    return -MEO_ERR_FULL;
   }
 
   // Three page-sized scratch buffers in one block: a copy of the node being
   // split, a copy of its parent being rebuilt, and the separator key that
   // travels up the tree. No page buffer is ever a stack local (ARCHITECTURE 0.5).
-  var scratch: uint8* = malloc((int64)DK_PAGE_SIZE * 3);
-  if (scratch == 0) { return -DK_ERR_NOMEM; }
+  var scratch: uint8* = malloc((int64)MEO_PAGE_SIZE * 3);
+  if (scratch == 0) { return -MEO_ERR_NOMEM; }
   defer free(scratch);
   var copy_a: uint8* = scratch;
-  var copy_b: uint8* = scratch + DK_PAGE_SIZE;
-  var sep_buf: uint8* = scratch + 2 * DK_PAGE_SIZE;
+  var copy_b: uint8* = scratch + MEO_PAGE_SIZE;
+  var sep_buf: uint8* = scratch + 2 * MEO_PAGE_SIZE;
 
   var cur_root: uint32 = root[0];
   if (cur_root == 0) {
-    var nrc: int32 = DK_OK;
-    var nf: DkFrame* = bt_alloc(p, &nrc);
+    var nrc: int32 = MEO_OK;
+    var nf: MeoFrame* = bt_alloc(p, &nrc);
     if (nf == 0) { return nrc; }
-    nrc = dk_page_init(nf->data, DK_PAGE_BTREE_LEAF);
-    if (nrc == DK_OK) {
-      nrc = dk_btn_leaf_append(nf->data, key.data, key.len, rowid);
+    nrc = meo_page_init(nf->data, MEO_PAGE_BTREE_LEAF);
+    if (nrc == MEO_OK) {
+      nrc = meo_btn_leaf_append(nf->data, key.data, key.len, rowid);
     }
     var first_page: uint32 = nf->page_no;
-    dk_pager_release(p, nf, nrc == DK_OK);
-    if (nrc != DK_OK) { return nrc; }
+    meo_pager_release(p, nf, nrc == MEO_OK);
+    if (nrc != MEO_OK) { return nrc; }
     root[0] = first_page;
-    return DK_OK;
+    return MEO_OK;
   }
 
-  var c: DkBtCursor;
+  var c: MeoBtCursor;
   c.pager = p;
   c.root = cur_root;
   c.cmp = cmp_cb;
-  c.err = DK_OK;
+  c.err = MEO_OK;
   c.depth = 0;
   c.leaf = 0;
   c.slot_in_leaf = 0;
   var rc: int32 = bt_seek_leaf(p, &c, cur_root, cmp_cb, key.data, key.len);
-  if (rc != DK_OK) { return rc; }
-  var n: int32 = dk_page_n_cells(c.leaf->data);
-  var at: int32 = dk_btn_leaf_search(c.leaf->data, key.data, key.len, cmp_cb);
+  if (rc != MEO_OK) { return rc; }
+  var n: int32 = meo_page_n_cells(c.leaf->data);
+  var at: int32 = meo_btn_leaf_search(c.leaf->data, key.data, key.len, cmp_cb);
   // at == n means the key is past this leaf's last cell -- and it belongs at
   // the END of this leaf, not at the front of the next one. The descent already
   // chose the leaf whose fence range contains the key (first separator strictly
@@ -450,132 +450,132 @@ export fn dk_bt_insert(p: DkPager*, root: uint32*,
 
   // Keys are unique (PHASE2.md 2D): an existing key replaces its rowid. The
   // body length is unchanged, so the cell does not move.
-  if (at < n && cmp_cb(dk_btn_leaf_key_ptr(c.leaf->data, at),
-      dk_btn_leaf_key_len(c.leaf->data, at), key.data, key.len) == 0) {
-    rc = dk_btn_leaf_set_rowid(c.leaf->data, at, rowid);
-    dk_pager_release(p, c.leaf, rc == DK_OK);
+  if (at < n && cmp_cb(meo_btn_leaf_key_ptr(c.leaf->data, at),
+      meo_btn_leaf_key_len(c.leaf->data, at), key.data, key.len) == 0) {
+    rc = meo_btn_leaf_set_rowid(c.leaf->data, at, rowid);
+    meo_pager_release(p, c.leaf, rc == MEO_OK);
     c.leaf = 0;
     return rc;
   }
 
   var leaf_page: uint32 = c.leaf->page_no;
-  if (dk_btn_leaf_room(c.leaf->data, key.len)) {
-    dk_bytes_copy(copy_a, c.leaf->data, (int64)DK_PAGE_SIZE);
-    rc = dk_btn_leaf_insert(c.leaf->data, copy_a, key.data, key.len, rowid, at);
-    if (rc != DK_OK) {
-      dk_bt_close(p, &c);
+  if (meo_btn_leaf_room(c.leaf->data, key.len)) {
+    meo_bytes_copy(copy_a, c.leaf->data, (int64)MEO_PAGE_SIZE);
+    rc = meo_btn_leaf_insert(c.leaf->data, copy_a, key.data, key.len, rowid, at);
+    if (rc != MEO_OK) {
+      meo_bt_close(p, &c);
       return rc;
     }
-    dk_pager_release(p, c.leaf, true);
+    meo_pager_release(p, c.leaf, true);
     c.leaf = 0;
-    return DK_OK;
+    return MEO_OK;
   }
 
   // A split here would carry a separator toward the root, and a split of the
   // root would build a seventeenth level. PHASE2.md 2D caps a chain at
-  // DK_BT_MAX_DEPTH levels, the leaf included, and every reader (bt_seek_leaf,
+  // MEO_BT_MAX_DEPTH levels, the leaf included, and every reader (bt_seek_leaf,
   // bt_descend_left) refuses a deeper one: writing it would let this insert
-  // answer DK_OK and leave the tree unreadable. Refuse BEFORE the sibling
+  // answer MEO_OK and leave the tree unreadable. Refuse BEFORE the sibling
   // allocation, so no page is burnt, nothing is dirtied and root* is untouched.
-  if (c.depth >= DK_BT_MAX_DEPTH) {
-    dk_bt_close(p, &c);
-    return -DK_ERR_CORRUPT;
+  if (c.depth >= MEO_BT_MAX_DEPTH) {
+    meo_bt_close(p, &c);
+    return -MEO_ERR_CORRUPT;
   }
 
   // The leaf is full: split it, then carry its first upper key up. Both halves
   // are smaller than the sequence that did not fit, so the split cannot run out
   // of room on either page.
-  var src_rc: int32 = DK_OK;
-  var sib: DkFrame* = bt_alloc(p, &src_rc);
+  var src_rc: int32 = MEO_OK;
+  var sib: MeoFrame* = bt_alloc(p, &src_rc);
   if (sib == 0) {
-    dk_bt_close(p, &c);
+    meo_bt_close(p, &c);
     return src_rc;
   }
-  dk_bytes_copy(copy_a, c.leaf->data, (int64)DK_PAGE_SIZE);
-  rc = dk_btn_leaf_split(c.leaf->data, sib->data, copy_a, key.data, key.len,
+  meo_bytes_copy(copy_a, c.leaf->data, (int64)MEO_PAGE_SIZE);
+  rc = meo_btn_leaf_split(c.leaf->data, sib->data, copy_a, key.data, key.len,
     rowid, at);
-  if (rc != DK_OK) {
-    dk_pager_release(p, sib, false);
-    dk_bt_close(p, &c);
+  if (rc != MEO_OK) {
+    meo_pager_release(p, sib, false);
+    meo_bt_close(p, &c);
     return rc;
   }
-  var sep_len: int32 = dk_btn_leaf_key_len(sib->data, 0);
-  dk_bytes_copy(sep_buf, dk_btn_leaf_key_ptr(sib->data, 0), (int64)sep_len);
-  dk_pager_release(p, c.leaf, true);
+  var sep_len: int32 = meo_btn_leaf_key_len(sib->data, 0);
+  meo_bytes_copy(sep_buf, meo_btn_leaf_key_ptr(sib->data, 0), (int64)sep_len);
+  meo_pager_release(p, c.leaf, true);
   c.leaf = 0;
 
   var level: int32 = c.depth - 1;
   var child_page: uint32 = leaf_page;
   var sibling_page: uint32 = sib->page_no;
-  var sib_frame: DkFrame* = sib;
+  var sib_frame: MeoFrame* = sib;
   while (true) {
     if (level == 0) {
       // The split reached the root: a new root with one keyed cell, the old
       // root as its left child and the sibling as its right child.
-      var nr_rc: int32 = DK_OK;
-      var nr: DkFrame* = bt_alloc(p, &nr_rc);
+      var nr_rc: int32 = MEO_OK;
+      var nr: MeoFrame* = bt_alloc(p, &nr_rc);
       if (nr == 0) {
-        dk_pager_release(p, sib_frame, true);
+        meo_pager_release(p, sib_frame, true);
         return nr_rc;
       }
-      nr_rc = dk_page_init(nr->data, DK_PAGE_BTREE_INNER);
-      if (nr_rc == DK_OK) {
-        nr_rc = dk_btn_inner_append(nr->data, child_page, sep_buf, sep_len);
+      nr_rc = meo_page_init(nr->data, MEO_PAGE_BTREE_INNER);
+      if (nr_rc == MEO_OK) {
+        nr_rc = meo_btn_inner_append(nr->data, child_page, sep_buf, sep_len);
       }
-      if (nr_rc == DK_OK) {
-        nr_rc = dk_btn_inner_append_right(nr->data, sibling_page);
+      if (nr_rc == MEO_OK) {
+        nr_rc = meo_btn_inner_append_right(nr->data, sibling_page);
       }
       var new_root: uint32 = nr->page_no;
-      dk_pager_release(p, nr, nr_rc == DK_OK);
-      dk_pager_release(p, sib_frame, true);
-      if (nr_rc != DK_OK) { return nr_rc; }
+      meo_pager_release(p, nr, nr_rc == MEO_OK);
+      meo_pager_release(p, sib_frame, true);
+      if (nr_rc != MEO_OK) { return nr_rc; }
       root[0] = new_root;
-      return DK_OK;
+      return MEO_OK;
     }
     level -= 1;
     var at_parent: int32 = c.slot[level];
     var parent_page: uint32 = c.path[level];
-    var prc: int32 = DK_OK;
-    var pf: DkFrame* = bt_pin(p, parent_page, true, &prc);
+    var prc: int32 = MEO_OK;
+    var pf: MeoFrame* = bt_pin(p, parent_page, true, &prc);
     if (pf == 0) {
-      dk_pager_release(p, sib_frame, true);
+      meo_pager_release(p, sib_frame, true);
       return prc;
     }
-    if (dk_btn_inner_room(pf->data, sep_len)) {
-      dk_bytes_copy(copy_b, pf->data, (int64)DK_PAGE_SIZE);
-      prc = dk_btn_inner_insert(pf->data, copy_b, at_parent, child_page,
+    if (meo_btn_inner_room(pf->data, sep_len)) {
+      meo_bytes_copy(copy_b, pf->data, (int64)MEO_PAGE_SIZE);
+      prc = meo_btn_inner_insert(pf->data, copy_b, at_parent, child_page,
         sibling_page, sep_buf, sep_len);
-      dk_pager_release(p, pf, prc == DK_OK);
-      dk_pager_release(p, sib_frame, true);
+      meo_pager_release(p, pf, prc == MEO_OK);
+      meo_pager_release(p, sib_frame, true);
       return prc;
     }
     // The parent is full too: insert the new cell and split it in one rebuild,
     // and its own middle key becomes the separator for the next level up.
-    dk_bytes_copy(copy_b, pf->data, (int64)DK_PAGE_SIZE);
-    var ps_rc: int32 = DK_OK;
-    var psib: DkFrame* = bt_alloc(p, &ps_rc);
+    meo_bytes_copy(copy_b, pf->data, (int64)MEO_PAGE_SIZE);
+    var ps_rc: int32 = MEO_OK;
+    var psib: MeoFrame* = bt_alloc(p, &ps_rc);
     if (psib == 0) {
-      dk_pager_release(p, pf, false);
-      dk_pager_release(p, sib_frame, true);
+      meo_pager_release(p, pf, false);
+      meo_pager_release(p, sib_frame, true);
       return ps_rc;
     }
     var new_sep_len: int32 = 0;
-    prc = dk_btn_inner_split_insert(pf->data, psib->data, copy_b, at_parent,
+    prc = meo_btn_inner_split_insert(pf->data, psib->data, copy_b, at_parent,
       child_page, sibling_page, sep_buf, sep_len, sep_buf, &new_sep_len);
     // The child this level came from is now inside the two halves: release it
     // before the next level pins anything, and keep at most two frames.
-    dk_pager_release(p, sib_frame, true);
-    if (prc != DK_OK) {
-      dk_pager_release(p, pf, false);
-      dk_pager_release(p, psib, false);
+    meo_pager_release(p, sib_frame, true);
+    if (prc != MEO_OK) {
+      meo_pager_release(p, pf, false);
+      meo_pager_release(p, psib, false);
       return prc;
     }
     var split_page: uint32 = pf->page_no;
-    dk_pager_release(p, pf, true);
+    meo_pager_release(p, pf, true);
     sib_frame = psib;
     sibling_page = psib->page_no;
     child_page = split_page;
     sep_len = new_sep_len;
   }
-  return -DK_ERR_CORRUPT;
+  return -MEO_ERR_CORRUPT;
 }

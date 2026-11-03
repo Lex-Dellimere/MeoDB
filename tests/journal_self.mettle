@@ -64,13 +64,13 @@ fn jrn_jpath(db: string) -> string {
 // Make `db` a zero-byte file and remove any journal beside it, so a run is
 // repeatable. A missing journal is not an error.
 fn jrn_reset(db: string) -> int32 {
-  var f: DkFile = dk_file_open(db,
-    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, 0);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
   var jpath: string = jrn_jpath(db);
-  dk_file_unlink(jpath);
+  meo_file_unlink(jpath);
   free(jpath.chars);
   return rc;
 }
@@ -78,76 +78,76 @@ fn jrn_reset(db: string) -> int32 {
 // Seed a database with `n` data pages, each carrying its page number in byte
 // 20, and leave it closed and durable.
 fn jrn_seed(db: string, n: int32) -> int32 {
-  var p: DkPager* = dk_pager_open(db, 16, DK_PAGER_CREATE);
-  if (p == 0) { return -DK_ERR_IO; }
+  var p: MeoPager* = meo_pager_open(db, 16, MEO_PAGER_CREATE);
+  if (p == 0) { return -MEO_ERR_IO; }
   var i: int32 = 0;
   while (i < n) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (f == 0) {
-      dk_pager_close(p);
-      dk_pager_free(p);
-      return -DK_ERR_NOMEM;
+      meo_pager_close(p);
+      meo_pager_free(p);
+      return -MEO_ERR_NOMEM;
     }
     f->data[20] = (uint8)(i + 1);
-    if (dk_pager_release(p, f, true) != DK_OK) {
-      dk_pager_close(p);
-      dk_pager_free(p);
-      return -DK_ERR_IO;
+    if (meo_pager_release(p, f, true) != MEO_OK) {
+      meo_pager_close(p);
+      meo_pager_free(p);
+      return -MEO_ERR_IO;
     }
     i += 1;
   }
-  var rc: int32 = dk_pager_flush(p);
-  if (rc == DK_OK) { rc = dk_pager_close(p); }
-  dk_pager_free(p);
+  var rc: int32 = meo_pager_flush(p);
+  if (rc == MEO_OK) { rc = meo_pager_close(p); }
+  meo_pager_free(p);
   return rc;
 }
 
 fn jrn_read_byte(db: string, page_no: uint32, off: int64) -> int32 {
-  var f: DkFile = dk_file_open(db, DK_OPEN_READ);
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ);
   if (!f.is_open) { return -1; }
   var one: uint8[1];
-  var rc: int32 = dk_file_read_at(f,
-    (int64)page_no * (int64)DK_PAGE_SIZE + off, &one[0], 1);
-  dk_file_close(f);
+  var rc: int32 = meo_file_read_at(f,
+    (int64)page_no * (int64)MEO_PAGE_SIZE + off, &one[0], 1);
+  meo_file_close(f);
   if (rc != 1) { return -1; }
   return (int32)one[0];
 }
 
 fn jrn_file_size(path: string) -> int64 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
   if (!f.is_open) { return -1; }
-  var n: int64 = dk_file_size(f);
-  dk_file_close(f);
+  var n: int64 = meo_file_size(f);
+  meo_file_close(f);
   return n;
 }
 
 fn jrn_exists(path: string) -> bool {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
   if (!f.is_open) { return false; }
-  dk_file_close(f);
+  meo_file_close(f);
   return true;
 }
 
 fn jrn_flip_byte(path: string, off: int64) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE);
-  if (!f.is_open) { return -DK_ERR_IO; }
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
   var one: uint8[1];
-  var rc: int32 = dk_file_read_at(f, off, &one[0], 1);
+  var rc: int32 = meo_file_read_at(f, off, &one[0], 1);
   if (rc != 1) {
-    dk_file_close(f);
-    return -DK_ERR_IO;
+    meo_file_close(f);
+    return -MEO_ERR_IO;
   }
   one[0] = (uint8)(one[0] ^ 0xFF);
-  rc = dk_file_write_at(f, off, &one[0], 1);
-  dk_file_close(f);
+  rc = meo_file_write_at(f, off, &one[0], 1);
+  meo_file_close(f);
   return rc;
 }
 
 fn jrn_truncate(path: string, size: int64) -> int32 {
-  var f: DkFile = dk_file_open(path, DK_OPEN_READ | DK_OPEN_WRITE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, size);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, size);
+  meo_file_close(f);
   return rc;
 }
 
@@ -162,19 +162,19 @@ fn jrn_crash(db: string, pages: int32, value: uint8) -> int32 {
   var pid: int64 = syscall(57);
   if (pid < 0) { return -1; }
   if (pid == 0) {
-    var p: DkPager* = dk_pager_open(db, 8, 0);
+    var p: MeoPager* = meo_pager_open(db, 8, 0);
     if (p == 0) { syscall(60, (int64)90); }
-    if (dk_pager_begin(p) != DK_OK) { syscall(60, (int64)91); }
+    if (meo_pager_begin(p) != MEO_OK) { syscall(60, (int64)91); }
     var i: int32 = 1;
     while (i <= pages) {
-      var f: DkFrame* = dk_pager_get(p, (uint32)i, true);
+      var f: MeoFrame* = meo_pager_get(p, (uint32)i, true);
       if (f == 0) { syscall(60, (int64)92); }
       f->data[20] = value;
-      if (dk_pager_release(p, f, true) != DK_OK) { syscall(60, (int64)93); }
+      if (meo_pager_release(p, f, true) != MEO_OK) { syscall(60, (int64)93); }
       i += 1;
     }
-    if (dk_pager_flush(p) != DK_OK) { syscall(60, (int64)94); }
-    if (dk_pager_sync(p) != DK_OK) { syscall(60, (int64)95); }
+    if (meo_pager_flush(p) != MEO_OK) { syscall(60, (int64)94); }
+    if (meo_pager_sync(p) != MEO_OK) { syscall(60, (int64)95); }
     syscall(60, (int64)42);
   }
   var status: int32 = 0;
@@ -188,85 +188,85 @@ fn jrn_crash(db: string, pages: int32, value: uint8) -> int32 {
 // --- J2: begin / modify / commit -------------------------------------------
 
 fn j2_commit() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j2: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 4) == DK_OK, "j2: seed four pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j2: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 4) == MEO_OK, "j2: seed four pages")) {
     return 1;
   }
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p != 0, "j2: open")) { return 1; }
-  if (!dk_t_check(dk_pager_begin(p) == DK_OK, "j2: begin")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p != 0, "j2: open")) { return 1; }
+  if (!meo_t_check(meo_pager_begin(p) == MEO_OK, "j2: begin")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_journal_attached(p), "j2: the journal is attached")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_journal_attached(p), "j2: the journal is attached")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   var i: uint32 = 1;
   while (i <= 4) {
-    var f: DkFrame* = dk_pager_get(p, i, true);
-    if (!dk_t_check(f != 0, "j2: get a page for write")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+    var f: MeoFrame* = meo_pager_get(p, i, true);
+    if (!meo_t_check(f != 0, "j2: get a page for write")) {
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     f->data[20] = (uint8)(0xA0 + i);
-    if (!dk_t_check(dk_pager_release(p, f, true) == DK_OK,
+    if (!meo_t_check(meo_pager_release(p, f, true) == MEO_OK,
         "j2: release it dirty")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check(dk_pager_commit(p) == DK_OK, "j2: commit")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_commit(p) == MEO_OK, "j2: commit")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_false(dk_pager_journal_attached(p),
+  if (!meo_t_check_false(meo_pager_journal_attached(p),
       "j2: commit detached the journal")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   var jpath: string = jrn_jpath(J_DB);
-  if (!dk_t_check_false(jrn_exists(jpath), "j2: no journal file remains")) {
+  if (!meo_t_check_false(jrn_exists(jpath), "j2: no journal file remains")) {
     free(jpath.chars);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   free(jpath.chars);
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j2: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j2: close")) { return 1; }
+  meo_pager_free(p);
 
-  var q: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(q != 0, "j2: reopen")) { return 1; }
+  var q: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(q != 0, "j2: reopen")) { return 1; }
   i = 1;
   while (i <= 4) {
-    var f: DkFrame* = dk_pager_get(q, i, false);
-    if (!dk_t_check(f != 0, "j2: get a committed page")) {
-      dk_pager_close(q);
-      dk_pager_free(q);
+    var f: MeoFrame* = meo_pager_get(q, i, false);
+    if (!meo_t_check(f != 0, "j2: get a committed page")) {
+      meo_pager_close(q);
+      meo_pager_free(q);
       return 1;
     }
-    if (!dk_t_check_i64((int64)f->data[20], (int64)(0xA0 + i),
+    if (!meo_t_check_i64((int64)f->data[20], (int64)(0xA0 + i),
         "j2: the committed content is durable")) {
-      dk_pager_release(q, f, false);
-      dk_pager_close(q);
-      dk_pager_free(q);
+      meo_pager_release(q, f, false);
+      meo_pager_close(q);
+      meo_pager_free(q);
       return 1;
     }
-    dk_pager_release(q, f, false);
+    meo_pager_release(q, f, false);
     i += 1;
   }
-  if (!dk_t_check(dk_pager_close(q) == DK_OK, "j2: close the reopen")) {
+  if (!meo_t_check(meo_pager_close(q) == MEO_OK, "j2: close the reopen")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
   println("PASS j2_commit");
   return 0;
 }
@@ -274,30 +274,30 @@ fn j2_commit() -> int32 {
 // --- J3: rollback ----------------------------------------------------------
 
 fn j3_rollback() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j3: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 4) == DK_OK, "j3: seed four pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j3: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 4) == MEO_OK, "j3: seed four pages")) {
     return 1;
   }
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p != 0, "j3: open")) { return 1; }
-  if (!dk_t_check(dk_pager_begin(p) == DK_OK, "j3: begin")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p != 0, "j3: open")) { return 1; }
+  if (!meo_t_check(meo_pager_begin(p) == MEO_OK, "j3: begin")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   var i: uint32 = 1;
   while (i <= 2) {
-    var f: DkFrame* = dk_pager_get(p, i, true);
-    if (!dk_t_check(f != 0, "j3: get a page for write")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+    var f: MeoFrame* = meo_pager_get(p, i, true);
+    if (!meo_t_check(f != 0, "j3: get a page for write")) {
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     f->data[20] = (uint8)0xEE;
-    if (!dk_t_check(dk_pager_release(p, f, true) == DK_OK,
+    if (!meo_t_check(meo_pager_release(p, f, true) == MEO_OK,
         "j3: release it dirty")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     i += 1;
@@ -305,90 +305,90 @@ fn j3_rollback() -> int32 {
   // Allocate a page too: the transaction grows the file, so rollback has to
   // restore page_count AND truncate the file back to it, or the next open
   // refuses a size that disagrees with the meta.
-  var nf: DkFrame* = dk_pager_alloc(p);
-  if (!dk_t_check(nf != 0, "j3: allocate a page in the transaction")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  var nf: MeoFrame* = meo_pager_alloc(p);
+  if (!meo_t_check(nf != 0, "j3: allocate a page in the transaction")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   nf->data[20] = (uint8)0x99;
-  if (!dk_t_check(dk_pager_release(p, nf, true) == DK_OK,
+  if (!meo_t_check(meo_pager_release(p, nf, true) == MEO_OK,
       "j3: release the new page dirty")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   // Force the new content to disk before the rollback, so the test proves the
   // before-images restore it rather than the cache never having written it.
-  if (!dk_t_check(dk_pager_flush(p) == DK_OK, "j3: flush the new content")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_flush(p) == MEO_OK, "j3: flush the new content")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), 6,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), 6,
       "j3: the transaction grew page_count")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_rollback(p) == DK_OK, "j3: rollback")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_rollback(p) == MEO_OK, "j3: rollback")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_false(dk_pager_journal_attached(p),
+  if (!meo_t_check_false(meo_pager_journal_attached(p),
       "j3: rollback detached the journal")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), 5,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), 5,
       "j3: rollback restored page_count")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   var jpath: string = jrn_jpath(J_DB);
-  if (!dk_t_check_false(jrn_exists(jpath), "j3: no journal file remains")) {
+  if (!meo_t_check_false(jrn_exists(jpath), "j3: no journal file remains")) {
     free(jpath.chars);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   free(jpath.chars);
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j3: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j3: close")) { return 1; }
+  meo_pager_free(p);
 
-  var q: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(q != 0, "j3: reopen")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(q), 5,
+  var q: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(q != 0, "j3: reopen")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(q), 5,
       "j3: page_count is unchanged after reopen")) {
-    dk_pager_close(q);
-    dk_pager_free(q);
+    meo_pager_close(q);
+    meo_pager_free(q);
     return 1;
   }
   i = 1;
   while (i <= 2) {
-    var f: DkFrame* = dk_pager_get(q, i, false);
-    if (!dk_t_check(f != 0, "j3: get a rolled-back page")) {
-      dk_pager_close(q);
-      dk_pager_free(q);
+    var f: MeoFrame* = meo_pager_get(q, i, false);
+    if (!meo_t_check(f != 0, "j3: get a rolled-back page")) {
+      meo_pager_close(q);
+      meo_pager_free(q);
       return 1;
     }
-    if (!dk_t_check_i64((int64)f->data[20], (int64)i,
+    if (!meo_t_check_i64((int64)f->data[20], (int64)i,
         "j3: the old content is back")) {
-      dk_pager_release(q, f, false);
-      dk_pager_close(q);
-      dk_pager_free(q);
+      meo_pager_release(q, f, false);
+      meo_pager_close(q);
+      meo_pager_free(q);
       return 1;
     }
-    dk_pager_release(q, f, false);
+    meo_pager_release(q, f, false);
     i += 1;
   }
-  if (!dk_t_check(dk_pager_close(q) == DK_OK, "j3: close the reopen")) {
+  if (!meo_t_check(meo_pager_close(q) == MEO_OK, "j3: close the reopen")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
   println("PASS j3_rollback");
   return 0;
 }
@@ -396,12 +396,12 @@ fn j3_rollback() -> int32 {
 // --- J4: a real crash ------------------------------------------------------
 
 fn j4_crash() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j4: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 4) == DK_OK, "j4: seed four pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j4: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 4) == MEO_OK, "j4: seed four pages")) {
     return 1;
   }
   var st: int32 = jrn_crash(J_DB, 3, (uint8)0xCC);
-  if (!dk_t_check_i64((int64)st, 42,
+  if (!meo_t_check_i64((int64)st, 42,
       "j4: the child died with _exit(42), not an early failure")) {
     return 1;
   }
@@ -409,37 +409,37 @@ fn j4_crash() -> int32 {
   // below proves nothing about recovery.
   var jpath: string = jrn_jpath(J_DB);
   var jsize: int64 = jrn_file_size(jpath);
-  if (!dk_t_check(jsize > 64,
+  if (!meo_t_check(jsize > 64,
       "j4: the journal is on disk and non-empty after the crash")) {
     free(jpath.chars);
     return 1;
   }
   free(jpath.chars);
 
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p != 0, "j4: reopen after the crash")) { return 1; }
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p != 0, "j4: reopen after the crash")) { return 1; }
   var i: uint32 = 1;
   while (i <= 3) {
-    var f: DkFrame* = dk_pager_get(p, i, false);
-    if (!dk_t_check(f != 0, "j4: get a restored page")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+    var f: MeoFrame* = meo_pager_get(p, i, false);
+    if (!meo_t_check(f != 0, "j4: get a restored page")) {
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
-    if (!dk_t_check_i64((int64)f->data[20], (int64)i,
+    if (!meo_t_check_i64((int64)f->data[20], (int64)i,
         "j4: the pre-transaction content is back")) {
-      dk_pager_release(p, f, false);
-      dk_pager_close(p);
-      dk_pager_free(p);
+      meo_pager_release(p, f, false);
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
-    dk_pager_release(p, f, false);
+    meo_pager_release(p, f, false);
     i += 1;
   }
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j4: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j4: close")) { return 1; }
+  meo_pager_free(p);
   var jpath2: string = jrn_jpath(J_DB);
-  if (!dk_t_check_false(jrn_exists(jpath2),
+  if (!meo_t_check_false(jrn_exists(jpath2),
       "j4: replay removed the journal")) {
     free(jpath2.chars);
     return 1;
@@ -452,36 +452,36 @@ fn j4_crash() -> int32 {
 // --- J5: a torn journal ----------------------------------------------------
 
 fn j5_torn() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j5: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 3) == DK_OK, "j5: seed three pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j5: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 3) == MEO_OK, "j5: seed three pages")) {
     return 1;
   }
   var st: int32 = jrn_crash(J_DB, 3, (uint8)0xDD);
-  if (!dk_t_check_i64((int64)st, 42, "j5: the crash child ran")) { return 1; }
+  if (!meo_t_check_i64((int64)st, 42, "j5: the crash child ran")) { return 1; }
   // The header still says three records; the file holds two and a fragment.
   var jpath: string = jrn_jpath(J_DB);
-  var cut: int64 = (int64)DK_JRN_HDR + 2 * (int64)DK_JRN_RECORD + 100;
-  if (!dk_t_check(jrn_truncate(jpath, cut) == DK_OK,
+  var cut: int64 = (int64)MEO_JRN_HDR + 2 * (int64)MEO_JRN_RECORD + 100;
+  if (!meo_t_check(jrn_truncate(jpath, cut) == MEO_OK,
       "j5: truncate the journal mid-record")) {
     free(jpath.chars);
     return 1;
   }
   free(jpath.chars);
 
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p == 0, "j5: a torn journal refuses the open")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_pager_err(0), (int64)DK_ERR_CORRUPT,
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p == 0, "j5: a torn journal refuses the open")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_err(0), (int64)MEO_ERR_CORRUPT,
       "j5: the refusal is CORRUPT")) {
     return 1;
   }
   // The database was not touched: the crashed transaction's bytes are still
   // there, because replay never started.
-  if (!dk_t_check_i64((int64)jrn_read_byte(J_DB, 1, 20), 0xDD,
+  if (!meo_t_check_i64((int64)jrn_read_byte(J_DB, 1, 20), 0xDD,
       "j5: the database was not replayed")) {
     return 1;
   }
   var jpath2: string = jrn_jpath(J_DB);
-  if (!dk_t_check(jrn_exists(jpath2),
+  if (!meo_t_check(jrn_exists(jpath2),
       "j5: a refused journal is left for inspection")) {
     free(jpath2.chars);
     return 1;
@@ -494,34 +494,34 @@ fn j5_torn() -> int32 {
 // --- J6: a bad checksum ----------------------------------------------------
 
 fn j6_checksum() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j6: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 3) == DK_OK, "j6: seed three pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j6: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 3) == MEO_OK, "j6: seed three pages")) {
     return 1;
   }
   var st: int32 = jrn_crash(J_DB, 3, (uint8)0xEE);
-  if (!dk_t_check_i64((int64)st, 42, "j6: the crash child ran")) { return 1; }
+  if (!meo_t_check_i64((int64)st, 42, "j6: the crash child ran")) { return 1; }
   // Byte 20 is inside db_size_pages, which the checksum covers but the
   // structure does not depend on, so only the checksum can catch it.
   var jpath: string = jrn_jpath(J_DB);
-  if (!dk_t_check(jrn_flip_byte(jpath, 20) == DK_OK,
+  if (!meo_t_check(jrn_flip_byte(jpath, 20) == MEO_OK,
       "j6: flip a header byte")) {
     free(jpath.chars);
     return 1;
   }
   free(jpath.chars);
 
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p == 0, "j6: a bad checksum refuses the open")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_pager_err(0), (int64)DK_ERR_CORRUPT,
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p == 0, "j6: a bad checksum refuses the open")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_err(0), (int64)MEO_ERR_CORRUPT,
       "j6: the refusal is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)jrn_read_byte(J_DB, 1, 20), 0xEE,
+  if (!meo_t_check_i64((int64)jrn_read_byte(J_DB, 1, 20), 0xEE,
       "j6: the database was not touched")) {
     return 1;
   }
   var jpath2: string = jrn_jpath(J_DB);
-  if (!dk_t_check(jrn_exists(jpath2),
+  if (!meo_t_check(jrn_exists(jpath2),
       "j6: a refused journal is left for inspection")) {
     free(jpath2.chars);
     return 1;
@@ -534,94 +534,94 @@ fn j6_checksum() -> int32 {
 // --- J7: capacity ----------------------------------------------------------
 
 fn j7_capacity() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j7: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 4) == DK_OK, "j7: seed four pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j7: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 4) == MEO_OK, "j7: seed four pages")) {
     return 1;
   }
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p != 0, "j7: open")) { return 1; }
-  if (!dk_t_check(dk_pager_set_journal_cap(p, 4) == DK_OK,
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p != 0, "j7: open")) { return 1; }
+  if (!meo_t_check(meo_pager_set_journal_cap(p, 4) == MEO_OK,
       "j7: lower the cap to four records")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_begin(p) == DK_OK, "j7: begin")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_begin(p) == MEO_OK, "j7: begin")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   var i: uint32 = 1;
   while (i <= 4) {
-    var f: DkFrame* = dk_pager_get(p, i, true);
-    if (!dk_t_check(f != 0, "j7: get a page for write")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+    var f: MeoFrame* = meo_pager_get(p, i, true);
+    if (!meo_t_check(f != 0, "j7: get a page for write")) {
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     f->data[20] = (uint8)0xAB;
-    if (!dk_t_check(dk_pager_release(p, f, true) == DK_OK,
+    if (!meo_t_check(meo_pager_release(p, f, true) == MEO_OK,
         "j7: release it dirty")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     i += 1;
   }
   // Page 0 is the fifth distinct page the flush will write.
-  dk_pager_set_txn_id(p, 1);
-  var rc: int32 = dk_pager_flush(p);
-  if (!dk_t_check_i64((int64)rc, (int64)(0 - DK_ERR_NOSPC),
+  meo_pager_set_txn_id(p, 1);
+  var rc: int32 = meo_pager_flush(p);
+  if (!meo_t_check_i64((int64)rc, (int64)(0 - MEO_ERR_NOSPC),
       "j7: the fifth before-image is NOSPC, not dropped")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_err(p), (int64)DK_ERR_NOSPC,
+  if (!meo_t_check_i64((int64)meo_pager_err(p), (int64)MEO_ERR_NOSPC,
       "j7: the pager records NOSPC")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_rollback(p) == DK_OK,
+  if (!meo_t_check(meo_pager_rollback(p) == MEO_OK,
       "j7: rollback after the aborted transaction")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j7: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j7: close")) { return 1; }
+  meo_pager_free(p);
 
-  var q: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(q != 0, "j7: reopen")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(q), 5,
+  var q: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(q != 0, "j7: reopen")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(q), 5,
       "j7: page_count is unchanged")) {
-    dk_pager_close(q);
-    dk_pager_free(q);
+    meo_pager_close(q);
+    meo_pager_free(q);
     return 1;
   }
   i = 1;
   while (i <= 4) {
-    var f: DkFrame* = dk_pager_get(q, i, false);
-    if (!dk_t_check(f != 0, "j7: get a page after the aborted transaction")) {
-      dk_pager_close(q);
-      dk_pager_free(q);
+    var f: MeoFrame* = meo_pager_get(q, i, false);
+    if (!meo_t_check(f != 0, "j7: get a page after the aborted transaction")) {
+      meo_pager_close(q);
+      meo_pager_free(q);
       return 1;
     }
-    if (!dk_t_check_i64((int64)f->data[20], (int64)i,
+    if (!meo_t_check_i64((int64)f->data[20], (int64)i,
         "j7: the aborted transaction left no partial commit")) {
-      dk_pager_release(q, f, false);
-      dk_pager_close(q);
-      dk_pager_free(q);
+      meo_pager_release(q, f, false);
+      meo_pager_close(q);
+      meo_pager_free(q);
       return 1;
     }
-    dk_pager_release(q, f, false);
+    meo_pager_release(q, f, false);
     i += 1;
   }
-  if (!dk_t_check(dk_pager_close(q) == DK_OK, "j7: close the reopen")) {
+  if (!meo_t_check(meo_pager_close(q) == MEO_OK, "j7: close the reopen")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
   println("PASS j7_capacity");
   return 0;
 }
@@ -629,94 +629,94 @@ fn j7_capacity() -> int32 {
 // --- J8: first touch only --------------------------------------------------
 
 fn j8_first_touch() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j8: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 4) == DK_OK, "j8: seed four pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j8: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 4) == MEO_OK, "j8: seed four pages")) {
     return 1;
   }
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p != 0, "j8: open")) { return 1; }
-  if (!dk_t_check(dk_pager_begin(p) == DK_OK, "j8: begin")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p != 0, "j8: open")) { return 1; }
+  if (!meo_t_check(meo_pager_begin(p) == MEO_OK, "j8: begin")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  var f: DkFrame* = dk_pager_get(p, 1, true);
-  if (!dk_t_check(f != 0, "j8: get page 1")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  var f: MeoFrame* = meo_pager_get(p, 1, true);
+  if (!meo_t_check(f != 0, "j8: get page 1")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   f->data[20] = (uint8)0x11;
-  if (!dk_t_check(dk_pager_release(p, f, true) == DK_OK,
+  if (!meo_t_check(meo_pager_release(p, f, true) == MEO_OK,
       "j8: release page 1 dirty")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_flush(p) == DK_OK, "j8: first flush")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_flush(p) == MEO_OK, "j8: first flush")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  f = dk_pager_get(p, 1, true);
-  if (!dk_t_check(f != 0, "j8: get page 1 again")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  f = meo_pager_get(p, 1, true);
+  if (!meo_t_check(f != 0, "j8: get page 1 again")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   f->data[20] = (uint8)0x22;
-  if (!dk_t_check(dk_pager_release(p, f, true) == DK_OK,
+  if (!meo_t_check(meo_pager_release(p, f, true) == MEO_OK,
       "j8: release page 1 dirty again")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_flush(p) == DK_OK, "j8: second flush")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_flush(p) == MEO_OK, "j8: second flush")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   // One record, not two: the second write must not append a second
   // before-image, or rollback would restore the first write's content.
   var jpath: string = jrn_jpath(J_DB);
   var jsize: int64 = jrn_file_size(jpath);
-  if (!dk_t_check_i64(jsize,
-      (int64)DK_JRN_HDR + (int64)DK_JRN_RECORD,
+  if (!meo_t_check_i64(jsize,
+      (int64)MEO_JRN_HDR + (int64)MEO_JRN_RECORD,
       "j8: a page written twice has one before-image")) {
     free(jpath.chars);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   free(jpath.chars);
-  if (!dk_t_check(dk_pager_rollback(p) == DK_OK, "j8: rollback")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_rollback(p) == MEO_OK, "j8: rollback")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j8: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j8: close")) { return 1; }
+  meo_pager_free(p);
 
-  var q: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(q != 0, "j8: reopen")) { return 1; }
-  var g: DkFrame* = dk_pager_get(q, 1, false);
-  if (!dk_t_check(g != 0, "j8: get page 1 after rollback")) {
-    dk_pager_close(q);
-    dk_pager_free(q);
+  var q: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(q != 0, "j8: reopen")) { return 1; }
+  var g: MeoFrame* = meo_pager_get(q, 1, false);
+  if (!meo_t_check(g != 0, "j8: get page 1 after rollback")) {
+    meo_pager_close(q);
+    meo_pager_free(q);
     return 1;
   }
-  if (!dk_t_check_i64((int64)g->data[20], 1,
+  if (!meo_t_check_i64((int64)g->data[20], 1,
       "j8: rollback restored the original content")) {
-    dk_pager_release(q, g, false);
-    dk_pager_close(q);
-    dk_pager_free(q);
+    meo_pager_release(q, g, false);
+    meo_pager_close(q);
+    meo_pager_free(q);
     return 1;
   }
-  dk_pager_release(q, g, false);
-  if (!dk_t_check(dk_pager_close(q) == DK_OK, "j8: close the reopen")) {
+  meo_pager_release(q, g, false);
+  if (!meo_t_check(meo_pager_close(q) == MEO_OK, "j8: close the reopen")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
   println("PASS j8_first_touch");
   return 0;
 }
@@ -724,100 +724,100 @@ fn j8_first_touch() -> int32 {
 // --- J9: page 0 flushed while not resident ---------------------------------
 
 fn j9_page0_nonresident() -> int32 {
-  if (!dk_t_check(jrn_reset(J_DB) == DK_OK, "j9: reset")) { return 1; }
-  if (!dk_t_check(jrn_seed(J_DB, 12) == DK_OK, "j9: seed twelve pages")) {
+  if (!meo_t_check(jrn_reset(J_DB) == MEO_OK, "j9: reset")) { return 1; }
+  if (!meo_t_check(jrn_seed(J_DB, 12) == MEO_OK, "j9: seed twelve pages")) {
     return 1;
   }
-  var p: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(p != 0, "j9: open with 8 frames")) { return 1; }
-  if (!dk_t_check(dk_pager_begin(p) == DK_OK, "j9: begin")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  var p: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(p != 0, "j9: open with 8 frames")) { return 1; }
+  if (!meo_t_check(meo_pager_begin(p) == MEO_OK, "j9: begin")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   // Churn twelve pages through eight frames so page 0 is evicted.
   var i: uint32 = 1;
   while (i <= 12) {
-    var f: DkFrame* = dk_pager_get(p, i, false);
-    if (!dk_t_check(f != 0, "j9: churn the cache")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+    var f: MeoFrame* = meo_pager_get(p, i, false);
+    if (!meo_t_check(f != 0, "j9: churn the cache")) {
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
-    if (!dk_t_check(dk_pager_release(p, f, false) == DK_OK,
+    if (!meo_t_check(meo_pager_release(p, f, false) == MEO_OK,
         "j9: release the churn")) {
-      dk_pager_close(p);
-      dk_pager_free(p);
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     i += 1;
   }
   // Page 0 is not resident now; this marks the meta dirty, so the flush takes
-  // the non-resident page-0 branch of dk_pager_write_planned.
-  dk_pager_set_txn_id(p, 99);
-  if (!dk_t_check(dk_pager_flush(p) == DK_OK, "j9: flush page 0")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  // the non-resident page-0 branch of meo_pager_write_planned.
+  meo_pager_set_txn_id(p, 99);
+  if (!meo_t_check(meo_pager_flush(p) == MEO_OK, "j9: flush page 0")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   var jpath: string = jrn_jpath(J_DB);
   var jsize: int64 = jrn_file_size(jpath);
-  if (!dk_t_check_i64(jsize,
-      (int64)DK_JRN_HDR + (int64)DK_JRN_RECORD,
+  if (!meo_t_check_i64(jsize,
+      (int64)MEO_JRN_HDR + (int64)MEO_JRN_RECORD,
       "j9: the non-resident page-0 write appended its before-image")) {
     free(jpath.chars);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   free(jpath.chars);
-  if (!dk_t_check(dk_pager_rollback(p) == DK_OK, "j9: rollback")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(meo_pager_rollback(p) == MEO_OK, "j9: rollback")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check(dk_pager_close(p) == DK_OK, "j9: close")) { return 1; }
-  dk_pager_free(p);
+  if (!meo_t_check(meo_pager_close(p) == MEO_OK, "j9: close")) { return 1; }
+  meo_pager_free(p);
 
-  var q: DkPager* = dk_pager_open(J_DB, 8, 0);
-  if (!dk_t_check(q != 0, "j9: reopen")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_pager_txn_id(q), 0,
+  var q: MeoPager* = meo_pager_open(J_DB, 8, 0);
+  if (!meo_t_check(q != 0, "j9: reopen")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_txn_id(q), 0,
       "j9: rollback restored the old txn_id")) {
-    dk_pager_close(q);
-    dk_pager_free(q);
+    meo_pager_close(q);
+    meo_pager_free(q);
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(q), 13,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(q), 13,
       "j9: page_count is unchanged")) {
-    dk_pager_close(q);
-    dk_pager_free(q);
+    meo_pager_close(q);
+    meo_pager_free(q);
     return 1;
   }
-  if (!dk_t_check(dk_pager_close(q) == DK_OK, "j9: close the reopen")) {
+  if (!meo_t_check(meo_pager_close(q) == MEO_OK, "j9: close the reopen")) {
     return 1;
   }
-  dk_pager_free(q);
+  meo_pager_free(q);
   println("PASS j9_page0_nonresident");
   return 0;
 }
 
 fn main() -> int32 {
   var rc: int32 = j2_commit();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j3_rollback();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j4_crash();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j5_torn();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j6_checksum();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j7_capacity();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j8_first_touch();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   rc = j9_page0_nonresident();
-  if (rc != 0) { return dk_t_report(); }
+  if (rc != 0) { return meo_t_report(); }
   println("PASS journal_self");
-  return dk_t_report();
+  return meo_t_report();
 }

@@ -41,7 +41,7 @@
 //                      child pointer, or leaves an outer separator naming a key
 //                      its subtree no longer starts at.
 //   b5_e7              PHASE2.md 2E E7: a root-to-leaf chain at the depth cap is
-//                      walked; one level deeper is -DK_ERR_CORRUPT for lookup,
+//                      walked; one level deeper is -MEO_ERR_CORRUPT for lookup,
 //                      insert and seek, not a crash or a stack overflow. A FULL
 //                      16-level chain also refuses the insert whose split would
 //                      reach the root and build a seventeenth level.
@@ -100,21 +100,21 @@ const B_WIDE_KEYS: int32 = 2000;
 // B_WIDE + 8 rowid + 4 = 112, so a leaf holds 4080 / 112 = 36.
 const B_FULL_INNER_CELL: int32 = B_WIDE + 4 + 4;
 const B_FULL_INNER_KEYS: int32 =
-  (DK_PAGE_SIZE - DK_PAGE_HDR - (4 + 4)) / B_FULL_INNER_CELL;
+  (MEO_PAGE_SIZE - MEO_PAGE_HDR - (4 + 4)) / B_FULL_INNER_CELL;
 const B_FULL_LEAF_CELL: int32 = B_WIDE + 8 + 4;
-const B_FULL_LEAF_KEYS: int32 = (DK_PAGE_SIZE - DK_PAGE_HDR) / B_FULL_LEAF_CELL;
+const B_FULL_LEAF_KEYS: int32 = (MEO_PAGE_SIZE - MEO_PAGE_HDR) / B_FULL_LEAF_CELL;
 // Every separator and leaf key in that chain is below this, so a descent for it
 // takes the right child at every level.
 const B_FULL_ABOVE: int64 = 1000;
 
-// Make `path` a zero-byte file, the state DK_PAGER_CREATE is defined against;
+// Make `path` a zero-byte file, the state MEO_PAGER_CREATE is defined against;
 // there is no unlink in the phase-1 platform surface.
 fn b_reset(path: string) -> int32 {
-  var f: DkFile = dk_file_open(path,
-    DK_OPEN_READ | DK_OPEN_WRITE | DK_OPEN_CREATE);
-  if (!f.is_open) { return -DK_ERR_IO; }
-  var rc: int32 = dk_file_truncate(f, 0);
-  dk_file_close(f);
+  var f: MeoFile = meo_file_open(path,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
   return rc;
 }
 
@@ -125,10 +125,10 @@ fn b_pass(name: string) {
 // Frames the pager currently has pinned. The cursor contract (PHASE2.md 2D) is
 // "exactly one leaf frame at a time", and the pin count is the only observable
 // form of it: a leaked pin is invisible until the frame table runs out.
-fn b_pins(p: DkPager*) -> int32 {
+fn b_pins(p: MeoPager*) -> int32 {
   var n: int32 = 0;
   var i: int32 = 0;
-  while (i < dk_pager_frames(p)) {
+  while (i < meo_pager_frames(p)) {
     if (p->frames[i].pin > 0) { n += 1; }
     i += 1;
   }
@@ -136,19 +136,19 @@ fn b_pins(p: DkPager*) -> int32 {
 }
 
 // The key bytes of the row the cursor holds.
-fn b_cursor_key(c: DkBtCursor*) -> uint8* {
-  return dk_btn_leaf_key_ptr(c->leaf->data, c->slot_in_leaf);
+fn b_cursor_key(c: MeoBtCursor*) -> uint8* {
+  return meo_btn_leaf_key_ptr(c->leaf->data, c->slot_in_leaf);
 }
 
-fn b_cursor_key_len(c: DkBtCursor*) -> int32 {
-  return dk_btn_leaf_key_len(c->leaf->data, c->slot_in_leaf);
+fn b_cursor_key_len(c: MeoBtCursor*) -> int32 {
+  return meo_btn_leaf_key_len(c->leaf->data, c->slot_in_leaf);
 }
 
 // Encode key `v` at width `klen`: the order-preserving int encoding, then a
 // constant tail. The comparator looks at the common prefix first, so the
 // integer still decides the order.
 fn b_make_key(buf: uint8*, v: int64, klen: int32) -> int32 {
-  var n: int32 = dk_key_int(buf, klen, v);
+  var n: int32 = meo_key_int(buf, klen, v);
   if (n < 0) { return n; }
   var i: int32 = n;
   while (i < klen) {
@@ -161,16 +161,16 @@ fn b_make_key(buf: uint8*, v: int64, klen: int32) -> int32 {
 // How many levels the leaf a seek for `v` lands on is below the root (1 = the
 // root itself is a leaf). -1 on failure. Closes the cursor, so the caller's pin
 // count is untouched.
-fn b_depth(p: DkPager*, root: uint32, v: int64, klen: int32) -> int32 {
+fn b_depth(p: MeoPager*, root: uint32, v: int64, klen: int32) -> int32 {
   var kb: uint8[B_WIDE];
   var kn: int32 = b_make_key(&kb[0], v, klen);
-  var kk: DkBtKey = { data: &kb[0], len: kn };
-  var c: DkBtCursor;
-  dk_bt_cursor_init(&c);
-  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
+  var kk: MeoBtKey = { data: &kb[0], len: kn };
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = meo_bt_seek(p, &c, root, &meo_key_compare, kk);
   if (rc < 0) { return -1; }
   var d: int32 = c.depth;
-  dk_bt_close(p, &c);
+  meo_bt_close(p, &c);
   return d;
 }
 
@@ -179,22 +179,22 @@ fn b_depth(p: DkPager*, root: uint32, v: int64, klen: int32) -> int32 {
 // complete: no key is skipped, duplicated or reordered), and when rowid_base is
 // not negative the rowid is rowid_base + i. Returns 0, or 1 after reporting the
 // first failure.
-fn b_scan(p: DkPager*, root: uint32, first: int64, expect: int32,
+fn b_scan(p: MeoPager*, root: uint32, first: int64, expect: int32,
     rowid_base: int64, klen: int32, label: string) -> int32 {
   var kb: uint8[B_WIDE];
   var kn: int32 = b_make_key(&kb[0], first, klen);
   if (kn < 0) { return 1; }
-  var k0: DkBtKey = { data: &kb[0], len: kn };
-  var c: DkBtCursor;
-  dk_bt_cursor_init(&c);
-  var rc: int32 = dk_bt_seek(p, &c, root, &dk_key_compare, k0);
+  var k0: MeoBtKey = { data: &kb[0], len: kn };
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = meo_bt_seek(p, &c, root, &meo_key_compare, k0);
   if (rc < 0) {
     println("FAIL {label}: seek {rc}");
     return 1;
   }
   // The seek pins one leaf; nothing else may be pinned.
-  if (!dk_t_check_i64(b_pins(p), 1, "{label}: seek pins exactly one frame")) {
-    dk_bt_close(p, &c);
+  if (!meo_t_check_i64(b_pins(p), 1, "{label}: seek pins exactly one frame")) {
+    meo_bt_close(p, &c);
     return 1;
   }
   var seen: int32 = 0;
@@ -202,46 +202,46 @@ fn b_scan(p: DkPager*, root: uint32, first: int64, expect: int32,
   while (rc == 0) {
     var want: int64 = first + (int64)seen;
     var wn: int32 = b_make_key(&want_buf[0], want, klen);
-    if (!dk_t_check_i64((int64)b_cursor_key_len(&c), (int64)wn,
+    if (!meo_t_check_i64((int64)b_cursor_key_len(&c), (int64)wn,
         "{label}: row {seen} key length")) {
-      dk_bt_close(p, &c);
+      meo_bt_close(p, &c);
       return 1;
     }
-    if (!dk_t_check_bytes(b_cursor_key(&c), &want_buf[0], (int64)wn,
+    if (!meo_t_check_bytes(b_cursor_key(&c), &want_buf[0], (int64)wn,
         "{label}: row {seen} ascending key")) {
-      dk_bt_close(p, &c);
+      meo_bt_close(p, &c);
       return 1;
     }
     if (rowid_base >= 0) {
       var rid: uint64 = 0;
-      if (!dk_t_check_i64(dk_bt_rowid(p, &c, &rid), DK_OK,
+      if (!meo_t_check_i64(meo_bt_rowid(p, &c, &rid), MEO_OK,
           "{label}: row {seen} rowid read")) {
-        dk_bt_close(p, &c);
+        meo_bt_close(p, &c);
         return 1;
       }
-      if (!dk_t_check_i64((int64)rid, (int64)rowid_base + (int64)seen,
+      if (!meo_t_check_i64((int64)rid, (int64)rowid_base + (int64)seen,
           "{label}: row {seen} rowid")) {
-        dk_bt_close(p, &c);
+        meo_bt_close(p, &c);
         return 1;
       }
     }
-    if (!dk_t_check_i64(b_pins(p), 1, "{label}: next pins exactly one frame")) {
-      dk_bt_close(p, &c);
+    if (!meo_t_check_i64(b_pins(p), 1, "{label}: next pins exactly one frame")) {
+      meo_bt_close(p, &c);
       return 1;
     }
     seen += 1;
-    rc = dk_bt_next(p, &c);
+    rc = meo_bt_next(p, &c);
     if (rc < 0) {
       println("FAIL {label}: next {rc} after {seen} rows");
-      dk_bt_close(p, &c);
+      meo_bt_close(p, &c);
       return 1;
     }
   }
-  dk_bt_close(p, &c);
-  if (!dk_t_check_i64(b_pins(p), 0, "{label}: close releases the frame")) {
+  meo_bt_close(p, &c);
+  if (!meo_t_check_i64(b_pins(p), 0, "{label}: close releases the frame")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)seen, (int64)expect,
+  if (!meo_t_check_i64((int64)seen, (int64)expect,
       "{label}: the scan saw every row")) {
     return 1;
   }
@@ -249,35 +249,35 @@ fn b_scan(p: DkPager*, root: uint32, first: int64, expect: int32,
 }
 
 // Insert one key of a tree of integer keys: the encoding is types/key.mettle's,
-// the ordering the tree uses is dk_key_compare, passed in as a parameter
+// the ordering the tree uses is meo_key_compare, passed in as a parameter
 // because btree/ must not import types/ (PHASE2.md 2D).
-fn b_insert(p: DkPager*, root: uint32*, v: int64, rowid: uint64,
+fn b_insert(p: MeoPager*, root: uint32*, v: int64, rowid: uint64,
     klen: int32, label: string) -> int32 {
   var kb: uint8[B_WIDE];
   var kn: int32 = b_make_key(&kb[0], v, klen);
   if (kn < 0) { return 1; }
-  var kk: DkBtKey = { data: &kb[0], len: kn };
-  var rc: int32 = dk_bt_insert(p, root, &dk_key_compare, kk, rowid);
-  if (rc != DK_OK) {
+  var kk: MeoBtKey = { data: &kb[0], len: kn };
+  var rc: int32 = meo_bt_insert(p, root, &meo_key_compare, kk, rowid);
+  if (rc != MEO_OK) {
     println("FAIL {label}: insert {v} answered {rc}");
     return 1;
   }
   return 0;
 }
 
-fn b_lookup(p: DkPager*, root: uint32, v: int64, klen: int32,
+fn b_lookup(p: MeoPager*, root: uint32, v: int64, klen: int32,
     label: string) -> int32 {
   var kb: uint8[B_WIDE];
   var kn: int32 = b_make_key(&kb[0], v, klen);
   if (kn < 0) { return -1; }
-  var kk: DkBtKey = { data: &kb[0], len: kn };
+  var kk: MeoBtKey = { data: &kb[0], len: kn };
   var rid: uint64 = 0;
-  var rc: int32 = dk_bt_lookup(p, root, &dk_key_compare, kk, &rid);
-  if (rc != DK_OK) {
+  var rc: int32 = meo_bt_lookup(p, root, &meo_key_compare, kk, &rid);
+  if (rc != MEO_OK) {
     println("FAIL {label}: lookup {v} answered {rc}");
     return -1;
   }
-  if (!dk_t_check_i64((int64)rid, (int64)B_ROWID_BASE + v,
+  if (!meo_t_check_i64((int64)rid, (int64)B_ROWID_BASE + v,
       "{label}: lookup {v} rowid")) {
     return -1;
   }
@@ -288,10 +288,10 @@ fn b_lookup(p: DkPager*, root: uint32, v: int64, klen: int32,
 
 fn b1_leaf() -> int32 {
   var rc: int32 = b_reset(B_LEAF);
-  if (!dk_t_check_i64(rc, DK_OK, "b1: reset file")) { return 1; }
-  var p: DkPager* = dk_pager_open(B_LEAF, 16, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "b1: open")) { return 1; }
-  defer dk_pager_free(p);
+  if (!meo_t_check_i64(rc, MEO_OK, "b1: reset file")) { return 1; }
+  var p: MeoPager* = meo_pager_open(B_LEAF, 16, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "b1: open")) { return 1; }
+  defer meo_pager_free(p);
 
   var root: uint32 = 0;
   // Out of order on purpose: a leaf that appends instead of inserting in key
@@ -301,13 +301,13 @@ fn b1_leaf() -> int32 {
   if (b_insert(p, &root, 50, B_ROWID_BASE + 50, B_KEY, "b1") != 0) { return 1; }
   if (b_insert(p, &root, 20, B_ROWID_BASE + 20, B_KEY, "b1") != 0) { return 1; }
   if (b_insert(p, &root, 40, B_ROWID_BASE + 40, B_KEY, "b1") != 0) { return 1; }
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b1: inserts leave no frame pinned")) {
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b1: inserts leave no frame pinned")) {
     return 1;
   }
-  if (!dk_t_check(root != 0, "b1: the first insert creates a root")) {
+  if (!meo_t_check(root != 0, "b1: the first insert creates a root")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), 2,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), 2,
       "b1: five keys still fit one leaf")) {
     return 1;
   }
@@ -318,75 +318,75 @@ fn b1_leaf() -> int32 {
   if (b_lookup(p, root, 30, B_KEY, "b1") != 0) { return 1; }
   if (b_lookup(p, root, 50, B_KEY, "b1") != 0) { return 1; }
   var kb: uint8[16];
-  var kk: DkBtKey = { data: &kb[0], len: dk_key_int(&kb[0], 16, 15) };
+  var kk: MeoBtKey = { data: &kb[0], len: meo_key_int(&kb[0], 16, 15) };
   var rid: uint64 = 0;
-  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid), 1,
+  if (!meo_t_check_i64(meo_bt_lookup(p, root, &meo_key_compare, kk, &rid), 1,
       "b1: an absent key answers 1, not an error")) {
     return 1;
   }
-  var c: DkBtCursor;
-  dk_bt_cursor_init(&c);
-  rc = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
-  if (!dk_t_check_i64(rc, DK_OK, "b1: seek 15 finds a row")) { return 1; }
-  if (!dk_t_check_i64((int64)dk_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf),
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  rc = meo_bt_seek(p, &c, root, &meo_key_compare, kk);
+  if (!meo_t_check_i64(rc, MEO_OK, "b1: seek 15 finds a row")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf),
       (int64)B_ROWID_BASE + 20, "b1: seek 15 lands on key 20")) {
-    dk_bt_close(p, &c);
+    meo_bt_close(p, &c);
     return 1;
   }
-  dk_bt_close(p, &c);
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b1: close after seek")) {
+  meo_bt_close(p, &c);
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b1: close after seek")) {
     return 1;
   }
-  kk.len = dk_key_int(&kb[0], 16, 51);
-  rc = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
-  if (!dk_t_check_i64(rc, 1, "b1: seek past the last key answers 1")) {
+  kk.len = meo_key_int(&kb[0], 16, 51);
+  rc = meo_bt_seek(p, &c, root, &meo_key_compare, kk);
+  if (!meo_t_check_i64(rc, 1, "b1: seek past the last key answers 1")) {
     return 1;
   }
-  dk_bt_close(p, &c);
+  meo_bt_close(p, &c);
 
-  // A duplicate key replaces the rowid and answers DK_OK.
+  // A duplicate key replaces the rowid and answers MEO_OK.
   if (b_insert(p, &root, 20, (uint64)7777, B_KEY, "b1") != 0) { return 1; }
   var rid20: uint64 = 0;
-  kk.len = dk_key_int(&kb[0], 16, 20);
-  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid20),
-      DK_OK, "b1: the replaced key is present")) {
+  kk.len = meo_key_int(&kb[0], 16, 20);
+  if (!meo_t_check_i64(meo_bt_lookup(p, root, &meo_key_compare, kk, &rid20),
+      MEO_OK, "b1: the replaced key is present")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)rid20, 7777, "b1: the rowid was replaced")) {
+  if (!meo_t_check_i64((int64)rid20, 7777, "b1: the rowid was replaced")) {
     return 1;
   }
 
   // Keys 10..50 do not form the contiguous run the scan helper wants, so the
   // scan of this case is spelled out: ascending and exactly five rows.
-  kk.len = dk_key_int(&kb[0], 16, 10);
-  rc = dk_bt_seek(p, &c, root, &dk_key_compare, kk);
-  if (!dk_t_check_i64(rc, DK_OK, "b1: scan start")) { return 1; }
+  kk.len = meo_key_int(&kb[0], 16, 10);
+  rc = meo_bt_seek(p, &c, root, &meo_key_compare, kk);
+  if (!meo_t_check_i64(rc, MEO_OK, "b1: scan start")) { return 1; }
   var seen: int32 = 0;
   var prev_buf: uint8[16];
   var prev_len: int32 = 0;
   while (rc == 0) {
     if (seen > 0) {
-      var order: int32 = dk_key_compare(&prev_buf[0], prev_len,
+      var order: int32 = meo_key_compare(&prev_buf[0], prev_len,
         b_cursor_key(&c), b_cursor_key_len(&c));
-      if (!dk_t_check(order < 0, "b1: the scan is strictly ascending")) {
-        dk_bt_close(p, &c);
+      if (!meo_t_check(order < 0, "b1: the scan is strictly ascending")) {
+        meo_bt_close(p, &c);
         return 1;
       }
     }
     prev_len = b_cursor_key_len(&c);
-    dk_bytes_copy(&prev_buf[0], b_cursor_key(&c), (int64)prev_len);
+    meo_bytes_copy(&prev_buf[0], b_cursor_key(&c), (int64)prev_len);
     seen += 1;
-    rc = dk_bt_next(p, &c);
+    rc = meo_bt_next(p, &c);
     if (rc < 0) { break; }
   }
-  dk_bt_close(p, &c);
-  if (!dk_t_check_i64((int64)seen, 5, "b1: the scan saw all five keys")) {
+  meo_bt_close(p, &c);
+  if (!meo_t_check_i64((int64)seen, 5, "b1: the scan saw all five keys")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b1: no frame left pinned")) {
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b1: no frame left pinned")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b1: close")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "b1: close")) { return 1; }
   b_pass("b1_leaf");
   return 0;
 }
@@ -395,10 +395,10 @@ fn b1_leaf() -> int32 {
 
 fn b2_root_split() -> int32 {
   var rc: int32 = b_reset(B_SPLIT);
-  if (!dk_t_check_i64(rc, DK_OK, "b2: reset file")) { return 1; }
-  var p: DkPager* = dk_pager_open(B_SPLIT, 64, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "b2: open")) { return 1; }
-  defer dk_pager_free(p);
+  if (!meo_t_check_i64(rc, MEO_OK, "b2: reset file")) { return 1; }
+  var p: MeoPager* = meo_pager_open(B_SPLIT, 64, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "b2: open")) { return 1; }
+  defer meo_pager_free(p);
 
   var root: uint32 = 0;
   // 500 nine-byte keys: a leaf holds ~194 of them, so this splits leaves and
@@ -413,15 +413,15 @@ fn b2_root_split() -> int32 {
     }
     i += 1;
   }
-  if (!dk_t_check(root != first_root,
+  if (!meo_t_check(root != first_root,
       "b2: a root split answers the new root through root*")) {
     return 1;
   }
-  if (!dk_t_check((int64)dk_pager_page_count(p) >= 4,
+  if (!meo_t_check((int64)meo_pager_page_count(p) >= 4,
       "b2: the tree has more than one leaf")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b2: inserts leave no frame pinned")) {
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b2: inserts leave no frame pinned")) {
     return 1;
   }
   i = 0;
@@ -430,7 +430,7 @@ fn b2_root_split() -> int32 {
     i += 1;
   }
   if (b_scan(p, root, 0, 500, (int64)B_ROWID_BASE, B_KEY, "b2") != 0) { return 1; }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b2: close")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "b2: close")) { return 1; }
   b_pass("b2_root_split");
   return 0;
 }
@@ -472,13 +472,13 @@ fn b_shuffle(order: int32*, n: int32) -> int32 {
 
 fn b3_e5() -> int32 {
   var rc: int32 = b_reset(B_E5);
-  if (!dk_t_check_i64(rc, DK_OK, "b3: reset file")) { return 1; }
-  var p: DkPager* = dk_pager_open(B_E5, 256, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "b3: open")) { return 1; }
-  defer dk_pager_free(p);
+  if (!meo_t_check_i64(rc, MEO_OK, "b3: reset file")) { return 1; }
+  var p: MeoPager* = meo_pager_open(B_E5, 256, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "b3: open")) { return 1; }
+  defer meo_pager_free(p);
 
   var order: int32[] = new int32[B_E5_KEYS];
-  if (!dk_t_check(order.data != 0, "b3: order buffer")) { return 1; }
+  if (!meo_t_check(order.data != 0, "b3: order buffer")) { return 1; }
   defer free(order.data);
   b_shuffle(order.data, B_E5_KEYS);
 
@@ -491,10 +491,10 @@ fn b3_e5() -> int32 {
     }
     i += 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b3: inserts leave no frame pinned")) {
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b3: inserts leave no frame pinned")) {
     return 1;
   }
-  if (!dk_t_check((int64)dk_pager_page_count(p) > 3,
+  if (!meo_t_check((int64)meo_pager_page_count(p) > 3,
       "b3: 1000 keys made a multi-page tree")) {
     return 1;
   }
@@ -505,18 +505,18 @@ fn b3_e5() -> int32 {
   }
   // Absent keys on both sides of the key space answer 1, not an error.
   var kb: uint8[16];
-  var kk: DkBtKey = { data: &kb[0], len: dk_key_int(&kb[0], 16, -1) };
+  var kk: MeoBtKey = { data: &kb[0], len: meo_key_int(&kb[0], 16, -1) };
   var rid: uint64 = 0;
-  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid), 1,
+  if (!meo_t_check_i64(meo_bt_lookup(p, root, &meo_key_compare, kk, &rid), 1,
       "b3: a key below the smallest answers 1")) {
     return 1;
   }
-  kk.len = dk_key_int(&kb[0], 16, (int64)B_E5_KEYS);
-  if (!dk_t_check_i64(dk_bt_lookup(p, root, &dk_key_compare, kk, &rid), 1,
+  kk.len = meo_key_int(&kb[0], 16, (int64)B_E5_KEYS);
+  if (!meo_t_check_i64(meo_bt_lookup(p, root, &meo_key_compare, kk, &rid), 1,
       "b3: a key above the largest answers 1")) {
     return 1;
   }
-  if (!dk_t_check((int64)b_depth(p, root, 0, B_KEY) >= 2,
+  if (!meo_t_check((int64)b_depth(p, root, 0, B_KEY) >= 2,
       "b3: a split moved the root off the leaf level")) {
     return 1;
   }
@@ -540,7 +540,7 @@ fn b3_e5() -> int32 {
       "b3 rewrite") != 0) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b3: close")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "b3: close")) { return 1; }
   b_pass("b3_e5");
   return 0;
 }
@@ -549,20 +549,20 @@ fn b3_e5() -> int32 {
 
 fn b4_e6() -> int32 {
   var rc: int32 = b_reset(B_E6);
-  if (!dk_t_check_i64(rc, DK_OK, "b4: reset file")) { return 1; }
+  if (!meo_t_check_i64(rc, MEO_OK, "b4: reset file")) { return 1; }
   // Eight frames, the pager's minimum, and B_WIDE-byte keys: a leaf holds 36 of
   // them, so 1000 keys make ~30 pages against an 8-frame cache and every split
   // forces evictions and write-backs. With E5's nine-byte keys the same 1000
   // keys make 7 pages, which fit in the cache and would prove nothing: a split
   // whose write is lost to an eviction only loses data once the cache is
   // smaller than the tree.
-  var p: DkPager* = dk_pager_open(B_E6, 8, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "b4: open")) { return 1; }
+  var p: MeoPager* = meo_pager_open(B_E6, 8, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "b4: open")) { return 1; }
 
   var order: int32[] = new int32[B_E5_KEYS];
-  if (!dk_t_check(order.data != 0, "b4: order buffer")) {
-    dk_pager_close(p);
-    dk_pager_free(p);
+  if (!meo_t_check(order.data != 0, "b4: order buffer")) {
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   b_shuffle(order.data, B_E5_KEYS);
@@ -573,21 +573,21 @@ fn b4_e6() -> int32 {
     var v: int64 = (int64)order[i];
     var kb: uint8[B_WIDE];
     var kn: int32 = b_make_key(&kb[0], v, B_WIDE);
-    var kk: DkBtKey = { data: &kb[0], len: kn };
-    rc = dk_bt_insert(p, &root, &dk_key_compare, kk, B_ROWID_BASE + (uint64)v);
-    if (rc != DK_OK) {
+    var kk: MeoBtKey = { data: &kb[0], len: kn };
+    rc = meo_bt_insert(p, &root, &meo_key_compare, kk, B_ROWID_BASE + (uint64)v);
+    if (rc != MEO_OK) {
       println("FAIL b4: insert {v} answered {rc}");
       free(order.data);
-      dk_pager_close(p);
-      dk_pager_free(p);
+      meo_pager_close(p);
+      meo_pager_free(p);
       return 1;
     }
     i += 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b4: inserts leave no frame pinned")) {
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b4: inserts leave no frame pinned")) {
     free(order.data);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   // E6's premise, not just its decoration: the tree must be larger than the
@@ -595,45 +595,45 @@ fn b4_e6() -> int32 {
   // B_WIDE keys it is 45 pages today (build/btree_self_e6.dat is 184320 bytes);
   // a leaf-capacity or key-width change that brought it to 8 or fewer makes
   // E6 stop testing write-back, so it must fail here instead of staying green.
-  if (!dk_t_check((int64)dk_pager_page_count(p) > 8,
+  if (!meo_t_check((int64)meo_pager_page_count(p) > 8,
       "b4: the tree is larger than the 8-frame cache")) {
     free(order.data);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
   // The root the caller must persist: insert answered it through root*, and the
   // meta is the only durable place for it.
-  if (!dk_t_check_i64(dk_pager_set_root(p, DK_ROOT_BTREE, root), DK_OK,
+  if (!meo_t_check_i64(meo_pager_set_root(p, MEO_ROOT_BTREE, root), MEO_OK,
       "b4: store the root")) {
     free(order.data);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_flush(p), DK_OK, "b4: flush")) {
+  if (!meo_t_check_i64(meo_pager_flush(p), MEO_OK, "b4: flush")) {
     free(order.data);
-    dk_pager_close(p);
-    dk_pager_free(p);
+    meo_pager_close(p);
+    meo_pager_free(p);
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b4: close")) {
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "b4: close")) {
     free(order.data);
-    dk_pager_free(p);
+    meo_pager_free(p);
     return 1;
   }
-  dk_pager_free(p);
+  meo_pager_free(p);
 
   // Reopen read-only: the walk must not need to write, and every key must have
   // survived the flush and the close/reopen.
-  var ro: DkPager* = dk_pager_open(B_E6, 8, DK_PAGER_READONLY);
-  if (!dk_t_check(ro != 0, "b4: reopen")) {
+  var ro: MeoPager* = meo_pager_open(B_E6, 8, MEO_PAGER_READONLY);
+  if (!meo_t_check(ro != 0, "b4: reopen")) {
     free(order.data);
     return 1;
   }
-  defer dk_pager_free(ro);
-  var root2: uint32 = dk_pager_root(ro, DK_ROOT_BTREE);
-  if (!dk_t_check_i64((int64)root2, (int64)root,
+  defer meo_pager_free(ro);
+  var root2: uint32 = meo_pager_root(ro, MEO_ROOT_BTREE);
+  if (!meo_t_check_i64((int64)root2, (int64)root,
       "b4: the root survived the reopen")) {
     free(order.data);
     return 1;
@@ -643,15 +643,15 @@ fn b4_e6() -> int32 {
     var v: int64 = (int64)i;
     var kb: uint8[B_WIDE];
     var kn: int32 = b_make_key(&kb[0], v, B_WIDE);
-    var kk: DkBtKey = { data: &kb[0], len: kn };
+    var kk: MeoBtKey = { data: &kb[0], len: kn };
     var rid: uint64 = 0;
-    rc = dk_bt_lookup(ro, root2, &dk_key_compare, kk, &rid);
-    if (rc != DK_OK) {
+    rc = meo_bt_lookup(ro, root2, &meo_key_compare, kk, &rid);
+    if (rc != MEO_OK) {
       println("FAIL b4: lookup {v} after reopen answered {rc}");
       free(order.data);
       return 1;
     }
-    if (!dk_t_check_i64((int64)rid, (int64)(B_ROWID_BASE + (uint64)v),
+    if (!meo_t_check_i64((int64)rid, (int64)(B_ROWID_BASE + (uint64)v),
         "b4: rowid {v} after reopen")) {
       free(order.data);
       return 1;
@@ -663,7 +663,7 @@ fn b4_e6() -> int32 {
     return 1;
   }
   free(order.data);
-  if (!dk_t_check_i64(dk_pager_close(ro), DK_OK, "b4: close reopened")) {
+  if (!meo_t_check_i64(meo_pager_close(ro), MEO_OK, "b4: close reopened")) {
     return 1;
   }
   b_pass("b4_e6");
@@ -683,13 +683,13 @@ fn b4_e6() -> int32 {
 // subtree's smallest key.
 fn b6_wide() -> int32 {
   var rc: int32 = b_reset(B_WIDE_PATH);
-  if (!dk_t_check_i64(rc, DK_OK, "b6: reset file")) { return 1; }
-  var p: DkPager* = dk_pager_open(B_WIDE_PATH, 16, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "b6: open")) { return 1; }
-  defer dk_pager_free(p);
+  if (!meo_t_check_i64(rc, MEO_OK, "b6: reset file")) { return 1; }
+  var p: MeoPager* = meo_pager_open(B_WIDE_PATH, 16, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "b6: open")) { return 1; }
+  defer meo_pager_free(p);
 
   var order: int32[] = new int32[B_WIDE_KEYS];
-  if (!dk_t_check(order.data != 0, "b6: order buffer")) { return 1; }
+  if (!meo_t_check(order.data != 0, "b6: order buffer")) { return 1; }
   defer free(order.data);
   b_shuffle(order.data, B_WIDE_KEYS);
 
@@ -702,11 +702,11 @@ fn b6_wide() -> int32 {
     }
     i += 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0, "b6: inserts leave no frame pinned")) {
+  if (!meo_t_check_i64((int64)b_pins(p), 0, "b6: inserts leave no frame pinned")) {
     return 1;
   }
   var d: int32 = b_depth(p, root, 0, B_WIDE);
-  if (!dk_t_check((int64)d >= 3, "b6: the tree is three levels deep")) {
+  if (!meo_t_check((int64)d >= 3, "b6: the tree is three levels deep")) {
     println("FAIL b6: depth {d}");
     return 1;
   }
@@ -718,7 +718,7 @@ fn b6_wide() -> int32 {
   if (b_scan(p, root, 0, B_WIDE_KEYS, (int64)B_ROWID_BASE, B_WIDE, "b6") != 0) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b6: close")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "b6: close")) { return 1; }
   b_pass("b6_wide");
   return 0;
 }
@@ -728,39 +728,39 @@ fn b6_wide() -> int32 {
 // Build a root-to-leaf chain of `inner_levels` single-child inner nodes over a
 // leaf that holds key 5. Every inner node has one cell: the bare right-child
 // pointer, so every descent takes it and the chain is the tree.
-fn b_chain(p: DkPager*, inner_levels: int32) -> uint32 {
+fn b_chain(p: MeoPager*, inner_levels: int32) -> uint32 {
   var ids: uint32[] = new uint32[inner_levels];
   if (ids.data == 0) { return 0; }
   defer free(ids.data);
   var i: int32 = 0;
   while (i < inner_levels) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (f == 0) { return 0; }
     ids[i] = f->page_no;
-    dk_pager_release(p, f, false);
+    meo_pager_release(p, f, false);
     i += 1;
   }
-  var lf: DkFrame* = dk_pager_alloc(p);
+  var lf: MeoFrame* = meo_pager_alloc(p);
   if (lf == 0) { return 0; }
   var leaf_no: uint32 = lf->page_no;
   var kb: uint8[16];
-  var kn: int32 = dk_key_int(&kb[0], 16, 5);
-  var rc: int32 = dk_page_init(lf->data, DK_PAGE_BTREE_LEAF);
-  if (rc == DK_OK) {
-    rc = dk_btn_leaf_append(lf->data, &kb[0], kn, (uint64)55);
+  var kn: int32 = meo_key_int(&kb[0], 16, 5);
+  var rc: int32 = meo_page_init(lf->data, MEO_PAGE_BTREE_LEAF);
+  if (rc == MEO_OK) {
+    rc = meo_btn_leaf_append(lf->data, &kb[0], kn, (uint64)55);
   }
-  dk_pager_release(p, lf, rc == DK_OK);
-  if (rc != DK_OK) { return 0; }
+  meo_pager_release(p, lf, rc == MEO_OK);
+  if (rc != MEO_OK) { return 0; }
   i = inner_levels - 1;
   while (i >= 0) {
     var child: uint32 = leaf_no;
     if (i < inner_levels - 1) { child = ids[i + 1]; }
-    var f: DkFrame* = dk_pager_get(p, ids[i], true);
+    var f: MeoFrame* = meo_pager_get(p, ids[i], true);
     if (f == 0) { return 0; }
-    rc = dk_page_init(f->data, DK_PAGE_BTREE_INNER);
-    if (rc == DK_OK) { rc = dk_btn_inner_append_right(f->data, child); }
-    dk_pager_release(p, f, rc == DK_OK);
-    if (rc != DK_OK) { return 0; }
+    rc = meo_page_init(f->data, MEO_PAGE_BTREE_INNER);
+    if (rc == MEO_OK) { rc = meo_btn_inner_append_right(f->data, child); }
+    meo_pager_release(p, f, rc == MEO_OK);
+    if (rc != MEO_OK) { return 0; }
     i -= 1;
   }
   return ids[0];
@@ -771,30 +771,30 @@ fn b_chain(p: DkPager*, inner_levels: int32) -> uint32 {
 // Every separator is below B_FULL_ABOVE, so a descent for that key takes the
 // right child at every level; every node is too full to take one more cell, so
 // an insert must carry a split all the way to the root. That is the only shape
-// that reaches dk_bt_insert's root-split branch while the chain is already at
-// DK_BT_MAX_DEPTH.
-fn b_full_chain(p: DkPager*, inner_levels: int32) -> uint32 {
+// that reaches meo_bt_insert's root-split branch while the chain is already at
+// MEO_BT_MAX_DEPTH.
+fn b_full_chain(p: MeoPager*, inner_levels: int32) -> uint32 {
   var ids: uint32[] = new uint32[inner_levels];
   if (ids.data == 0) { return 0; }
   defer free(ids.data);
   var i: int32 = 0;
   while (i < inner_levels) {
-    var f: DkFrame* = dk_pager_alloc(p);
+    var f: MeoFrame* = meo_pager_alloc(p);
     if (f == 0) { return 0; }
     ids[i] = f->page_no;
-    dk_pager_release(p, f, false);
+    meo_pager_release(p, f, false);
     i += 1;
   }
-  var lf: DkFrame* = dk_pager_alloc(p);
+  var lf: MeoFrame* = meo_pager_alloc(p);
   if (lf == 0) { return 0; }
   var leaf_no: uint32 = lf->page_no;
-  var rc: int32 = dk_page_init(lf->data, DK_PAGE_BTREE_LEAF);
+  var rc: int32 = meo_page_init(lf->data, MEO_PAGE_BTREE_LEAF);
   var j: int32 = 0;
-  while (rc == DK_OK && j < B_FULL_LEAF_KEYS) {
+  while (rc == MEO_OK && j < B_FULL_LEAF_KEYS) {
     var kb: uint8[B_WIDE];
     var v: int64 = (int64)(B_FULL_INNER_KEYS + j);
     var kn: int32 = b_make_key(&kb[0], v, B_WIDE);
-    rc = dk_btn_leaf_append(lf->data, &kb[0], kn, (uint64)v);
+    rc = meo_btn_leaf_append(lf->data, &kb[0], kn, (uint64)v);
     j += 1;
   }
   // "full" is the premise of the whole case: a leaf with room takes the new
@@ -802,38 +802,38 @@ fn b_full_chain(p: DkPager*, inner_levels: int32) -> uint32 {
   // reaches the root-split branch at the depth cap. A key-width or capacity
   // change must fail here rather than leave the chain half-empty and E7's
   // second half testing nothing.
-  if (rc == DK_OK && !dk_t_check_false(
-      dk_btn_leaf_room(lf->data, B_WIDE),
+  if (rc == MEO_OK && !meo_t_check_false(
+      meo_btn_leaf_room(lf->data, B_WIDE),
       "b5: the full chain's leaf refuses one more cell")) {
-    rc = -DK_ERR_CORRUPT;
+    rc = -MEO_ERR_CORRUPT;
   }
-  dk_pager_release(p, lf, rc == DK_OK);
-  if (rc != DK_OK) { return 0; }
+  meo_pager_release(p, lf, rc == MEO_OK);
+  if (rc != MEO_OK) { return 0; }
   i = inner_levels - 1;
   while (i >= 0) {
     var child: uint32 = leaf_no;
     if (i < inner_levels - 1) { child = ids[i + 1]; }
-    var f: DkFrame* = dk_pager_get(p, ids[i], true);
+    var f: MeoFrame* = meo_pager_get(p, ids[i], true);
     if (f == 0) { return 0; }
-    rc = dk_page_init(f->data, DK_PAGE_BTREE_INNER);
+    rc = meo_page_init(f->data, MEO_PAGE_BTREE_INNER);
     j = 0;
-    while (rc == DK_OK && j < B_FULL_INNER_KEYS) {
+    while (rc == MEO_OK && j < B_FULL_INNER_KEYS) {
       var kb: uint8[B_WIDE];
       var kn: int32 = b_make_key(&kb[0], (int64)j, B_WIDE);
-      rc = dk_btn_inner_append(f->data, child, &kb[0], kn);
+      rc = meo_btn_inner_append(f->data, child, &kb[0], kn);
       j += 1;
     }
-    if (rc == DK_OK) { rc = dk_btn_inner_append_right(f->data, child); }
+    if (rc == MEO_OK) { rc = meo_btn_inner_append_right(f->data, child); }
     // Same premise one level up: every inner node on the chain must be full,
     // or the insert's split stops at the first node with room and never
     // reaches the root branch the case exists to exercise.
-    if (rc == DK_OK && !dk_t_check_false(
-        dk_btn_inner_room(f->data, B_WIDE),
+    if (rc == MEO_OK && !meo_t_check_false(
+        meo_btn_inner_room(f->data, B_WIDE),
         "b5: a full chain inner node refuses one more cell")) {
-      rc = -DK_ERR_CORRUPT;
+      rc = -MEO_ERR_CORRUPT;
     }
-    dk_pager_release(p, f, rc == DK_OK);
-    if (rc != DK_OK) { return 0; }
+    meo_pager_release(p, f, rc == MEO_OK);
+    if (rc != MEO_OK) { return 0; }
     i -= 1;
   }
   return ids[0];
@@ -841,17 +841,17 @@ fn b_full_chain(p: DkPager*, inner_levels: int32) -> uint32 {
 
 fn b5_e7() -> int32 {
   var rc: int32 = b_reset(B_E7);
-  if (!dk_t_check_i64(rc, DK_OK, "b5: reset file")) { return 1; }
-  var p: DkPager* = dk_pager_open(B_E7, 32, DK_PAGER_CREATE);
-  if (!dk_t_check(p != 0, "b5: open")) { return 1; }
-  defer dk_pager_free(p);
+  if (!meo_t_check_i64(rc, MEO_OK, "b5: reset file")) { return 1; }
+  var p: MeoPager* = meo_pager_open(B_E7, 32, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "b5: open")) { return 1; }
+  defer meo_pager_free(p);
 
   var kb: uint8[16];
-  var kk: DkBtKey = { data: &kb[0], len: dk_key_int(&kb[0], 16, 5) };
+  var kk: MeoBtKey = { data: &kb[0], len: meo_key_int(&kb[0], 16, 5) };
   var rid: uint64 = 0;
 
   // The depths here are the literals PHASE2.md 2D names, not the constant: a
-  // test written in terms of DK_BT_MAX_DEPTH would move with it, so a cap of 15
+  // test written in terms of MEO_BT_MAX_DEPTH would move with it, so a cap of 15
   // would still pass. The cursor's path array holds 16 page numbers and 16 is
   // the number the contract names, so 16 levels must work and 17 must not.
   //
@@ -859,121 +859,121 @@ fn b5_e7() -> int32 {
   // the cursor can describe, and the walk must find the row. This is the half
   // that catches a cap that refuses one level too early.
   var root_ok: uint32 = b_chain(p, 15);
-  if (!dk_t_check(root_ok != 0, "b5: chain at the depth cap")) { return 1; }
-  rc = dk_bt_lookup(p, root_ok, &dk_key_compare, kk, &rid);
-  if (!dk_t_check_i64(rc, DK_OK, "b5: a chain at the cap is readable")) {
+  if (!meo_t_check(root_ok != 0, "b5: chain at the depth cap")) { return 1; }
+  rc = meo_bt_lookup(p, root_ok, &meo_key_compare, kk, &rid);
+  if (!meo_t_check_i64(rc, MEO_OK, "b5: a chain at the cap is readable")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)rid, 55, "b5: the deepest leaf's rowid")) {
+  if (!meo_t_check_i64((int64)rid, 55, "b5: the deepest leaf's rowid")) {
     return 1;
   }
 
   // The depth guard must not refuse a legitimate insert. It sits AFTER the
   // room fast path, and this chain is one bare right-child cell per level over
   // a leaf that holds only key 5, so key 6 fits without a split: the insert
-  // must answer DK_OK, the row must be readable, and no frame may be left
+  // must answer MEO_OK, the row must be readable, and no frame may be left
   // pinned. Without this row, moving the guard above the room check -- turning
-  // every insert into a capped tree into -DK_ERR_CORRUPT -- would keep this
+  // every insert into a capped tree into -MEO_ERR_CORRUPT -- would keep this
   // suite green, which is the same "a rule that refused everything would pass"
   // hole the pinned-refusal case in freelist_self closes.
   var fit_root: uint32 = root_ok;
   var kb_fit: uint8[16];
-  var kk_fit: DkBtKey = {
-    data: &kb_fit[0], len: dk_key_int(&kb_fit[0], 16, 6) };
-  rc = dk_bt_insert(p, &fit_root, &dk_key_compare, kk_fit, (uint64)66);
-  if (!dk_t_check_i64(rc, DK_OK,
-      "b5: an insert that fits in a capped deep tree is DK_OK")) {
+  var kk_fit: MeoBtKey = {
+    data: &kb_fit[0], len: meo_key_int(&kb_fit[0], 16, 6) };
+  rc = meo_bt_insert(p, &fit_root, &meo_key_compare, kk_fit, (uint64)66);
+  if (!meo_t_check_i64(rc, MEO_OK,
+      "b5: an insert that fits in a capped deep tree is MEO_OK")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)fit_root, (int64)root_ok,
+  if (!meo_t_check_i64((int64)fit_root, (int64)root_ok,
       "b5: a fit-in-place insert does not move the root")) {
     return 1;
   }
-  rc = dk_bt_lookup(p, fit_root, &dk_key_compare, kk_fit, &rid);
-  if (!dk_t_check_i64(rc, DK_OK, "b5: the inserted row is readable")) {
+  rc = meo_bt_lookup(p, fit_root, &meo_key_compare, kk_fit, &rid);
+  if (!meo_t_check_i64(rc, MEO_OK, "b5: the inserted row is readable")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)rid, 66, "b5: the inserted row's rowid")) {
+  if (!meo_t_check_i64((int64)rid, 66, "b5: the inserted row's rowid")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0,
+  if (!meo_t_check_i64((int64)b_pins(p), 0,
       "b5: a fit-in-place insert leaves nothing pinned")) {
     return 1;
   }
 
   // One level deeper than the cap: 16 inner levels plus the leaf is 17 levels.
-  // -DK_ERR_CORRUPT from every entry point, not a crash, not a write past
+  // -MEO_ERR_CORRUPT from every entry point, not a crash, not a write past
   // path[15], not an answer from a tree the cursor cannot describe.
   var root_deep: uint32 = b_chain(p, 16);
-  if (!dk_t_check(root_deep != 0, "b5: chain past the depth cap")) { return 1; }
-  rc = dk_bt_lookup(p, root_deep, &dk_key_compare, kk, &rid);
-  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+  if (!meo_t_check(root_deep != 0, "b5: chain past the depth cap")) { return 1; }
+  rc = meo_bt_lookup(p, root_deep, &meo_key_compare, kk, &rid);
+  if (!meo_t_check_i64(rc, -MEO_ERR_CORRUPT,
       "b5: lookup past the cap is CORRUPT")) {
     return 1;
   }
-  var c: DkBtCursor;
-  dk_bt_cursor_init(&c);
-  rc = dk_bt_seek(p, &c, root_deep, &dk_key_compare, kk);
-  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT, "b5: seek past the cap is CORRUPT")) {
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  rc = meo_bt_seek(p, &c, root_deep, &meo_key_compare, kk);
+  if (!meo_t_check_i64(rc, -MEO_ERR_CORRUPT, "b5: seek past the cap is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)c.err, (int64)DK_ERR_CORRUPT,
+  if (!meo_t_check_i64((int64)c.err, (int64)MEO_ERR_CORRUPT,
       "b5: the cursor records the code")) {
     return 1;
   }
-  dk_bt_close(p, &c);
-  if (!dk_t_check_i64((int64)b_pins(p), 0,
+  meo_bt_close(p, &c);
+  if (!meo_t_check_i64((int64)b_pins(p), 0,
       "b5: a refused descent leaves nothing pinned")) {
     return 1;
   }
   var deep_root: uint32 = root_deep;
   var kb2: uint8[16];
-  var kk2: DkBtKey = { data: &kb2[0], len: dk_key_int(&kb2[0], 16, 6) };
-  rc = dk_bt_insert(p, &deep_root, &dk_key_compare, kk2, (uint64)66);
-  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+  var kk2: MeoBtKey = { data: &kb2[0], len: meo_key_int(&kb2[0], 16, 6) };
+  rc = meo_bt_insert(p, &deep_root, &meo_key_compare, kk2, (uint64)66);
+  if (!meo_t_check_i64(rc, -MEO_ERR_CORRUPT,
       "b5: insert past the cap is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)deep_root, (int64)root_deep,
+  if (!meo_t_check_i64((int64)deep_root, (int64)root_deep,
       "b5: a refused insert does not move the root")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0,
+  if (!meo_t_check_i64((int64)b_pins(p), 0,
       "b5: a refused insert leaves nothing pinned")) {
     return 1;
   }
 
   // The insert that would make the seventeenth level the slow way: a FULL
   // 16-level chain, so the split cannot stop at any inner node -- every one is
-  // too full -- and reaches dk_bt_insert's root-split branch. Without the depth
-  // guard there, the insert answers DK_OK, root* names a 17-level tree, and
-  // every later lookup/seek answers -DK_ERR_CORRUPT: success plus silent
+  // too full -- and reaches meo_bt_insert's root-split branch. Without the depth
+  // guard there, the insert answers MEO_OK, root* names a 17-level tree, and
+  // every later lookup/seek answers -MEO_ERR_CORRUPT: success plus silent
   // corruption. The refusal must also burn no page and move no root.
   var full_root: uint32 = b_full_chain(p, 15);
-  if (!dk_t_check(full_root != 0, "b5: full chain at the depth cap")) { return 1; }
-  var full_pages: uint32 = dk_pager_page_count(p);
+  if (!meo_t_check(full_root != 0, "b5: full chain at the depth cap")) { return 1; }
+  var full_pages: uint32 = meo_pager_page_count(p);
   var kb3: uint8[B_WIDE];
-  var kk3: DkBtKey = {
+  var kk3: MeoBtKey = {
     data: &kb3[0], len: b_make_key(&kb3[0], B_FULL_ABOVE, B_WIDE) };
   var full_root_out: uint32 = full_root;
-  rc = dk_bt_insert(p, &full_root_out, &dk_key_compare, kk3, (uint64)77);
-  if (!dk_t_check_i64(rc, -DK_ERR_CORRUPT,
+  rc = meo_bt_insert(p, &full_root_out, &meo_key_compare, kk3, (uint64)77);
+  if (!meo_t_check_i64(rc, -MEO_ERR_CORRUPT,
       "b5: a split at the depth cap is CORRUPT")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)full_root_out, (int64)full_root,
+  if (!meo_t_check_i64((int64)full_root_out, (int64)full_root,
       "b5: a refused root split does not move the root")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)b_pins(p), 0,
+  if (!meo_t_check_i64((int64)b_pins(p), 0,
       "b5: a refused root split leaves nothing pinned")) {
     return 1;
   }
-  if (!dk_t_check_i64((int64)dk_pager_page_count(p), (int64)full_pages,
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)full_pages,
       "b5: a refused root split allocates no page")) {
     return 1;
   }
-  if (!dk_t_check_i64(dk_pager_close(p), DK_OK, "b5: close")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "b5: close")) { return 1; }
   b_pass("b5_e7");
   return 0;
 }
@@ -985,5 +985,5 @@ fn main() -> int32 {
   if (b4_e6() != 0) { return 1; }
   if (b6_wide() != 0) { return 1; }
   if (b5_e7() != 0) { return 1; }
-  return dk_t_report();
+  return meo_t_report();
 }

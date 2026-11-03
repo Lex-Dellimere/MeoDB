@@ -26,7 +26,7 @@ fn a_bytes() -> int32 {
   if (buf == 0) { return a_fail("bytes: malloc"); }
   defer free(buf);
 
-  dk_bytes_zero(buf, 64);
+  meo_bytes_zero(buf, 64);
   var i: int64 = 0;
   while (i < 64) {
     if (buf[i] != 0) { return a_fail("bytes: zero"); }
@@ -34,33 +34,33 @@ fn a_bytes() -> int32 {
   }
 
   // Little-endian byte order is the contract, not "reads back".
-  dk_put_u16le(buf, 0, (uint16)0x1234);
+  meo_put_u16le(buf, 0, (uint16)0x1234);
   if (buf[0] != 0x34) { return a_fail("bytes: u16le low byte"); }
   if (buf[1] != 0x12) { return a_fail("bytes: u16le high byte"); }
-  if (dk_get_u16le(buf, 0) != (uint16)0x1234) { return a_fail("bytes: u16 get"); }
+  if (meo_get_u16le(buf, 0) != (uint16)0x1234) { return a_fail("bytes: u16 get"); }
 
-  dk_put_u32le(buf, 1, (uint32)0xDEADBEEF);
+  meo_put_u32le(buf, 1, (uint32)0xDEADBEEF);
   if (buf[1] != 0xEF) { return a_fail("bytes: u32le byte 0"); }
   if (buf[2] != 0xBE) { return a_fail("bytes: u32le byte 1"); }
   if (buf[3] != 0xAD) { return a_fail("bytes: u32le byte 2"); }
   if (buf[4] != 0xDE) { return a_fail("bytes: u32le byte 3"); }
-  if (dk_get_u32le(buf, 1) != (uint32)0xDEADBEEF) { return a_fail("bytes: u32 get"); }
+  if (meo_get_u32le(buf, 1) != (uint32)0xDEADBEEF) { return a_fail("bytes: u32 get"); }
 
   // Unaligned is legal everywhere: every read is a byte load.
-  dk_put_u64le(buf, 3, (uint64)0x0102030405060708);
+  meo_put_u64le(buf, 3, (uint64)0x0102030405060708);
   if (buf[3] != 0x08) { return a_fail("bytes: u64le byte 0"); }
   if (buf[10] != 0x01) { return a_fail("bytes: u64le byte 7"); }
-  if (dk_get_u64le(buf, 3) != (uint64)0x0102030405060708) {
+  if (meo_get_u64le(buf, 3) != (uint64)0x0102030405060708) {
     return a_fail("bytes: u64 get");
   }
 
   // Extremes survive the round trip.
-  dk_put_u64le(buf, 8, (uint64)0xFFFFFFFFFFFFFFFF);
-  if (dk_get_u64le(buf, 8) != (uint64)0xFFFFFFFFFFFFFFFF) {
+  meo_put_u64le(buf, 8, (uint64)0xFFFFFFFFFFFFFFFF);
+  if (meo_get_u64le(buf, 8) != (uint64)0xFFFFFFFFFFFFFFFF) {
     return a_fail("bytes: u64 max");
   }
-  dk_put_u32le(buf, 8, (uint32)0x80000000);
-  if (dk_get_u32le(buf, 8) != (uint32)0x80000000) {
+  meo_put_u32le(buf, 8, (uint32)0x80000000);
+  if (meo_get_u32le(buf, 8) != (uint32)0x80000000) {
     return a_fail("bytes: u32 high bit");
   }
 
@@ -68,15 +68,15 @@ fn a_bytes() -> int32 {
   var dst: uint8* = malloc(16);
   if (dst == 0) { return a_fail("bytes: malloc dst"); }
   defer free(dst);
-  dk_put_u64le(buf, 0, (uint64)0x0807060504030201);
-  dk_bytes_copy(dst, buf, 8);
-  if (!dk_bytes_equal(dst, buf, 8)) { return a_fail("bytes: copy/equal"); }
-  if (dk_bytes_compare(dst, buf, 8) != 0) { return a_fail("bytes: compare equal"); }
+  meo_put_u64le(buf, 0, (uint64)0x0807060504030201);
+  meo_bytes_copy(dst, buf, 8);
+  if (!meo_bytes_equal(dst, buf, 8)) { return a_fail("bytes: copy/equal"); }
+  if (meo_bytes_compare(dst, buf, 8) != 0) { return a_fail("bytes: compare equal"); }
 
   dst[7] = 0x09;
-  if (dk_bytes_equal(dst, buf, 8)) { return a_fail("bytes: unequal detected"); }
-  if (dk_bytes_compare(dst, buf, 8) != 1) { return a_fail("bytes: compare greater"); }
-  if (dk_bytes_compare(buf, dst, 8) != -1) { return a_fail("bytes: compare less"); }
+  if (meo_bytes_equal(dst, buf, 8)) { return a_fail("bytes: unequal detected"); }
+  if (meo_bytes_compare(dst, buf, 8) != 1) { return a_fail("bytes: compare greater"); }
+  if (meo_bytes_compare(buf, dst, 8) != -1) { return a_fail("bytes: compare less"); }
 
   return 0;
 }
@@ -85,30 +85,30 @@ fn a_bytes() -> int32 {
 
 fn a_crc32() -> int32 {
   var digits: uint8* = (uint8*)"123456789";
-  if (dk_crc32(digits, 9) != (uint32)0xCBF43926) {
+  if (meo_crc32(digits, 9) != (uint32)0xCBF43926) {
     return a_fail("crc32: check vector 123456789");
   }
 
   // Empty input is 0, and update(0, ...) must equal crc32(...).
-  if (dk_crc32(digits, 0) != (uint32)0) { return a_fail("crc32: empty"); }
-  if (dk_crc32_update((uint32)0, digits, 9) != dk_crc32(digits, 9)) {
+  if (meo_crc32(digits, 0) != (uint32)0) { return a_fail("crc32: empty"); }
+  if (meo_crc32_update((uint32)0, digits, 9) != meo_crc32(digits, 9)) {
     return a_fail("crc32: update matches crc32");
   }
 
   // Chunked calls are the same CRC as one call: the update form takes the
   // finalised value from the previous chunk.
-  var first: uint32 = dk_crc32_update((uint32)0, digits, 4);
-  var whole: uint32 = dk_crc32_update(first, digits + 4, 5);
+  var first: uint32 = meo_crc32_update((uint32)0, digits, 4);
+  var whole: uint32 = meo_crc32_update(first, digits + 4, 5);
   if (whole != (uint32)0xCBF43926) { return a_fail("crc32: chunked update"); }
 
   // A single flipped bit must change the CRC.
   var buf: uint8* = malloc(4);
   if (buf == 0) { return a_fail("crc32: malloc"); }
   defer free(buf);
-  dk_bytes_zero(buf, 4);
-  var zero_crc: uint32 = dk_crc32(buf, 4);
+  meo_bytes_zero(buf, 4);
+  var zero_crc: uint32 = meo_crc32(buf, 4);
   buf[2] = 1;
-  if (dk_crc32(buf, 4) == zero_crc) { return a_fail("crc32: bit sensitivity"); }
+  if (meo_crc32(buf, 4) == zero_crc) { return a_fail("crc32: bit sensitivity"); }
 
   return 0;
 }
@@ -117,20 +117,20 @@ fn a_crc32() -> int32 {
 
 fn a_varint_one(v: uint64, label: string) -> int32 {
   var buf: uint8[16];
-  dk_bytes_zero(&buf[0], 16);
+  meo_bytes_zero(&buf[0], 16);
 
-  var want_len: int32 = dk_varint_len(v);
-  var n: int32 = dk_varint_put(&buf[0], 16, v);
+  var want_len: int32 = meo_varint_len(v);
+  var n: int32 = meo_varint_put(&buf[0], 16, v);
   if (n != want_len) { return a_fail("varint: len disagrees with put {label}"); }
 
   var out: uint64 = 12345;
-  var got: int32 = dk_varint_get(&buf[0], 16, &out);
+  var got: int32 = meo_varint_get(&buf[0], 16, &out);
   if (got != n) { return a_fail("varint: get length {label}"); }
   if (out != v) { return a_fail("varint: round trip {label}"); }
 
   // A capacity of n-1 must be a hard FULL, not a truncated write.
   if (n > 1) {
-    if (dk_varint_put(&buf[0], (int64)(n - 1), v) != -DK_ERR_FULL) {
+    if (meo_varint_put(&buf[0], (int64)(n - 1), v) != -MEO_ERR_FULL) {
       return a_fail("varint: short cap FULL {label}");
     }
   }
@@ -138,7 +138,7 @@ fn a_varint_one(v: uint64, label: string) -> int32 {
   // A truncated buffer must be CORRUPT, not a silent value.
   if (n > 1) {
     var partial: uint64 = 0;
-    if (dk_varint_get(&buf[0], (int64)(n - 1), &partial) != -DK_ERR_CORRUPT) {
+    if (meo_varint_get(&buf[0], (int64)(n - 1), &partial) != -MEO_ERR_CORRUPT) {
       return a_fail("varint: truncated get CORRUPT {label}");
     }
   }
@@ -162,30 +162,30 @@ fn a_varint() -> int32 {
   if (rc != 0) { return rc; }
 
   // Length table: 1 byte up to 127, 2 from 128, 10 for the maximum.
-  if (dk_varint_len((uint64)0) != 1) { return a_fail("varint: len 0"); }
-  if (dk_varint_len((uint64)127) != 1) { return a_fail("varint: len 127"); }
-  if (dk_varint_len((uint64)128) != 2) { return a_fail("varint: len 128"); }
-  if (dk_varint_len((uint64)300) != 2) { return a_fail("varint: len 300"); }
-  if (dk_varint_len((uint64)0xFFFFFFFFFFFFFFFF) != 10) {
+  if (meo_varint_len((uint64)0) != 1) { return a_fail("varint: len 0"); }
+  if (meo_varint_len((uint64)127) != 1) { return a_fail("varint: len 127"); }
+  if (meo_varint_len((uint64)128) != 2) { return a_fail("varint: len 128"); }
+  if (meo_varint_len((uint64)300) != 2) { return a_fail("varint: len 300"); }
+  if (meo_varint_len((uint64)0xFFFFFFFFFFFFFFFF) != 10) {
     return a_fail("varint: len 2^64-1");
   }
 
   // Exactly the documented bytes, not just a round trip.
   var buf: uint8[4];
-  if (dk_varint_put(&buf[0], 4, (uint64)300) != 2) { return a_fail("varint: put 300"); }
+  if (meo_varint_put(&buf[0], 4, (uint64)300) != 2) { return a_fail("varint: put 300"); }
   if (buf[0] != 0xAC) { return a_fail("varint: 300 byte 0"); }
   if (buf[1] != 0x02) { return a_fail("varint: 300 byte 1"); }
 
   // Overflow: an 11-byte encoding or a 10th byte above 1 is corrupt.
   var bad: uint8[11];
-  dk_bytes_zero(&bad[0], 11);
+  meo_bytes_zero(&bad[0], 11);
   var i: int32 = 0;
   while (i < 10) {
     bad[i] = 0xFF;
     i += 1;
   }
   var sink: uint64 = 0;
-  if (dk_varint_get(&bad[0], 11, &sink) != -DK_ERR_CORRUPT) {
+  if (meo_varint_get(&bad[0], 11, &sink) != -MEO_ERR_CORRUPT) {
     return a_fail("varint: 10th byte overflow");
   }
   var long_run: uint8[16];
@@ -194,27 +194,27 @@ fn a_varint() -> int32 {
     long_run[i] = 0x80;
     i += 1;
   }
-  if (dk_varint_get(&long_run[0], 16, &sink) != -DK_ERR_CORRUPT) {
+  if (meo_varint_get(&long_run[0], 16, &sink) != -MEO_ERR_CORRUPT) {
     return a_fail("varint: unterminated run");
   }
 
   // Zigzag: the signed values record codecs will see.
-  if (dk_zigzag_enc((int64)0) != (uint64)0) { return a_fail("zigzag: enc 0"); }
-  if (dk_zigzag_enc((int64)-1) != (uint64)1) { return a_fail("zigzag: enc -1"); }
-  if (dk_zigzag_enc((int64)1) != (uint64)2) { return a_fail("zigzag: enc 1"); }
-  if (dk_zigzag_enc((int64)-2) != (uint64)3) { return a_fail("zigzag: enc -2"); }
-  if (dk_zigzag_enc((int64)2) != (uint64)4) { return a_fail("zigzag: enc 2"); }
-  if (dk_zigzag_dec((uint64)0) != 0) { return a_fail("zigzag: dec 0"); }
-  if (dk_zigzag_dec((uint64)1) != -1) { return a_fail("zigzag: dec -1"); }
-  if (dk_zigzag_dec((uint64)2) != 1) { return a_fail("zigzag: dec 1"); }
-  if (dk_zigzag_dec((uint64)3) != -2) { return a_fail("zigzag: dec -2"); }
-  if (dk_zigzag_dec((uint64)4) != 2) { return a_fail("zigzag: dec 2"); }
+  if (meo_zigzag_enc((int64)0) != (uint64)0) { return a_fail("zigzag: enc 0"); }
+  if (meo_zigzag_enc((int64)-1) != (uint64)1) { return a_fail("zigzag: enc -1"); }
+  if (meo_zigzag_enc((int64)1) != (uint64)2) { return a_fail("zigzag: enc 1"); }
+  if (meo_zigzag_enc((int64)-2) != (uint64)3) { return a_fail("zigzag: enc -2"); }
+  if (meo_zigzag_enc((int64)2) != (uint64)4) { return a_fail("zigzag: enc 2"); }
+  if (meo_zigzag_dec((uint64)0) != 0) { return a_fail("zigzag: dec 0"); }
+  if (meo_zigzag_dec((uint64)1) != -1) { return a_fail("zigzag: dec -1"); }
+  if (meo_zigzag_dec((uint64)2) != 1) { return a_fail("zigzag: dec 1"); }
+  if (meo_zigzag_dec((uint64)3) != -2) { return a_fail("zigzag: dec -2"); }
+  if (meo_zigzag_dec((uint64)4) != 2) { return a_fail("zigzag: dec 2"); }
 
-  if (dk_zigzag_dec(dk_zigzag_enc((int64)9223372036854775807)) != 9223372036854775807) {
+  if (meo_zigzag_dec(meo_zigzag_enc((int64)9223372036854775807)) != 9223372036854775807) {
     return a_fail("zigzag: round trip max");
   }
   var int_min: int64 = -9223372036854775807 - 1;
-  if (dk_zigzag_dec(dk_zigzag_enc(int_min)) != int_min) {
+  if (meo_zigzag_dec(meo_zigzag_enc(int_min)) != int_min) {
     return a_fail("zigzag: round trip min");
   }
 
@@ -224,125 +224,125 @@ fn a_varint() -> int32 {
 // --- format/page: header, cells, sealing ------------------------------------
 
 fn a_page_header() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("page: malloc"); }
   defer free(p);
 
-  if (dk_page_init(p, DK_PAGE_META) != DK_OK) { return a_fail("page: init meta"); }
-  if (dk_page_type(p) != DK_PAGE_META) { return a_fail("page: meta type"); }
-  if (dk_page_n_cells(p) != 0) { return a_fail("page: meta n_cells"); }
-  if (dk_page_free_start(p) != DK_META_BODY) { return a_fail("page: meta free_start"); }
-  if (dk_page_free_start(p) != 128) { return a_fail("page: meta free_start 128"); }
-  if (dk_page_free_end(p) != DK_PAGE_SIZE) { return a_fail("page: meta free_end"); }
-  if (dk_page_check(p) != DK_OK) { return a_fail("page: meta check"); }
-  if (dk_page_verify(p) != DK_OK) { return a_fail("page: meta verify"); }
+  if (meo_page_init(p, MEO_PAGE_META) != MEO_OK) { return a_fail("page: init meta"); }
+  if (meo_page_type(p) != MEO_PAGE_META) { return a_fail("page: meta type"); }
+  if (meo_page_n_cells(p) != 0) { return a_fail("page: meta n_cells"); }
+  if (meo_page_free_start(p) != MEO_META_BODY) { return a_fail("page: meta free_start"); }
+  if (meo_page_free_start(p) != 128) { return a_fail("page: meta free_start 128"); }
+  if (meo_page_free_end(p) != MEO_PAGE_SIZE) { return a_fail("page: meta free_end"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("page: meta check"); }
+  if (meo_page_verify(p) != MEO_OK) { return a_fail("page: meta verify"); }
 
-  // Every non-meta type starts with the pointer array at DK_PAGE_HDR.
-  var t: int32 = DK_PAGE_BTREE_LEAF;
-  while (t < DK_PAGE_COUNT_TYPES) {
-    if (dk_page_init(p, t) != DK_OK) { return a_fail("page: init type"); }
-    if (dk_page_type(p) != t) { return a_fail("page: type round trip"); }
-    if (dk_page_flags(p) != 0) { return a_fail("page: flags fresh"); }
-    if (dk_page_free_start(p) != DK_PAGE_HDR) { return a_fail("page: free_start fresh"); }
-    if (dk_page_free_end(p) != DK_PAGE_SIZE) { return a_fail("page: free_end fresh"); }
-    if (dk_page_free_bytes(p) != DK_PAGE_SIZE - DK_PAGE_HDR) {
+  // Every non-meta type starts with the pointer array at MEO_PAGE_HDR.
+  var t: int32 = MEO_PAGE_BTREE_LEAF;
+  while (t < MEO_PAGE_COUNT_TYPES) {
+    if (meo_page_init(p, t) != MEO_OK) { return a_fail("page: init type"); }
+    if (meo_page_type(p) != t) { return a_fail("page: type round trip"); }
+    if (meo_page_flags(p) != 0) { return a_fail("page: flags fresh"); }
+    if (meo_page_free_start(p) != MEO_PAGE_HDR) { return a_fail("page: free_start fresh"); }
+    if (meo_page_free_end(p) != MEO_PAGE_SIZE) { return a_fail("page: free_end fresh"); }
+    if (meo_page_free_bytes(p) != MEO_PAGE_SIZE - MEO_PAGE_HDR) {
       return a_fail("page: free_bytes fresh");
     }
-    if (dk_page_used(p) != DK_PAGE_HDR) { return a_fail("page: used fresh"); }
-    if (dk_page_check(p) != DK_OK) { return a_fail("page: check fresh"); }
-    if (dk_page_verify(p) != DK_OK) { return a_fail("page: verify fresh"); }
+    if (meo_page_used(p) != MEO_PAGE_HDR) { return a_fail("page: used fresh"); }
+    if (meo_page_check(p) != MEO_OK) { return a_fail("page: check fresh"); }
+    if (meo_page_verify(p) != MEO_OK) { return a_fail("page: verify fresh"); }
 
     // An unknown type is refused and the page is not touched.
     t += 1;
   }
-  if (dk_page_init(p, DK_PAGE_COUNT_TYPES) != -DK_ERR_USAGE) {
+  if (meo_page_init(p, MEO_PAGE_COUNT_TYPES) != -MEO_ERR_USAGE) {
     return a_fail("page: init bad type");
   }
-  if (dk_page_init(p, -1) != -DK_ERR_USAGE) { return a_fail("page: init negative type"); }
+  if (meo_page_init(p, -1) != -MEO_ERR_USAGE) { return a_fail("page: init negative type"); }
 
   // flags and n_cells are persisted fields.
-  dk_page_init(p, DK_PAGE_FREE);
-  dk_page_set_flags(p, 0x5A);
-  if (dk_page_flags(p) != 0x5A) { return a_fail("page: set flags"); }
-  dk_page_set_flags(p, 0);
-  if (dk_page_flags(p) != 0) { return a_fail("page: clear flags"); }
+  meo_page_init(p, MEO_PAGE_FREE);
+  meo_page_set_flags(p, 0x5A);
+  if (meo_page_flags(p) != 0x5A) { return a_fail("page: set flags"); }
+  meo_page_set_flags(p, 0);
+  if (meo_page_flags(p) != 0) { return a_fail("page: clear flags"); }
 
   // init zeroes all 4096 bytes, even a page that previously held data.
   var z: int32 = 0;
-  while (z < DK_PAGE_SIZE) {
+  while (z < MEO_PAGE_SIZE) {
     p[z] = 0xFF;
     z += 1;
   }
-  dk_page_init(p, DK_PAGE_FREE);
-  z = DK_PAGE_HDR;
-  while (z < DK_PAGE_SIZE) {
+  meo_page_init(p, MEO_PAGE_FREE);
+  z = MEO_PAGE_HDR;
+  while (z < MEO_PAGE_SIZE) {
     if (p[z] != 0) { return a_fail("page: init did not zero body"); }
     z += 1;
   }
 
   // Raw header bytes at the section 3.1 offsets, not just accessor output.
-  dk_page_init(p, DK_PAGE_BTREE_LEAF);
+  meo_page_init(p, MEO_PAGE_BTREE_LEAF);
   if (p[0] != 2) { return a_fail("page: raw type offset 0"); }
   if (p[1] != 0) { return a_fail("page: raw flags offset 1"); }
   if (p[2] != 0 || p[3] != 0) { return a_fail("page: raw n_cells offset 2"); }
-  if (dk_get_u16le(p, 4) != 16) { return a_fail("page: raw cell_start offset 4"); }
-  if (dk_get_u16le(p, 6) != 16) { return a_fail("page: raw free_start offset 6"); }
+  if (meo_get_u16le(p, 4) != 16) { return a_fail("page: raw cell_start offset 4"); }
+  if (meo_get_u16le(p, 6) != 16) { return a_fail("page: raw free_start offset 6"); }
   if (p[8] != 0 || p[9] != 0x10) { return a_fail("page: raw free_end offset 8"); }
-  if (dk_get_u16le(p, 10) != 0) { return a_fail("page: raw reserved offset 10"); }
-  if (dk_get_u32le(p, 12) != dk_page_checksum(p)) {
+  if (meo_get_u16le(p, 10) != 0) { return a_fail("page: raw reserved offset 10"); }
+  if (meo_get_u32le(p, 12) != meo_page_checksum(p)) {
     return a_fail("page: raw crc offset 12");
   }
-  dk_page_init(p, DK_PAGE_META);
+  meo_page_init(p, MEO_PAGE_META);
   if (p[0] != 1) { return a_fail("page: raw meta type"); }
-  if (dk_get_u16le(p, 6) != 128) { return a_fail("page: raw meta free_start"); }
+  if (meo_get_u16le(p, 6) != 128) { return a_fail("page: raw meta free_start"); }
 
   // Every header byte is covered by the checksum, directly or because the
   // stored value itself changes. A flip must be reported, never crash.
-  dk_page_init(p, DK_PAGE_BTREE_LEAF);
+  meo_page_init(p, MEO_PAGE_BTREE_LEAF);
   var b: int32 = 0;
-  while (b < DK_PAGE_HDR) {
+  while (b < MEO_PAGE_HDR) {
     var save: uint8 = p[b];
     p[b] = save ^ (uint8)0xFF;
-    if (dk_page_verify(p) != -DK_ERR_CORRUPT) {
+    if (meo_page_verify(p) != -MEO_ERR_CORRUPT) {
       return a_fail("page: header byte flip not rejected");
     }
     p[b] = save;
     b += 1;
   }
-  if (dk_page_verify(p) != DK_OK) { return a_fail("page: verify after restore"); }
+  if (meo_page_verify(p) != MEO_OK) { return a_fail("page: verify after restore"); }
 
   // A body byte is covered too.
-  p[DK_PAGE_SIZE - 1] = 0x77;
-  if (dk_page_verify(p) != -DK_ERR_CORRUPT) { return a_fail("page: body flip"); }
-  p[DK_PAGE_SIZE - 1] = 0;
+  p[MEO_PAGE_SIZE - 1] = 0x77;
+  if (meo_page_verify(p) != -MEO_ERR_CORRUPT) { return a_fail("page: body flip"); }
+  p[MEO_PAGE_SIZE - 1] = 0;
 
   // Sealing twice is stable.
-  dk_page_init(p, DK_PAGE_FREE);
-  var once: uint32 = dk_get_u32le(p, 12);
-  dk_page_seal(p);
-  if (dk_get_u32le(p, 12) != once) { return a_fail("page: seal is stable"); }
+  meo_page_init(p, MEO_PAGE_FREE);
+  var once: uint32 = meo_get_u32le(p, 12);
+  meo_page_seal(p);
+  if (meo_get_u32le(p, 12) != once) { return a_fail("page: seal is stable"); }
 
   // The four stored checksum bytes are not part of the checksum input: scribble
   // them, and both the computed value and a fresh seal are unaffected.
-  var computed: uint32 = dk_page_checksum(p);
+  var computed: uint32 = meo_page_checksum(p);
   p[12] = 0xFF;
   p[13] = 0xFF;
   p[14] = 0xFF;
   p[15] = 0xFF;
-  if (dk_page_checksum(p) != computed) { return a_fail("page: crc includes itself"); }
-  dk_page_seal(p);
-  if (dk_get_u32le(p, 12) != computed) { return a_fail("page: reseal after scribble"); }
-  if (dk_page_verify(p) != DK_OK) { return a_fail("page: verify after reseal"); }
+  if (meo_page_checksum(p) != computed) { return a_fail("page: crc includes itself"); }
+  meo_page_seal(p);
+  if (meo_get_u32le(p, 12) != computed) { return a_fail("page: reseal after scribble"); }
+  if (meo_page_verify(p) != MEO_OK) { return a_fail("page: verify after reseal"); }
 
   return 0;
 }
 
 fn a_page_cells() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("page: malloc cells"); }
   defer free(p);
 
-  if (dk_page_init(p, DK_PAGE_BTREE_LEAF) != DK_OK) { return a_fail("page: init cells"); }
+  if (meo_page_init(p, MEO_PAGE_BTREE_LEAF) != MEO_OK) { return a_fail("page: init cells"); }
 
   var sizes: int32[5] = [1, 7, 2, 33, 64];
   // Each cell also takes a two-byte length prefix (PHASE2.md 2A), so the
@@ -352,12 +352,12 @@ fn a_page_cells() -> int32 {
 
   var i: int32 = 0;
   while (i < 5) {
-    var off: int32 = dk_page_alloc(p, sizes[i]);
+    var off: int32 = meo_page_alloc(p, sizes[i]);
     if (off != want[i]) { return a_fail("page: alloc offset"); }
     offs[i] = off;
-    if (dk_page_insert_cell(p, off, i) != DK_OK) { return a_fail("page: insert"); }
+    if (meo_page_insert_cell(p, off, i) != MEO_OK) { return a_fail("page: insert"); }
     // Known bytes at known offsets, written through the body pointer.
-    var body: uint8* = dk_page_cell_ptr(p, i);
+    var body: uint8* = meo_page_cell_ptr(p, i);
     if (body != p + (int64)off) { return a_fail("page: cell_ptr"); }
     var k: int32 = 0;
     while (k < sizes[i]) {
@@ -367,25 +367,25 @@ fn a_page_cells() -> int32 {
     i += 1;
   }
 
-  if (dk_page_n_cells(p) != 5) { return a_fail("page: n_cells 5"); }
-  if (dk_page_free_start(p) != 16 + 2 * 5) { return a_fail("page: free_start dense"); }
-  if (dk_page_free_end(p) != DK_PAGE_SIZE - 107 - 2 * 5) {
+  if (meo_page_n_cells(p) != 5) { return a_fail("page: n_cells 5"); }
+  if (meo_page_free_start(p) != 16 + 2 * 5) { return a_fail("page: free_start dense"); }
+  if (meo_page_free_end(p) != MEO_PAGE_SIZE - 107 - 2 * 5) {
     return a_fail("page: free_end bodies plus prefixes");
   }
-  if (dk_page_free_bytes(p) != (DK_PAGE_SIZE - 107 - 2 * 5) - 26) {
+  if (meo_page_free_bytes(p) != (MEO_PAGE_SIZE - 107 - 2 * 5) - 26) {
     return a_fail("page: free_bytes after alloc");
   }
-  if (dk_get_u16le(p, 2) != 5) { return a_fail("page: raw n_cells 5"); }
-  if (dk_get_u16le(p, 6) != 26) { return a_fail("page: raw free_start 26"); }
-  if (dk_get_u16le(p, 8) != 3979) { return a_fail("page: raw free_end 3979"); }
-  if (dk_page_used(p) != 26 + 107 + 2 * 5) {
+  if (meo_get_u16le(p, 2) != 5) { return a_fail("page: raw n_cells 5"); }
+  if (meo_get_u16le(p, 6) != 26) { return a_fail("page: raw free_start 26"); }
+  if (meo_get_u16le(p, 8) != 3979) { return a_fail("page: raw free_end 3979"); }
+  if (meo_page_used(p) != 26 + 107 + 2 * 5) {
     return a_fail("page: used counts prefixes too");
   }
 
   i = 0;
   while (i < 5) {
-    if (dk_page_cell_off(p, i) != want[i]) { return a_fail("page: cell_off exact"); }
-    var body: uint8* = dk_page_cell_ptr(p, i);
+    if (meo_page_cell_off(p, i) != want[i]) { return a_fail("page: cell_off exact"); }
+    var body: uint8* = meo_page_cell_ptr(p, i);
     var k: int32 = 0;
     while (k < 5) {
       // Read back the full cell, not just the first byte.
@@ -396,40 +396,40 @@ fn a_page_cells() -> int32 {
     }
     i += 1;
   }
-  if (dk_page_cell_off(p, 5) != -1) { return a_fail("page: cell_off sentinel"); }
-  if (dk_page_cell_ptr(p, 5) != 0) { return a_fail("page: cell_ptr null"); }
-  if (dk_page_cell_off(p, -1) != -1) { return a_fail("page: cell_off negative"); }
-  if (dk_page_cell_len(p, 5) != -1) { return a_fail("page: cell_len sentinel"); }
-  if (dk_page_cell_len(p, -1) != -1) { return a_fail("page: cell_len negative"); }
+  if (meo_page_cell_off(p, 5) != -1) { return a_fail("page: cell_off sentinel"); }
+  if (meo_page_cell_ptr(p, 5) != 0) { return a_fail("page: cell_ptr null"); }
+  if (meo_page_cell_off(p, -1) != -1) { return a_fail("page: cell_off negative"); }
+  if (meo_page_cell_len(p, 5) != -1) { return a_fail("page: cell_len sentinel"); }
+  if (meo_page_cell_len(p, -1) != -1) { return a_fail("page: cell_len negative"); }
 
-  if (dk_page_check(p) != DK_OK) { return a_fail("page: check 5 cells"); }
-  dk_page_seal(p);
-  if (dk_page_verify(p) != DK_OK) { return a_fail("page: verify 5 cells"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("page: check 5 cells"); }
+  meo_page_seal(p);
+  if (meo_page_verify(p) != MEO_OK) { return a_fail("page: verify 5 cells"); }
 
   // FLIPWATCH: pointers now descending; a corrupt offset is caught.
   var save: uint8 = p[18];
   p[18] = p[18] ^ (uint8)0x10;
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("page: check bad offset"); }
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("page: check bad offset"); }
   p[18] = save;
-  if (dk_page_check(p) != DK_OK) { return a_fail("page: check restored"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("page: check restored"); }
 
   // alloc when the gap is exhausted: FULL and the page is unchanged. A body
   // of n needs n + 2, so the whole gap is n = 4096 - 16 - 2 and the body lands
   // at 16 + 4 with its prefix filling 16..18 at the end.
-  if (dk_page_init(p, DK_PAGE_FREE) != DK_OK) { return a_fail("page: init full"); }
-  if (dk_page_alloc(p, DK_PAGE_SIZE - DK_PAGE_HDR - 2) != DK_PAGE_HDR + 2) {
+  if (meo_page_init(p, MEO_PAGE_FREE) != MEO_OK) { return a_fail("page: init full"); }
+  if (meo_page_alloc(p, MEO_PAGE_SIZE - MEO_PAGE_HDR - 2) != MEO_PAGE_HDR + 2) {
     return a_fail("page: alloc whole gap");
   }
-  if (dk_page_free_end(p) != DK_PAGE_HDR) {
+  if (meo_page_free_end(p) != MEO_PAGE_HDR) {
     return a_fail("page: alloc whole gap leaves no room");
   }
-  if (dk_page_free_bytes(p) != 0) { return a_fail("page: alloc whole gap is full"); }
-  if (dk_page_alloc(p, 1) != -DK_ERR_FULL) { return a_fail("page: alloc FULL"); }
-  if (dk_page_free_end(p) != DK_PAGE_HDR) {
+  if (meo_page_free_bytes(p) != 0) { return a_fail("page: alloc whole gap is full"); }
+  if (meo_page_alloc(p, 1) != -MEO_ERR_FULL) { return a_fail("page: alloc FULL"); }
+  if (meo_page_free_end(p) != MEO_PAGE_HDR) {
     return a_fail("page: FULL changed page");
   }
-  if (dk_page_alloc(p, -1) != -DK_ERR_USAGE) { return a_fail("page: alloc negative"); }
-  if (dk_page_alloc(p, 65534) != -DK_ERR_USAGE) {
+  if (meo_page_alloc(p, -1) != -MEO_ERR_USAGE) { return a_fail("page: alloc negative"); }
+  if (meo_page_alloc(p, 65534) != -MEO_ERR_USAGE) {
     return a_fail("page: alloc length past u16 range");
   }
 
@@ -437,167 +437,167 @@ fn a_page_cells() -> int32 {
 }
 
 fn a_page_check_rejects() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("page: malloc check"); }
   defer free(p);
 
-  dk_page_init(p, DK_PAGE_FREE);
-  var off: int32 = dk_page_alloc(p, 1);
-  dk_page_insert_cell(p, off, 0);
-  if (dk_page_check(p) != DK_OK) { return a_fail("page: check baseline"); }
+  meo_page_init(p, MEO_PAGE_FREE);
+  var off: int32 = meo_page_alloc(p, 1);
+  meo_page_insert_cell(p, off, 0);
+  if (meo_page_check(p) != MEO_OK) { return a_fail("page: check baseline"); }
 
   // 1. unknown type.
   p[0] = 99;
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: type"); }
-  p[0] = (uint8)DK_PAGE_FREE;
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: type"); }
+  p[0] = (uint8)MEO_PAGE_FREE;
   // 2. flags and reserved.
   p[1] = 1;
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: flags"); }
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: flags"); }
   p[1] = 0;
-  dk_put_u16le(p, 10, (uint16)1);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: reserved"); }
-  dk_put_u16le(p, 10, (uint16)0);
+  meo_put_u16le(p, 10, (uint16)1);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: reserved"); }
+  meo_put_u16le(p, 10, (uint16)0);
   // 3. cell_start.
-  dk_put_u16le(p, 4, (uint16)15);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: cell_start"); }
-  dk_put_u16le(p, 4, (uint16)DK_PAGE_HDR);
+  meo_put_u16le(p, 4, (uint16)15);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: cell_start"); }
+  meo_put_u16le(p, 4, (uint16)MEO_PAGE_HDR);
   // 4. dense pointer array: free_start must be 16 + 2*n_cells.
-  dk_put_u16le(p, 6, (uint16)20);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: free_start dense"); }
-  dk_put_u16le(p, 6, (uint16)18);
+  meo_put_u16le(p, 6, (uint16)20);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: free_start dense"); }
+  meo_put_u16le(p, 6, (uint16)18);
   // 6. the gap cannot invert or leave the page.
-  dk_put_u16le(p, 8, (uint16)17);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: gap inverted"); }
-  dk_put_u16le(p, 8, (uint16)4097);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: gap past page"); }
+  meo_put_u16le(p, 8, (uint16)17);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: gap inverted"); }
+  meo_put_u16le(p, 8, (uint16)4097);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: gap past page"); }
   // One 1-byte cell occupies [4093,4096): prefix at 4093, body at 4095.
-  dk_put_u16le(p, 8, (uint16)4093);
+  meo_put_u16le(p, 8, (uint16)4093);
   // 7/8. a pointer may not overlap the pointer array or leave the page.
-  dk_put_u16le(p, 16, (uint16)17);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: pointer in array"); }
-  dk_put_u16le(p, 16, (uint16)4096);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: pointer past page"); }
+  meo_put_u16le(p, 16, (uint16)17);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: pointer in array"); }
+  meo_put_u16le(p, 16, (uint16)4096);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: pointer past page"); }
   // 9/10. a body may not start below free_end, which is free_end + 2 now that
   // every cell carries its length prefix (PHASE2.md 2A).
-  dk_put_u16le(p, 16, (uint16)4094);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: body in gap"); }
-  dk_put_u16le(p, 16, (uint16)4095);
-  if (dk_page_check(p) != DK_OK) { return a_fail("check: restored baseline"); }
+  meo_put_u16le(p, 16, (uint16)4094);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: body in gap"); }
+  meo_put_u16le(p, 16, (uint16)4095);
+  if (meo_page_check(p) != MEO_OK) { return a_fail("check: restored baseline"); }
   // 11. the stored length must be one a u16 can hold AND one the page can
   // hold: the cell here is 1 byte at 4095, so anything above 1 leaves the page.
-  dk_put_u16le(p, 4093, (uint16)65534);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: length past u16 range"); }
-  dk_put_u16le(p, 4093, (uint16)2);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: length past the page"); }
-  dk_put_u16le(p, 4093, (uint16)1);
-  if (dk_page_check(p) != DK_OK) { return a_fail("check: length restored"); }
+  meo_put_u16le(p, 4093, (uint16)65534);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: length past u16 range"); }
+  meo_put_u16le(p, 4093, (uint16)2);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: length past the page"); }
+  meo_put_u16le(p, 4093, (uint16)1);
+  if (meo_page_check(p) != MEO_OK) { return a_fail("check: length restored"); }
 
   // 9 again, with two cells: strictly descending pointer order.
-  dk_page_init(p, DK_PAGE_FREE);
-  var a: int32 = dk_page_alloc(p, 1);
-  dk_page_insert_cell(p, a, 0);
-  var b: int32 = dk_page_alloc(p, 1);
-  dk_page_insert_cell(p, b, 1);
-  if (dk_page_check(p) != DK_OK) { return a_fail("check: two cells"); }
-  dk_put_u16le(p, 18, (uint16)4095); // second pointer >= first
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) { return a_fail("check: pointer order"); }
+  meo_page_init(p, MEO_PAGE_FREE);
+  var a: int32 = meo_page_alloc(p, 1);
+  meo_page_insert_cell(p, a, 0);
+  var b: int32 = meo_page_alloc(p, 1);
+  meo_page_insert_cell(p, b, 1);
+  if (meo_page_check(p) != MEO_OK) { return a_fail("check: two cells"); }
+  meo_put_u16le(p, 18, (uint16)4095); // second pointer >= first
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: pointer order"); }
 
   return 0;
 }
 
 fn a_page_free_defrag() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("page: malloc defrag"); }
   defer free(p);
 
-  dk_page_init(p, DK_PAGE_FREE);
+  meo_page_init(p, MEO_PAGE_FREE);
   // Three cells, each preceded by its two-byte length: 1 body byte @4095
   // (extent 4093..4096), 7 @4086 (4084..4093), 4 @4080 (4078..4084).
-  var o0: int32 = dk_page_alloc(p, 1);
-  dk_page_insert_cell(p, o0, 0);
-  var o1: int32 = dk_page_alloc(p, 7);
-  dk_page_insert_cell(p, o1, 1);
-  var o2: int32 = dk_page_alloc(p, 4);
-  dk_page_insert_cell(p, o2, 2);
+  var o0: int32 = meo_page_alloc(p, 1);
+  meo_page_insert_cell(p, o0, 0);
+  var o1: int32 = meo_page_alloc(p, 7);
+  meo_page_insert_cell(p, o1, 1);
+  var o2: int32 = meo_page_alloc(p, 4);
+  meo_page_insert_cell(p, o2, 2);
   if (o0 != 4095 || o1 != 4086 || o2 != 4080) { return a_fail("page: defrag setup"); }
   p[4095] = 0x11;
   p[4086] = 0x22;
   p[4080] = 0x33;
 
-  var gap_before: int32 = dk_page_free_bytes(p);
+  var gap_before: int32 = meo_page_free_bytes(p);
   // Freeing the middle cell strands its whole extent: only the pointer array
   // shrinks, so the gap does not grow while reclaimable does.
-  if (dk_page_free_cell(p, 1) != DK_OK) { return a_fail("page: free middle"); }
-  if (dk_page_n_cells(p) != 2) { return a_fail("page: free n_cells"); }
-  if (dk_page_free_end(p) != 4078) { return a_fail("page: free moved free_end"); }
-  if (dk_page_free_bytes(p) != gap_before + 2) {
+  if (meo_page_free_cell(p, 1) != MEO_OK) { return a_fail("page: free middle"); }
+  if (meo_page_n_cells(p) != 2) { return a_fail("page: free n_cells"); }
+  if (meo_page_free_end(p) != 4078) { return a_fail("page: free moved free_end"); }
+  if (meo_page_free_bytes(p) != gap_before + 2) {
     return a_fail("page: free_cell strands");
   }
-  if (dk_page_reclaimable(p) != dk_page_free_bytes(p) + 9) {
+  if (meo_page_reclaimable(p) != meo_page_free_bytes(p) + 9) {
     return a_fail("page: reclaimable counts the dead extent");
   }
 
   // Defrag reclaims the interior hole too (PHASE2.md 2A): the 4-byte cell
   // moves from 4080 to 4089 so the page is packed against the end.
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("page: defrag middle"); }
-  if (dk_page_free_end(p) != 4087) { return a_fail("page: defrag reclaimed the hole"); }
-  if (dk_page_cell_off(p, 0) != 4095) {
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("page: defrag middle"); }
+  if (meo_page_free_end(p) != 4087) { return a_fail("page: defrag reclaimed the hole"); }
+  if (meo_page_cell_off(p, 0) != 4095) {
     return a_fail("page: defrag moved a packed cell");
   }
-  if (dk_page_cell_off(p, 1) != 4089) {
+  if (meo_page_cell_off(p, 1) != 4089) {
     return a_fail("page: defrag rewrote the pointer");
   }
-  if (dk_page_cell_len(p, 1) != 4) { return a_fail("page: defrag kept the length"); }
+  if (meo_page_cell_len(p, 1) != 4) { return a_fail("page: defrag kept the length"); }
   if (p[4095] != 0x11) { return a_fail("page: defrag lost body 0"); }
   if (p[4089] != 0x33) { return a_fail("page: defrag kept the shifted body"); }
-  if (dk_page_reclaimable(p) != dk_page_free_bytes(p)) {
+  if (meo_page_reclaimable(p) != meo_page_free_bytes(p)) {
     return a_fail("page: a packed page has nothing reclaimable");
   }
   // ... and a second pass changes nothing.
-  var fe_packed: int32 = dk_page_free_end(p);
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("page: defrag twice"); }
-  if (dk_page_free_end(p) != fe_packed) { return a_fail("page: defrag not idempotent"); }
+  var fe_packed: int32 = meo_page_free_end(p);
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("page: defrag twice"); }
+  if (meo_page_free_end(p) != fe_packed) { return a_fail("page: defrag not idempotent"); }
   if (p[4089] != 0x33) { return a_fail("page: second defrag moved a body"); }
 
   // Free the newest cell too; defrag pulls the surviving cell back to the end.
-  if (dk_page_free_cell(p, 1) != DK_OK) { return a_fail("page: free newest"); }
-  if (dk_page_n_cells(p) != 1) { return a_fail("page: free newest n_cells"); }
-  if (dk_page_free_end(p) != 4087) { return a_fail("page: newest free_end"); }
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("page: defrag newest"); }
-  if (dk_page_free_end(p) != 4093) { return a_fail("page: defrag reclaimed newest"); }
-  var fe_after: int32 = dk_page_free_end(p);
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("page: defrag twice again"); }
-  if (dk_page_free_end(p) != fe_after) { return a_fail("page: defrag not idempotent"); }
+  if (meo_page_free_cell(p, 1) != MEO_OK) { return a_fail("page: free newest"); }
+  if (meo_page_n_cells(p) != 1) { return a_fail("page: free newest n_cells"); }
+  if (meo_page_free_end(p) != 4087) { return a_fail("page: newest free_end"); }
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("page: defrag newest"); }
+  if (meo_page_free_end(p) != 4093) { return a_fail("page: defrag reclaimed newest"); }
+  var fe_after: int32 = meo_page_free_end(p);
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("page: defrag twice again"); }
+  if (meo_page_free_end(p) != fe_after) { return a_fail("page: defrag not idempotent"); }
   // The surviving cell and its byte are untouched.
-  if (dk_page_cell_off(p, 0) != 4095) { return a_fail("page: defrag moved pointer"); }
+  if (meo_page_cell_off(p, 0) != 4095) { return a_fail("page: defrag moved pointer"); }
   if (p[4095] != 0x11) { return a_fail("page: defrag moved body"); }
-  if (dk_page_check(p) != DK_OK) { return a_fail("page: check after defrag"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("page: check after defrag"); }
 
   // out-of-range free is a range error and changes nothing.
-  if (dk_page_free_cell(p, 1) != -DK_ERR_RANGE) { return a_fail("page: free range"); }
-  if (dk_page_free_cell(p, -1) != -DK_ERR_RANGE) { return a_fail("page: free negative"); }
+  if (meo_page_free_cell(p, 1) != -MEO_ERR_RANGE) { return a_fail("page: free range"); }
+  if (meo_page_free_cell(p, -1) != -MEO_ERR_RANGE) { return a_fail("page: free negative"); }
 
   // A full page -- one live cell whose body fills everything above its
   // pointer, so free_start == free_end == 18 and free_bytes is 0 -- defrags to
-  // itself: DK_OK, not one byte moved (PHASE1.md section 7).
-  var snap: uint8* = malloc((int64)DK_PAGE_SIZE);
+  // itself: MEO_OK, not one byte moved (PHASE1.md section 7).
+  var snap: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (snap == 0) { return a_fail("page: malloc full snapshot"); }
   defer free(snap);
-  if (dk_page_init(p, DK_PAGE_FREE) != DK_OK) { return a_fail("page: init full"); }
+  if (meo_page_init(p, MEO_PAGE_FREE) != MEO_OK) { return a_fail("page: init full"); }
   // One body plus its prefix fills everything above the one-element pointer
   // array: free_start == free_end == 18 and the body sits at 20.
-  var o_full: int32 = dk_page_alloc(p, DK_PAGE_SIZE - (DK_PAGE_HDR + 2) - 2);
-  if (o_full != DK_PAGE_HDR + 4) { return a_fail("page: full setup offset"); }
-  if (dk_page_insert_cell(p, o_full, 0) != DK_OK) {
+  var o_full: int32 = meo_page_alloc(p, MEO_PAGE_SIZE - (MEO_PAGE_HDR + 2) - 2);
+  if (o_full != MEO_PAGE_HDR + 4) { return a_fail("page: full setup offset"); }
+  if (meo_page_insert_cell(p, o_full, 0) != MEO_OK) {
     return a_fail("page: full setup insert");
   }
-  if (dk_page_free_bytes(p) != 0) { return a_fail("page: the page is not full"); }
-  dk_bytes_copy(snap, p, (int64)DK_PAGE_SIZE);
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("page: defrag a full page"); }
-  if (!dk_bytes_equal(snap, p, (int64)DK_PAGE_SIZE)) {
+  if (meo_page_free_bytes(p) != 0) { return a_fail("page: the page is not full"); }
+  meo_bytes_copy(snap, p, (int64)MEO_PAGE_SIZE);
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("page: defrag a full page"); }
+  if (!meo_bytes_equal(snap, p, (int64)MEO_PAGE_SIZE)) {
     return a_fail("page: defrag moved a full page");
   }
-  if (dk_page_check(p) != DK_OK) { return a_fail("page: full page checks"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("page: full page checks"); }
 
   return 0;
 }
@@ -611,11 +611,11 @@ fn a_page_free_defrag() -> int32 {
 // that describe it -- a page whose free_end claims space it does not have, or
 // whose bodies no longer start where the pointer says.
 fn a_page_extents() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("e1: malloc"); }
   defer free(p);
 
-  if (dk_page_init(p, DK_PAGE_BTREE_LEAF) != DK_OK) { return a_fail("e1: init"); }
+  if (meo_page_init(p, MEO_PAGE_BTREE_LEAF) != MEO_OK) { return a_fail("e1: init"); }
 
   // Five unequal cells, so a repack has to move something: each body is
   // preceded by its two-byte length, hence 4096 - sum(sizes + 2).
@@ -623,10 +623,10 @@ fn a_page_extents() -> int32 {
   var want_off: int32[5] = [4086, 4064, 4032, 3990, 3938];
   var i: int32 = 0;
   while (i < 5) {
-    var off: int32 = dk_page_alloc(p, sizes[i]);
+    var off: int32 = meo_page_alloc(p, sizes[i]);
     if (off != want_off[i]) { return a_fail("e1: alloc offset"); }
-    if (dk_page_insert_cell(p, off, i) != DK_OK) { return a_fail("e1: insert"); }
-    var body: uint8* = dk_page_cell_ptr(p, i);
+    if (meo_page_insert_cell(p, off, i) != MEO_OK) { return a_fail("e1: insert"); }
+    var body: uint8* = meo_page_cell_ptr(p, i);
     var k: int32 = 0;
     while (k < sizes[i]) {
       body[k] = (uint8)(0xA0 + i);
@@ -639,38 +639,38 @@ fn a_page_extents() -> int32 {
   // not at off - 1 or off - 4.
   i = 0;
   while (i < 5) {
-    if (dk_page_cell_len(p, i) != sizes[i]) { return a_fail("e1: cell_len"); }
-    if (dk_get_u16le(p, (int64)(want_off[i] - 2)) != (uint16)sizes[i]) {
+    if (meo_page_cell_len(p, i) != sizes[i]) { return a_fail("e1: cell_len"); }
+    if (meo_get_u16le(p, (int64)(want_off[i] - 2)) != (uint16)sizes[i]) {
       return a_fail("e1: length prefix offset");
     }
     i += 1;
   }
-  if (dk_page_free_end(p) != 3936) { return a_fail("e1: free_end after 5 allocs"); }
-  if (dk_page_reclaimable(p) != dk_page_free_bytes(p)) {
+  if (meo_page_free_end(p) != 3936) { return a_fail("e1: free_end after 5 allocs"); }
+  if (meo_page_reclaimable(p) != meo_page_free_bytes(p)) {
     return a_fail("e1: nothing is dead yet");
   }
-  if (dk_page_check(p) != DK_OK) { return a_fail("e1: check before free"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("e1: check before free"); }
 
   // Free the middle cell (30 body bytes, extent [4030,4062), 32 bytes with the
   // prefix): the body is stranded, so the gap does not grow by it and the
   // reclaimable total does.
-  var gap_before: int32 = dk_page_free_bytes(p);
-  var fe_before: int32 = dk_page_free_end(p);
-  if (dk_page_free_cell(p, 2) != DK_OK) { return a_fail("e1: free middle"); }
-  if (dk_page_free_end(p) != fe_before) { return a_fail("e1: free moved free_end"); }
-  if (dk_page_free_bytes(p) != gap_before + 2) {
+  var gap_before: int32 = meo_page_free_bytes(p);
+  var fe_before: int32 = meo_page_free_end(p);
+  if (meo_page_free_cell(p, 2) != MEO_OK) { return a_fail("e1: free middle"); }
+  if (meo_page_free_end(p) != fe_before) { return a_fail("e1: free moved free_end"); }
+  if (meo_page_free_bytes(p) != gap_before + 2) {
     return a_fail("e1: free returns only the pointer slot");
   }
-  if (dk_page_reclaimable(p) != dk_page_free_bytes(p) + 32) {
+  if (meo_page_reclaimable(p) != meo_page_free_bytes(p) + 32) {
     return a_fail("e1: reclaimable grew by the dead extent");
   }
 
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("e1: defrag"); }
-  if (dk_page_free_end(p) != fe_before + 32) {
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("e1: defrag"); }
+  if (meo_page_free_end(p) != fe_before + 32) {
     return a_fail("e1: defrag moved free_end by exactly the dead bytes");
   }
-  if (dk_page_n_cells(p) != 4) { return a_fail("e1: n_cells after defrag"); }
-  if (dk_page_reclaimable(p) != dk_page_free_bytes(p)) {
+  if (meo_page_n_cells(p) != 4) { return a_fail("e1: n_cells after defrag"); }
+  if (meo_page_reclaimable(p) != meo_page_free_bytes(p)) {
     return a_fail("e1: a repacked page has nothing reclaimable");
   }
 
@@ -680,13 +680,13 @@ fn a_page_extents() -> int32 {
   var live_byte: int32[4] = [0xA0, 0xA1, 0xA3, 0xA4];
   i = 0;
   while (i < 4) {
-    if (dk_page_cell_off(p, i) != live_off[i]) {
+    if (meo_page_cell_off(p, i) != live_off[i]) {
       return a_fail("e1: repacked pointer");
     }
-    if (dk_page_cell_len(p, i) != live_size[i]) {
+    if (meo_page_cell_len(p, i) != live_size[i]) {
       return a_fail("e1: repacked length");
     }
-    var body: uint8* = dk_page_cell_ptr(p, i);
+    var body: uint8* = meo_page_cell_ptr(p, i);
     var k: int32 = 0;
     while (k < live_size[i]) {
       if (body[k] != (uint8)live_byte[i]) {
@@ -696,73 +696,73 @@ fn a_page_extents() -> int32 {
     }
     i += 1;
   }
-  if (dk_page_check(p) != DK_OK) { return a_fail("e1: check after defrag"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("e1: check after defrag"); }
 
   // A second pass changes nothing.
-  if (dk_page_defrag(p) != DK_OK) { return a_fail("e1: defrag twice"); }
-  if (dk_page_free_end(p) != fe_before + 32) {
+  if (meo_page_defrag(p) != MEO_OK) { return a_fail("e1: defrag twice"); }
+  if (meo_page_free_end(p) != fe_before + 32) {
     return a_fail("e1: defrag is idempotent");
   }
-  if (dk_page_cell_off(p, 3) != 3970) { return a_fail("e1: second defrag moved a cell"); }
+  if (meo_page_cell_off(p, 3) != 3970) { return a_fail("e1: second defrag moved a cell"); }
 
-  dk_page_seal(p);
-  if (dk_page_verify(p) != DK_OK) { return a_fail("e1: verify after defrag"); }
+  meo_page_seal(p);
+  if (meo_page_verify(p) != MEO_OK) { return a_fail("e1: verify after defrag"); }
   return 0;
 }
 
 // --- PHASE2.md 2A: overlapping cells (test E2) ------------------------------
 
 // No cell's extent [off - 2, off + len) may cross another's. The bug this
-// catches: a dk_page_check that only compares offsets, so a page whose cells
+// catches: a meo_page_check that only compares offsets, so a page whose cells
 // overlap is accepted and a reader sees one cell's bytes inside another's.
 // Both corruption shapes are here: a pointer that walks into the cell above it
 // and a stored length that does, each with everything else still in range and
 // still ordered.
 fn a_page_overlap() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("e2: malloc"); }
   defer free(p);
 
-  if (dk_page_init(p, DK_PAGE_BTREE_LEAF) != DK_OK) { return a_fail("e2: init"); }
+  if (meo_page_init(p, MEO_PAGE_BTREE_LEAF) != MEO_OK) { return a_fail("e2: init"); }
 
   // Hand-built: two cells whose extents are adjacent but do not cross. The
   // higher one is 8 bytes at 4088 (extent 4086..4096), the lower one 4 bytes
   // at 4074 (extent 4072..4076), with free_start 20 and free_end 4070.
   // Every pointer is written by hand so the corruption below is the only
   // difference from a legal page.
-  dk_put_u16le(p, 2, (uint16)2);
-  dk_put_u16le(p, 6, (uint16)20);
-  dk_put_u16le(p, 8, (uint16)4070);
-  dk_put_u16le(p, 16, (uint16)4088);
-  dk_put_u16le(p, 18, (uint16)4074);
-  dk_put_u16le(p, 4086, (uint16)8);
-  dk_put_u16le(p, 4072, (uint16)4);
-  if (dk_page_cell_len(p, 0) != 8) { return a_fail("e2: cell_len 0"); }
-  if (dk_page_cell_len(p, 1) != 4) { return a_fail("e2: cell_len 1"); }
-  if (dk_page_check(p) != DK_OK) { return a_fail("e2: adjacent extents are legal"); }
+  meo_put_u16le(p, 2, (uint16)2);
+  meo_put_u16le(p, 6, (uint16)20);
+  meo_put_u16le(p, 8, (uint16)4070);
+  meo_put_u16le(p, 16, (uint16)4088);
+  meo_put_u16le(p, 18, (uint16)4074);
+  meo_put_u16le(p, 4086, (uint16)8);
+  meo_put_u16le(p, 4072, (uint16)4);
+  if (meo_page_cell_len(p, 0) != 8) { return a_fail("e2: cell_len 0"); }
+  if (meo_page_cell_len(p, 1) != 4) { return a_fail("e2: cell_len 1"); }
+  if (meo_page_check(p) != MEO_OK) { return a_fail("e2: adjacent extents are legal"); }
 
   // Length overlap: the pointers stay ordered and inside the page, only the
   // stored length grows, so an extent [4072,4088) runs through the higher
   // cell's prefix at 4086. A checker that trusts the pointer array alone
   // accepts this page.
-  dk_put_u16le(p, 4072, (uint16)14);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) {
+  meo_put_u16le(p, 4072, (uint16)14);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) {
     return a_fail("e2: length overlap is corrupt");
   }
-  dk_put_u16le(p, 4072, (uint16)4);
-  if (dk_page_check(p) != DK_OK) { return a_fail("e2: length restored"); }
+  meo_put_u16le(p, 4072, (uint16)4);
+  if (meo_page_check(p) != MEO_OK) { return a_fail("e2: length restored"); }
 
   // Pointer overlap: the lower body moves to 4086 with an honest prefix of its
   // own, so its extent [4084,4090) crosses the higher cell instead. Still
   // descending, still above free_end + 2, still inside the page.
-  dk_put_u16le(p, 4084, (uint16)4);
-  dk_put_u16le(p, 18, (uint16)4086);
-  if (dk_page_check(p) != -DK_ERR_CORRUPT) {
+  meo_put_u16le(p, 4084, (uint16)4);
+  meo_put_u16le(p, 18, (uint16)4086);
+  if (meo_page_check(p) != -MEO_ERR_CORRUPT) {
     return a_fail("e2: pointer overlap is corrupt");
   }
-  dk_put_u16le(p, 18, (uint16)4074);
-  dk_put_u16le(p, 4084, (uint16)0);
-  if (dk_page_check(p) != DK_OK) {
+  meo_put_u16le(p, 18, (uint16)4074);
+  meo_put_u16le(p, 4084, (uint16)0);
+  if (meo_page_check(p) != MEO_OK) {
     return a_fail("e2: pointer overlap restored");
   }
 
@@ -771,12 +771,12 @@ fn a_page_overlap() -> int32 {
 
 // --- format/meta ------------------------------------------------------------
 
-fn a_meta_base() -> DkMeta {
-  var m: DkMeta;
+fn a_meta_base() -> MeoMeta {
+  var m: MeoMeta;
   m.valid = true;
-  m.magic = DK_MAGIC;
-  m.version = DK_FORMAT_VERSION;
-  m.page_size = DK_PAGE_SIZE;
+  m.magic = MEO_MAGIC;
+  m.version = MEO_FORMAT_VERSION;
+  m.page_size = MEO_PAGE_SIZE;
   m.page_count = (uint32)1;
   m.freelist_root = (uint32)0;
   m.catalog_root = (uint32)0;
@@ -787,14 +787,14 @@ fn a_meta_base() -> DkMeta {
 }
 
 fn a_meta() -> int32 {
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return a_fail("meta: malloc"); }
   defer free(p);
 
-  if (dk_page_init(p, DK_PAGE_META) != DK_OK) { return a_fail("meta: page init"); }
+  if (meo_page_init(p, MEO_PAGE_META) != MEO_OK) { return a_fail("meta: page init"); }
 
-  // The on-disk magic is the bytes "DKPG", little-endian u32 0x47504B44.
-  var m: DkMeta = a_meta_base();
+  // The on-disk magic is the bytes "MEOP", little-endian u32 0x504F454D.
+  var m: MeoMeta = a_meta_base();
   m.page_count = 7;
   m.freelist_root = 11;
   m.catalog_root = 12;
@@ -802,31 +802,31 @@ fn a_meta() -> int32 {
   m.txn_id = (uint64)0x1122334455667788;
   m.write_version = (uint64)0xFFFFFFFFFFFFFFFF;
 
-  if (dk_meta_write(p, m) != DK_OK) { return a_fail("meta: write"); }
-  if (p[16] != 0x44) { return a_fail("meta: magic byte D"); }
-  if (p[17] != 0x4B) { return a_fail("meta: magic byte K"); }
-  if (p[18] != 0x50) { return a_fail("meta: magic byte P"); }
-  if (p[19] != 0x47) { return a_fail("meta: magic byte G"); }
+  if (meo_meta_write(p, m) != MEO_OK) { return a_fail("meta: write"); }
+  if (p[16] != 0x4D) { return a_fail("meta: magic byte M"); }
+  if (p[17] != 0x45) { return a_fail("meta: magic byte E"); }
+  if (p[18] != 0x4F) { return a_fail("meta: magic byte O"); }
+  if (p[19] != 0x50) { return a_fail("meta: magic byte P"); }
   // write does not touch the header's free_start / n_cells.
-  if (dk_page_free_start(p) != DK_META_BODY) { return a_fail("meta: write free_start"); }
-  if (dk_page_verify(p) != DK_OK) { return a_fail("meta: write seals"); }
+  if (meo_page_free_start(p) != MEO_META_BODY) { return a_fail("meta: write free_start"); }
+  if (meo_page_verify(p) != MEO_OK) { return a_fail("meta: write seals"); }
 
   // Exact body offsets.
-  if (dk_get_u32le(p, 16) != DK_MAGIC) { return a_fail("meta: magic offset"); }
-  if (dk_get_u16le(p, 20) != (uint16)DK_FORMAT_VERSION) {
+  if (meo_get_u32le(p, 16) != MEO_MAGIC) { return a_fail("meta: magic offset"); }
+  if (meo_get_u16le(p, 20) != (uint16)MEO_FORMAT_VERSION) {
     return a_fail("meta: version offset");
   }
-  if (dk_get_u16le(p, 22) != (uint16)DK_PAGE_SIZE) {
+  if (meo_get_u16le(p, 22) != (uint16)MEO_PAGE_SIZE) {
     return a_fail("meta: page_size offset");
   }
-  if (dk_get_u32le(p, 24) != (uint32)7) { return a_fail("meta: page_count offset"); }
-  if (dk_get_u32le(p, 28) != (uint32)11) { return a_fail("meta: freelist offset"); }
-  if (dk_get_u32le(p, 32) != (uint32)12) { return a_fail("meta: catalog offset"); }
-  if (dk_get_u32le(p, 36) != (uint32)13) { return a_fail("meta: btree offset"); }
-  if (dk_get_u64le(p, 40) != (uint64)0x1122334455667788) {
+  if (meo_get_u32le(p, 24) != (uint32)7) { return a_fail("meta: page_count offset"); }
+  if (meo_get_u32le(p, 28) != (uint32)11) { return a_fail("meta: freelist offset"); }
+  if (meo_get_u32le(p, 32) != (uint32)12) { return a_fail("meta: catalog offset"); }
+  if (meo_get_u32le(p, 36) != (uint32)13) { return a_fail("meta: btree offset"); }
+  if (meo_get_u64le(p, 40) != (uint64)0x1122334455667788) {
     return a_fail("meta: txn_id offset");
   }
-  if (dk_get_u64le(p, 48) != (uint64)0xFFFFFFFFFFFFFFFF) {
+  if (meo_get_u64le(p, 48) != (uint64)0xFFFFFFFFFFFFFFFF) {
     return a_fail("meta: write_version offset");
   }
   var z: int64 = 56;
@@ -836,13 +836,13 @@ fn a_meta() -> int32 {
   }
 
   // Round trip.
-  if (dk_meta_check(p) != DK_OK) { return a_fail("meta: check good"); }
-  var r: DkMeta = dk_meta_read(p);
+  if (meo_meta_check(p) != MEO_OK) { return a_fail("meta: check good"); }
+  var r: MeoMeta = meo_meta_read(p);
   if (!r.valid) { return a_fail("meta: read valid"); }
-  if (r.magic != DK_MAGIC || r.version != DK_FORMAT_VERSION) {
+  if (r.magic != MEO_MAGIC || r.version != MEO_FORMAT_VERSION) {
     return a_fail("meta: read magic/version");
   }
-  if (r.page_size != DK_PAGE_SIZE) { return a_fail("meta: read page_size"); }
+  if (r.page_size != MEO_PAGE_SIZE) { return a_fail("meta: read page_size"); }
   if (r.page_count != (uint32)7) { return a_fail("meta: read page_count"); }
   if (r.freelist_root != (uint32)11) { return a_fail("meta: read freelist"); }
   if (r.catalog_root != (uint32)12) { return a_fail("meta: read catalog"); }
@@ -853,69 +853,69 @@ fn a_meta() -> int32 {
   }
 
   // Roots by slot.
-  if (dk_meta_root(r, DK_ROOT_FREELIST) != (uint32)11) { return a_fail("meta: root freelist"); }
-  if (dk_meta_root(r, DK_ROOT_CATALOG) != (uint32)12) { return a_fail("meta: root catalog"); }
-  if (dk_meta_root(r, DK_ROOT_BTREE) != (uint32)13) { return a_fail("meta: root btree"); }
-  if (dk_meta_root(r, DK_ROOT_COUNT) != (uint32)0) { return a_fail("meta: root unknown"); }
-  if (dk_meta_set_root(&r, DK_ROOT_FREELIST, (uint32)99) != DK_OK) {
+  if (meo_meta_root(r, MEO_ROOT_FREELIST) != (uint32)11) { return a_fail("meta: root freelist"); }
+  if (meo_meta_root(r, MEO_ROOT_CATALOG) != (uint32)12) { return a_fail("meta: root catalog"); }
+  if (meo_meta_root(r, MEO_ROOT_BTREE) != (uint32)13) { return a_fail("meta: root btree"); }
+  if (meo_meta_root(r, MEO_ROOT_COUNT) != (uint32)0) { return a_fail("meta: root unknown"); }
+  if (meo_meta_set_root(&r, MEO_ROOT_FREELIST, (uint32)99) != MEO_OK) {
     return a_fail("meta: set root");
   }
   if (r.freelist_root != (uint32)99) { return a_fail("meta: set root value"); }
-  if (dk_meta_set_root(&r, DK_ROOT_COUNT, (uint32)99) != -DK_ERR_RANGE) {
+  if (meo_meta_set_root(&r, MEO_ROOT_COUNT, (uint32)99) != -MEO_ERR_RANGE) {
     return a_fail("meta: set root range");
   }
 
   // Bad magic: read is zeroed + invalid, check is NOT_A_DB. write seals, so
   // this is a structurally valid page carrying a foreign magic.
-  var bad_magic: DkMeta = a_meta_base();
+  var bad_magic: MeoMeta = a_meta_base();
   bad_magic.magic = (uint32)0xDEADBEEF;
-  dk_meta_write(p, bad_magic);
-  var rm: DkMeta = dk_meta_read(p);
+  meo_meta_write(p, bad_magic);
+  var rm: MeoMeta = meo_meta_read(p);
   if (rm.valid) { return a_fail("meta: bad magic still valid"); }
   if (rm.magic != (uint32)0) { return a_fail("meta: bad magic not zeroed"); }
-  if (dk_meta_check(p) != -DK_ERR_NOT_A_DB) { return a_fail("meta: bad magic check"); }
+  if (meo_meta_check(p) != -MEO_ERR_NOT_A_DB) { return a_fail("meta: bad magic check"); }
 
   // A real phase-1 file carries version 1. Its body fields sit at the same
   // offsets and its page is structurally sound, so the version check alone
   // stops a phase-2 decoder from reading phase-1 cell pointers (PHASE2.md
   // section 2A: refused rather than misread).
-  var v1: DkMeta = a_meta_base();
+  var v1: MeoMeta = a_meta_base();
   v1.version = 1;
-  dk_meta_write(p, v1);
-  var rv1: DkMeta = dk_meta_read(p);
+  meo_meta_write(p, v1);
+  var rv1: MeoMeta = meo_meta_read(p);
   if (rv1.valid) { return a_fail("meta: version 1 still valid"); }
   if (rv1.version != 0) { return a_fail("meta: version 1 not zeroed"); }
-  if (dk_meta_check(p) != -DK_ERR_VERSION) {
+  if (meo_meta_check(p) != -MEO_ERR_VERSION) {
     return a_fail("meta: version 1 check");
   }
 
   // Bad version: read invalid, check VERSION.
-  var bad_ver: DkMeta = a_meta_base();
+  var bad_ver: MeoMeta = a_meta_base();
   bad_ver.version = 99;
-  dk_meta_write(p, bad_ver);
-  if (dk_meta_read(p).valid) { return a_fail("meta: bad version valid"); }
-  if (dk_meta_check(p) != -DK_ERR_VERSION) { return a_fail("meta: bad version check"); }
+  meo_meta_write(p, bad_ver);
+  if (meo_meta_read(p).valid) { return a_fail("meta: bad version valid"); }
+  if (meo_meta_check(p) != -MEO_ERR_VERSION) { return a_fail("meta: bad version check"); }
 
   // Bad page size: read invalid, check VERSION.
-  var bad_size: DkMeta = a_meta_base();
+  var bad_size: MeoMeta = a_meta_base();
   bad_size.page_size = 8192;
-  dk_meta_write(p, bad_size);
-  if (dk_meta_read(p).valid) { return a_fail("meta: bad size valid"); }
-  if (dk_meta_check(p) != -DK_ERR_VERSION) { return a_fail("meta: bad size check"); }
+  meo_meta_write(p, bad_size);
+  if (meo_meta_read(p).valid) { return a_fail("meta: bad size valid"); }
+  if (meo_meta_check(p) != -MEO_ERR_VERSION) { return a_fail("meta: bad size check"); }
 
   // A structurally broken page is CORRUPT before magic is even considered.
-  dk_meta_write(p, a_meta_base());
-  dk_put_u16le(p, 6, (uint16)16); // free_start must be DK_META_BODY
-  dk_page_seal(p);
-  if (dk_meta_check(p) != -DK_ERR_CORRUPT) { return a_fail("meta: corrupt structure"); }
+  meo_meta_write(p, a_meta_base());
+  meo_put_u16le(p, 6, (uint16)16); // free_start must be MEO_META_BODY
+  meo_page_seal(p);
+  if (meo_meta_check(p) != -MEO_ERR_CORRUPT) { return a_fail("meta: corrupt structure"); }
 
   // Our magic on a non-meta page is our file with a broken page 0.
-  dk_page_init(p, DK_PAGE_BTREE_LEAF);
-  dk_put_u32le(p, 16, DK_MAGIC);
-  dk_put_u16le(p, 20, (uint16)DK_FORMAT_VERSION);
-  dk_put_u16le(p, 22, (uint16)DK_PAGE_SIZE);
-  dk_page_seal(p);
-  if (dk_meta_check(p) != -DK_ERR_CORRUPT) { return a_fail("meta: wrong page type"); }
+  meo_page_init(p, MEO_PAGE_BTREE_LEAF);
+  meo_put_u32le(p, 16, MEO_MAGIC);
+  meo_put_u16le(p, 20, (uint16)MEO_FORMAT_VERSION);
+  meo_put_u16le(p, 22, (uint16)MEO_PAGE_SIZE);
+  meo_page_seal(p);
+  if (meo_meta_check(p) != -MEO_ERR_CORRUPT) { return a_fail("meta: wrong page type"); }
 
   return 0;
 }
@@ -931,18 +931,18 @@ fn a_meta() -> int32 {
   var buf: uint8[16];
 
   // Little-endian byte order, not just "it reads back".
-  dk_put_u16le(&buf[0], 0, (uint16)0x1234);
+  meo_put_u16le(&buf[0], 0, (uint16)0x1234);
   assert_eq((int64)buf[0], 0x34);
   assert_eq((int64)buf[1], 0x12);
-  assert_eq((int64)dk_get_u16le(&buf[0], 0), 0x1234);
-  dk_put_u32le(&buf[0], 1, (uint32)0xDEADBEEF);
+  assert_eq((int64)meo_get_u16le(&buf[0], 0), 0x1234);
+  meo_put_u32le(&buf[0], 1, (uint32)0xDEADBEEF);
   assert_eq((int64)buf[1], 0xEF);
   assert_eq((int64)buf[4], 0xDE);
-  assert_eq((int64)dk_get_u32le(&buf[0], 1), 0xDEADBEEF);
-  dk_put_u64le(&buf[0], 3, (uint64)0x0102030405060708);
+  assert_eq((int64)meo_get_u32le(&buf[0], 1), 0xDEADBEEF);
+  meo_put_u64le(&buf[0], 3, (uint64)0x0102030405060708);
   assert_eq((int64)buf[3], 0x08);
   assert_eq((int64)buf[10], 0x01);
-  assert_eq((int64)dk_get_u64le(&buf[0], 3), 0x0102030405060708);
+  assert_eq((int64)meo_get_u64le(&buf[0], 3), 0x0102030405060708);
 
   // CRC-32/ISO-HDLC check vector.
   var digits: uint8[9];
@@ -951,87 +951,87 @@ fn a_meta() -> int32 {
     digits[d] = (uint8)(0x31 + d); // "123456789"
     d += 1;
   }
-  assert_eq((int64)dk_crc32(&digits[0], 9), 0xCBF43926);
-  assert_eq((int64)dk_crc32_update((uint32)0, &digits[0], 9), 0xCBF43926);
-  var split: uint32 = dk_crc32_update((uint32)0, &digits[0], 4);
-  assert_eq((int64)dk_crc32_update(split, &digits[4], 5), 0xCBF43926);
+  assert_eq((int64)meo_crc32(&digits[0], 9), 0xCBF43926);
+  assert_eq((int64)meo_crc32_update((uint32)0, &digits[0], 9), 0xCBF43926);
+  var split: uint32 = meo_crc32_update((uint32)0, &digits[0], 4);
+  assert_eq((int64)meo_crc32_update(split, &digits[4], 5), 0xCBF43926);
 
   // Varint round trip and exact bytes.
   var out: uint64 = 0;
-  assert_eq((int64)dk_varint_len((uint64)300), 2);
-  assert_eq((int64)dk_varint_put(&buf[0], 16, (uint64)300), 2);
+  assert_eq((int64)meo_varint_len((uint64)300), 2);
+  assert_eq((int64)meo_varint_put(&buf[0], 16, (uint64)300), 2);
   assert_eq((int64)buf[0], 0xAC);
   assert_eq((int64)buf[1], 0x02);
-  assert_eq((int64)dk_varint_get(&buf[0], 16, &out), 2);
+  assert_eq((int64)meo_varint_get(&buf[0], 16, &out), 2);
   assert_eq((int64)out, 300);
-  assert_eq((int64)dk_varint_put(&buf[0], 16, (uint64)0xFFFFFFFFFFFFFFFF), 10);
-  assert_eq((int64)dk_varint_get(&buf[0], 16, &out), 10);
-  assert_eq((int64)dk_varint_put(&buf[0], 1, (uint64)300), -DK_ERR_FULL);
+  assert_eq((int64)meo_varint_put(&buf[0], 16, (uint64)0xFFFFFFFFFFFFFFFF), 10);
+  assert_eq((int64)meo_varint_get(&buf[0], 16, &out), 10);
+  assert_eq((int64)meo_varint_put(&buf[0], 1, (uint64)300), -MEO_ERR_FULL);
 
   // Zigzag, including the extremes.
-  assert_eq((int64)dk_zigzag_enc((int64)-1), 1);
-  assert_eq((int64)dk_zigzag_enc((int64)1), 2);
-  assert_eq(dk_zigzag_dec((uint64)1), -1);
-  assert_eq(dk_zigzag_dec((uint64)2), 1);
-  assert_eq(dk_zigzag_dec(dk_zigzag_enc((int64)9223372036854775807)), 9223372036854775807);
+  assert_eq((int64)meo_zigzag_enc((int64)-1), 1);
+  assert_eq((int64)meo_zigzag_enc((int64)1), 2);
+  assert_eq(meo_zigzag_dec((uint64)1), -1);
+  assert_eq(meo_zigzag_dec((uint64)2), 1);
+  assert_eq(meo_zigzag_dec(meo_zigzag_enc((int64)9223372036854775807)), 9223372036854775807);
   var int_min: int64 = -9223372036854775807 - 1;
-  assert_eq(dk_zigzag_dec(dk_zigzag_enc(int_min)), int_min);
+  assert_eq(meo_zigzag_dec(meo_zigzag_enc(int_min)), int_min);
 
   // Page: exact offsets after 5 cells of 1, 7, 2, 33, 64, then seal/check.
-  var p: uint8* = malloc((int64)DK_PAGE_SIZE);
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (p == 0) { return 1; }
-  if (dk_page_init(p, DK_PAGE_BTREE_LEAF) != DK_OK) { free(p); return 2; }
+  if (meo_page_init(p, MEO_PAGE_BTREE_LEAF) != MEO_OK) { free(p); return 2; }
   var sizes: int32[5] = [1, 7, 2, 33, 64];
   var want: int32[5] = [4095, 4086, 4082, 4047, 3981];
   var i: int32 = 0;
   while (i < 5) {
-    var off: int32 = dk_page_alloc(p, sizes[i]);
+    var off: int32 = meo_page_alloc(p, sizes[i]);
     if (off != want[i]) { free(p); return 3; }
-    if (dk_page_insert_cell(p, off, i) != DK_OK) { free(p); return 4; }
-    dk_page_cell_ptr(p, i)[0] = (uint8)(0xA0 + i);
+    if (meo_page_insert_cell(p, off, i) != MEO_OK) { free(p); return 4; }
+    meo_page_cell_ptr(p, i)[0] = (uint8)(0xA0 + i);
     i += 1;
   }
-  if (dk_page_n_cells(p) != 5) { free(p); return 5; }
-  if (dk_page_free_start(p) != 26) { free(p); return 6; }
-  if (dk_page_free_end(p) != 4096 - 107 - 2 * 5) { free(p); return 7; }
-  if (dk_page_check(p) != DK_OK) { free(p); return 8; }
-  dk_page_seal(p);
-  if (dk_page_verify(p) != DK_OK) { free(p); return 9; }
-  if (dk_page_cell_off(p, 5) != -1) { free(p); return 10; }
+  if (meo_page_n_cells(p) != 5) { free(p); return 5; }
+  if (meo_page_free_start(p) != 26) { free(p); return 6; }
+  if (meo_page_free_end(p) != 4096 - 107 - 2 * 5) { free(p); return 7; }
+  if (meo_page_check(p) != MEO_OK) { free(p); return 8; }
+  meo_page_seal(p);
+  if (meo_page_verify(p) != MEO_OK) { free(p); return 9; }
+  if (meo_page_cell_off(p, 5) != -1) { free(p); return 10; }
 
   // Meta round trip and rejection, at exact body offsets.
-  if (dk_page_init(p, DK_PAGE_META) != DK_OK) { free(p); return 11; }
-  var m: DkMeta;
+  if (meo_page_init(p, MEO_PAGE_META) != MEO_OK) { free(p); return 11; }
+  var m: MeoMeta;
   m.valid = true;
-  m.magic = DK_MAGIC;
-  m.version = DK_FORMAT_VERSION;
-  m.page_size = DK_PAGE_SIZE;
+  m.magic = MEO_MAGIC;
+  m.version = MEO_FORMAT_VERSION;
+  m.page_size = MEO_PAGE_SIZE;
   m.page_count = (uint32)3;
   m.btree_root = (uint32)2;
   m.txn_id = (uint64)9;
   m.write_version = (uint64)4;
-  if (dk_meta_write(p, m) != DK_OK) { free(p); return 12; }
-  assert_eq((int64)dk_get_u32le(p, 16), 0x47504B44);
-  assert_eq((int64)dk_get_u16le(p, 20), DK_FORMAT_VERSION);
-  assert_eq((int64)dk_get_u16le(p, 22), DK_PAGE_SIZE);
-  assert_eq((int64)dk_get_u32le(p, 24), 3);
-  if (dk_meta_check(p) != DK_OK) { free(p); return 13; }
-  var r: DkMeta = dk_meta_read(p);
+  if (meo_meta_write(p, m) != MEO_OK) { free(p); return 12; }
+  assert_eq((int64)meo_get_u32le(p, 16), 0x504F454D);
+  assert_eq((int64)meo_get_u16le(p, 20), MEO_FORMAT_VERSION);
+  assert_eq((int64)meo_get_u16le(p, 22), MEO_PAGE_SIZE);
+  assert_eq((int64)meo_get_u32le(p, 24), 3);
+  if (meo_meta_check(p) != MEO_OK) { free(p); return 13; }
+  var r: MeoMeta = meo_meta_read(p);
   if (!r.valid) { free(p); return 14; }
   if (r.page_count != (uint32)3) { free(p); return 15; }
-  if (dk_meta_root(r, DK_ROOT_BTREE) != (uint32)2) { free(p); return 16; }
+  if (meo_meta_root(r, MEO_ROOT_BTREE) != (uint32)2) { free(p); return 16; }
   m.version = 99;
-  dk_meta_write(p, m);
-  if (dk_meta_read(p).valid) { free(p); return 17; }
-  if (dk_meta_check(p) != -DK_ERR_VERSION) { free(p); return 18; }
-  m.version = DK_FORMAT_VERSION;
+  meo_meta_write(p, m);
+  if (meo_meta_read(p).valid) { free(p); return 17; }
+  if (meo_meta_check(p) != -MEO_ERR_VERSION) { free(p); return 18; }
+  m.version = MEO_FORMAT_VERSION;
   m.page_size = 8192;
-  dk_meta_write(p, m);
-  if (dk_meta_check(p) != -DK_ERR_VERSION) { free(p); return 19; }
-  m.page_size = DK_PAGE_SIZE;
+  meo_meta_write(p, m);
+  if (meo_meta_check(p) != -MEO_ERR_VERSION) { free(p); return 19; }
+  m.page_size = MEO_PAGE_SIZE;
   m.magic = (uint32)0xDEADBEEF;
-  dk_meta_write(p, m);
-  if (dk_meta_check(p) != -DK_ERR_NOT_A_DB) { free(p); return 20; }
+  meo_meta_write(p, m);
+  if (meo_meta_check(p) != -MEO_ERR_NOT_A_DB) { free(p); return 20; }
 
   free(p);
   return 0;

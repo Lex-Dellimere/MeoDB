@@ -2,100 +2,100 @@
 // temporary allocations (PHASE1.md 5.2).
 //
 // There is no per-object free and no thread safety. An arena is owned by one
-// statement at a time: allocate freely, then dk_arena_free the whole thing,
-// or dk_arena_reset it to reuse the first chunk for the next statement. Two
-// threads must not touch the same DkArena without their own external lock.
+// statement at a time: allocate freely, then meo_arena_free the whole thing,
+// or meo_arena_reset it to reuse the first chunk for the next statement. Two
+// threads must not touch the same MeoArena without their own external lock.
 //
 // Chunks are a singly linked list of blocks. Each block starts with a
-// DkArenaChunk header; the bytes it serves follow. `head` is the first block
-// (the only one dk_arena_reset keeps), `cur`/`end` are the bump pointer and
+// MeoArenaChunk header; the bytes it serves follow. `head` is the first block
+// (the only one meo_arena_reset keeps), `cur`/`end` are the bump pointer and
 // limit of the chunk currently serving allocations, and `owns` is the total
 // bytes held in blocks so a leak is visible in a debugger. A block is freed
-// only through dk_arena_reset (the later ones) or dk_arena_free (all).
+// only through meo_arena_reset (the later ones) or meo_arena_free (all).
 
-// No status codes: dk_arena_* answer a pointer, and 0 is the only failure.
+// No status codes: meo_arena_* answer a pointer, and 0 is the only failure.
 import "std/mem";
 
 // A chunk request beyond 1 TiB is bad input: block sizes are (header + cap)
 // int64 arithmetic, and refusing the absurd beats overflowing it.
-const DK_ARENA_MAX: int64 = 1099511627776;
+const MEO_ARENA_MAX: int64 = 1099511627776;
 
 // Every served pointer is 8-byte aligned. malloc already returns 16-byte
 // aligned blocks, so rounding each request up keeps `cur` aligned for free and
 // lets an arena back an array of pointers or structs.
-const DK_ARENA_ALIGN: int64 = 8;
+const MEO_ARENA_ALIGN: int64 = 8;
 
-struct DkArenaChunk {
-  next: DkArenaChunk*;
+struct MeoArenaChunk {
+  next: MeoArenaChunk*;
   cap: int64;  // bytes the block serves, excluding this header
 }
 
-const DK_ARENA_HDR: int64 = sizeof(DkArenaChunk);
+const MEO_ARENA_HDR: int64 = sizeof(MeoArenaChunk);
 
-export struct DkArena {
+export struct MeoArena {
   cur: uint8*;    // next free byte of the serving chunk
   end: uint8*;    // end of the serving chunk
-  head: uint8*;   // first chunk block; kept by dk_arena_reset
+  head: uint8*;   // first chunk block; kept by meo_arena_reset
   chunk: int64;   // default size of a new chunk
   owns: int64;    // total bytes held in chunk blocks
 }
 
-fn dk_arena_round(n: int64) -> int64 {
-  return (n + (DK_ARENA_ALIGN - 1)) & (~(DK_ARENA_ALIGN - 1));
+fn meo_arena_round(n: int64) -> int64 {
+  return (n + (MEO_ARENA_ALIGN - 1)) & (~(MEO_ARENA_ALIGN - 1));
 }
 
 // Append a block to the end of the list. head is never 0 for a live arena, so
 // the walk terminates at the newest chunk.
-fn dk_arena_link(a: DkArena*, c: DkArenaChunk*) {
-  var t: DkArenaChunk* = (DkArenaChunk*)a->head;
+fn meo_arena_link(a: MeoArena*, c: MeoArenaChunk*) {
+  var t: MeoArenaChunk* = (MeoArenaChunk*)a->head;
   while (t->next != 0) { t = t->next; }
   t->next = c;
 }
 
-export fn dk_arena_new(chunk: int64) -> DkArena* {
-  if (chunk <= 0 || chunk > DK_ARENA_MAX) { return 0; }
-  var a: DkArena* = new DkArena;
+export fn meo_arena_new(chunk: int64) -> MeoArena* {
+  if (chunk <= 0 || chunk > MEO_ARENA_MAX) { return 0; }
+  var a: MeoArena* = new MeoArena;
   if (a == 0) { return 0; }
-  var block: uint8* = malloc(DK_ARENA_HDR + chunk);
+  var block: uint8* = malloc(MEO_ARENA_HDR + chunk);
   if (block == 0) {
     free(a);
     return 0;
   }
-  var c: DkArenaChunk* = (DkArenaChunk*)block;
+  var c: MeoArenaChunk* = (MeoArenaChunk*)block;
   c->next = 0;
   c->cap = chunk;
   a->head = block;
-  a->cur = block + DK_ARENA_HDR;
-  a->end = block + DK_ARENA_HDR + chunk;
+  a->cur = block + MEO_ARENA_HDR;
+  a->end = block + MEO_ARENA_HDR + chunk;
   a->chunk = chunk;
-  a->owns = DK_ARENA_HDR + chunk;
+  a->owns = MEO_ARENA_HDR + chunk;
   return a;
 }
 
 // A new chunk when the serving one cannot hold n, and a dedicated chunk (not
 // adopted as the serving one) when n is larger than the default chunk size.
 // Returns 0 on failure or for a non-positive size.
-export fn dk_arena_alloc(a: DkArena*, n: int64) -> uint8* {
-  if (a == 0 || n <= 0 || n > DK_ARENA_MAX) { return 0; }
-  var want: int64 = dk_arena_round(n);
+export fn meo_arena_alloc(a: MeoArena*, n: int64) -> uint8* {
+  if (a == 0 || n <= 0 || n > MEO_ARENA_MAX) { return 0; }
+  var want: int64 = meo_arena_round(n);
   if (want < n) { return 0; }  // rounding overflowed
   if ((int64)a->end - (int64)a->cur < want) {
     var cap: int64 = a->chunk;
     if (want > cap) { cap = want; }
-    var block: uint8* = malloc(DK_ARENA_HDR + cap);
+    var block: uint8* = malloc(MEO_ARENA_HDR + cap);
     if (block == 0) { return 0; }
-    var c: DkArenaChunk* = (DkArenaChunk*)block;
+    var c: MeoArenaChunk* = (MeoArenaChunk*)block;
     c->next = 0;
     c->cap = cap;
-    dk_arena_link(a, c);
-    a->owns = a->owns + DK_ARENA_HDR + cap;
+    meo_arena_link(a, c);
+    a->owns = a->owns + MEO_ARENA_HDR + cap;
     if (want > a->chunk) {
       // Oversized: served here, while the previous chunk keeps serving later
       // small allocations.
-      return block + DK_ARENA_HDR;
+      return block + MEO_ARENA_HDR;
     }
-    a->cur = block + DK_ARENA_HDR;
-    a->end = block + DK_ARENA_HDR + cap;
+    a->cur = block + MEO_ARENA_HDR;
+    a->end = block + MEO_ARENA_HDR + cap;
   }
   var p: uint8* = a->cur;
   a->cur = a->cur + want;
@@ -104,34 +104,34 @@ export fn dk_arena_alloc(a: DkArena*, n: int64) -> uint8* {
 
 // Zeroed even when the bytes come from a chunk that served an earlier
 // statement: the arena never hands out stale content by accident.
-export fn dk_arena_alloc_zeroed(a: DkArena*, n: int64) -> uint8* {
-  var p: uint8* = dk_arena_alloc(a, n);
+export fn meo_arena_alloc_zeroed(a: MeoArena*, n: int64) -> uint8* {
+  var p: uint8* = meo_arena_alloc(a, n);
   if (p == 0) { return 0; }
   memset(p, 0, n);
   return p;
 }
 
 // Keep the first chunk and free every chunk allocated after it.
-export fn dk_arena_reset(a: DkArena*) {
+export fn meo_arena_reset(a: MeoArena*) {
   if (a == 0 || a->head == 0) { return; }
-  var first: DkArenaChunk* = (DkArenaChunk*)a->head;
-  var c: DkArenaChunk* = first->next;
+  var first: MeoArenaChunk* = (MeoArenaChunk*)a->head;
+  var c: MeoArenaChunk* = first->next;
   while (c != 0) {
-    var next: DkArenaChunk* = c->next;
+    var next: MeoArenaChunk* = c->next;
     free(c);
     c = next;
   }
   first->next = 0;
-  a->cur = a->head + DK_ARENA_HDR;
-  a->end = a->head + DK_ARENA_HDR + first->cap;
-  a->owns = DK_ARENA_HDR + first->cap;
+  a->cur = a->head + MEO_ARENA_HDR;
+  a->end = a->head + MEO_ARENA_HDR + first->cap;
+  a->owns = MEO_ARENA_HDR + first->cap;
 }
 
-export fn dk_arena_free(a: DkArena*) {
+export fn meo_arena_free(a: MeoArena*) {
   if (a == 0) { return; }
-  var c: DkArenaChunk* = (DkArenaChunk*)a->head;
+  var c: MeoArenaChunk* = (MeoArenaChunk*)a->head;
   while (c != 0) {
-    var next: DkArenaChunk* = c->next;
+    var next: MeoArenaChunk* = c->next;
     free(c);
     c = next;
   }

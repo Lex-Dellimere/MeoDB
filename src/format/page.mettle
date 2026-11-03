@@ -3,7 +3,7 @@
 //
 // PHASE1.md sections 3 and 5.7, amended by PHASE2.md section 2A (cell
 // extents, format version 2). Every function takes a raw pointer to
-// DK_PAGE_SIZE bytes and never allocates. No struct is overlaid on a page:
+// MEO_PAGE_SIZE bytes and never allocates. No struct is overlaid on a page:
 // fields are encoded and decoded at the offsets below, little-endian, through
 // format/bytes.mettle.
 //
@@ -15,12 +15,12 @@
 // two-byte little-endian length, so a cell's extent is known without the
 // caller:
 //   ... | free gap | [len0][body0] [len1][body1] | end of page
-//                   ^ free_end                   ^ DK_PAGE_SIZE
+//                   ^ free_end                   ^ MEO_PAGE_SIZE
 // A pointer names the BODY; the length lives at body - 2.
 //
 // The page is not resealed by the mutators. A mutator leaves the checksum
-// stale on purpose; dk_page_seal is called by whoever is about to write the
-// page, and by dk_page_init.
+// stale on purpose; meo_page_seal is called by whoever is about to write the
+// page, and by meo_page_init.
 
 import "../error/status.mettle";
 import "bytes.mettle";
@@ -28,24 +28,24 @@ import "crc32.mettle";
 
 // --- constants (PHASE1.md section 2) ---------------------------------------
 
-export const DK_PAGE_SIZE: int32 = 4096;
-export const DK_PAGE_HDR: int32 = 16;
-export const DK_FORMAT_VERSION: int32 = 2;
-export const DK_MAGIC: uint32 = 0x47504B44; // on disk the bytes read "DKPG"
+export const MEO_PAGE_SIZE: int32 = 4096;
+export const MEO_PAGE_HDR: int32 = 16;
+export const MEO_FORMAT_VERSION: int32 = 2;
+export const MEO_MAGIC: uint32 = 0x504F454D; // on disk the bytes read "MEOP"
 
-export const DK_PAGE_FREE: int32 = 0;
-export const DK_PAGE_META: int32 = 1; // page 0 only
-export const DK_PAGE_BTREE_LEAF: int32 = 2;
-export const DK_PAGE_BTREE_INNER: int32 = 3;
-export const DK_PAGE_OVERFLOW: int32 = 4;
-export const DK_PAGE_FREELIST: int32 = 5;
-export const DK_PAGE_COUNT_TYPES: int32 = 6; // dk_page_type must be < this
+export const MEO_PAGE_FREE: int32 = 0;
+export const MEO_PAGE_META: int32 = 1; // page 0 only
+export const MEO_PAGE_BTREE_LEAF: int32 = 2;
+export const MEO_PAGE_BTREE_INNER: int32 = 3;
+export const MEO_PAGE_OVERFLOW: int32 = 4;
+export const MEO_PAGE_FREELIST: int32 = 5;
+export const MEO_PAGE_COUNT_TYPES: int32 = 6; // meo_page_type must be < this
 
-// DK_META_BODY belongs to the meta page's contract (PHASE1.md section 2 and
-// section 4) but is defined here because dk_page_init needs it and
-// format/meta.mettle imports this module for dk_page_seal: a cycle would be a
+// MEO_META_BODY belongs to the meta page's contract (PHASE1.md section 2 and
+// section 4) but is defined here because meo_page_init needs it and
+// format/meta.mettle imports this module for meo_page_seal: a cycle would be a
 // build error. There is exactly one definition of the value.
-export const DK_META_BODY: int32 = 128; // first free byte of the meta page
+export const MEO_META_BODY: int32 = 128; // first free byte of the meta page
 
 // Header field offsets. Named once and used everywhere; never write a bare
 // number for a header field.
@@ -59,7 +59,7 @@ const PAGE_OFF_RESERVED: int32 = 10;
 const PAGE_OFF_CRC32: int32 = 12;
 
 // A u16 pointer array cannot exceed this many cells and still fit the page.
-const PAGE_MAX_CELLS: int32 = (DK_PAGE_SIZE - DK_PAGE_HDR) / 2;
+const PAGE_MAX_CELLS: int32 = (MEO_PAGE_SIZE - MEO_PAGE_HDR) / 2;
 
 // Largest body a u16 length prefix can name (PHASE2.md section 2A: n <= 65533).
 const PAGE_CELL_MAX_BODY: int32 = 65533;
@@ -69,99 +69,99 @@ const PAGE_CELL_PREFIX: int32 = 2;
 
 // --- header accessors -------------------------------------------------------
 
-export fn dk_page_type(p: uint8*) -> int32 {
+export fn meo_page_type(p: uint8*) -> int32 {
   return (int32)p[PAGE_OFF_TYPE];
 }
 
-export fn dk_page_flags(p: uint8*) -> int32 {
+export fn meo_page_flags(p: uint8*) -> int32 {
   return (int32)p[PAGE_OFF_FLAGS];
 }
 
-export fn dk_page_set_flags(p: uint8*, v: int32) {
+export fn meo_page_set_flags(p: uint8*, v: int32) {
   p[PAGE_OFF_FLAGS] = (uint8)(v & 0xFF);
 }
 
-export fn dk_page_n_cells(p: uint8*) -> int32 {
-  return (int32)dk_get_u16le(p, PAGE_OFF_N_CELLS);
+export fn meo_page_n_cells(p: uint8*) -> int32 {
+  return (int32)meo_get_u16le(p, PAGE_OFF_N_CELLS);
 }
 
-export fn dk_page_free_start(p: uint8*) -> int32 {
-  return (int32)dk_get_u16le(p, PAGE_OFF_FREE_START);
+export fn meo_page_free_start(p: uint8*) -> int32 {
+  return (int32)meo_get_u16le(p, PAGE_OFF_FREE_START);
 }
 
-export fn dk_page_free_end(p: uint8*) -> int32 {
-  return (int32)dk_get_u16le(p, PAGE_OFF_FREE_END);
+export fn meo_page_free_end(p: uint8*) -> int32 {
+  return (int32)meo_get_u16le(p, PAGE_OFF_FREE_END);
 }
 
-export fn dk_page_free_bytes(p: uint8*) -> int32 {
-  return dk_page_free_end(p) - dk_page_free_start(p);
+export fn meo_page_free_bytes(p: uint8*) -> int32 {
+  return meo_page_free_end(p) - meo_page_free_start(p);
 }
 
-export fn dk_page_used(p: uint8*) -> int32 {
-  return DK_PAGE_SIZE - dk_page_free_bytes(p);
+export fn meo_page_used(p: uint8*) -> int32 {
+  return MEO_PAGE_SIZE - meo_page_free_bytes(p);
 }
 
 // --- lifecycle --------------------------------------------------------------
 
-// Zero all DK_PAGE_SIZE bytes, write the header and seal. The meta page gets
-// DK_META_BODY as free_start; every other type gets DK_PAGE_HDR + 2*n_cells,
-// which is DK_PAGE_HDR because a fresh page has no cells.
-export fn dk_page_init(p: uint8*, page_type: int32) -> int32 {
-  if (page_type < 0 || page_type >= DK_PAGE_COUNT_TYPES) {
-    return -DK_ERR_USAGE;
+// Zero all MEO_PAGE_SIZE bytes, write the header and seal. The meta page gets
+// MEO_META_BODY as free_start; every other type gets MEO_PAGE_HDR + 2*n_cells,
+// which is MEO_PAGE_HDR because a fresh page has no cells.
+export fn meo_page_init(p: uint8*, page_type: int32) -> int32 {
+  if (page_type < 0 || page_type >= MEO_PAGE_COUNT_TYPES) {
+    return -MEO_ERR_USAGE;
   }
-  dk_bytes_zero(p, (int64)DK_PAGE_SIZE);
+  meo_bytes_zero(p, (int64)MEO_PAGE_SIZE);
   p[PAGE_OFF_TYPE] = (uint8)page_type;
   p[PAGE_OFF_FLAGS] = 0;
-  dk_put_u16le(p, PAGE_OFF_N_CELLS, (uint16)0);
-  dk_put_u16le(p, PAGE_OFF_CELL_START, (uint16)DK_PAGE_HDR);
-  if (page_type == DK_PAGE_META) {
-    dk_put_u16le(p, PAGE_OFF_FREE_START, (uint16)DK_META_BODY);
+  meo_put_u16le(p, PAGE_OFF_N_CELLS, (uint16)0);
+  meo_put_u16le(p, PAGE_OFF_CELL_START, (uint16)MEO_PAGE_HDR);
+  if (page_type == MEO_PAGE_META) {
+    meo_put_u16le(p, PAGE_OFF_FREE_START, (uint16)MEO_META_BODY);
   } else {
-    dk_put_u16le(p, PAGE_OFF_FREE_START, (uint16)DK_PAGE_HDR);
+    meo_put_u16le(p, PAGE_OFF_FREE_START, (uint16)MEO_PAGE_HDR);
   }
-  dk_put_u16le(p, PAGE_OFF_FREE_END, (uint16)DK_PAGE_SIZE);
-  dk_put_u16le(p, PAGE_OFF_RESERVED, (uint16)0);
-  dk_page_seal(p);
-  return DK_OK;
+  meo_put_u16le(p, PAGE_OFF_FREE_END, (uint16)MEO_PAGE_SIZE);
+  meo_put_u16le(p, PAGE_OFF_RESERVED, (uint16)0);
+  meo_page_seal(p);
+  return MEO_OK;
 }
 
 // Enforce the nine relationships in PHASE1.md section 3.2 plus the three
 // extent rules of PHASE2.md section 2A. Now that every cell carries its length
 // this can prove that no two cells overlap, which is the corruption class the
 // phase-1 format could only be surprised by.
-export fn dk_page_check(p: uint8*) -> int32 {
-  var t: int32 = dk_page_type(p);
+export fn meo_page_check(p: uint8*) -> int32 {
+  var t: int32 = meo_page_type(p);
   // 1. known page type.
-  if (t < 0 || t >= DK_PAGE_COUNT_TYPES) { return -DK_ERR_CORRUPT; }
+  if (t < 0 || t >= MEO_PAGE_COUNT_TYPES) { return -MEO_ERR_CORRUPT; }
   // 2. flags and reserved are 0 in phase 1.
-  if (dk_page_flags(p) != 0) { return -DK_ERR_CORRUPT; }
-  if (dk_get_u16le(p, PAGE_OFF_RESERVED) != (uint16)0) {
-    return -DK_ERR_CORRUPT;
+  if (meo_page_flags(p) != 0) { return -MEO_ERR_CORRUPT; }
+  if (meo_get_u16le(p, PAGE_OFF_RESERVED) != (uint16)0) {
+    return -MEO_ERR_CORRUPT;
   }
-  // 3. cell_start is always DK_PAGE_HDR.
-  if (dk_get_u16le(p, PAGE_OFF_CELL_START) != (uint16)DK_PAGE_HDR) {
-    return -DK_ERR_CORRUPT;
+  // 3. cell_start is always MEO_PAGE_HDR.
+  if (meo_get_u16le(p, PAGE_OFF_CELL_START) != (uint16)MEO_PAGE_HDR) {
+    return -MEO_ERR_CORRUPT;
   }
 
-  var n: int32 = dk_page_n_cells(p);
-  var fs: int32 = dk_page_free_start(p);
-  var fe: int32 = dk_page_free_end(p);
+  var n: int32 = meo_page_n_cells(p);
+  var fs: int32 = meo_page_free_start(p);
+  var fe: int32 = meo_page_free_end(p);
 
   // 4/5. the pointer array is dense, and the meta page has no cells and a
   // fixed free_start.
-  if (t == DK_PAGE_META) {
-    if (n != 0 || fs != DK_META_BODY) { return -DK_ERR_CORRUPT; }
+  if (t == MEO_PAGE_META) {
+    if (n != 0 || fs != MEO_META_BODY) { return -MEO_ERR_CORRUPT; }
   } else {
-    if (n > PAGE_MAX_CELLS) { return -DK_ERR_CORRUPT; }
-    if (fs != DK_PAGE_HDR + 2 * n) { return -DK_ERR_CORRUPT; }
+    if (n > PAGE_MAX_CELLS) { return -MEO_ERR_CORRUPT; }
+    if (fs != MEO_PAGE_HDR + 2 * n) { return -MEO_ERR_CORRUPT; }
   }
   // 6. the gap is inside the page and not inverted.
-  if (fs > fe || fe > DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
+  if (fs > fe || fe > MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
 
   // 7/8. every pointer is at or above free_start (so it cannot overlap the
   // pointer array) and below the end of the page.
-  // 9. every body starts inside [free_end, DK_PAGE_SIZE) and the pointers are
+  // 9. every body starts inside [free_end, MEO_PAGE_SIZE) and the pointers are
   // strictly descending, which is the ordering the packing rule produces.
   // 10. the length prefix is above the gap: body >= free_end + 2.
   // 11. the extent [body - 2, body + len) fits inside the page and its length
@@ -169,139 +169,139 @@ export fn dk_page_check(p: uint8*) -> int32 {
   // 12. no extent crosses another one. Strictly descending pointers mean only
   // the next-higher cell can be crossed, so the extent must end at or below
   // that cell's prefix.
-  var prev: int32 = DK_PAGE_SIZE;
-  var higher_lo: int32 = DK_PAGE_SIZE;
+  var prev: int32 = MEO_PAGE_SIZE;
+  var higher_lo: int32 = MEO_PAGE_SIZE;
   var i: int32 = 0;
   while (i < n) {
-    var off: int32 = dk_page_cell_off(p, i);
-    var len: int32 = dk_page_cell_len(p, i);
-    if (off < fs) { return -DK_ERR_CORRUPT; }
-    if (off - PAGE_CELL_PREFIX < fe) { return -DK_ERR_CORRUPT; }
-    if (off > DK_PAGE_SIZE - 1) { return -DK_ERR_CORRUPT; }
-    if (len > PAGE_CELL_MAX_BODY) { return -DK_ERR_CORRUPT; }
-    if (off + len > DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
-    if (off >= prev) { return -DK_ERR_CORRUPT; }
-    if (off + len > higher_lo) { return -DK_ERR_CORRUPT; }
+    var off: int32 = meo_page_cell_off(p, i);
+    var len: int32 = meo_page_cell_len(p, i);
+    if (off < fs) { return -MEO_ERR_CORRUPT; }
+    if (off - PAGE_CELL_PREFIX < fe) { return -MEO_ERR_CORRUPT; }
+    if (off > MEO_PAGE_SIZE - 1) { return -MEO_ERR_CORRUPT; }
+    if (len > PAGE_CELL_MAX_BODY) { return -MEO_ERR_CORRUPT; }
+    if (off + len > MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
+    if (off >= prev) { return -MEO_ERR_CORRUPT; }
+    if (off + len > higher_lo) { return -MEO_ERR_CORRUPT; }
     prev = off;
     higher_lo = off - PAGE_CELL_PREFIX;
     i += 1;
   }
-  return DK_OK;
+  return MEO_OK;
 }
 
 // The CRC-32 the page should carry: computed over [0,12) then [16,4096), so
 // the four checksum bytes are excluded from their own input.
-export fn dk_page_checksum(p: uint8*) -> uint32 {
-  var crc: uint32 = dk_crc32_update((uint32)0, p, (int64)PAGE_OFF_CRC32);
-  crc = dk_crc32_update(crc, p + PAGE_OFF_CRC32 + 4,
-    (int64)(DK_PAGE_SIZE - PAGE_OFF_CRC32 - 4));
+export fn meo_page_checksum(p: uint8*) -> uint32 {
+  var crc: uint32 = meo_crc32_update((uint32)0, p, (int64)PAGE_OFF_CRC32);
+  crc = meo_crc32_update(crc, p + PAGE_OFF_CRC32 + 4,
+    (int64)(MEO_PAGE_SIZE - PAGE_OFF_CRC32 - 4));
   return crc;
 }
 
 // Write the checksum. Sealing twice is stable: the checksum bytes are not
 // part of the input.
-export fn dk_page_seal(p: uint8*) {
-  dk_put_u32le(p, PAGE_OFF_CRC32, dk_page_checksum(p));
+export fn meo_page_seal(p: uint8*) {
+  meo_put_u32le(p, PAGE_OFF_CRC32, meo_page_checksum(p));
 }
 
 // Compare the stored checksum with the computed one. This is the integrity
-// check, not the structural one; dk_page_check is the structural one.
-export fn dk_page_verify(p: uint8*) -> int32 {
-  if (dk_get_u32le(p, PAGE_OFF_CRC32) != dk_page_checksum(p)) {
-    return -DK_ERR_CORRUPT;
+// check, not the structural one; meo_page_check is the structural one.
+export fn meo_page_verify(p: uint8*) -> int32 {
+  if (meo_get_u32le(p, PAGE_OFF_CRC32) != meo_page_checksum(p)) {
+    return -MEO_ERR_CORRUPT;
   }
-  return DK_OK;
+  return MEO_OK;
 }
 
 // --- cells ------------------------------------------------------------------
 
 // Offset of cell i, or -1 when i is not a cell index. (This is a sentinel per
-// PHASE1.md section 5.7, not a DK_ERR_* failure.)
-export fn dk_page_cell_off(p: uint8*, i: int32) -> int32 {
-  if (i < 0 || i >= dk_page_n_cells(p)) { return -1; }
-  return (int32)dk_get_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)i);
+// PHASE1.md section 5.7, not a MEO_ERR_* failure.)
+export fn meo_page_cell_off(p: uint8*, i: int32) -> int32 {
+  if (i < 0 || i >= meo_page_n_cells(p)) { return -1; }
+  return (int32)meo_get_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)i);
 }
 
 // Pointer to cell i's body, or 0 when i is not a cell index.
-export fn dk_page_cell_ptr(p: uint8*, i: int32) -> uint8* {
-  var off: int32 = dk_page_cell_off(p, i);
+export fn meo_page_cell_ptr(p: uint8*, i: int32) -> uint8* {
+  var off: int32 = meo_page_cell_off(p, i);
   if (off < 0) { return 0; }
   return p + (int64)off;
 }
 
 // Length of cell i's body, read from the u16 in front of it (PHASE2.md section
-// 2A). -1 when i is not a cell index, the same sentinel dk_page_cell_off uses.
-export fn dk_page_cell_len(p: uint8*, i: int32) -> int32 {
-  var off: int32 = dk_page_cell_off(p, i);
+// 2A). -1 when i is not a cell index, the same sentinel meo_page_cell_off uses.
+export fn meo_page_cell_len(p: uint8*, i: int32) -> int32 {
+  var off: int32 = meo_page_cell_off(p, i);
   if (off < 0) { return -1; }
-  return (int32)dk_get_u16le(p, (int64)(off - PAGE_CELL_PREFIX));
+  return (int32)meo_get_u16le(p, (int64)(off - PAGE_CELL_PREFIX));
 }
 
 // Carve a cell of `n` body bytes from the gap: free_end moves down by n + 2,
 // the length goes in at the new free_end, and the BODY offset (free_end + 2)
-// is returned. The page is unchanged on -DK_ERR_FULL. This only moves the
+// is returned. The page is unchanged on -MEO_ERR_FULL. This only moves the
 // frontier and writes the length; the caller records the returned offset with
-// dk_page_insert_cell.
-export fn dk_page_alloc(p: uint8*, n: int32) -> int32 {
-  if (n < 0 || n > PAGE_CELL_MAX_BODY) { return -DK_ERR_USAGE; }
-  var fs: int32 = dk_page_free_start(p);
-  var fe: int32 = dk_page_free_end(p);
-  if (n + PAGE_CELL_PREFIX > fe - fs) { return -DK_ERR_FULL; }
+// meo_page_insert_cell.
+export fn meo_page_alloc(p: uint8*, n: int32) -> int32 {
+  if (n < 0 || n > PAGE_CELL_MAX_BODY) { return -MEO_ERR_USAGE; }
+  var fs: int32 = meo_page_free_start(p);
+  var fe: int32 = meo_page_free_end(p);
+  if (n + PAGE_CELL_PREFIX > fe - fs) { return -MEO_ERR_FULL; }
   var new_fe: int32 = fe - (n + PAGE_CELL_PREFIX);
-  dk_put_u16le(p, (int64)new_fe, (uint16)n);
-  dk_put_u16le(p, PAGE_OFF_FREE_END, (uint16)new_fe);
+  meo_put_u16le(p, (int64)new_fe, (uint16)n);
+  meo_put_u16le(p, PAGE_OFF_FREE_END, (uint16)new_fe);
   return new_fe + PAGE_CELL_PREFIX;
 }
 
 // Remove the pointer at index i (shift the rest of the dense array down) and
 // leave the [len][body] extent where it is: free_end is not moved, so the
 // freed bytes do not return to the gap. The extent is still known, which is
-// what lets dk_page_defrag reclaim a hole anywhere in the page.
-export fn dk_page_free_cell(p: uint8*, i: int32) -> int32 {
-  var n: int32 = dk_page_n_cells(p);
-  if (i < 0 || i >= n) { return -DK_ERR_RANGE; }
+// what lets meo_page_defrag reclaim a hole anywhere in the page.
+export fn meo_page_free_cell(p: uint8*, i: int32) -> int32 {
+  var n: int32 = meo_page_n_cells(p);
+  if (i < 0 || i >= n) { return -MEO_ERR_RANGE; }
   var k: int32 = i;
   while (k < n - 1) {
-    dk_put_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)k,
-      dk_get_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)(k + 1)));
+    meo_put_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)k,
+      meo_get_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)(k + 1)));
     k += 1;
   }
-  dk_put_u16le(p, PAGE_OFF_N_CELLS, (uint16)(n - 1));
-  dk_put_u16le(p, PAGE_OFF_FREE_START,
-    (uint16)(DK_PAGE_HDR + 2 * (n - 1)));
-  return DK_OK;
+  meo_put_u16le(p, PAGE_OFF_N_CELLS, (uint16)(n - 1));
+  meo_put_u16le(p, PAGE_OFF_FREE_START,
+    (uint16)(MEO_PAGE_HDR + 2 * (n - 1)));
+  return MEO_OK;
 }
 
 // Insert the pointer `off` at index `at` (0..n_cells; n_cells appends). The
 // array stays dense, so free_start grows by two.
 //
-// Order is the caller's responsibility: dk_page_check requires strictly
+// Order is the caller's responsibility: meo_page_check requires strictly
 // descending offsets (the packing rule), so the normal build sequence is
 // allocate a body (always the new lowest offset) and append its pointer with
 // at == n_cells.
-export fn dk_page_insert_cell(p: uint8*, off: int32, at: int32) -> int32 {
-  var n: int32 = dk_page_n_cells(p);
-  if (at < 0 || at > n) { return -DK_ERR_RANGE; }
-  var fs: int32 = dk_page_free_start(p);
-  var fe: int32 = dk_page_free_end(p);
-  if (off < 0 || off > DK_PAGE_SIZE - 1) { return -DK_ERR_RANGE; }
-  if (off - PAGE_CELL_PREFIX < fe) { return -DK_ERR_RANGE; }
-  if (fs + 2 > fe) { return -DK_ERR_FULL; }
+export fn meo_page_insert_cell(p: uint8*, off: int32, at: int32) -> int32 {
+  var n: int32 = meo_page_n_cells(p);
+  if (at < 0 || at > n) { return -MEO_ERR_RANGE; }
+  var fs: int32 = meo_page_free_start(p);
+  var fe: int32 = meo_page_free_end(p);
+  if (off < 0 || off > MEO_PAGE_SIZE - 1) { return -MEO_ERR_RANGE; }
+  if (off - PAGE_CELL_PREFIX < fe) { return -MEO_ERR_RANGE; }
+  if (fs + 2 > fe) { return -MEO_ERR_FULL; }
 
   var k: int32 = n;
   while (k > at) {
-    dk_put_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)k,
-      dk_get_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)(k - 1)));
+    meo_put_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)k,
+      meo_get_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)(k - 1)));
     k -= 1;
   }
-  dk_put_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)at, (uint16)off);
-  dk_put_u16le(p, PAGE_OFF_N_CELLS, (uint16)(n + 1));
-  dk_put_u16le(p, PAGE_OFF_FREE_START, (uint16)(DK_PAGE_HDR + 2 * (n + 1)));
-  return DK_OK;
+  meo_put_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)at, (uint16)off);
+  meo_put_u16le(p, PAGE_OFF_N_CELLS, (uint16)(n + 1));
+  meo_put_u16le(p, PAGE_OFF_FREE_START, (uint16)(MEO_PAGE_HDR + 2 * (n + 1)));
+  return MEO_OK;
 }
 
 // Copy `n` bytes of the page from `src` to `dst` with the direction chosen by
-// the offsets. dk_bytes_copy takes non-overlapping ranges, and a repack moves
+// the offsets. meo_bytes_copy takes non-overlapping ranges, and a repack moves
 // an extent down into a region that can still hold a cell it has not copied
 // yet, so the direction is part of the contract here.
 fn page_cell_move(p: uint8*, dst: int32, src: int32, n: int32) {
@@ -321,17 +321,17 @@ fn page_cell_move(p: uint8*, dst: int32, src: int32, n: int32) {
 }
 
 // Reclaim EVERY hole: walk the cells in pointer order and copy each
-// [len][body] extent downward from DK_PAGE_SIZE, rewriting the pointers. On a
+// [len][body] extent downward from MEO_PAGE_SIZE, rewriting the pointers. On a
 // page that is already compact nothing moves and the second call is a no-op,
 // so this is idempotent (PHASE2.md section 2A).
 //
 // The loop reads cell i's offset before it rewrites pointer i, and offsets
 // descend in pointer order, so the repack keeps every pointer strictly
-// descending (dk_page_check rule 9).
-export fn dk_page_defrag(p: uint8*) -> int32 {
-  var n: int32 = dk_page_n_cells(p);
-  var fs: int32 = dk_page_free_start(p);
-  if (fs > DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
+// descending (meo_page_check rule 9).
+export fn meo_page_defrag(p: uint8*) -> int32 {
+  var n: int32 = meo_page_n_cells(p);
+  var fs: int32 = meo_page_free_start(p);
+  if (fs > MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
 
   // Validate before moving anything: a corrupt extent must not be copied, and
   // the repacked page must still fit. The pointer array is included in the
@@ -339,44 +339,44 @@ export fn dk_page_defrag(p: uint8*) -> int32 {
   var need: int32 = fs;
   var i: int32 = 0;
   while (i < n) {
-    var off: int32 = dk_page_cell_off(p, i);
-    var len: int32 = dk_page_cell_len(p, i);
-    if (off - PAGE_CELL_PREFIX < fs) { return -DK_ERR_CORRUPT; }
-    if (len > PAGE_CELL_MAX_BODY) { return -DK_ERR_CORRUPT; }
-    if (off + len > DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
+    var off: int32 = meo_page_cell_off(p, i);
+    var len: int32 = meo_page_cell_len(p, i);
+    if (off - PAGE_CELL_PREFIX < fs) { return -MEO_ERR_CORRUPT; }
+    if (len > PAGE_CELL_MAX_BODY) { return -MEO_ERR_CORRUPT; }
+    if (off + len > MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
     need += len + PAGE_CELL_PREFIX;
     i += 1;
   }
-  if (need > DK_PAGE_SIZE) { return -DK_ERR_CORRUPT; }
+  if (need > MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
 
-  var cursor: int32 = DK_PAGE_SIZE;
+  var cursor: int32 = MEO_PAGE_SIZE;
   i = 0;
   while (i < n) {
-    var off: int32 = dk_page_cell_off(p, i);
-    var len: int32 = dk_page_cell_len(p, i);
+    var off: int32 = meo_page_cell_off(p, i);
+    var len: int32 = meo_page_cell_len(p, i);
     var ext: int32 = len + PAGE_CELL_PREFIX;
     var dst: int32 = cursor - ext;
     page_cell_move(p, dst, off - PAGE_CELL_PREFIX, ext);
-    dk_put_u16le(p, (int64)DK_PAGE_HDR + 2 * (int64)i,
+    meo_put_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)i,
       (uint16)(dst + PAGE_CELL_PREFIX));
     cursor = dst;
     i += 1;
   }
-  dk_put_u16le(p, PAGE_OFF_FREE_END, (uint16)cursor);
-  return DK_OK;
+  meo_put_u16le(p, PAGE_OFF_FREE_END, (uint16)cursor);
+  return MEO_OK;
 }
 
 // Free bytes plus the bytes the dead cells still occupy: the gap a defrag
 // would produce. A caller short of space defrags when
 // reclaimable >= needed + 2 and free_bytes < needed + 2 (PHASE2.md 2A).
-export fn dk_page_reclaimable(p: uint8*) -> int32 {
-  var n: int32 = dk_page_n_cells(p);
+export fn meo_page_reclaimable(p: uint8*) -> int32 {
+  var n: int32 = meo_page_n_cells(p);
   var live: int32 = 0;
   var i: int32 = 0;
   while (i < n) {
-    live += dk_page_cell_len(p, i) + PAGE_CELL_PREFIX;
+    live += meo_page_cell_len(p, i) + PAGE_CELL_PREFIX;
     i += 1;
   }
-  return dk_page_free_bytes(p)
-    + (DK_PAGE_SIZE - dk_page_free_end(p) - live);
+  return meo_page_free_bytes(p)
+    + (MEO_PAGE_SIZE - meo_page_free_end(p) - live);
 }

@@ -7,14 +7,14 @@
 // directly from a test. PHASE1.md section 5.5.
 
 // CRC of one buffer, from scratch.
-export fn dk_crc32(data: uint8*, len: int64) -> uint32 {
-  return dk_crc32_update(0, data, len);
+export fn meo_crc32(data: uint8*, len: int64) -> uint32 {
+  return meo_crc32_update(0, data, len);
 }
 
 // Continue a CRC over the next chunk. `crc` is the already-finalised value
 // returned by the previous call (or 0 for the first chunk); the function
 // un-finalises, folds in the new bytes, and finalises again.
-export fn dk_crc32_update(crc: uint32, data: uint8*, len: int64) -> uint32 {
+export fn meo_crc32_update(crc: uint32, data: uint8*, len: int64) -> uint32 {
   var c: uint32 = crc ^ (uint32)0xFFFFFFFF;
   var i: int64 = 0;
   while (i < len) {
