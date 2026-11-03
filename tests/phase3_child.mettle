@@ -1,0 +1,84 @@
+// phase3_child: the process the phase-3 crash cases kill (tests/phase3.mettle).
+//
+// The parent forks and execve()s this binary with argv[1] = "3" (K3) or "4"
+// (K4). The database path is fixed per scenario (build/phase3_k3.dat,
+// build/phase3_k4.dat); the parent has already built the committed 1000-key
+// tree there. This process opens it, begins a transaction, inserts keys, makes
+// the uncommitted pages durable in the database file (flush + fsync, which
+// appends and fsyncs every before-image first), and then dies through the raw
+// exit_group syscall (231): no close, no free, no flush, no atexit path runs,
+// and the journal is left hot beside the database.
+//
+// Nothing is printed: stdout may be buffered and exit_group would drop it. The
+// outcome is the exit status only:
+//   42  the crash state was reached (for K4: the root page number changed)
+//   43  K4 inserted the whole budget without splitting the root
+//   50+ a setup step failed (see the call sites)
+//   64  bad argv
+
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/meta.mettle";
+import "../src/pager/pager.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/btree.mettle";
+
+const P3_FRAMES: int32 = 16;
+// K4 keeps inserting until the root splits; this bounds a tree that never does.
+const P3_K4_BUDGET: int32 = 400000;
+
+fn p3c_die(code: int32) {
+  syscall(231, (int64)code);
+  syscall(60, (int64)code);
+}
+
+fn p3c_insert(p: MeoPager*, root: uint32*, k: int32) -> int32 {
+  var kb: uint8[16];
+  var kn: int32 = meo_key_int(&kb[0], 16, (int64)k);
+  var bk: MeoBtKey = { data: &kb[0], len: kn };
+  return meo_bt_insert(p, root, &meo_key_compare, bk, (uint64)k);
+}
+
+fn p3c_run(scenario: uint8) -> int32 {
+  var path: string = "build/phase3_k3.dat";
+  if (scenario == (uint8)52) { path = "build/phase3_k4.dat"; }
+  var p: MeoPager* = meo_pager_open(path, P3_FRAMES, 0);
+  if (p == 0) { return 50; }
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var old_root: uint32 = root;
+  if (root == 0) { return 51; }
+  if (meo_pager_begin(p) != MEO_OK) { return 52; }
+  if (scenario == (uint8)51) {
+    // K3: 500 more keys, never committed.
+    var k: int32 = 1000;
+    while (k < 1500) {
+      if (p3c_insert(p, &root, k) != MEO_OK) { return 53; }
+      k += 1;
+    }
+  } else {
+    // K4: insert until the ROOT splits (root* changes), then stop right there.
+    var k: int32 = 1000;
+    while (root == old_root) {
+      if (k >= 1000 + P3_K4_BUDGET) { return 43; }
+      if (p3c_insert(p, &root, k) != MEO_OK) { return 53; }
+      k += 1;
+    }
+  }
+  // Put the new root in the meta too, so page 0 on disk names the new tree:
+  // recovery must take that back as well.
+  if (meo_pager_set_root(p, MEO_ROOT_BTREE, root) != MEO_OK) { return 54; }
+  if (meo_pager_flush(p) != MEO_OK) { return 55; }
+  if (meo_pager_sync(p) != MEO_OK) { return 56; }
+  return 42;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) { p3c_die(64); }
+  var a: uint8* = (uint8*)argv[1];
+  var s: uint8 = a[0];
+  if (s != (uint8)51 && s != (uint8)52) { p3c_die(64); }
+  // Every path out of here is a raw exit: a pager may be open and must not be
+  // closed or flushed by any normal return path.
+  p3c_die(p3c_run(s));
+  return 0;
+}

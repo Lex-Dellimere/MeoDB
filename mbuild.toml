@@ -69,3 +69,11 @@ main = "tests/feed_self.mettle"
 # catalog/schema, sql/ast, the f64 byte helpers, codes 13-18).
 [bin.ws0_self]
 main = "tests/ws0_self.mettle"
+
+# The phase-3 gate (K1-K5): b-tree commit / rollback / crash / crash mid-split /
+# journal capacity. phase3_child is the process the crash cases kill.
+[bin.phase3]
+main = "tests/phase3.mettle"
+
+[bin.phase3_child]
+main = "tests/phase3_child.mettle"

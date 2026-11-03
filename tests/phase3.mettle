@@ -1,0 +1,481 @@
+// phase3: the phase-3 integration gate (AC I5) -- the b-tree and the rollback
+// journal working together through the pager.
+//
+//   K1 commit    1000-key tree; reopen, begin, +500 keys, commit; reopen: walk
+//                1500 ascending with correct rowids, page_count matches the
+//                committed value and the file size, no journal left.
+//   K2 rollback  same, but rollback: walk exactly the original 1000, root and
+//                page_count equal the pre-transaction values.
+//   K3 crash     a child process begins, inserts 500, flushes + fsyncs the
+//                uncommitted pages into the database and dies; the parent sees
+//                the hot journal, reopens (recovery replays it): walk 1000,
+//                page_count and root unchanged, journal gone.
+//   K4 crash mid-split  the child inserts until the ROOT splits (it checks the
+//                root page number changed and writes it to the meta), makes it
+//                durable and dies. The parent confirms page 0 on disk names the
+//                new root, then reopens: root = old root, walk 1000, page_count
+//                unchanged, and no page is counted twice between the tree, the
+//                freelist chain and the freelist entries (live + free <= count).
+//   K5 journal cap  cap 4 records; a transaction rewriting every leaf needs
+//                more, and must fail with -MEO_ERR_NOSPC (not drop a before-
+//                image); rollback; reopen: tree unchanged.
+//
+// CRASH MECHANISM: raw fork (57), then in the child execve (59) of the
+// phase3_child binary that sits beside this one (found through readlink (89)
+// of /proc/self/exe, so the same profile -- debug or release -- is used), then
+// wait4 (61) in the parent. phase3_child ends with exit_group (231): no close,
+// no flush and no atexit path runs. execve gives the child a fresh address
+// space, so nothing this process has buffered or opened leaks into it.
+// phase3_child must be built in the same profile first (mbuild build).
+//
+// Data files live under build/ and every case resets its database and removes
+// any leftover -journal first, so repeated runs give the same answer.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/pager/journal.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+
+const P3_FRAMES: int32 = 16;
+// Red-check switch: set to n (1..5) to break one expectation of case Kn and
+// confirm it goes red. Must be 0 when committed.
+const P3_RED: int32 = 0;
+
+fn p3_red(n: int32) -> int32 {
+  if (P3_RED == n) { return 1; }
+  return 0;
+}
+
+fn p3_fail(n: int32, msg: string) -> int32 {
+  println("FAIL K{n}: {msg}");
+  return 1;
+}
+
+// --- file helpers ----------------------------------------------------------
+
+fn p3_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn p3_file_size(db: string) -> int64 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ);
+  if (!f.is_open) { return -1; }
+  var n: int64 = meo_file_size(f);
+  meo_file_close(f);
+  return n;
+}
+
+// The btree root page 0 on disk names right now, read without a pager (and
+// therefore without recovery). 0 when page 0 cannot be read.
+fn p3_disk_root(db: string) -> uint32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ);
+  if (!f.is_open) { return 0; }
+  var buf: uint8[] = new uint8[4096];
+  var out: uint32 = 0;
+  if (meo_file_read_at(f, 0, buf.data, (int64)MEO_PAGE_SIZE) == MEO_PAGE_SIZE) {
+    var m: MeoMeta = meo_meta_read(buf.data);
+    if (m.valid) { out = meo_meta_root(m, MEO_ROOT_BTREE); }
+  }
+  free(buf.data);
+  meo_file_close(f);
+  return out;
+}
+
+// --- tree helpers ----------------------------------------------------------
+
+fn p3_insert(p: MeoPager*, root: uint32*, k: int32, rowid: uint64) -> int32 {
+  var kb: uint8[16];
+  var kn: int32 = meo_key_int(&kb[0], 16, (int64)k);
+  var bk: MeoBtKey = { data: &kb[0], len: kn };
+  return meo_bt_insert(p, root, &meo_key_compare, bk, rowid);
+}
+
+// Build a fresh, committed (flushed and closed) 1000-key tree: key i, rowid i.
+fn p3_build(db: string) -> int32 {
+  var rc: int32 = p3_reset(db);
+  if (rc != MEO_OK) { return rc; }
+  var p: MeoPager* = meo_pager_open(db, P3_FRAMES, MEO_PAGER_CREATE);
+  if (p == 0) { return -MEO_ERR_IO; }
+  var root: uint32 = 0;
+  var k: int32 = 0;
+  while (k < 1000 && rc == MEO_OK) {
+    rc = p3_insert(p, &root, k, (uint64)k);
+    k += 1;
+  }
+  if (rc == MEO_OK) { rc = meo_pager_set_root(p, MEO_ROOT_BTREE, root); }
+  if (rc == MEO_OK) { rc = meo_pager_flush(p); }
+  var crc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  if (rc == MEO_OK) { rc = crc; }
+  return rc;
+}
+
+// Walk the tree from key 0 ascending. Every row must be key i with rowid i.
+// Answers the number of rows walked, or -1 (after printing why) on a mismatch.
+fn p3_walk(p: MeoPager*, n: int32) -> int64 {
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var kb: uint8[16];
+  var want_buf: uint8[16];
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var kn0: int32 = meo_key_int(&kb[0], 16, 0);
+  var k0: MeoBtKey = { data: &kb[0], len: kn0 };
+  var wrc: int32 = meo_bt_seek(p, &c, root, &meo_key_compare, k0);
+  var walked: int64 = 0;
+  while (wrc == 0) {
+    var wn: int32 = meo_key_int(&want_buf[0], 16, walked);
+    var got_len: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+    var got_ptr: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
+    if (got_len != wn || !meo_bytes_equal(got_ptr, &want_buf[0], (int64)wn)) {
+      println("FAIL K{n}: walk order at {walked}");
+      meo_bt_close(p, &c);
+      return -1;
+    }
+    var rid: uint64 = 0;
+    if (meo_bt_rowid(p, &c, &rid) != MEO_OK || rid != (uint64)walked) {
+      println("FAIL K{n}: walk rowid at {walked} = {(int64)rid}");
+      meo_bt_close(p, &c);
+      return -1;
+    }
+    walked += 1;
+    wrc = meo_bt_next(p, &c);
+  }
+  meo_bt_close(p, &c);
+  if (wrc < 0) {
+    println("FAIL K{n}: walk next {wrc}");
+    return -1;
+  }
+  return walked;
+}
+
+// Mark page `pg` seen; 1 when it was new, 0 when already seen or out of range.
+fn p3_mark(seen: uint8*, pc: uint32, pg: uint32) -> int32 {
+  if (pg == 0 || pg >= pc) { return 0; }
+  if (seen[pg] != (uint8)0) { return 0; }
+  seen[pg] = 1;
+  return 1;
+}
+
+// Count the pages of the tree under `pg`, marking each; -1 on a page reached
+// twice, out of range, or unreadable.
+fn p3_tree_pages(p: MeoPager*, pg: uint32, seen: uint8*, pc: uint32,
+    depth: int32) -> int64 {
+  if (depth > MEO_BT_MAX_DEPTH) { return -1; }
+  if (p3_mark(seen, pc, pg) == 0) { return -1; }
+  var f: MeoFrame* = meo_pager_get(p, pg, false);
+  if (f == 0) { return -1; }
+  if (meo_btn_is_leaf(f->data)) {
+    meo_pager_release(p, f, false);
+    return 1;
+  }
+  var n: int32 = meo_page_n_cells(f->data);
+  var kids: uint32[] = new uint32[n + 1];
+  var i: int32 = 0;
+  while (i < n) {
+    kids[i] = meo_btn_inner_child(f->data, i);
+    i += 1;
+  }
+  meo_pager_release(p, f, false);
+  var total: int64 = 1;
+  i = 0;
+  while (i < n) {
+    var sub: int64 = p3_tree_pages(p, kids[i], seen, pc, depth + 1);
+    if (sub < 0) { free(kids.data); return -1; }
+    total += sub;
+    i += 1;
+  }
+  free(kids.data);
+  return total;
+}
+
+// --- crash child -----------------------------------------------------------
+
+fn p3_cbuf(s: string) -> uint8* {
+  var n: int64 = (int64)s.length;
+  var b: uint8[] = new uint8[n + 1];
+  var i: int64 = 0;
+  while (i < n) { b[i] = (uint8)s.chars[i]; i += 1; }
+  b[n] = 0;
+  return b.data;
+}
+
+// fork + execve(phase3_child, [phase3_child, arg]) + wait4. Answers the
+// child's exit status, -1 when fork/wait failed, -2 when it died on a signal.
+fn p3_run_child(arg: string) -> int32 {
+  var exe: uint8[] = new uint8[4096];
+  var proc: uint8* = p3_cbuf("/proc/self/exe");
+  var n: int64 = syscall(89, (int64)proc, (int64)exe.data, (int64)4000);
+  free(proc);
+  if (n <= 0) { free(exe.data); return -1; }
+  var slash: int64 = n - 1;
+  while (slash > 0 && exe[slash] != (uint8)47) { slash -= 1; }
+  var name: string = "phase3_child";
+  var i: int64 = 0;
+  while (i < (int64)name.length) {
+    exe[slash + 1 + i] = (uint8)name.chars[i];
+    i += 1;
+  }
+  exe[slash + 1 + i] = 0;
+  var a1: uint8* = p3_cbuf(arg);
+  var argv: int64[] = new int64[3];
+  argv[0] = (int64)exe.data;
+  argv[1] = (int64)a1;
+  argv[2] = 0;
+  var envp: int64[] = new int64[1];
+  envp[0] = 0;
+  var pid: int64 = syscall(57);
+  if (pid == 0) {
+    syscall(59, (int64)exe.data, (int64)argv.data, (int64)envp.data);
+    syscall(231, (int64)127); // execve failed
+  }
+  free(exe.data);
+  free(a1);
+  free(argv.data);
+  free(envp.data);
+  if (pid < 0) { return -1; }
+  var status: int32 = 0;
+  var w: int64 = syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  if (w < 0) { return -1; }
+  if ((status & 0x7F) != 0) { return -2; }
+  return (status >> 8) & 0xFF;
+}
+
+// --- K1 / K2: commit and rollback ------------------------------------------
+
+fn p3_txn(n: int32, db: string, commit: bool) -> int32 {
+  if (p3_build(db) != MEO_OK) { return p3_fail(n, "build 1000"); }
+  var p: MeoPager* = meo_pager_open(db, P3_FRAMES, 0);
+  if (p == 0) { return p3_fail(n, "reopen"); }
+  var pc0: uint32 = meo_pager_page_count(p);
+  var root0: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  if (meo_pager_begin(p) != MEO_OK) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "begin");
+  }
+  var root: uint32 = root0;
+  var k: int32 = 1000;
+  var rc: int32 = MEO_OK;
+  while (k < 1500 && rc == MEO_OK) {
+    rc = p3_insert(p, &root, k, (uint64)k);
+    k += 1;
+  }
+  if (rc == MEO_OK) { rc = meo_pager_set_root(p, MEO_ROOT_BTREE, root); }
+  if (rc != MEO_OK) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "insert 500 rc {rc}");
+  }
+  var pc_txn: uint32 = meo_pager_page_count(p);
+  if (pc_txn <= pc0) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "500 inserts did not grow the file");
+  }
+  if (commit) { rc = meo_pager_commit(p); } else { rc = meo_pager_rollback(p); }
+  if (rc != MEO_OK) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "commit/rollback rc {rc}");
+  }
+  var want_pc: uint32 = pc0;
+  var want_rows: int64 = 1000;
+  if (commit) { want_pc = pc_txn; want_rows = 1500; }
+  var pc_after: uint32 = meo_pager_page_count(p);
+  if (!commit && pc_after != pc0) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "rollback left page_count {(int64)pc_after}");
+  }
+  rc = meo_pager_close(p);
+  meo_pager_free(p);
+  if (rc != MEO_OK) { return p3_fail(n, "close rc {rc}"); }
+  if (meo_jrn_present(db) != 0) { return p3_fail(n, "journal left behind"); }
+
+  var r: MeoPager* = meo_pager_open(db, P3_FRAMES, MEO_PAGER_READONLY);
+  if (r == 0) { return p3_fail(n, "second reopen"); }
+  var pc: uint32 = meo_pager_page_count(r);
+  var rroot: uint32 = meo_pager_root(r, MEO_ROOT_BTREE);
+  var walked: int64 = p3_walk(r, n);
+  meo_pager_close(r);
+  meo_pager_free(r);
+  if (walked < 0) { return 1; }
+  var expect: int64 = want_rows + (int64)p3_red(n);
+  if (walked != expect) {
+    return p3_fail(n, "walked {walked} rows, want {expect}");
+  }
+  if (pc != want_pc) {
+    return p3_fail(n, "page_count {(int64)pc}, want {(int64)want_pc}");
+  }
+  if (p3_file_size(db) != (int64)pc * (int64)MEO_PAGE_SIZE) {
+    return p3_fail(n, "file size {p3_file_size(db)} != page_count {(int64)pc} pages");
+  }
+  if (!commit && rroot != root0) {
+    return p3_fail(n, "root {(int64)rroot}, want {(int64)root0}");
+  }
+  println("PASS K{n}: {walked} rows ascending, page_count {(int64)pc} (before txn {(int64)pc0}, in txn {(int64)pc_txn})");
+  return 0;
+}
+
+// --- K3 / K4: crash ---------------------------------------------------------
+
+fn p3_crash(n: int32, db: string, arg: string) -> int32 {
+  if (p3_build(db) != MEO_OK) { return p3_fail(n, "build 1000"); }
+  var ro: MeoPager* = meo_pager_open(db, P3_FRAMES, MEO_PAGER_READONLY);
+  if (ro == 0) { return p3_fail(n, "reopen before crash"); }
+  var pc0: uint32 = meo_pager_page_count(ro);
+  var root0: uint32 = meo_pager_root(ro, MEO_ROOT_BTREE);
+  meo_pager_close(ro);
+  meo_pager_free(ro);
+
+  var st: int32 = p3_run_child(arg);
+  if (st != 42) { return p3_fail(n, "child exit status {st}, want 42"); }
+  if (meo_jrn_present(db) != 1) { return p3_fail(n, "no hot journal after the crash"); }
+  var droot: uint32 = p3_disk_root(db);
+  var dsize: int64 = p3_file_size(db);
+  if (n == 4 && (droot == root0 || droot == 0)) {
+    return p3_fail(n, "page 0 on disk does not name the split root ({(int64)droot})");
+  }
+  if (dsize <= (int64)pc0 * (int64)MEO_PAGE_SIZE) {
+    return p3_fail(n, "crash did not grow the file ({dsize} bytes)");
+  }
+
+  var p: MeoPager* = meo_pager_open(db, P3_FRAMES, 0); // recovery runs here
+  if (p == 0) { return p3_fail(n, "reopen after crash err {meo_pager_err(p)}"); }
+  var fails: int32 = 0;
+  if (meo_jrn_present(db) != 0) { fails += p3_fail(n, "journal not removed by recovery"); }
+  var pc: uint32 = meo_pager_page_count(p);
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  if (pc != pc0) { fails += p3_fail(n, "page_count {(int64)pc}, want {(int64)pc0}"); }
+  if (root != root0) { fails += p3_fail(n, "root {(int64)root}, want {(int64)root0}"); }
+  var walked: int64 = p3_walk(p, n);
+  var expect: int64 = 1000 + (int64)p3_red(n);
+  if (walked < 0) { fails += 1; }
+  else if (walked != expect) { fails += p3_fail(n, "walked {walked} rows, want {expect}"); }
+
+  // Page accounting: tree pages, freelist chain pages and freelist entries
+  // are disjoint, inside the file, and together no more than page_count.
+  var live: int64 = 0;
+  var free_n: int64 = 0;
+  if (fails == 0) {
+    var seen: uint8[] = new uint8[(int64)pc + 1];
+    var i: int64 = 0;
+    while (i <= (int64)pc) { seen[i] = 0; i += 1; }
+    var tp: int64 = p3_tree_pages(p, root, seen.data, pc, 1);
+    if (tp < 0) { fails += p3_fail(n, "tree reaches a page twice or out of range"); }
+    live = 1 + tp; // page 0
+    var fl: uint32 = meo_pager_root(p, MEO_ROOT_FREELIST);
+    while (fails == 0 && fl != 0) {
+      if (p3_mark(seen.data, pc, fl) == 0) { fails += p3_fail(n, "freelist chain page {(int64)fl} reused"); break; }
+      live += 1;
+      var f: MeoFrame* = meo_pager_get(p, fl, false);
+      if (f == 0) { fails += p3_fail(n, "freelist page unreadable"); break; }
+      var c: int32 = meo_free_page_count(f->data);
+      var j: int32 = 0;
+      while (j < c) {
+        if (p3_mark(seen.data, pc, meo_free_page_at(f->data, j)) == 0) {
+          fails += p3_fail(n, "free page {(int64)meo_free_page_at(f->data, j)} counted twice or out of range");
+          break;
+        }
+        free_n += 1;
+        j += 1;
+      }
+      fl = meo_free_page_next(f->data);
+      meo_pager_release(p, f, false);
+    }
+    free(seen.data);
+    if (fails == 0 && free_n != meo_free_count(p)) {
+      fails += p3_fail(n, "freelist entries {free_n} != meo_free_count {meo_free_count(p)}");
+    }
+    if (fails == 0 && live + free_n > (int64)pc) {
+      fails += p3_fail(n, "live {live} + free {free_n} > page_count {(int64)pc}");
+    }
+  }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (fails != 0) { return 1; }
+  if (p3_file_size(db) != (int64)pc0 * (int64)MEO_PAGE_SIZE) {
+    return p3_fail(n, "file not truncated back to {(int64)pc0} pages");
+  }
+  println("PASS K{n}: child exit 42, disk root {(int64)droot} -> recovered root {(int64)root}, {walked} rows, page_count {(int64)pc}, live {live} + free {free_n}");
+  return 0;
+}
+
+// --- K5: journal capacity ---------------------------------------------------
+
+fn p3_cap(db: string) -> int32 {
+  var n: int32 = 5;
+  if (p3_build(db) != MEO_OK) { return p3_fail(n, "build 1000"); }
+  var p: MeoPager* = meo_pager_open(db, P3_FRAMES, 0);
+  if (p == 0) { return p3_fail(n, "reopen"); }
+  var pc0: uint32 = meo_pager_page_count(p);
+  var root0: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  if (meo_pager_set_journal_cap(p, 4) != MEO_OK
+      || meo_pager_begin(p) != MEO_OK) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "cap/begin");
+  }
+  // Give every 10th key a new rowid: that dirties every leaf, far more than
+  // four pre-existing pages, and the before-images must not fit.
+  var root: uint32 = root0;
+  var rc: int32 = MEO_OK;
+  var k: int32 = 0;
+  while (k < 1000 && rc == MEO_OK) {
+    rc = p3_insert(p, &root, k, (uint64)(k + 1000000));
+    k += 10;
+  }
+  var stage: string = "insert";
+  if (rc == MEO_OK) { rc = meo_pager_flush(p); stage = "flush"; }
+  if (rc != -MEO_ERR_NOSPC - p3_red(n)) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "{stage} rc {rc}, want -NOSPC {-MEO_ERR_NOSPC}");
+  }
+  var rrc: int32 = meo_pager_rollback(p);
+  if (rrc != MEO_OK) {
+    meo_pager_close(p); meo_pager_free(p);
+    return p3_fail(n, "rollback after NOSPC rc {rrc}");
+  }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  var r: MeoPager* = meo_pager_open(db, P3_FRAMES, MEO_PAGER_READONLY);
+  if (r == 0) { return p3_fail(n, "reopen after rollback"); }
+  var pc: uint32 = meo_pager_page_count(r);
+  var rroot: uint32 = meo_pager_root(r, MEO_ROOT_BTREE);
+  var walked: int64 = p3_walk(r, n);
+  meo_pager_close(r);
+  meo_pager_free(r);
+  if (walked < 0) { return 1; }
+  if (walked != 1000) { return p3_fail(n, "walked {walked} rows"); }
+  if (pc != pc0 || rroot != root0) {
+    return p3_fail(n, "page_count {(int64)pc}/{(int64)pc0} root {(int64)rroot}/{(int64)root0}");
+  }
+  println("PASS K5: {stage} answered -NOSPC ({rc}), rollback OK, {walked} rows with original rowids, page_count {(int64)pc}");
+  return 0;
+}
+
+fn main() -> int32 {
+  var failures: int32 = 0;
+  failures += p3_txn(1, "build/phase3_k1.dat", true);
+  failures += p3_txn(2, "build/phase3_k2.dat", false);
+  failures += p3_crash(3, "build/phase3_k3.dat", "3");
+  failures += p3_crash(4, "build/phase3_k4.dat", "4");
+  failures += p3_cap("build/phase3_k5.dat");
+  if (failures != 0) {
+    println("FAILED phase3: {failures} case(s)");
+    return 1;
+  }
+  println("PASS phase3");
+  return 0;
+}
