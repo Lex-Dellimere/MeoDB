@@ -1,0 +1,64 @@
+// conc/lock: the database-wide, owner re-entrant lock (D9).
+// Draft is single-thread: every caller is thread 1, enter never waits.
+// WS4: std/thread mutex, GetCurrentThreadId owner, BUSY after timeout_ms.
+
+import "../error/status.mettle";
+
+export struct MeoLock {
+  mtx: int64;     // std/thread mutex handle (WS4); 0 in the draft
+  owner: int32;   // thread id of the holder, 0 = free
+  depth: int32;   // nested enters by the owner
+}
+
+// WS4: the calling thread's id (GetCurrentThreadId).
+fn lock_self_id() -> int32 {
+  return 1;
+}
+
+// Prepare a lock. MEO_OK, -MEO_ERR_USAGE for a null lock. WS4: mutex_create,
+// -MEO_ERR_NOMEM when it fails.
+export fn meo_lock_init(l: MeoLock*) -> int32 {
+  if (l == 0) { return -MEO_ERR_USAGE; }
+  l->mtx = 0;
+  l->owner = 0;
+  l->depth = 0;
+  return MEO_OK;
+}
+
+// Take the lock, or re-enter it as its owner. MEO_OK, -MEO_ERR_BUSY after
+// timeout_ms (WS4), -MEO_ERR_USAGE for a null lock.
+export fn meo_lock_enter(l: MeoLock*, timeout_ms: int32) -> int32 {
+  if (l == 0) { return -MEO_ERR_USAGE; }
+  var me: int32 = lock_self_id();
+  if (l->depth > 0 && l->owner == me) {
+    l->depth += 1;
+    return MEO_OK;
+  }
+  if (l->depth > 0) { return -MEO_ERR_BUSY; }  // WS4: wait up to timeout_ms
+  l->owner = me;
+  l->depth = 1;
+  return MEO_OK;
+}
+
+// Undo one enter. MEO_OK, -MEO_ERR_USAGE when the caller does not hold it.
+export fn meo_lock_leave(l: MeoLock*) -> int32 {
+  if (l == 0) { return -MEO_ERR_USAGE; }
+  if (l->depth <= 0 || l->owner != lock_self_id()) { return -MEO_ERR_USAGE; }
+  l->depth -= 1;
+  if (l->depth == 0) { l->owner = 0; }
+  return MEO_OK;
+}
+
+// True when the CALLING thread holds the lock.
+export fn meo_lock_held(l: MeoLock*) -> bool {
+  if (l == 0) { return false; }
+  return l->depth > 0 && l->owner == lock_self_id();
+}
+
+// Release the lock's resources. -MEO_ERR_BUSY while it is held.
+export fn meo_lock_destroy(l: MeoLock*) -> int32 {
+  if (l == 0) { return -MEO_ERR_USAGE; }
+  if (l->depth > 0) { return -MEO_ERR_BUSY; }
+  l->mtx = 0;
+  return MEO_OK;
+}

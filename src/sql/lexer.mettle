@@ -1,0 +1,153 @@
+// sql/lexer: SQL bytes -> (kind, off, len) tokens, no allocation (D7).
+// Keywords lex as IDENT and are matched with meo_lex_kw; quoted spans include
+// their quotes. WS7 owns it (parse_self).
+
+import "../error/status.mettle";
+
+export const MEO_TK_EOF: int32 = 0;
+export const MEO_TK_IDENT: int32 = 1;    // bare word (keyword or name)
+export const MEO_TK_QIDENT: int32 = 2;   // "quoted identifier"
+export const MEO_TK_INT: int32 = 3;
+export const MEO_TK_REAL: int32 = 4;
+export const MEO_TK_STRING: int32 = 5;   // 'string literal'
+export const MEO_TK_PARAM: int32 = 6;    // ?
+export const MEO_TK_LPAREN: int32 = 7;
+export const MEO_TK_RPAREN: int32 = 8;
+export const MEO_TK_COMMA: int32 = 9;
+export const MEO_TK_SEMI: int32 = 10;
+export const MEO_TK_STAR: int32 = 11;
+export const MEO_TK_EQ: int32 = 12;
+export const MEO_TK_MINUS: int32 = 13;
+export const MEO_TK_DOT: int32 = 14;
+
+export struct MeoToken {
+  kind: int32;   // MEO_TK_*
+  off: int32;    // byte offset of the first byte (the opening quote, if any)
+  len: int32;    // bytes, quotes included
+}
+
+export struct MeoLexer {
+  src: uint8*;
+  n: int32;
+  pos: int32;
+}
+
+export fn meo_lex_init(lx: MeoLexer*, src: uint8*, n: int32) {
+  lx->src = src;
+  lx->n = n;
+  lx->pos = 0;
+}
+
+fn lex_is_alpha(c: uint8) -> bool {
+  return (c >= (uint8)65 && c <= (uint8)90) || (c >= (uint8)97 && c <= (uint8)122)
+    || c == (uint8)95;
+}
+
+fn lex_is_digit(c: uint8) -> bool {
+  return c >= (uint8)48 && c <= (uint8)57;
+}
+
+fn lex_is_space(c: uint8) -> bool {
+  return c == (uint8)32 || c == (uint8)9 || c == (uint8)10 || c == (uint8)13;
+}
+
+// Scan a quoted run starting at the opening quote `q`; a doubled quote is an
+// escaped one. Answers the index after the closing quote, or -1 unterminated.
+fn lex_quoted(lx: MeoLexer*, start: int32, q: uint8) -> int32 {
+  var i: int32 = start + 1;
+  while (i < lx->n) {
+    if (lx->src[i] == q) {
+      if (i + 1 < lx->n && lx->src[i + 1] == q) {
+        i += 2;
+      } else {
+        return i + 1;
+      }
+    } else {
+      i += 1;
+    }
+  }
+  return -1;
+}
+
+// The next token. MEO_OK with *tok set (MEO_TK_EOF at the end), or
+// -MEO_ERR_SQL with tok->off at the offending byte.
+export fn meo_lex_next(lx: MeoLexer*, tok: MeoToken*) -> int32 {
+  while (lx->pos < lx->n) {
+    var c0: uint8 = lx->src[lx->pos];
+    if (lex_is_space(c0)) {
+      lx->pos += 1;
+    } else if (c0 == (uint8)45 && lx->pos + 1 < lx->n && lx->src[lx->pos + 1] == (uint8)45) {
+      while (lx->pos < lx->n && lx->src[lx->pos] != (uint8)10) { lx->pos += 1; }
+    } else {
+      break;
+    }
+  }
+  var s: int32 = lx->pos;
+  tok->off = s;
+  tok->len = 0;
+  if (s >= lx->n) {
+    tok->kind = MEO_TK_EOF;
+    return MEO_OK;
+  }
+  var c: uint8 = lx->src[s];
+  var e: int32 = s + 1;
+  if (lex_is_alpha(c)) {
+    while (e < lx->n && (lex_is_alpha(lx->src[e]) || lex_is_digit(lx->src[e]))) { e += 1; }
+    tok->kind = MEO_TK_IDENT;
+  } else if (lex_is_digit(c)) {
+    tok->kind = MEO_TK_INT;
+    while (e < lx->n && lex_is_digit(lx->src[e])) { e += 1; }
+    if (e + 1 < lx->n && lx->src[e] == (uint8)46 && lex_is_digit(lx->src[e + 1])) {
+      tok->kind = MEO_TK_REAL;
+      e += 1;
+      while (e < lx->n && lex_is_digit(lx->src[e])) { e += 1; }
+    }
+    if (e < lx->n && lex_is_alpha(lx->src[e])) { return -MEO_ERR_SQL; }
+  } else if (c == (uint8)34 || c == (uint8)39) {
+    e = lex_quoted(lx, s, c);
+    if (e < 0) { return -MEO_ERR_SQL; }
+    if (c == (uint8)34) {
+      tok->kind = MEO_TK_QIDENT;
+      if (e - s <= 2) { return -MEO_ERR_SQL; }   // "" is not a name
+    } else {
+      tok->kind = MEO_TK_STRING;
+    }
+  } else if (c == (uint8)63) {
+    tok->kind = MEO_TK_PARAM;
+  } else if (c == (uint8)40) {
+    tok->kind = MEO_TK_LPAREN;
+  } else if (c == (uint8)41) {
+    tok->kind = MEO_TK_RPAREN;
+  } else if (c == (uint8)44) {
+    tok->kind = MEO_TK_COMMA;
+  } else if (c == (uint8)59) {
+    tok->kind = MEO_TK_SEMI;
+  } else if (c == (uint8)42) {
+    tok->kind = MEO_TK_STAR;
+  } else if (c == (uint8)61) {
+    tok->kind = MEO_TK_EQ;
+  } else if (c == (uint8)45) {
+    tok->kind = MEO_TK_MINUS;
+  } else if (c == (uint8)46) {
+    tok->kind = MEO_TK_DOT;
+  } else {
+    return -MEO_ERR_SQL;
+  }
+  tok->len = e - s;
+  lx->pos = e;
+  return MEO_OK;
+}
+
+// True when `tok` is the bare keyword `kw` (kw spelled in UPPER case).
+export fn meo_lex_kw(lx: MeoLexer*, tok: MeoToken*, kw: string) -> bool {
+  if (tok->kind != MEO_TK_IDENT) { return false; }
+  if ((int64)tok->len != (int64)kw.length) { return false; }
+  var i: int32 = 0;
+  while (i < tok->len) {
+    var x: uint8 = lx->src[tok->off + i];
+    if (x >= (uint8)97 && x <= (uint8)122) { x = x - (uint8)32; }
+    if (x != kw.chars[i]) { return false; }
+    i += 1;
+  }
+  return true;
+}

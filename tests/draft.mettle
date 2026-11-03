@@ -1,0 +1,160 @@
+// draft: the D10 draft slice. CREATE TABLE, 3000 bound INSERTs in one
+// transaction, commit, reopen, SELECT *: rows, order, text, the root split
+// (8-byte separators) and the root read back from the catalog.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/btree/node.mettle";
+import "../src/meosql.mettle";
+
+const DR_ROWS: int32 = 3000;
+// Red-check switch: 1 expects one row too many. Must be 0 when committed.
+const DR_RED: int32 = 0;
+
+fn dr_fail(msg: string) -> int32 {
+  println("FAIL draft: {msg}");
+  return 1;
+}
+
+fn dr_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn dr_table(db: MeoDb*) -> MeoTable* {
+  var nm: string = "t";
+  return meo_cat_find(db->cat, nm.chars, 1);
+}
+
+// Every separator of the (inner) root is at most 8 bytes: D2's truncation.
+fn dr_root_keys_ok(db: MeoDb*, root: uint32) -> int32 {
+  var f: MeoFrame* = meo_pager_get(db->pager, root, false);
+  if (f == 0) { return -1; }
+  var rc: int32 = 0;
+  if (meo_btn_is_leaf(f->data)) {
+    rc = -2;
+  } else {
+    var n: int32 = meo_page_n_cells(f->data);
+    var i: int32 = 0;
+    while (i < n - 1) {
+      if (meo_btn_inner_key_len(f->data, i) != 8) { rc = -3; }
+      i += 1;
+    }
+  }
+  meo_pager_release(db->pager, f, false);
+  return rc;
+}
+
+fn dr_write(path: string, root_out: uint32*) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return dr_fail("open rc={rc}"); }
+  rc = meo_sql_exec(db, "CREATE TABLE \"t\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT)");
+  if (rc != MEO_OK) { return dr_fail("create rc={rc}"); }
+  var t: MeoTable* = dr_table(db);
+  if (t == 0) { return dr_fail("table not in the catalog after CREATE"); }
+  if (meo_pager_root(db->pager, MEO_ROOT_CATALOG) == 0) { return dr_fail("catalog root 0"); }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return dr_fail("begin rc={rc}"); }
+  if (meo_db_begin(db, MEO_TX_DEFAULT) != -MEO_ERR_TX) { return dr_fail("nested begin not TX"); }
+  var st: MeoStmt* = 0;
+  var off: int32 = 0;
+  rc = meo_sql_prepare(db, "INSERT INTO \"t\" (\"id\",\"name\") VALUES (?, ?)", &st, &off);
+  if (rc != MEO_OK) { return dr_fail("prepare insert rc={rc} off={off}"); }
+  if (meo_sql_bind_count(st) != 2) { return dr_fail("bind_count != 2"); }
+  var first_root: uint32 = 0;
+  var i: int32 = 1;
+  while (i <= DR_ROWS) {
+    var txt: string = "row-{i}";
+    var b1: int32 = meo_sql_bind_int64(st, 1, (int64)i);
+    var b2: int32 = meo_sql_bind_text(st, 2, txt);
+    free(txt.chars);
+    if (b1 != MEO_OK || b2 != MEO_OK) { return dr_fail("bind row {i}: {b1} {b2}"); }
+    rc = meo_sql_step(st);
+    if (rc != MEO_DONE) { return dr_fail("insert step row {i} rc={rc}"); }
+    if (meo_sql_changes(st) != 1) { return dr_fail("changes != 1 at row {i}"); }
+    if (meo_sql_last_insert_rowid(st) != (int64)i) { return dr_fail("last rowid at row {i}"); }
+    rc = meo_sql_reset(st);
+    if (rc != MEO_OK) { return dr_fail("reset rc={rc}"); }
+    if (i == 1) { first_root = t->root; }
+    i += 1;
+  }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return dr_fail("commit rc={rc}"); }
+  if (meo_db_last_insert_rowid(db) != (int64)DR_ROWS) { return dr_fail("db last rowid"); }
+  if (first_root == 0) { return dr_fail("no root after the first row"); }
+  if (t->root == first_root) { return dr_fail("table root never split ({first_root})"); }
+  var kc: int32 = dr_root_keys_ok(db, t->root);
+  if (kc != 0) { return dr_fail("inner root separators not truncated to 8 ({kc})"); }
+  root_out[0] = t->root;
+  println("  root split {first_root} -> {t->root}, separators 8 bytes");
+  rc = meo_sql_finalize(st);
+  if (rc != MEO_OK) { return dr_fail("finalize rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return dr_fail("close rc={rc}"); }
+  return 0;
+}
+
+fn dr_read(path: string, want_root: uint32) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return dr_fail("reopen rc={rc}"); }
+  var t: MeoTable* = dr_table(db);
+  if (t == 0) { return dr_fail("table missing after reopen"); }
+  if (t->root != want_root) { return dr_fail("reopened root {t->root} != committed {want_root}"); }
+  if (t->n_cols != 2 || t->columns[0].cflags != (MEO_COL_PK | MEO_COL_ROWID_ALIAS)) {
+    return dr_fail("reopened schema differs");
+  }
+  var st: MeoStmt* = 0;
+  var off: int32 = 0;
+  rc = meo_sql_prepare(db, "SELECT * FROM \"t\"", &st, &off);
+  if (rc != MEO_OK) { return dr_fail("prepare select rc={rc} off={off}"); }
+  if (meo_sql_column_count(st) != 2) { return dr_fail("column_count != 2"); }
+  var want_rows: int32 = DR_ROWS + DR_RED;
+  var i: int32 = 1;
+  while (i <= want_rows) {
+    rc = meo_sql_step(st);
+    if (rc != MEO_ROW) { return dr_fail("select step {i}: rc={rc}, want MEO_ROW"); }
+    if (meo_sql_column_type(st, 0) != MEO_T_INT) { return dr_fail("col 0 type at {i}"); }
+    var id: int64 = meo_sql_column_int64(st, 0);
+    if (id != (int64)i) { return dr_fail("row {i}: id {id}"); }
+    var want: string = "row-{i}";
+    var got: uint8* = meo_sql_column_text(st, 1);
+    var n: int32 = meo_sql_column_bytes(st, 1);
+    var same: bool = got != 0 && (int64)n == (int64)want.length
+      && meo_bytes_equal(got, want.chars, (int64)n) && got[n] == (uint8)0;
+    free(want.chars);
+    if (!same) { return dr_fail("row {i}: text differs"); }
+    i += 1;
+  }
+  rc = meo_sql_step(st);
+  if (rc != MEO_DONE) { return dr_fail("after {want_rows} rows: rc={rc}, want MEO_DONE"); }
+  if (meo_sql_step(st) != MEO_DONE) { return dr_fail("step after DONE"); }
+  meo_sql_finalize(st);
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return dr_fail("close 2 rc={rc}"); }
+  return 0;
+}
+
+fn main() -> int32 {
+  var path: string = "build/draft.dat";
+  if (dr_reset(path) != MEO_OK) { return dr_fail("reset"); }
+  var root: uint32 = 0;
+  if (dr_write(path, &root) != 0) { return 1; }
+  if (dr_read(path, root) != 0) { return 1; }
+  println("PASS draft");
+  return 0;
+}

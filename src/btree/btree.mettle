@@ -390,6 +390,51 @@ export fn meo_bt_lookup(p: MeoPager*, root: uint32,
 export fn meo_bt_insert(p: MeoPager*, root: uint32*,
     cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
     rowid: uint64) -> int32 {
+  return bt_insert_impl(p, root, cmp_cb, key, rowid, 0);
+}
+
+// meo_bt_insert, but a leaf split copies at most sep_max key bytes up (D2;
+// 0 = whole key). Only for a comparator decided by the first sep_max bytes
+// (meo_tbl_cmp); a prefix-ordered comparator like meo_key_compare must pass 0.
+export fn meo_bt_insert_sep(p: MeoPager*, root: uint32*,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
+    rowid: uint64, sep_max: int32) -> int32 {
+  if (sep_max < 0) { return -MEO_ERR_USAGE; }
+  return bt_insert_impl(p, root, cmp_cb, key, rowid, sep_max);
+}
+
+// Rowid of the largest key: MEO_OK, 1 empty tree, negative on failure.
+// WS2: step back past an empty rightmost leaf once delete exists.
+export fn meo_bt_last(p: MeoPager*, root: uint32, rowid: uint64*) -> int32 {
+  if (p == 0 || rowid == 0) { return -MEO_ERR_USAGE; }
+  if (root == 0) { return 1; }
+  var page: uint32 = root;
+  var level: int32 = 0;
+  while (level < MEO_BT_MAX_DEPTH) {
+    var rc: int32 = MEO_OK;
+    var f: MeoFrame* = bt_pin(p, page, false, &rc);
+    if (f == 0) { return rc; }
+    var n: int32 = meo_page_n_cells(f->data);
+    if (meo_btn_is_leaf(f->data)) {
+      if (n == 0) {
+        meo_pager_release(p, f, false);
+        return 1;
+      }
+      rowid[0] = meo_btn_leaf_rowid(f->data, n - 1);
+      meo_pager_release(p, f, false);
+      return MEO_OK;
+    }
+    var child: uint32 = meo_btn_inner_child(f->data, n - 1);
+    meo_pager_release(p, f, false);
+    page = child;
+    level += 1;
+  }
+  return -MEO_ERR_CORRUPT;
+}
+
+fn bt_insert_impl(p: MeoPager*, root: uint32*,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
+    rowid: uint64, sep_max: int32) -> int32 {
   if (p == 0 || root == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
     return -MEO_ERR_USAGE;
   }
@@ -500,6 +545,7 @@ export fn meo_bt_insert(p: MeoPager*, root: uint32*,
     return rc;
   }
   var sep_len: int32 = meo_btn_leaf_key_len(sib->data, 0);
+  if (sep_max > 0 && sep_len > sep_max) { sep_len = sep_max; }
   meo_bytes_copy(sep_buf, meo_btn_leaf_key_ptr(sib->data, 0), (int64)sep_len);
   meo_pager_release(p, c.leaf, true);
   c.leaf = 0;

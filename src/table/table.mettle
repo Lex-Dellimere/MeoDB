@@ -1,0 +1,319 @@
+// table/table: unlocked row primitives over one table b-tree (D1, D2, D5).
+// Key = 8-byte rowid ++ record, separators truncated to 8; the rowid alias is
+// stored NULL and filled from the key. Caller holds the db lock; a root change
+// is saved through meo_cat_save_table in the same transaction.
+// WS6: index maintenance, Phase A/B, delete, update, index lookup.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../pager/pager.mettle";
+import "../btree/node.mettle";
+import "../btree/btree.mettle";
+import "../types/key.mettle";
+import "../record/value.mettle";
+import "../record/codec.mettle";
+import "../catalog/schema.mettle";
+import "../catalog/catalog.mettle";
+import "../db/db.mettle";
+
+// One row: its rowid and a view of its record bytes (see the header).
+export struct MeoTblRow {
+  rowid: int64;
+  rec: uint8*;
+  rec_len: int32;
+}
+
+// A full-scan cursor in rowid order. Holds one pinned leaf while open.
+export struct MeoTblScan {
+  db: MeoDb*;
+  t: MeoTable*;
+  cur: MeoBtCursor;
+  started: bool;
+  done: bool;
+}
+
+// The table-tree comparator (D2): the 8-byte rowid prefix decides.
+export fn meo_tbl_cmp(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
+  return meo_cat_cmp(a, an, b, bn);
+}
+
+// Index of the rowid-alias column, or -1.
+export fn meo_tbl_alias_col(t: MeoTable*) -> int32 {
+  if (t == 0) { return -1; }
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    if ((t->columns[i].cflags & MEO_COL_ROWID_ALIAS) != 0) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+// True when column `i` has (or needs) a secondary index (D5).
+export fn meo_tbl_col_indexed(t: MeoTable*, i: int32) -> bool {
+  var f: int32 = t->columns[i].cflags;
+  if ((f & MEO_COL_ROWID_ALIAS) != 0) { return false; }
+  return (f & (MEO_COL_UNIQUE | MEO_COL_PK)) != 0;
+}
+
+// Coerce / check one value against column `i` (D5 strict typing): NULL or the
+// affinity, INTEGER into REAL converts; NOT NULL / PK -> CONSTRAINT.
+fn tbl_check_value(t: MeoTable*, i: int32, v: MeoValue*) -> int32 {
+  var rc: int32 = meo_value_check(v);
+  if (rc != MEO_OK) { return rc; }
+  var col: MeoColumn* = &t->columns[i];
+  if (v->type == MEO_T_NULL) {
+    if ((col->cflags & MEO_COL_ROWID_ALIAS) != 0) { return MEO_OK; }
+    if ((col->cflags & (MEO_COL_NOT_NULL | MEO_COL_PK)) != 0) {
+      return -MEO_ERR_CONSTRAINT;
+    }
+    return MEO_OK;
+  }
+  if (v->type == col->affinity) { return MEO_OK; }
+  if (col->affinity == MEO_T_REAL && v->type == MEO_T_INT) {
+    meo_value_set_real(v, (float64)v->i);
+    return MEO_OK;
+  }
+  return -MEO_ERR_MISMATCH;
+}
+
+// The next free rowid: max + 1, 1 for an empty table, -MEO_ERR_FULL at
+// INT64_MAX.
+fn tbl_next_rowid(db: MeoDb*, t: MeoTable*, out: int64*) -> int32 {
+  var last: uint64 = 0;
+  var rc: int32 = meo_bt_last(db->pager, t->root, &last);
+  if (rc < 0) { return rc; }
+  if (rc == 1) {
+    out[0] = 1;
+    return MEO_OK;
+  }
+  var mx: int64 = (int64)last;
+  if (mx == (int64)(((uint64)1 << 63) - (uint64)1)) { return -MEO_ERR_FULL; }
+  out[0] = mx + 1;
+  if (out[0] < 1) { out[0] = 1; }
+  return MEO_OK;
+}
+
+// Look rowid up. MEO_OK (present), 1 (absent), negative on failure.
+fn tbl_rowid_exists(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
+  if (t->root == 0) { return 1; }
+  var k: uint8[8];
+  meo_key_rowid(&k[0], 8, rowid);
+  var key: MeoBtKey = { data: &k[0], len: 8 };
+  var got: uint64 = 0;
+  return meo_bt_lookup(db->pager, t->root, meo_tbl_cmp, key, &got);
+}
+
+// Phase A for one row (D5): arity, types, NOT NULL, rowid conflict, record
+// size. Writes nothing. *rowid_out gets the rowid the row will take.
+// WS6: unique-index conflicts.
+export fn meo_tbl_check_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
+    rowid_out: int64*) -> int32 {
+  if (db == 0 || t == 0 || vals == 0 || rowid_out == 0) { return -MEO_ERR_USAGE; }
+  if (!t->live) { return -MEO_ERR_SQL; }
+  if (n != t->n_cols) { return -MEO_ERR_SQL; }
+  var i: int32 = 0;
+  while (i < n) {
+    var rc: int32 = tbl_check_value(t, i, &vals[i]);
+    if (rc != MEO_OK) { return rc; }
+    i += 1;
+  }
+  var alias: int32 = meo_tbl_alias_col(t);
+  var rowid: int64 = 0;
+  if (alias >= 0 && vals[alias].type == MEO_T_INT) {
+    rowid = vals[alias].i;
+    var ex: int32 = tbl_rowid_exists(db, t, rowid);
+    if (ex < 0) { return ex; }
+    if (ex == MEO_OK) { return -MEO_ERR_CONFLICT; }
+  } else {
+    var nr: int32 = tbl_next_rowid(db, t, &rowid);
+    if (nr != MEO_OK) { return nr; }
+  }
+  rowid_out[0] = rowid;
+  return MEO_OK;
+}
+
+// Insert one row: `vals` holds n == t->n_cols values in column order (they may
+// be coerced in place, INTEGER -> REAL). The rowid alias, when NULL, gets
+// max + 1. MEO_OK and *rowid_out; -MEO_ERR_SQL (arity / dead table),
+// MISMATCH, CONSTRAINT, CONFLICT (rowid taken), TOOBIG (record over
+// MEO_REC_MAX), UNSUPPORTED (indexed table, WS6), or a storage error.
+export fn meo_tbl_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
+    rowid_out: int64*) -> int32 {
+  var rowid: int64 = 0;
+  var rc: int32 = meo_tbl_check_insert(db, t, vals, n, &rowid);
+  if (rc != MEO_OK) { return rc; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (meo_tbl_col_indexed(t, i)) { return -MEO_ERR_UNSUPPORTED; }  // WS6
+    i += 1;
+  }
+  var alias: int32 = meo_tbl_alias_col(t);
+  var saved: MeoValue;
+  if (alias >= 0) {
+    saved = vals[alias];
+    meo_value_set_null(&vals[alias]);
+  }
+  var sz: int32 = meo_rec_size(vals, n);
+  if (sz < 0 || sz > MEO_REC_MAX) {
+    if (alias >= 0) { vals[alias] = saved; }
+    if (sz < 0) { return sz; }
+    return -MEO_ERR_TOOBIG;
+  }
+  var buf: uint8* = malloc((int64)sz + 8);
+  if (buf == 0) {
+    if (alias >= 0) { vals[alias] = saved; }
+    return -MEO_ERR_NOMEM;
+  }
+  meo_key_rowid(buf, 8, rowid);
+  var w: int32 = meo_rec_encode(buf + 8, sz, vals, n);
+  if (alias >= 0) { vals[alias] = saved; }
+  if (w < 0) {
+    free(buf);
+    return w;
+  }
+  var key: MeoBtKey = { data: buf, len: w + 8 };
+  var root: uint32 = t->root;
+  rc = meo_bt_insert_sep(db->pager, &root, meo_tbl_cmp, key, (uint64)rowid, 8);
+  free(buf);
+  if (rc != MEO_OK) { return rc; }
+  if (root != t->root) {
+    t->root = root;
+    rc = meo_cat_save_table(db->cat, t);
+    if (rc != MEO_OK) { return rc; }
+  }
+  db->last_rowid = rowid;
+  rowid_out[0] = rowid;
+  return MEO_OK;
+}
+
+// Delete the row with this rowid and its index entries. MEO_OK, 1 absent.
+// WS6 (needs WS2's meo_bt_delete).
+export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
+  return -MEO_ERR_UNSUPPORTED;  // WS6: delete row + index entries
+}
+
+// Replace the row with this rowid by `vals` (n == t->n_cols, same rowid; a
+// changed rowid alias is delete + insert). MEO_OK, 1 absent. WS6.
+export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*,
+    n: int32) -> int32 {
+  return -MEO_ERR_UNSUPPORTED;  // WS6: delete + insert with index maintenance
+}
+
+// The rowid a unique index maps `v` to: MEO_OK and *rowid_out, 1 absent
+// (NULL is never indexed), -MEO_ERR_USAGE when column `col` has no index. WS6.
+export fn meo_tbl_index_lookup(db: MeoDb*, t: MeoTable*, col: int32, v: MeoValue*,
+    rowid_out: int64*) -> int32 {
+  return -MEO_ERR_UNSUPPORTED;  // WS6: meo_key_* encode + meo_bt_lookup
+}
+
+// Point lookup: copy the record of `rowid` into buf[0..cap) (cap >=
+// MEO_REC_MAX always suffices) and point row at it. MEO_OK, 1 absent,
+// -MEO_ERR_FULL when cap is too small, negative on failure.
+export fn meo_tbl_lookup_rowid(db: MeoDb*, t: MeoTable*, rowid: int64, buf: uint8*,
+    cap: int32, row: MeoTblRow*) -> int32 {
+  if (db == 0 || t == 0 || buf == 0 || row == 0) { return -MEO_ERR_USAGE; }
+  if (t->root == 0) { return 1; }
+  var k: uint8[8];
+  meo_key_rowid(&k[0], 8, rowid);
+  var key: MeoBtKey = { data: &k[0], len: 8 };
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = meo_bt_seek(db->pager, &c, t->root, meo_tbl_cmp, key);
+  if (rc != 0) {
+    meo_bt_close(db->pager, &c);
+    return rc;
+  }
+  var got: uint64 = meo_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf);
+  if ((int64)got != rowid) {
+    meo_bt_close(db->pager, &c);
+    return 1;
+  }
+  var kl: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+  if (kl < 9) {
+    meo_bt_close(db->pager, &c);
+    return -MEO_ERR_CORRUPT;
+  }
+  if (kl - 8 > cap) {
+    meo_bt_close(db->pager, &c);
+    return -MEO_ERR_FULL;
+  }
+  meo_bytes_copy(buf, meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf) + 8, (int64)(kl - 8));
+  meo_bt_close(db->pager, &c);
+  row->rowid = rowid;
+  row->rec = buf;
+  row->rec_len = kl - 8;
+  return MEO_OK;
+}
+
+// Open a full scan in rowid order. MEO_OK; nothing is pinned until the first
+// meo_tbl_scan_next.
+export fn meo_tbl_scan_open(db: MeoDb*, t: MeoTable*, sc: MeoTblScan*) -> int32 {
+  if (db == 0 || t == 0 || sc == 0) { return -MEO_ERR_USAGE; }
+  if (!t->live) { return -MEO_ERR_SQL; }
+  sc->db = db;
+  sc->t = t;
+  sc->started = false;
+  sc->done = false;
+  meo_bt_cursor_init(&sc->cur);
+  return MEO_OK;
+}
+
+// The next row: 0 = *row filled (borrowing the pinned leaf), 1 = done,
+// negative on failure.
+export fn meo_tbl_scan_next(sc: MeoTblScan*, row: MeoTblRow*) -> int32 {
+  if (sc == 0 || row == 0) { return -MEO_ERR_USAGE; }
+  if (sc->done) { return 1; }
+  var p: MeoPager* = sc->db->pager;
+  var rc: int32 = 0;
+  if (!sc->started) {
+    sc->started = true;
+    if (sc->t->root == 0) {
+      sc->done = true;
+      return 1;
+    }
+    var k: uint8[8];
+    meo_key_rowid(&k[0], 8, (int64)((uint64)1 << 63));  // INT64_MIN
+    var key: MeoBtKey = { data: &k[0], len: 8 };
+    rc = meo_bt_seek(p, &sc->cur, sc->t->root, meo_tbl_cmp, key);
+  } else {
+    rc = meo_bt_next(p, &sc->cur);
+  }
+  if (rc != 0) {
+    sc->done = true;
+    meo_bt_close(p, &sc->cur);
+    return rc;
+  }
+  var lf: uint8* = sc->cur.leaf->data;
+  var at: int32 = sc->cur.slot_in_leaf;
+  var kl: int32 = meo_btn_leaf_key_len(lf, at);
+  if (kl < 9) {
+    sc->done = true;
+    meo_bt_close(p, &sc->cur);
+    return -MEO_ERR_CORRUPT;
+  }
+  row->rowid = (int64)meo_btn_leaf_rowid(lf, at);
+  row->rec = meo_btn_leaf_key_ptr(lf, at) + 8;
+  row->rec_len = kl - 8;
+  return 0;
+}
+
+// Release the scan's leaf. Always safe.
+export fn meo_tbl_scan_close(sc: MeoTblScan*) {
+  if (sc == 0 || sc->db == 0) { return; }
+  meo_bt_close(sc->db->pager, &sc->cur);
+  sc->done = true;
+}
+
+// Column `col` of a row, the rowid alias filled from the rowid. out.p
+// borrows row->rec.
+export fn meo_tbl_row_get(t: MeoTable*, row: MeoTblRow*, col: int32, out: MeoValue*) -> int32 {
+  if (t == 0 || row == 0 || out == 0 || col < 0 || col >= t->n_cols) {
+    return -MEO_ERR_USAGE;
+  }
+  if ((t->columns[col].cflags & MEO_COL_ROWID_ALIAS) != 0) {
+    meo_value_set_int(out, row->rowid);
+    return MEO_OK;
+  }
+  return meo_rec_get(row->rec, row->rec_len, col, out);
+}

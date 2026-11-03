@@ -1,0 +1,225 @@
+// sql/plan: resolve a MeoAst against one MeoTable and pick the access path
+// (D7). Sees schemas only (D1); the caller looks the table up.
+// Real: CREATE, INSERT, SELECT with FULL_SCAN.
+// WS8: WHERE paths, ORDER BY, LIMIT/OFFSET, UPDATE, DELETE.
+
+import "../error/status.mettle";
+import "../record/value.mettle";
+import "../mem/arena.mettle";
+import "../catalog/schema.mettle";
+import "ast.mettle";
+
+export const MEO_PATH_FULL_SCAN: int32 = 1;
+export const MEO_PATH_ROWID_EQ: int32 = 2;
+export const MEO_PATH_ROWID_IN: int32 = 3;
+export const MEO_PATH_UNIQUE_EQ: int32 = 4;
+export const MEO_PATH_UNIQUE_IN: int32 = 5;
+
+export struct MeoPlan {
+  kind: int32;            // MEO_AST_*
+  t: MeoTable*;           // resolved table; 0 for CREATE
+  table_id: int64;        // t->id, re-checked against the catalog at step
+
+  // CREATE: the columns to hand to meo_cat_create_table (arena; names are
+  // views into the AST).
+  new_cols: MeoColumn*;
+  n_new_cols: int32;
+
+  // INSERT: for table column c, col_src[c] is the operand index within one
+  // VALUES row, or -1 (the column was not listed: NULL).
+  col_src: int32*;
+
+  // SELECT: result column i is table column out_cols[i].
+  out_cols: int32*;
+  n_out: int32;
+
+  // WHERE (SELECT / UPDATE / DELETE): term_cols[k] = table column of term k.
+  term_cols: int32*;
+  access: int32;          // MEO_PATH_*
+  access_term: int32;     // the term that drives a non-scan path, -1
+
+  // ORDER BY: order_cols[k] = table column of item k. UPDATE: set_cols[k].
+  order_cols: int32*;
+  need_sort: bool;
+  set_cols: int32*;
+}
+
+export fn meo_plan_init(pl: MeoPlan*) {
+  pl->kind = 0;
+  pl->t = 0;
+  pl->table_id = 0;
+  pl->new_cols = 0;
+  pl->n_new_cols = 0;
+  pl->col_src = 0;
+  pl->out_cols = 0;
+  pl->n_out = 0;
+  pl->term_cols = 0;
+  pl->access = MEO_PATH_FULL_SCAN;
+  pl->access_term = -1;
+  pl->order_cols = 0;
+  pl->need_sort = false;
+  pl->set_cols = 0;
+}
+
+fn plan_name_eq(a: uint8*, an: int32, b: uint8*, bn: int32) -> bool {
+  if (an != bn) { return false; }
+  var i: int32 = 0;
+  while (i < an) {
+    var x: uint8 = a[i];
+    var y: uint8 = b[i];
+    if (x >= (uint8)65 && x <= (uint8)90) { x = x + (uint8)32; }
+    if (y >= (uint8)65 && y <= (uint8)90) { y = y + (uint8)32; }
+    if (x != y) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+// Column index of `nm` in t, or -1.
+export fn meo_plan_col(t: MeoTable*, nm: MeoAstName*) -> int32 {
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    if (plan_name_eq(t->columns[i].name, t->columns[i].name_len, nm->p, nm->n)) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+fn plan_ints(arena: MeoArena*, n: int32) -> int32* {
+  var k: int32 = n;
+  if (k < 1) { k = 1; }
+  return (int32*)meo_arena_alloc_zeroed(arena, (int64)k * 4);
+}
+
+fn plan_create(ast: MeoAst*, arena: MeoArena*, pl: MeoPlan*, err_off: int32*) -> int32 {
+  if (ast->n_cols < 1 || ast->n_cols > MEO_MAX_COLS) {
+    err_off[0] = ast->table.off;
+    return -MEO_ERR_SQL;
+  }
+  pl->new_cols = (MeoColumn*)meo_arena_alloc_zeroed(arena,
+    (int64)ast->n_cols * (int64)sizeof(MeoColumn));
+  if (pl->new_cols == 0) { return -MEO_ERR_NOMEM; }
+  var n_pk: int32 = 0;
+  var i: int32 = 0;
+  while (i < ast->n_cols) {
+    var cd: MeoAstColDef* = &ast->cols[i];
+    var c: MeoColumn* = &pl->new_cols[i];
+    c->name = cd->name.p;
+    c->name_len = cd->name.n;
+    c->affinity = cd->affinity;
+    c->cflags = cd->cflags;     // MEO_AST_C_* == MEO_COL_* (sql/ast header)
+    c->index_root = 0;
+    if ((cd->cflags & MEO_AST_C_PK) != 0) {
+      n_pk += 1;
+      if (cd->affinity == MEO_T_INT) {
+        c->cflags = c->cflags | MEO_COL_ROWID_ALIAS;
+      } else {
+        c->cflags = c->cflags | MEO_COL_NOT_NULL;   // a non-rowid PK implies NOT NULL
+      }
+    }
+    var j: int32 = 0;
+    while (j < i) {
+      if (plan_name_eq(pl->new_cols[j].name, pl->new_cols[j].name_len, c->name, c->name_len)) {
+        err_off[0] = cd->name.off;
+        return -MEO_ERR_SQL;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  if (n_pk > 1) {
+    err_off[0] = ast->table.off;
+    return -MEO_ERR_SQL;   // no composite keys in v1
+  }
+  pl->n_new_cols = ast->n_cols;
+  return MEO_OK;
+}
+
+fn plan_insert(ast: MeoAst*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*, err_off: int32*) -> int32 {
+  pl->col_src = plan_ints(arena, t->n_cols);
+  if (pl->col_src == 0) { return -MEO_ERR_NOMEM; }
+  var i: int32 = 0;
+  if (ast->n_names == 0) {
+    if (ast->row_width != t->n_cols) {
+      err_off[0] = ast->table.off;
+      return -MEO_ERR_SQL;
+    }
+    while (i < t->n_cols) {
+      pl->col_src[i] = i;
+      i += 1;
+    }
+    return MEO_OK;
+  }
+  if (ast->row_width != ast->n_names) {
+    err_off[0] = ast->table.off;
+    return -MEO_ERR_SQL;
+  }
+  while (i < t->n_cols) {
+    pl->col_src[i] = -1;
+    i += 1;
+  }
+  i = 0;
+  while (i < ast->n_names) {
+    var c: int32 = meo_plan_col(t, &ast->names[i]);
+    if (c < 0 || pl->col_src[c] >= 0) {
+      err_off[0] = ast->names[i].off;
+      return -MEO_ERR_SQL;     // unknown or repeated column
+    }
+    pl->col_src[c] = i;
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+fn plan_select(ast: MeoAst*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*, err_off: int32*) -> int32 {
+  var i: int32 = 0;
+  if (ast->select_star) {
+    pl->n_out = t->n_cols;
+    pl->out_cols = plan_ints(arena, t->n_cols);
+    if (pl->out_cols == 0) { return -MEO_ERR_NOMEM; }
+    while (i < t->n_cols) {
+      pl->out_cols[i] = i;
+      i += 1;
+    }
+  } else {
+    pl->n_out = ast->n_names;
+    pl->out_cols = plan_ints(arena, ast->n_names);
+    if (pl->out_cols == 0) { return -MEO_ERR_NOMEM; }
+    while (i < ast->n_names) {
+      var c: int32 = meo_plan_col(t, &ast->names[i]);
+      if (c < 0) {
+        err_off[0] = ast->names[i].off;
+        return -MEO_ERR_SQL;
+      }
+      pl->out_cols[i] = c;
+      i += 1;
+    }
+  }
+  if (ast->n_where > 0 || ast->n_order > 0 || ast->limit >= 0 || ast->offset > 0) {
+    err_off[0] = ast->table.off;
+    return -MEO_ERR_UNSUPPORTED;   // WS8: terms, access path, ORDER BY, LIMIT/OFFSET
+  }
+  pl->access = MEO_PATH_FULL_SCAN;
+  return MEO_OK;
+}
+
+// Build the plan for `ast` against table `t` (0 only for CREATE). MEO_OK,
+// -MEO_ERR_SQL (unknown table / column, arity; *err_off set),
+// -MEO_ERR_UNSUPPORTED, -MEO_ERR_NOMEM.
+export fn meo_plan_build(ast: MeoAst*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*,
+    err_off: int32*) -> int32 {
+  if (ast == 0 || arena == 0 || pl == 0 || err_off == 0) { return -MEO_ERR_USAGE; }
+  meo_plan_init(pl);
+  pl->kind = ast->kind;
+  if (ast->kind == MEO_AST_CREATE) { return plan_create(ast, arena, pl, err_off); }
+  if (t == 0) {
+    err_off[0] = ast->table.off;
+    return -MEO_ERR_SQL;     // no such table
+  }
+  pl->t = t;
+  pl->table_id = t->id;
+  if (ast->kind == MEO_AST_INSERT) { return plan_insert(ast, t, arena, pl, err_off); }
+  if (ast->kind == MEO_AST_SELECT) { return plan_select(ast, t, arena, pl, err_off); }
+  err_off[0] = ast->table.off;
+  return -MEO_ERR_UNSUPPORTED;   // WS8: UPDATE, DELETE
+}

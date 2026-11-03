@@ -1,0 +1,309 @@
+// sql/api: the public meo_sql_* interface (D8). Binds are 1-based and copy
+// bytes; columns are 0-based and borrowed until the next step/reset/finalize.
+// WS8 owns it.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../record/value.mettle";
+import "../mem/arena.mettle";
+import "../catalog/schema.mettle";
+import "../catalog/catalog.mettle";
+import "../db/db.mettle";
+import "../db/flags.mettle";
+import "ast.mettle";
+import "parser.mettle";
+import "plan.mettle";
+import "exec.mettle";
+
+fn api_free(st: MeoStmt*) {
+  var i: int32 = 0;
+  while (i < st->n_binds) {
+    if (st->bind_buf[i] != 0) { free(st->bind_buf[i]); }
+    i += 1;
+  }
+  if (st->bind_buf != 0) { free(st->bind_buf); }
+  if (st->bind_cap != 0) { free(st->bind_cap); }
+  if (st->binds != 0) { free(st->binds); }
+  if (st->res != 0) { free(st->res); }
+  if (st->res_arena != 0) { meo_arena_free(st->res_arena); }
+  if (st->arena != 0) { meo_arena_free(st->arena); }
+  if (st->sql != 0) { free(st->sql); }
+  free(st);
+}
+
+// Compile one statement. MEO_OK and *out; on failure *out = 0 and, for
+// -MEO_ERR_SQL / -MEO_ERR_UNSUPPORTED, *err_off is the byte offset (err_off
+// may be 0).
+export fn meo_sql_prepare(db: MeoDb*, sql: string, out: MeoStmt**, err_off: int32*) -> int32 {
+  if (db == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  out[0] = 0;
+  var off: int32 = 0;
+  if (err_off != 0) { err_off[0] = 0; }
+  var st: MeoStmt* = new MeoStmt;
+  if (st == 0) { return -MEO_ERR_NOMEM; }
+  st->db = db;
+  st->sql = 0;
+  st->arena = 0;
+  st->binds = 0;
+  st->bind_buf = 0;
+  st->bind_cap = 0;
+  st->n_binds = 0;
+  st->state = MEO_STMT_PREPARED;
+  st->err = MEO_OK;
+  st->res = 0;
+  st->res_cap = 0;
+  st->res_arena = 0;
+  st->n_rows = 0;
+  st->n_cols = 0;
+  st->cur = 0;
+  st->changes = 0;
+  st->last_rowid = 0;
+  var n: int64 = (int64)sql.length;
+  if (n > (int64)2147483646) {
+    api_free(st);
+    return -MEO_ERR_TOOBIG;
+  }
+  st->sql_len = (int32)n;
+  st->sql = malloc(n + 1);
+  st->arena = meo_arena_new(4096);
+  st->res_arena = meo_arena_new(65536);
+  if (st->sql == 0 || st->arena == 0 || st->res_arena == 0) {
+    api_free(st);
+    return -MEO_ERR_NOMEM;
+  }
+  meo_bytes_copy(st->sql, sql.chars, n);
+  st->sql[n] = 0;
+  var rc: int32 = meo_sql_parse(st->sql, st->sql_len, st->arena, &st->ast, &off);
+  if (rc == MEO_OK) {
+    rc = meo_db_enter(db);
+    if (rc == MEO_OK) {
+      var t: MeoTable* = 0;
+      if (st->ast.kind != MEO_AST_CREATE) {
+        t = meo_cat_find(db->cat, st->ast.table.p, st->ast.table.n);
+      }
+      rc = meo_plan_build(&st->ast, t, st->arena, &st->plan, &off);
+      if (rc == MEO_OK) { db->n_stmts += 1; }
+      meo_db_leave(db);
+    }
+  }
+  if (rc == MEO_OK && st->ast.n_params > 0) {
+    var k: int32 = st->ast.n_params;
+    st->binds = (MeoValue*)malloc((int64)k * (int64)sizeof(MeoValue));
+    st->bind_buf = (uint8**)malloc((int64)k * (int64)sizeof(uint8*));
+    st->bind_cap = (int32*)malloc((int64)k * 4);
+    if (st->binds == 0 || st->bind_buf == 0 || st->bind_cap == 0) {
+      meo_db_enter(db);
+      db->n_stmts -= 1;
+      meo_db_leave(db);
+      rc = -MEO_ERR_NOMEM;
+    } else {
+      st->n_binds = k;
+      var i: int32 = 0;
+      while (i < k) {
+        meo_value_set_null(&st->binds[i]);
+        st->bind_buf[i] = 0;
+        st->bind_cap[i] = 0;
+        i += 1;
+      }
+    }
+  }
+  if (rc != MEO_OK) {
+    if (err_off != 0) { err_off[0] = off; }
+    api_free(st);
+    return rc;
+  }
+  out[0] = st;
+  return MEO_OK;
+}
+
+export fn meo_sql_finalize(st: MeoStmt*) -> int32 {
+  if (st == 0) { return MEO_OK; }
+  var db: MeoDb* = st->db;
+  meo_db_enter(db);
+  db->n_stmts -= 1;
+  meo_db_leave(db);
+  api_free(st);
+  return MEO_OK;
+}
+
+// prepare + step to the end + finalize. MEO_OK or the first failure.
+export fn meo_sql_exec(db: MeoDb*, sql: string) -> int32 {
+  var st: MeoStmt* = 0;
+  var off: int32 = 0;
+  var rc: int32 = meo_sql_prepare(db, sql, &st, &off);
+  if (rc != MEO_OK) { return rc; }
+  while (true) {
+    rc = meo_exec_step(st);
+    if (rc != MEO_ROW) { break; }
+  }
+  meo_sql_finalize(st);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+export fn meo_sql_step(st: MeoStmt*) -> int32 {
+  return meo_exec_step(st);
+}
+
+export fn meo_sql_reset(st: MeoStmt*) -> int32 {
+  return meo_exec_reset(st);
+}
+
+export fn meo_sql_changes(st: MeoStmt*) -> int32 {
+  if (st == 0) { return 0; }
+  return st->changes;
+}
+
+export fn meo_sql_last_insert_rowid(st: MeoStmt*) -> int64 {
+  if (st == 0) { return 0; }
+  return st->last_rowid;
+}
+
+// --- binding ---------------------------------------------------------------
+
+export fn meo_sql_bind_count(st: MeoStmt*) -> int32 {
+  if (st == 0) { return 0; }
+  return st->n_binds;
+}
+
+// The slot for 1-based `i`, or 0 (bad index, or the statement is mid-rows).
+fn api_slot(st: MeoStmt*, i: int32) -> MeoValue* {
+  if (st == 0 || i < 1 || i > st->n_binds) { return 0; }
+  if (st->state == MEO_STMT_ROWS) { return 0; }
+  return &st->binds[i - 1];
+}
+
+fn api_bind_bytes(st: MeoStmt*, i: int32, p: uint8*, n: int32, blob: bool) -> int32 {
+  var v: MeoValue* = api_slot(st, i);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  if (n < 0 || (n > 0 && p == 0)) { return -MEO_ERR_USAGE; }
+  var k: int32 = i - 1;
+  if (st->bind_cap[k] < n + 1) {
+    var nb: uint8* = malloc((int64)n + 1);
+    if (nb == 0) { return -MEO_ERR_NOMEM; }
+    if (st->bind_buf[k] != 0) { free(st->bind_buf[k]); }
+    st->bind_buf[k] = nb;
+    st->bind_cap[k] = n + 1;
+  }
+  meo_bytes_copy(st->bind_buf[k], p, (int64)n);
+  st->bind_buf[k][n] = 0;
+  if (blob) {
+    meo_value_set_blob(v, st->bind_buf[k], n);
+  } else {
+    meo_value_set_text(v, st->bind_buf[k], n);
+  }
+  return MEO_OK;
+}
+
+export fn meo_sql_bind_null(st: MeoStmt*, i: int32) -> int32 {
+  var v: MeoValue* = api_slot(st, i);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  meo_value_set_null(v);
+  return MEO_OK;
+}
+
+export fn meo_sql_bind_int64(st: MeoStmt*, i: int32, x: int64) -> int32 {
+  var v: MeoValue* = api_slot(st, i);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  meo_value_set_int(v, x);
+  return MEO_OK;
+}
+
+export fn meo_sql_bind_double(st: MeoStmt*, i: int32, x: float64) -> int32 {
+  var v: MeoValue* = api_slot(st, i);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  meo_value_set_real(v, x);
+  return MEO_OK;
+}
+
+export fn meo_sql_bind_text(st: MeoStmt*, i: int32, s: string) -> int32 {
+  var n: int64 = (int64)s.length;
+  if (n > (int64)2147483646) { return -MEO_ERR_TOOBIG; }
+  return api_bind_bytes(st, i, s.chars, (int32)n, false);
+}
+
+export fn meo_sql_bind_blob(st: MeoStmt*, i: int32, p: uint8*, n: int32) -> int32 {
+  return api_bind_bytes(st, i, p, n, true);
+}
+
+// Bind a copy of *v (text/blob bytes copied).
+export fn meo_sql_bind_value(st: MeoStmt*, i: int32, v: MeoValue*) -> int32 {
+  var rc: int32 = meo_value_check(v);
+  if (rc != MEO_OK) { return -MEO_ERR_USAGE; }
+  if (v->type == MEO_T_INT) { return meo_sql_bind_int64(st, i, v->i); }
+  if (v->type == MEO_T_REAL) { return meo_sql_bind_double(st, i, v->f); }
+  if (v->type == MEO_T_TEXT) { return api_bind_bytes(st, i, v->p, v->n, false); }
+  if (v->type == MEO_T_BLOB) { return api_bind_bytes(st, i, v->p, v->n, true); }
+  return meo_sql_bind_null(st, i);
+}
+
+export fn meo_sql_clear_bindings(st: MeoStmt*) -> int32 {
+  if (st == 0) { return -MEO_ERR_USAGE; }
+  if (st->state == MEO_STMT_ROWS) { return -MEO_ERR_USAGE; }
+  var i: int32 = 0;
+  while (i < st->n_binds) {
+    meo_value_set_null(&st->binds[i]);
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// --- columns ---------------------------------------------------------------
+
+// Result columns of a SELECT (known after prepare), 0 for other statements.
+export fn meo_sql_column_count(st: MeoStmt*) -> int32 {
+  if (st == 0) { return 0; }
+  return st->plan.n_out;
+}
+
+// MEO_T_* of the current row's column i; MEO_T_NULL when there is none.
+export fn meo_sql_column_type(st: MeoStmt*, i: int32) -> int32 {
+  var v: MeoValue* = meo_exec_cell(st, i);
+  if (v == 0) { return MEO_T_NULL; }
+  return v->type;
+}
+
+export fn meo_sql_column_int64(st: MeoStmt*, i: int32) -> int64 {
+  var v: MeoValue* = meo_exec_cell(st, i);
+  if (v == 0) { return 0; }
+  if (v->type == MEO_T_INT) { return v->i; }
+  if (v->type == MEO_T_REAL) { return (int64)v->f; }
+  return 0;
+}
+
+export fn meo_sql_column_double(st: MeoStmt*, i: int32) -> float64 {
+  var v: MeoValue* = meo_exec_cell(st, i);
+  if (v == 0) { return 0.0; }
+  if (v->type == MEO_T_REAL) { return v->f; }
+  if (v->type == MEO_T_INT) { return (float64)v->i; }
+  return 0.0;
+}
+
+// NUL-terminated bytes of a TEXT (or BLOB) cell, borrowed; 0 otherwise.
+export fn meo_sql_column_text(st: MeoStmt*, i: int32) -> uint8* {
+  var v: MeoValue* = meo_exec_cell(st, i);
+  if (v == 0) { return 0; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) { return v->p; }
+  return 0;
+}
+
+export fn meo_sql_column_blob(st: MeoStmt*, i: int32) -> uint8* {
+  return meo_sql_column_text(st, i);
+}
+
+export fn meo_sql_column_bytes(st: MeoStmt*, i: int32) -> int32 {
+  var v: MeoValue* = meo_exec_cell(st, i);
+  if (v == 0) { return 0; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) { return v->n; }
+  return 0;
+}
+
+// Copy the cell into *out (out.p borrowed). -MEO_ERR_USAGE when not on a row.
+export fn meo_sql_column(st: MeoStmt*, i: int32, out: MeoValue*) -> int32 {
+  if (out == 0) { return -MEO_ERR_USAGE; }
+  var v: MeoValue* = meo_exec_cell(st, i);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  out[0] = v[0];
+  return MEO_OK;
+}

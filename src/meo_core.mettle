@@ -1,0 +1,4 @@
+// meo_core: import root of the embedded tier, db + tables, no SQL (D1).
+
+import "db/db.mettle";
+import "table/table.mettle";

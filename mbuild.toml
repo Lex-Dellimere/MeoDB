@@ -77,3 +77,8 @@ main = "tests/phase3.mettle"
 
 [bin.phase3_child]
 main = "tests/phase3_child.mettle"
+
+# Run 1, draft slice: CREATE TABLE + 3000 INSERTs in one transaction, reopen,
+# SELECT * -- one thin path through every new layer (DECISIONS.md D10).
+[bin.draft]
+main = "tests/draft.mettle"

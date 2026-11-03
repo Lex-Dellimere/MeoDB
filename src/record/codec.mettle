@@ -1,0 +1,143 @@
+// record/codec: a row's values <-> the record bytes after the rowid in a
+// table leaf key (D3). Column past n_cols reads NULL; any overrun is CORRUPT.
+// Size limits (MEO_REC_MAX, MEO_MAX_COLS) are enforced by table/, not here.
+// WS3: round-trip test (int64 min/max, -0.0, NaN, empty, 1280-byte record).
+
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../format/varint.mettle";
+import "value.mettle";
+
+// Bytes one value's body takes (the tag byte is counted by the caller).
+fn rec_body_size(v: MeoValue*) -> int32 {
+  if (v->type == MEO_T_INT) { return meo_varint_len(meo_zigzag_enc(v->i)); }
+  if (v->type == MEO_T_REAL) { return 8; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) {
+    return meo_varint_len((uint64)v->n) + v->n;
+  }
+  return 0;
+}
+
+// The encoded size of `n` values, or -MEO_ERR_USAGE / -MEO_ERR_MISMATCH for a
+// bad argument or a value meo_value_check rejects.
+export fn meo_rec_size(vals: MeoValue*, n: int32) -> int32 {
+  if (n < 0 || (n > 0 && vals == 0)) { return -MEO_ERR_USAGE; }
+  var total: int64 = (int64)meo_varint_len((uint64)n) + (int64)n;
+  var i: int32 = 0;
+  while (i < n) {
+    var rc: int32 = meo_value_check(&vals[i]);
+    if (rc != MEO_OK) { return rc; }
+    total += (int64)rec_body_size(&vals[i]);
+    if (total > (int64)2147483647) { return -MEO_ERR_TOOBIG; }
+    i += 1;
+  }
+  return (int32)total;
+}
+
+// Encode `n` values into buf[0..cap). Returns the byte count, -MEO_ERR_FULL
+// when cap is too small (buf may be partly written), or meo_rec_size's errors.
+export fn meo_rec_encode(buf: uint8*, cap: int32, vals: MeoValue*, n: int32) -> int32 {
+  if (buf == 0 || cap < 0) { return -MEO_ERR_USAGE; }
+  var need: int32 = meo_rec_size(vals, n);
+  if (need < 0) { return need; }
+  if (need > cap) { return -MEO_ERR_FULL; }
+  var off: int32 = meo_varint_put(buf, (int64)cap, (uint64)n);
+  if (off < 0) { return off; }
+  var i: int32 = 0;
+  while (i < n) {
+    buf[off] = (uint8)vals[i].type;
+    off += 1;
+    i += 1;
+  }
+  i = 0;
+  while (i < n) {
+    var v: MeoValue* = &vals[i];
+    if (v->type == MEO_T_INT) {
+      var w: int32 = meo_varint_put(buf + off, (int64)(cap - off), meo_zigzag_enc(v->i));
+      if (w < 0) { return w; }
+      off += w;
+    } else if (v->type == MEO_T_REAL) {
+      meo_put_f64le(buf, (int64)off, v->f);
+      off += 8;
+    } else if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) {
+      var w2: int32 = meo_varint_put(buf + off, (int64)(cap - off), (uint64)v->n);
+      if (w2 < 0) { return w2; }
+      off += w2;
+      meo_bytes_copy(buf + off, v->p, (int64)v->n);
+      off += v->n;
+    }
+    i += 1;
+  }
+  return off;
+}
+
+// Read the header: n_cols, and the offset of the first tag byte.
+fn rec_header(buf: uint8*, len: int32, ncols: int32*, tags_off: int32*) -> int32 {
+  if (buf == 0 || len <= 0) { return -MEO_ERR_CORRUPT; }
+  var u: uint64 = 0;
+  var w: int32 = meo_varint_get(buf, (int64)len, &u);
+  if (w < 0) { return -MEO_ERR_CORRUPT; }
+  if (u > (uint64)(len - w)) { return -MEO_ERR_CORRUPT; }
+  ncols[0] = (int32)u;
+  tags_off[0] = w;
+  return MEO_OK;
+}
+
+// The number of columns a record holds, or -MEO_ERR_CORRUPT.
+export fn meo_rec_ncols(buf: uint8*, len: int32) -> int32 {
+  var nc: int32 = 0;
+  var to: int32 = 0;
+  var rc: int32 = rec_header(buf, len, &nc, &to);
+  if (rc != MEO_OK) { return rc; }
+  return nc;
+}
+
+// Decode column `col` (0-based) into `out`. MEO_OK; a column past the
+// record's end reads as NULL; -MEO_ERR_CORRUPT for any overrun or bad tag;
+// -MEO_ERR_USAGE for a negative col or null out. TEXT/BLOB out.p borrows buf.
+export fn meo_rec_get(buf: uint8*, len: int32, col: int32, out: MeoValue*) -> int32 {
+  if (out == 0 || col < 0) { return -MEO_ERR_USAGE; }
+  var nc: int32 = 0;
+  var to: int32 = 0;
+  var rc: int32 = rec_header(buf, len, &nc, &to);
+  if (rc != MEO_OK) { return rc; }
+  meo_value_set_null(out);
+  if (col >= nc) { return MEO_OK; }
+  var off: int32 = to + nc;
+  var i: int32 = 0;
+  while (i <= col) {
+    var tag: int32 = (int32)buf[to + i];
+    if (tag == MEO_T_NULL) {
+      if (i == col) { meo_value_set_null(out); }
+    } else if (tag == MEO_T_INT) {
+      var u: uint64 = 0;
+      var w: int32 = meo_varint_get(buf + off, (int64)(len - off), &u);
+      if (w < 0) { return -MEO_ERR_CORRUPT; }
+      if (i == col) { meo_value_set_int(out, meo_zigzag_dec(u)); }
+      off += w;
+    } else if (tag == MEO_T_REAL) {
+      if (len - off < 8) { return -MEO_ERR_CORRUPT; }
+      if (i == col) { meo_value_set_real(out, meo_get_f64le(buf, (int64)off)); }
+      off += 8;
+    } else if (tag == MEO_T_TEXT || tag == MEO_T_BLOB) {
+      var ln: uint64 = 0;
+      var w2: int32 = meo_varint_get(buf + off, (int64)(len - off), &ln);
+      if (w2 < 0) { return -MEO_ERR_CORRUPT; }
+      off += w2;
+      if (ln > (uint64)(len - off)) { return -MEO_ERR_CORRUPT; }
+      if (i == col) {
+        if (tag == MEO_T_TEXT) {
+          meo_value_set_text(out, buf + off, (int32)ln);
+        } else {
+          meo_value_set_blob(out, buf + off, (int32)ln);
+        }
+      }
+      off += (int32)ln;
+    } else {
+      return -MEO_ERR_CORRUPT;
+    }
+    if (off > len) { return -MEO_ERR_CORRUPT; }
+    i += 1;
+  }
+  return MEO_OK;
+}

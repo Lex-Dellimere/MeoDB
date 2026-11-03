@@ -1,0 +1,476 @@
+// catalog/catalog: the persisted table list (D4), a D2 table tree at
+// meta.catalog_root. Rowid 0 = header ["meocat", 1]; rowid k = table id k:
+// [name, root, n_cols, tflags, then per column: name, affinity, cflags,
+// index_root]. MeoTable pointers stay valid while open; reload updates them
+// in place and marks vanished tables live = false.
+// WS5: save one row via meo_bt_delete + insert (draft rewrites the tree).
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../format/page.mettle";
+import "../format/meta.mettle";
+import "../pager/pager.mettle";
+import "../btree/node.mettle";
+import "../btree/btree.mettle";
+import "../types/key.mettle";
+import "../record/value.mettle";
+import "../record/codec.mettle";
+import "schema.mettle";
+
+export const MEO_CAT_VERSION: int32 = 1;
+
+export struct MeoCatalog {
+  pager: MeoPager*;
+  tables: MeoTable**;    // n_tables stable pointers, in id order of discovery
+  n_tables: int32;
+  cap_tables: int32;
+  next_id: int64;        // id the next CREATE TABLE gets
+}
+
+// The table-tree comparator: the first 8 bytes (the encoded rowid) decide.
+// table/ uses the same order (meo_tbl_cmp).
+export fn meo_cat_cmp(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
+  var n: int32 = an;
+  if (n > 8) { n = 8; }
+  var m: int32 = bn;
+  if (m > 8) { m = 8; }
+  return meo_key_compare(a, n, b, m);
+}
+
+// ASCII case-insensitive identifier equality.
+export fn meo_cat_name_eq(a: uint8*, an: int32, b: uint8*, bn: int32) -> bool {
+  if (an != bn) { return false; }
+  var i: int32 = 0;
+  while (i < an) {
+    var x: uint8 = a[i];
+    var y: uint8 = b[i];
+    if (x >= (uint8)65 && x <= (uint8)90) { x = x + (uint8)32; }
+    if (y >= (uint8)65 && y <= (uint8)90) { y = y + (uint8)32; }
+    if (x != y) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+fn cat_dup(p: uint8*, n: int32) -> uint8* {
+  var q: uint8* = malloc((int64)n + 1);
+  if (q == 0) { return 0; }
+  meo_bytes_copy(q, p, (int64)n);
+  q[n] = 0;
+  return q;
+}
+
+fn cat_free_table(t: MeoTable*) {
+  if (t == 0) { return; }
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    if (t->columns[i].name != 0) { free(t->columns[i].name); }
+    i += 1;
+  }
+  if (t->columns != 0) { free(t->columns); }
+  if (t->name != 0) { free(t->name); }
+  free(t);
+}
+
+fn cat_push(cat: MeoCatalog*, t: MeoTable*) -> int32 {
+  if (cat->n_tables == cat->cap_tables) {
+    var nc: int32 = cat->cap_tables * 2;
+    if (nc < 8) { nc = 8; }
+    var nt: MeoTable** = (MeoTable**)malloc((int64)nc * (int64)sizeof(MeoTable*));
+    if (nt == 0) { return -MEO_ERR_NOMEM; }
+    var i: int32 = 0;
+    while (i < cat->n_tables) {
+      nt[i] = cat->tables[i];
+      i += 1;
+    }
+    if (cat->tables != 0) { free(cat->tables); }
+    cat->tables = nt;
+    cat->cap_tables = nc;
+  }
+  cat->tables[cat->n_tables] = t;
+  cat->n_tables += 1;
+  return MEO_OK;
+}
+
+// --- decode ----------------------------------------------------------------
+
+fn cat_get_int(rec: uint8*, len: int32, col: int32, out: int64*) -> int32 {
+  var v: MeoValue;
+  var rc: int32 = meo_rec_get(rec, len, col, &v);
+  if (rc != MEO_OK) { return rc; }
+  if (v.type != MEO_T_INT) { return -MEO_ERR_CORRUPT; }
+  out[0] = v.i;
+  return MEO_OK;
+}
+
+fn cat_check_header(rec: uint8*, len: int32) -> int32 {
+  var v: MeoValue;
+  var rc: int32 = meo_rec_get(rec, len, 0, &v);
+  if (rc != MEO_OK) { return rc; }
+  if (v.type != MEO_T_TEXT || v.n != 6) { return -MEO_ERR_CORRUPT; }
+  var magic: string = "meocat";
+  if (!meo_bytes_equal(v.p, magic.chars, 6)) { return -MEO_ERR_CORRUPT; }
+  var ver: int64 = 0;
+  rc = cat_get_int(rec, len, 1, &ver);
+  if (rc != MEO_OK) { return rc; }
+  if (ver != (int64)MEO_CAT_VERSION) { return -MEO_ERR_VERSION; }
+  return MEO_OK;
+}
+
+// Decode one table row into a fresh MeoTable (live, owned buffers).
+fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int32 {
+  var v: MeoValue;
+  var rc: int32 = meo_rec_get(rec, len, 0, &v);
+  if (rc != MEO_OK) { return rc; }
+  if (v.type != MEO_T_TEXT || v.n <= 0) { return -MEO_ERR_CORRUPT; }
+  var root: int64 = 0;
+  var ncols: int64 = 0;
+  var tflags: int64 = 0;
+  rc = cat_get_int(rec, len, 1, &root);
+  if (rc == MEO_OK) { rc = cat_get_int(rec, len, 2, &ncols); }
+  if (rc == MEO_OK) { rc = cat_get_int(rec, len, 3, &tflags); }
+  if (rc != MEO_OK) { return rc; }
+  if (ncols < 1 || ncols > (int64)MEO_MAX_COLS || root < 0) { return -MEO_ERR_CORRUPT; }
+  var t: MeoTable* = new MeoTable;
+  if (t == 0) { return -MEO_ERR_NOMEM; }
+  t->id = id;
+  t->name = 0;
+  t->n_cols = 0;
+  t->columns = 0;
+  t->root = (uint32)root;
+  t->tflags = (int32)tflags;
+  t->live = true;
+  t->name = cat_dup(v.p, v.n);
+  t->name_len = v.n;
+  t->columns = (MeoColumn*)malloc(ncols * (int64)sizeof(MeoColumn));
+  if (t->name == 0 || t->columns == 0) {
+    cat_free_table(t);
+    return -MEO_ERR_NOMEM;
+  }
+  var i: int32 = 0;
+  while (i < (int32)ncols) {
+    t->columns[i].name = 0;
+    i += 1;
+  }
+  t->n_cols = (int32)ncols;
+  i = 0;
+  while (i < (int32)ncols) {
+    var base: int32 = 4 + i * 4;
+    var cv: MeoValue;
+    rc = meo_rec_get(rec, len, base, &cv);
+    if (rc == MEO_OK && (cv.type != MEO_T_TEXT || cv.n <= 0)) { rc = -MEO_ERR_CORRUPT; }
+    var aff: int64 = 0;
+    var cfl: int64 = 0;
+    var iroot: int64 = 0;
+    if (rc == MEO_OK) { rc = cat_get_int(rec, len, base + 1, &aff); }
+    if (rc == MEO_OK) { rc = cat_get_int(rec, len, base + 2, &cfl); }
+    if (rc == MEO_OK) { rc = cat_get_int(rec, len, base + 3, &iroot); }
+    if (rc == MEO_OK && !meo_schema_affinity_ok((int32)aff)) { rc = -MEO_ERR_CORRUPT; }
+    if (rc != MEO_OK) {
+      cat_free_table(t);
+      return rc;
+    }
+    t->columns[i].name = cat_dup(cv.p, cv.n);
+    if (t->columns[i].name == 0) {
+      cat_free_table(t);
+      return -MEO_ERR_NOMEM;
+    }
+    t->columns[i].name_len = cv.n;
+    t->columns[i].affinity = (int32)aff;
+    t->columns[i].cflags = (int32)cfl;
+    t->columns[i].index_root = (uint32)iroot;
+    i += 1;
+  }
+  out[0] = t;
+  return MEO_OK;
+}
+
+// Merge a decoded table into the catalog: update the existing object with the
+// same id in place (its pointer stays valid), or append the new one.
+fn cat_merge(cat: MeoCatalog*, t: MeoTable*) -> int32 {
+  var i: int32 = 0;
+  while (i < cat->n_tables) {
+    var old: MeoTable* = cat->tables[i];
+    if (old->id == t->id) {
+      // v1 has no ALTER: the shape cannot change, only the roots.
+      if (old->n_cols != t->n_cols) {
+        cat_free_table(t);
+        return -MEO_ERR_CORRUPT;
+      }
+      old->root = t->root;
+      old->tflags = t->tflags;
+      old->live = true;
+      var k: int32 = 0;
+      while (k < old->n_cols) {
+        old->columns[k].index_root = t->columns[k].index_root;
+        k += 1;
+      }
+      cat_free_table(t);
+      return MEO_OK;
+    }
+    i += 1;
+  }
+  var rc: int32 = cat_push(cat, t);
+  if (rc != MEO_OK) { cat_free_table(t); }
+  return rc;
+}
+
+// Re-read the catalog tree into `cat` in place (see the header). MEO_OK,
+// -MEO_ERR_VERSION for a foreign header version, -MEO_ERR_CORRUPT for an
+// undecodable row, or a pager/b-tree error.
+export fn meo_cat_reload(cat: MeoCatalog*) -> int32 {
+  if (cat == 0) { return -MEO_ERR_USAGE; }
+  var p: MeoPager* = cat->pager;
+  var i: int32 = 0;
+  while (i < cat->n_tables) {
+    cat->tables[i]->live = false;
+    i += 1;
+  }
+  cat->next_id = 1;
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
+  if (root == 0) { return MEO_OK; }
+  var k0: uint8[8];
+  meo_key_rowid(&k0[0], 8, 0);
+  var key: MeoBtKey = { data: &k0[0], len: 8 };
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = meo_bt_seek(p, &c, root, meo_cat_cmp, key);
+  var seen_header: bool = false;
+  while (rc == 0) {
+    var kp: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
+    var kl: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+    var rid: uint64 = meo_btn_leaf_rowid(c.leaf->data, c.slot_in_leaf);
+    if (kl < 9) {
+      rc = -MEO_ERR_CORRUPT;
+      break;
+    }
+    if (rid == 0) {
+      rc = cat_check_header(kp + 8, kl - 8);
+      if (rc != MEO_OK) { break; }
+      seen_header = true;
+    } else {
+      if (!seen_header) {
+        rc = -MEO_ERR_CORRUPT;
+        break;
+      }
+      var t: MeoTable* = 0;
+      rc = cat_decode_table((int64)rid, kp + 8, kl - 8, &t);
+      if (rc != MEO_OK) { break; }
+      rc = cat_merge(cat, t);
+      if (rc != MEO_OK) { break; }
+      if ((int64)rid >= cat->next_id) { cat->next_id = (int64)rid + 1; }
+    }
+    rc = meo_bt_next(p, &c);
+  }
+  meo_bt_close(p, &c);
+  if (rc < 0) { return rc; }
+  if (!seen_header) { return -MEO_ERR_CORRUPT; }
+  return MEO_OK;
+}
+
+// Load the catalog of an open pager into a new MeoCatalog.
+export fn meo_cat_open(p: MeoPager*, out: MeoCatalog**) -> int32 {
+  if (p == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  out[0] = 0;
+  var cat: MeoCatalog* = new MeoCatalog;
+  if (cat == 0) { return -MEO_ERR_NOMEM; }
+  cat->pager = p;
+  cat->tables = 0;
+  cat->n_tables = 0;
+  cat->cap_tables = 0;
+  cat->next_id = 1;
+  var rc: int32 = meo_cat_reload(cat);
+  if (rc != MEO_OK) {
+    meo_cat_close(cat);
+    return rc;
+  }
+  out[0] = cat;
+  return MEO_OK;
+}
+
+// Free the catalog and every MeoTable it ever held. The pager is not touched.
+export fn meo_cat_close(cat: MeoCatalog*) {
+  if (cat == 0) { return; }
+  var i: int32 = 0;
+  while (i < cat->n_tables) {
+    cat_free_table(cat->tables[i]);
+    i += 1;
+  }
+  if (cat->tables != 0) { free(cat->tables); }
+  free(cat);
+}
+
+// The live table with this name (ASCII case-insensitive), or 0.
+export fn meo_cat_find(cat: MeoCatalog*, name: uint8*, n: int32) -> MeoTable* {
+  if (cat == 0 || name == 0) { return 0; }
+  var i: int32 = 0;
+  while (i < cat->n_tables) {
+    var t: MeoTable* = cat->tables[i];
+    if (t->live && meo_cat_name_eq(t->name, t->name_len, name, n)) { return t; }
+    i += 1;
+  }
+  return 0;
+}
+
+// The table with this id, live or not, or 0.
+export fn meo_cat_get(cat: MeoCatalog*, id: int64) -> MeoTable* {
+  if (cat == 0) { return 0; }
+  var i: int32 = 0;
+  while (i < cat->n_tables) {
+    if (cat->tables[i]->id == id) { return cat->tables[i]; }
+    i += 1;
+  }
+  return 0;
+}
+
+// --- encode / save ---------------------------------------------------------
+
+// Insert one row (rowid, values) into the catalog tree under construction.
+fn cat_put_row(p: MeoPager*, root: uint32*, rowid: int64, vals: MeoValue*, n: int32) -> int32 {
+  var sz: int32 = meo_rec_size(vals, n);
+  if (sz < 0) { return sz; }
+  var buf: uint8* = malloc((int64)sz + 8);
+  if (buf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(buf);
+  meo_key_rowid(buf, 8, rowid);
+  var w: int32 = meo_rec_encode(buf + 8, sz, vals, n);
+  if (w < 0) { return w; }
+  var key: MeoBtKey = { data: buf, len: w + 8 };
+  return meo_bt_insert_sep(p, root, meo_cat_cmp, key, (uint64)rowid, 8);
+}
+
+fn cat_put_table(p: MeoPager*, root: uint32*, t: MeoTable*) -> int32 {
+  var n: int32 = 4 + 4 * t->n_cols;
+  var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
+  if (vals == 0) { return -MEO_ERR_NOMEM; }
+  defer free(vals);
+  meo_value_set_text(&vals[0], t->name, t->name_len);
+  meo_value_set_int(&vals[1], (int64)t->root);
+  meo_value_set_int(&vals[2], (int64)t->n_cols);
+  meo_value_set_int(&vals[3], (int64)t->tflags);
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    var b: int32 = 4 + i * 4;
+    meo_value_set_text(&vals[b], t->columns[i].name, t->columns[i].name_len);
+    meo_value_set_int(&vals[b + 1], (int64)t->columns[i].affinity);
+    meo_value_set_int(&vals[b + 2], (int64)t->columns[i].cflags);
+    meo_value_set_int(&vals[b + 3], (int64)t->columns[i].index_root);
+    i += 1;
+  }
+  return cat_put_row(p, root, t->id, vals, n);
+}
+
+// Return every page of the tree under `page` to the freelist.
+fn cat_free_tree(p: MeoPager*, page: uint32, depth: int32) -> int32 {
+  if (page == 0) { return MEO_OK; }
+  if (depth >= MEO_BT_MAX_DEPTH) { return -MEO_ERR_CORRUPT; }
+  var f: MeoFrame* = meo_pager_get(p, page, false);
+  if (f == 0) { return -MEO_ERR_CORRUPT; }
+  var rc: int32 = MEO_OK;
+  if (!meo_btn_is_leaf(f->data)) {
+    var n: int32 = meo_page_n_cells(f->data);
+    var i: int32 = 0;
+    while (i < n && rc == MEO_OK) {
+      rc = cat_free_tree(p, meo_btn_inner_child(f->data, i), depth + 1);
+      i += 1;
+    }
+  }
+  meo_pager_release(p, f, false);
+  if (rc != MEO_OK) { return rc; }
+  return meo_pager_free_page(p, page);
+}
+
+// Persist `t`'s current row (name, roots, columns) in the caller's pager
+// transaction. DRAFT: rewrites the whole catalog tree; see the header.
+export fn meo_cat_save_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
+  if (cat == 0 || t == 0) { return -MEO_ERR_USAGE; }
+  var p: MeoPager* = cat->pager;
+  var root: uint32 = 0;
+  var hv: MeoValue[2];
+  var magic: string = "meocat";
+  meo_value_set_text(&hv[0], magic.chars, 6);
+  meo_value_set_int(&hv[1], (int64)MEO_CAT_VERSION);
+  var rc: int32 = cat_put_row(p, &root, 0, &hv[0], 2);
+  var i: int32 = 0;
+  while (rc == MEO_OK && i < cat->n_tables) {
+    if (cat->tables[i]->live) { rc = cat_put_table(p, &root, cat->tables[i]); }
+    i += 1;
+  }
+  if (rc != MEO_OK) { return rc; }
+  var old: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
+  rc = meo_pager_set_root(p, MEO_ROOT_CATALOG, root);
+  if (rc != MEO_OK) { return rc; }
+  return cat_free_tree(p, old, 0);
+}
+
+// Create a table: validate, copy name and columns, give it the next id and
+// root 0 (its tree is created by the first insert), and save it. MEO_OK and
+// *out set; -MEO_ERR_SQL when a live table has the name or two columns share
+// one; -MEO_ERR_USAGE for 0 or more than MEO_MAX_COLS columns or a bad
+// affinity. The caller holds the db lock and a pager transaction.
+export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
+    cols: MeoColumn*, n_cols: int32, out: MeoTable**) -> int32 {
+  if (cat == 0 || name == 0 || name_len <= 0 || cols == 0 || out == 0) {
+    return -MEO_ERR_USAGE;
+  }
+  if (n_cols < 1 || n_cols > MEO_MAX_COLS) { return -MEO_ERR_USAGE; }
+  if (meo_cat_find(cat, name, name_len) != 0) { return -MEO_ERR_SQL; }
+  var i: int32 = 0;
+  while (i < n_cols) {
+    if (!meo_schema_affinity_ok(cols[i].affinity) || cols[i].name_len <= 0) {
+      return -MEO_ERR_USAGE;
+    }
+    var j: int32 = 0;
+    while (j < i) {
+      if (meo_cat_name_eq(cols[i].name, cols[i].name_len, cols[j].name, cols[j].name_len)) {
+        return -MEO_ERR_SQL;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  var t: MeoTable* = new MeoTable;
+  if (t == 0) { return -MEO_ERR_NOMEM; }
+  t->id = cat->next_id;
+  t->root = 0;
+  t->tflags = 0;
+  t->live = true;
+  t->n_cols = 0;
+  t->name = cat_dup(name, name_len);
+  t->name_len = name_len;
+  t->columns = (MeoColumn*)malloc((int64)n_cols * (int64)sizeof(MeoColumn));
+  if (t->name == 0 || t->columns == 0) {
+    cat_free_table(t);
+    return -MEO_ERR_NOMEM;
+  }
+  i = 0;
+  while (i < n_cols) {
+    t->columns[i].name = cat_dup(cols[i].name, cols[i].name_len);
+    t->columns[i].name_len = cols[i].name_len;
+    t->columns[i].affinity = cols[i].affinity;
+    t->columns[i].cflags = cols[i].cflags;
+    t->columns[i].index_root = 0;
+    t->n_cols = i + 1;
+    if (t->columns[i].name == 0) {
+      cat_free_table(t);
+      return -MEO_ERR_NOMEM;
+    }
+    i += 1;
+  }
+  var rc: int32 = cat_push(cat, t);
+  if (rc != MEO_OK) {
+    cat_free_table(t);
+    return rc;
+  }
+  rc = meo_cat_save_table(cat, t);
+  if (rc != MEO_OK) {
+    // Not saved: hide it. The object stays (pointers are stable); the caller
+    // rolls the transaction back, and reload would drop it anyway.
+    t->live = false;
+    return rc;
+  }
+  cat->next_id += 1;
+  out[0] = t;
+  return MEO_OK;
+}

@@ -1,0 +1,4 @@
+// meosql: import root of the full engine, meo_core + sql/api (D1).
+
+import "meo_core.mettle";
+import "sql/api.mettle";
