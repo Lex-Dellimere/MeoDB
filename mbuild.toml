@@ -60,3 +60,7 @@ main = "tests/j_self.mettle"
 
 [bin.journal_self]
 main = "tests/journal_self.mettle"
+
+# The change feed and the persisted commit counter (src/feed/, meta.commit_seq).
+[bin.feed_self]
+main = "tests/feed_self.mettle"

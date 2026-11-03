@@ -1,0 +1,1109 @@
+// feed_self: the committed-change feed (src/feed/feed.mettle) and the
+// persisted commit counter (meta.commit_seq, meo_peek_commit_seq).
+//
+// A program, not @test functions: every case needs real files in build/, a
+// pager, fork and threads, none of which the compile-time interpreter gives.
+//
+//   mbuild run feed_self        (and -r for release)
+//
+// Prints "PASS <case>" per case and "FAIL <case>: <detail>" per failing check;
+// a failing case stops the run. tests/tinytest.mettle is the reporting layer.
+//
+// Cases, each with the bug it exists to catch:
+//   f1_commit        a commit publishes exactly its inserts, in order, with
+//                    consecutive seqs, one commit_seq and a nondecreasing time;
+//                    nothing is visible before the commit. Catches publishing
+//                    at capture time, or out of order.
+//   f2_rollback      an explicit rollback publishes nothing and the next commit
+//                    carries none of the rolled-back events. Catches a
+//                    pending buffer that survives a rollback.
+//   f3_close         close with an open transaction publishes nothing, detaches
+//                    the feed, and a re-attached feed reports a GAP first.
+//                    Catches the implicit rollback path skipping the hook.
+//   f4_free          free with an open transaction publishes nothing. Catches
+//                    the other implicit rollback path.
+//   f5_replace       a second write of a key is REPLACE with the old rowid; a
+//                    new key is INSERT with old_rowid 0. Catches a capture that
+//                    classifies after the write instead of before it.
+//   f6_root_split    every root change the caller sees is one ROOT_MOVED event
+//                    with the old and new root. Catches a feed that lets a root
+//                    tracker go stale.
+//   f7_gap           a reader that falls behind the ring gets exactly one GAP
+//                    and continues; an overflowing transaction publishes one
+//                    GAP instead of partial data.
+//   f8_two_readers   two cursors read the same events independently.
+//   f9_persist_peek  commit_seq survives close/reopen, is readable from disk by
+//                    meo_peek_commit_seq while the pager is open, peek answers 1
+//                    while a journal exists, and autocommit flushes count
+//                    (empty ones do not) and publish their events.
+//   f10_crash        a process killed between the commit's fsync and the journal
+//                    unlink: peek sees the uncommitted value with status 1;
+//                    recovery restores the pre-transaction commit_seq and data;
+//                    a feed in the new process is empty.
+//   f11_threads      a writer thread commits N transactions while a reader
+//                    thread polls: every event exactly once, in order, no GAP.
+//
+// f10 uses fork(57), _exit(60) and wait4(61) exactly as journal_self's j4
+// does: a genuine process death with no unwinding.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/btree.mettle";
+import "../src/feed/feed.mettle";
+import "tinytest.mettle";
+
+const F_DB: string = "build/feed_self.dat";
+const F_DB2: string = "build/feed_self_threads.dat";
+const F_TABLE: uint32 = 7;
+const F_OUT_CAP: int32 = 4096;
+const F_KEY_CAP: int32 = 1048576;
+// f6's keys: an int key padded to 200 bytes, so few fit a page and the root
+// splits twice within a few hundred inserts.
+const F_WIDE: int32 = 200;
+
+// Read scratch shared by the single-threaded cases (allocated in main).
+var g_out: MeoChange* = 0;
+var g_kb: uint8* = 0;
+
+// --- helpers ---------------------------------------------------------------
+
+fn fd_jpath(db: string) -> string {
+  var out: string = db + "-journal";
+  return out;
+}
+
+fn fd_exists(path: string) -> bool {
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return false; }
+  meo_file_close(f);
+  return true;
+}
+
+// Make `db` a zero-byte file and remove any journal beside it.
+fn fd_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = fd_jpath(db);
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn fd_open(db: string) -> MeoPager* {
+  return meo_pager_open(db, 16, MEO_PAGER_CREATE);
+}
+
+fn fd_close(p: MeoPager*) -> int32 {
+  var rc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  return rc;
+}
+
+// Insert key v -> rowid through the feed. The key bytes live on this frame;
+// the feed and the tree both copy them.
+fn fd_ins(f: MeoFeed*, p: MeoPager*, root: uint32*, v: int64,
+    rowid: uint64) -> int32 {
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, v);
+  if (n < 0) { return n; }
+  var k: MeoBtKey = { data: &kb[0], len: n };
+  return meo_feed_insert(f, p, F_TABLE, root, &meo_key_compare, k, rowid);
+}
+
+// Is the change's key the encoding of v?
+fn fd_key_is(c: MeoChange*, v: int64) -> bool {
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, v);
+  if (c->key_len != n || c->key == 0) { return false; }
+  return meo_key_compare(c->key, c->key_len, &kb[0], n) == 0;
+}
+
+fn fd_lookup(p: MeoPager*, root: uint32, v: int64, out: uint64*) -> int32 {
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, v);
+  var k: MeoBtKey = { data: &kb[0], len: n };
+  return meo_bt_lookup(p, root, &meo_key_compare, k, out);
+}
+
+// Insert a wide key (key v, zero-padded to F_WIDE bytes) through the feed.
+fn fd_ins_wide(f: MeoFeed*, p: MeoPager*, root: uint32*, v: int64) -> int32 {
+  var kb: uint8[200];
+  var i: int32 = 0;
+  while (i < F_WIDE) {
+    kb[i] = 0;
+    i += 1;
+  }
+  var n: int32 = meo_key_int(&kb[0], F_WIDE, v);
+  if (n < 0) { return n; }
+  var k: MeoBtKey = { data: &kb[0], len: F_WIDE };
+  return meo_feed_insert(f, p, F_TABLE, root, &meo_key_compare, k, (uint64)v);
+}
+
+// Is the change's key the wide encoding of v?
+fn fd_wide_is(c: MeoChange*, v: int64) -> bool {
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, v);
+  if (c->key_len != F_WIDE || c->key == 0) { return false; }
+  return meo_key_compare(c->key, n, &kb[0], n) == 0;
+}
+
+fn fd_read(f: MeoFeed*, cur: MeoFeedCursor*) -> int32 {
+  return meo_feed_read(f, cur, g_out, F_OUT_CAP, g_kb, F_KEY_CAP);
+}
+
+// --- f1: commit publishes exactly the inserts ------------------------------
+
+fn f1_commit() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f1: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  if (!meo_t_check(p != 0, "f1: open")) { return 1; }
+  var f: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check(f != 0, "f1: feed_new")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "f1: attach")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "f1: begin")) { return 1; }
+  var i: int64 = 1;
+  while (i <= 5) {
+    if (!meo_t_check_i64(fd_ins(f, p, &root, i * 10, (uint64)(100 + i)),
+        MEO_OK, "f1: insert")) {
+      return 1;
+    }
+    i += 1;
+  }
+  // INSERT 10, ROOT_MOVED (the tree's first page), INSERT 20..50.
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 6, "f1: six pending")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fd_read(f, &cur), 0,
+      "f1: nothing is visible before the commit")) {
+    return 1;
+  }
+  if (!meo_t_check_false(meo_feed_pending_for(f, &cur),
+      "f1: pending_for is false before the commit")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "f1: commit")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(p), 1,
+      "f1: commit_seq is 1")) {
+    return 1;
+  }
+  if (!meo_t_check(meo_feed_pending_for(f, &cur),
+      "f1: pending_for is true after the commit")) {
+    return 1;
+  }
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 6, "f1: six events")) { return 1; }
+  var k: int32 = 0;
+  while (k < 6) {
+    var c: MeoChange* = &g_out[k];
+    if (!meo_t_check_i64((int64)c->seq, (int64)(k + 1),
+        "f1: consecutive seqs from 1")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)c->commit_seq, 1, "f1: one commit_seq")) {
+      return 1;
+    }
+    if (!meo_t_check(c->time_us > 0, "f1: a wall-clock time")) { return 1; }
+    if (!meo_t_check_i64(c->time_us, g_out[0].time_us,
+        "f1: one time per commit")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)c->table_id, (int64)F_TABLE, "f1: table_id")) {
+      return 1;
+    }
+    k += 1;
+  }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "f1: 0 INSERT")) {
+    return 1;
+  }
+  if (!meo_t_check(fd_key_is(&g_out[0], 10), "f1: 0 key 10")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].rowid, 101, "f1: 0 rowid")) { return 1; }
+  if (!meo_t_check_i64(g_out[1].kind, MEO_CHANGE_ROOT_MOVED,
+      "f1: 1 ROOT_MOVED")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[1].rowid, (int64)root,
+      "f1: 1 new root")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[1].old_rowid, 0, "f1: 1 old root 0")) {
+    return 1;
+  }
+  k = 2;
+  while (k < 6) {
+    if (!meo_t_check_i64(g_out[k].kind, MEO_CHANGE_INSERT, "f1: INSERT")) {
+      return 1;
+    }
+    if (!meo_t_check(fd_key_is(&g_out[k], (int64)k * 10), "f1: key order")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)g_out[k].old_rowid, 0, "f1: old_rowid 0")) {
+      return 1;
+    }
+    k += 1;
+  }
+  var t1: int64 = g_out[0].time_us;
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f1: read once only")) { return 1; }
+
+  // A second commit: commit_seq 2, a time not before the first.
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "f1: begin 2")) { return 1; }
+  if (!meo_t_check_i64(fd_ins(f, p, &root, 60, 106), MEO_OK, "f1: ins 60")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "f1: commit 2")) {
+    return 1;
+  }
+  n = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f1: one event in commit 2")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].seq, 7, "f1: seq continues")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq, 2, "f1: commit_seq 2")) {
+    return 1;
+  }
+  if (!meo_t_check(g_out[0].time_us >= t1, "f1: time nondecreasing")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f), 2, "f1: last_commit")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fd_close(p), MEO_OK, "f1: close")) { return 1; }
+  meo_feed_free(f);
+  println("PASS f1_commit");
+  return 0;
+}
+
+// --- f2: explicit rollback --------------------------------------------------
+
+fn f2_rollback() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f2: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  if (!meo_t_check(p != 0, "f2: open")) { return 1; }
+  var f: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "f2: attach")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 1, 1);
+  meo_pager_commit(p);
+  if (!meo_t_check_i64(fd_read(f, &cur), 2, "f2: the seed commit")) {
+    return 1;
+  }
+  var saved_root: uint32 = root;
+
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "f2: begin")) { return 1; }
+  var i: int64 = 100;
+  while (i < 103) {
+    if (!meo_t_check_i64(fd_ins(f, p, &root, i, (uint64)i), MEO_OK,
+        "f2: insert")) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 3, "f2: three pending")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_rollback(p), MEO_OK, "f2: rollback")) {
+    return 1;
+  }
+  root = saved_root; // the caller's copy of the root goes back with the txn
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 0,
+      "f2: rollback discarded the pending events")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f2: nothing published")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(p), 1,
+      "f2: commit_seq unchanged by the rollback")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f), 1,
+      "f2: last_commit unchanged")) {
+    return 1;
+  }
+  // The next commit carries only its own event.
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 200, 200);
+  meo_pager_commit(p);
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f2: only the new commit's event")) { return 1; }
+  if (!meo_t_check(fd_key_is(&g_out[0], 200), "f2: key 200")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq, 2, "f2: commit_seq 2")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fd_close(p), MEO_OK, "f2: close")) { return 1; }
+  meo_feed_free(f);
+  println("PASS f2_rollback");
+  return 0;
+}
+
+// --- f3: close with an open transaction ------------------------------------
+
+fn f3_close() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f3: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var f: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "f3: attach")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 5, 5);
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "f3: close")) { return 1; }
+  meo_pager_free(p);
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f3: nothing published")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 0, "f3: pending dropped")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f), 0, "f3: no commit")) {
+    return 1;
+  }
+  // The close detached the feed, so it can be attached again -- and the
+  // first commit it then publishes is a GAP, because it was blind meanwhile.
+  var q: MeoPager* = fd_open(F_DB);
+  if (!meo_t_check(q != 0, "f3: reopen")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(q), 0,
+      "f3: the rolled-back commit never counted")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_feed_attach(q, f), MEO_OK, "f3: re-attach")) {
+    return 1;
+  }
+  root = 0;
+  meo_pager_begin(q);
+  fd_ins(f, q, &root, 6, 6);
+  meo_pager_commit(q);
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f3: one event")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP,
+      "f3: a re-attached feed reports a GAP")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq, 1, "f3: gap commit_seq")) {
+    return 1;
+  }
+  // And it is ordinary again afterwards.
+  meo_pager_begin(q);
+  fd_ins(f, q, &root, 7, 7);
+  meo_pager_commit(q);
+  n = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f3: one event after the gap")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "f3: INSERT")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_feed_detach(q), MEO_OK, "f3: detach")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_detach(q), -MEO_ERR_USAGE,
+      "f3: detach twice is refused")) {
+    return 1;
+  }
+  fd_close(q);
+  meo_feed_free(f);
+  println("PASS f3_close");
+  return 0;
+}
+
+// --- f4: free with an open transaction -------------------------------------
+
+fn f4_free() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f4: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var f: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "f4: attach")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 5, 5);
+  fd_ins(f, p, &root, 6, 6);
+  meo_pager_free(p);
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f4: nothing published")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 0, "f4: pending dropped")) {
+    return 1;
+  }
+  var jpath: string = fd_jpath(F_DB);
+  var hot: bool = fd_exists(jpath);
+  free(jpath.chars);
+  if (!meo_t_check_false(hot, "f4: free rolled back, no journal left")) {
+    return 1;
+  }
+  meo_feed_free(f);
+  println("PASS f4_free");
+  return 0;
+}
+
+// --- f5: replace classification --------------------------------------------
+
+fn f5_replace() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f5: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var f: MeoFeed* = meo_feed_new(64);
+  meo_feed_attach(p, f);
+  var cur: MeoFeedCursor;
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 42, 10);
+  meo_pager_commit(p);
+  meo_feed_cursor_end(f, &cur);
+  meo_pager_begin(p);
+  if (!meo_t_check_i64(fd_ins(f, p, &root, 42, 20), MEO_OK, "f5: replace")) {
+    return 1;
+  }
+  fd_ins(f, p, &root, 43, 30);
+  meo_pager_commit(p);
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 2, "f5: two events")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_REPLACE, "f5: REPLACE")) {
+    return 1;
+  }
+  if (!meo_t_check(fd_key_is(&g_out[0], 42), "f5: replace key")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].rowid, 20, "f5: new rowid")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[0].old_rowid, 10, "f5: old rowid")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(g_out[1].kind, MEO_CHANGE_INSERT, "f5: INSERT")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[1].old_rowid, 0, "f5: insert old 0")) {
+    return 1;
+  }
+  var rid: uint64 = 0;
+  if (!meo_t_check_i64(fd_lookup(p, root, 42, &rid), MEO_OK, "f5: lookup")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)rid, 20, "f5: the tree holds the new rowid")) {
+    return 1;
+  }
+  fd_close(p);
+  meo_feed_free(f);
+  println("PASS f5_replace");
+  return 0;
+}
+
+// --- f6: root splits --------------------------------------------------------
+
+fn f6_root_split() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f6: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var f: MeoFeed* = meo_feed_new(4096);
+  meo_feed_attach(p, f);
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  var roots: uint32[16];
+  var n_roots: int32 = 0;
+  meo_pager_begin(p);
+  var i: int64 = 0;
+  while (i < 600) {
+    var before: uint32 = root;
+    if (!meo_t_check_i64(fd_ins_wide(f, p, &root, i), MEO_OK,
+        "f6: insert")) {
+      return 1;
+    }
+    if (root != before) {
+      if (!meo_t_check(n_roots < 16, "f6: root changes fit")) { return 1; }
+      roots[n_roots] = root;
+      n_roots += 1;
+    }
+    i += 1;
+  }
+  if (!meo_t_check(n_roots >= 3,
+      "f6: the tree was created and its root split at least twice")) {
+    return 1;
+  }
+  meo_pager_commit(p);
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 600 + n_roots, "f6: inserts plus root moves")) {
+    return 1;
+  }
+  var seen: int32 = 0;
+  var prev: uint32 = 0;
+  var inserts: int32 = 0;
+  var k: int32 = 0;
+  while (k < n) {
+    var c: MeoChange* = &g_out[k];
+    if (c->kind == MEO_CHANGE_ROOT_MOVED) {
+      if (!meo_t_check_i64((int64)c->old_rowid, (int64)prev,
+          "f6: ROOT_MOVED names the previous root")) {
+        return 1;
+      }
+      if (!meo_t_check_i64((int64)c->rowid, (int64)roots[seen],
+          "f6: ROOT_MOVED names the root the caller saw")) {
+        return 1;
+      }
+      if (!meo_t_check_i64(c->key_len, 0, "f6: ROOT_MOVED has no key")) {
+        return 1;
+      }
+      prev = (uint32)c->rowid;
+      seen += 1;
+    } else {
+      if (!meo_t_check(fd_wide_is(c, (int64)inserts), "f6: insert order")) {
+        return 1;
+      }
+      inserts += 1;
+    }
+    k += 1;
+  }
+  if (!meo_t_check_i64(seen, n_roots, "f6: one ROOT_MOVED per root change")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)prev, (int64)root, "f6: the last is the root")) {
+    return 1;
+  }
+  fd_close(p);
+  meo_feed_free(f);
+  println("PASS f6_root_split");
+  return 0;
+}
+
+// --- f7: gaps ---------------------------------------------------------------
+
+fn f7_gap() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f7: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var f: MeoFeed* = meo_feed_new(4);
+  meo_feed_attach(p, f);
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  // Ten one-insert commits; the first also moves the root: 11 events, the
+  // ring keeps the last 4 (seqs 8..11).
+  var i: int64 = 0;
+  while (i < 10) {
+    meo_pager_begin(p);
+    fd_ins(f, p, &root, i, (uint64)i);
+    meo_pager_commit(p);
+    i += 1;
+  }
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 5, "f7: one GAP plus the four retained")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP, "f7: GAP first")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[0].seq, 7, "f7: GAP names the last lost")) {
+    return 1;
+  }
+  var k: int32 = 1;
+  while (k < 5) {
+    if (!meo_t_check_i64(g_out[k].kind, MEO_CHANGE_INSERT,
+        "f7: exactly one GAP")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)g_out[k].seq, (int64)(7 + k),
+        "f7: continues at the oldest retained")) {
+      return 1;
+    }
+    if (!meo_t_check(fd_key_is(&g_out[k], (int64)(5 + k)), "f7: keys 6..9")) {
+      return 1;
+    }
+    k += 1;
+  }
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f7: caught up")) { return 1; }
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 100, 100);
+  meo_pager_commit(p);
+  n = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f7: one new event")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "f7: no second GAP")) {
+    return 1;
+  }
+
+  // A transaction that captures more than the pending cap is one GAP.
+  meo_feed_set_pending_max(f, 2);
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 200, 1);
+  fd_ins(f, p, &root, 201, 1);
+  fd_ins(f, p, &root, 202, 1);
+  meo_pager_commit(p);
+  n = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f7: overflow publishes one event")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP, "f7: overflow GAP")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq,
+      (int64)meo_pager_commit_seq(p), "f7: overflow GAP commit_seq")) {
+    return 1;
+  }
+  // A transaction more than the ring can hold is one GAP too (cap is 4).
+  meo_feed_set_pending_max(f, MEO_FEED_PENDING_MAX);
+  meo_pager_begin(p);
+  i = 300;
+  while (i < 306) {
+    fd_ins(f, p, &root, i, 1);
+    i += 1;
+  }
+  meo_pager_commit(p);
+  n = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f7: oversize publishes one event")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP, "f7: oversize GAP")) {
+    return 1;
+  }
+  fd_close(p);
+  meo_feed_free(f);
+  println("PASS f7_gap");
+  return 0;
+}
+
+// --- f8: two readers --------------------------------------------------------
+
+fn f8_two_readers() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f8: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var f: MeoFeed* = meo_feed_new(64);
+  meo_feed_attach(p, f);
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  var i: int64 = 0;
+  while (i < 9) {
+    fd_ins(f, p, &root, i, (uint64)i);
+    i += 1;
+  }
+  meo_pager_commit(p);
+  // Reader A in chunks of 2 with a key buffer of exactly two keys; reader B in
+  // one call. Both must see seqs 1..10.
+  var a: MeoFeedCursor;
+  a.next_seq = 0;
+  var b: MeoFeedCursor;
+  b.next_seq = 0;
+  var outa: MeoChange[] = new MeoChange[2];
+  var kba: uint8[] = new uint8[18];
+  var got_a: int32 = 0;
+  var want: uint64 = 1;
+  while (true) {
+    var na: int32 = meo_feed_read(f, &a, outa.data, 2, kba.data, 18);
+    if (!meo_t_check(na >= 0, "f8: reader A reads")) { return 1; }
+    if (na == 0) { break; }
+    var j: int32 = 0;
+    while (j < na) {
+      if (!meo_t_check_i64((int64)outa[j].seq, (int64)want, "f8: A in order")) {
+        return 1;
+      }
+      want += 1;
+      j += 1;
+    }
+    got_a += na;
+  }
+  var nb: int32 = fd_read(f, &b);
+  if (!meo_t_check_i64(got_a, 10, "f8: A saw ten")) { return 1; }
+  if (!meo_t_check_i64(nb, 10, "f8: B saw ten, unaffected by A")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[9].seq, 10, "f8: B ends at seq 10")) {
+    return 1;
+  }
+  // A key buffer too small for even one key is FULL, and moves nothing.
+  meo_pager_begin(p);
+  fd_ins(f, p, &root, 50, 50);
+  meo_pager_commit(p);
+  var before: uint64 = a.next_seq;
+  if (!meo_t_check_i64(meo_feed_read(f, &a, outa.data, 2, kba.data, 4),
+      -MEO_ERR_FULL, "f8: tiny key buffer is FULL")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)a.next_seq, (int64)before,
+      "f8: FULL leaves the cursor")) {
+    return 1;
+  }
+  free(outa.data);
+  free(kba.data);
+  fd_close(p);
+  meo_feed_free(f);
+  println("PASS f8_two_readers");
+  return 0;
+}
+
+// --- f9: persistence, peek, autocommit --------------------------------------
+
+fn f9_persist_peek() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f9: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var seq: uint64 = 99;
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), MEO_OK,
+      "f9: peek a fresh file")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 0, "f9: a fresh file reads 0")) {
+    return 1;
+  }
+  var root: uint32 = 0;
+  var c: int32 = 0;
+  while (c < 3) {
+    meo_pager_begin(p);
+    var kb: uint8[16];
+    var kn: int32 = meo_key_int(&kb[0], 16, (int64)c);
+    var k: MeoBtKey = { data: &kb[0], len: kn };
+    meo_bt_insert(p, &root, &meo_key_compare, k, (uint64)c);
+    meo_pager_set_root(p, MEO_ROOT_BTREE, root);
+    if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "f9: commit")) {
+      return 1;
+    }
+    c += 1;
+  }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(p), 3, "f9: three")) {
+    return 1;
+  }
+  // Read from disk while the first pager is still open.
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), MEO_OK,
+      "f9: peek while open")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 3, "f9: peek sees 3")) { return 1; }
+  // A commit with no changes still counts.
+  meo_pager_begin(p);
+  meo_pager_commit(p);
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(p), 4,
+      "f9: an empty commit counts")) {
+    return 1;
+  }
+  // An open transaction leaves a journal: peek says "maybe uncommitted".
+  meo_pager_begin(p);
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), 1,
+      "f9: peek answers 1 while a journal exists")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 4, "f9: and still reads the value")) {
+    return 1;
+  }
+  meo_pager_rollback(p);
+  // Autocommit: a flush outside a transaction with changes counts...
+  var kb2: uint8[16];
+  var kn2: int32 = meo_key_int(&kb2[0], 16, 77);
+  var k2: MeoBtKey = { data: &kb2[0], len: kn2 };
+  meo_bt_insert(p, &root, &meo_key_compare, k2, 77);
+  if (!meo_t_check_i64(meo_pager_flush(p), MEO_OK, "f9: autocommit flush")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(p), 5,
+      "f9: an autocommit flush counts")) {
+    return 1;
+  }
+  // ...and one with nothing to write does not.
+  meo_pager_flush(p);
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(p), 5,
+      "f9: an empty flush does not count")) {
+    return 1;
+  }
+  // An attached feed publishes autocommit writes at the flush.
+  var f: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "f9: attach")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  fd_ins(f, p, &root, 78, 78);
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f9: not before the flush")) {
+    return 1;
+  }
+  meo_pager_flush(p);
+  var n: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(n, 1, "f9: published at the flush")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq, 6,
+      "f9: with the autocommit's commit_seq")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fd_close(p), MEO_OK, "f9: close")) { return 1; }
+  meo_feed_free(f);
+
+  var q: MeoPager* = fd_open(F_DB);
+  if (!meo_t_check(q != 0, "f9: reopen")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(q), 6,
+      "f9: commit_seq survived close/reopen")) {
+    return 1;
+  }
+  fd_close(q);
+  if (!meo_t_check_i64(meo_peek_commit_seq("build/feed_self_missing.dat",
+      &seq), -MEO_ERR_IO, "f9: peek a missing file is IO")) {
+    return 1;
+  }
+  println("PASS f9_persist_peek");
+  return 0;
+}
+
+// --- f10: crash between the commit's fsync and the journal unlink -----------
+
+// Fork; the child opens `db`, attaches a feed, begins, inserts keys 1000..1004
+// through it, runs the first half of the commit (bump, flush, fsync -- the
+// journal is still there) and dies with _exit(42).
+fn fd_crash_child(db: string) -> int32 {
+  var pid: int64 = syscall(57);
+  if (pid < 0) { return -1; }
+  if (pid == 0) {
+    var p: MeoPager* = meo_pager_open(db, 16, 0);
+    if (p == 0) { syscall(60, (int64)90); }
+    var f: MeoFeed* = meo_feed_new(64);
+    if (meo_feed_attach(p, f) != MEO_OK) { syscall(60, (int64)91); }
+    if (meo_pager_begin(p) != MEO_OK) { syscall(60, (int64)92); }
+    var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+    var i: int64 = 1000;
+    while (i < 1005) {
+      if (fd_ins(f, p, &root, i, (uint64)i) != MEO_OK) {
+        syscall(60, (int64)93);
+      }
+      i += 1;
+    }
+    meo_pager_set_root(p, MEO_ROOT_BTREE, root);
+    if (meo_pager_commit_prepare(p) != MEO_OK) { syscall(60, (int64)94); }
+    syscall(60, (int64)42);
+  }
+  var status: int32 = 0;
+  var w: int64 = syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  if (w < 0) { return -1; }
+  if ((status & 0x7F) != 0) { return -2; }
+  return (status >> 8) & 0xFF;
+}
+
+fn f10_crash() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f10: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  var kb: uint8[16];
+  var kn: int32 = meo_key_int(&kb[0], 16, 1);
+  var k: MeoBtKey = { data: &kb[0], len: kn };
+  meo_bt_insert(p, &root, &meo_key_compare, k, 1);
+  meo_pager_set_root(p, MEO_ROOT_BTREE, root);
+  meo_pager_commit(p);
+  if (!meo_t_check_i64(fd_close(p), MEO_OK, "f10: seed")) { return 1; }
+
+  var st: int32 = fd_crash_child(F_DB);
+  if (!meo_t_check_i64((int64)st, 42,
+      "f10: the child died with _exit(42), not an early failure")) {
+    return 1;
+  }
+  var jpath: string = fd_jpath(F_DB);
+  var hot: bool = fd_exists(jpath);
+  free(jpath.chars);
+  if (!meo_t_check(hot, "f10: the journal is on disk after the crash")) {
+    return 1;
+  }
+  // The child's page 0 reached the disk with commit_seq 2, but it is not
+  // committed: peek must say so.
+  var seq: uint64 = 0;
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), 1,
+      "f10: peek flags the hot journal")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 2,
+      "f10: and shows the uncommitted value")) {
+    return 1;
+  }
+
+  var q: MeoPager* = fd_open(F_DB);
+  if (!meo_t_check(q != 0, "f10: reopen recovers")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_commit_seq(q), 1,
+      "f10: commit_seq is back to the pre-transaction value")) {
+    return 1;
+  }
+  var f: MeoFeed* = meo_feed_new(64);
+  meo_feed_attach(q, f);
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  if (!meo_t_check_i64(fd_read(f, &cur), 0, "f10: the new feed is empty")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f), 0,
+      "f10: and has published no commit")) {
+    return 1;
+  }
+  var rid: uint64 = 0;
+  var r2: uint32 = meo_pager_root(q, MEO_ROOT_BTREE);
+  if (!meo_t_check_i64(fd_lookup(q, r2, 1000, &rid), 1,
+      "f10: the child's insert is gone")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fd_lookup(q, r2, 1, &rid), MEO_OK,
+      "f10: the committed key is still there")) {
+    return 1;
+  }
+  fd_close(q);
+  meo_feed_free(f);
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), MEO_OK,
+      "f10: peek after recovery")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 1, "f10: peek reads 1")) { return 1; }
+  println("PASS f10_crash");
+  return 0;
+}
+
+// --- f11: a writer thread and a reader thread -------------------------------
+
+const F_TXNS: int32 = 200;
+const F_PER_TXN: int32 = 3;
+
+struct FdShared {
+  feed: MeoFeed*;
+  pager: MeoPager*;
+  done: int32;        // writer finished (atomic)
+  writer_err: int32;  // 0, or the step that failed
+  reader_err: int32;  // 0, or the check that failed
+  inserts_seen: int32;
+  gaps_seen: int32;
+  events_seen: int32;
+}
+
+fn fd_writer(arg: cstring) -> uint32 {
+  var sh: FdShared* = (FdShared*)arg;
+  var root: uint32 = 0;
+  var t: int32 = 0;
+  while (t < F_TXNS) {
+    if (meo_pager_begin(sh->pager) != MEO_OK) {
+      sh->writer_err = 1;
+      break;
+    }
+    var j: int32 = 0;
+    while (j < F_PER_TXN) {
+      var v: int64 = (int64)t * (int64)F_PER_TXN + (int64)j;
+      if (fd_ins(sh->feed, sh->pager, &root, v, (uint64)v) != MEO_OK) {
+        sh->writer_err = 2;
+      }
+      j += 1;
+    }
+    if (meo_pager_commit(sh->pager) != MEO_OK) {
+      sh->writer_err = 3;
+      break;
+    }
+    t += 1;
+  }
+  atomic_exchange_i32(&sh->done, 1);
+  return 0;
+}
+
+fn fd_reader(arg: cstring) -> uint32 {
+  var sh: FdShared* = (FdShared*)arg;
+  var out: MeoChange[] = new MeoChange[64];
+  var kb: uint8[] = new uint8[4096];
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var want_seq: uint64 = 1;
+  var last_commit: uint64 = 0;
+  while (true) {
+    var n: int32 = meo_feed_read(sh->feed, &cur, out.data, 64, kb.data, 4096);
+    if (n < 0) {
+      sh->reader_err = 1;
+      break;
+    }
+    var i: int32 = 0;
+    while (i < n) {
+      var c: MeoChange* = &out[i];
+      if (c->seq != want_seq) { sh->reader_err = 2; }
+      if (c->commit_seq < last_commit) { sh->reader_err = 3; }
+      if (c->kind == MEO_CHANGE_GAP) { sh->gaps_seen += 1; }
+      if (c->kind == MEO_CHANGE_INSERT) {
+        if (!fd_key_is(c, (int64)sh->inserts_seen)) { sh->reader_err = 4; }
+        sh->inserts_seen += 1;
+      }
+      last_commit = c->commit_seq;
+      want_seq += 1;
+      sh->events_seen += 1;
+      i += 1;
+    }
+    if (n == 0) {
+      // Done only when the writer has finished AND nothing is left: the
+      // writer's last publish happens before it sets `done`.
+      if (atomic_compare_exchange_i32(&sh->done, 1, 1) == 1) {
+        if (!meo_feed_pending_for(sh->feed, &cur)) { break; }
+      }
+    }
+  }
+  free(out.data);
+  free(kb.data);
+  return 0;
+}
+
+fn f11_threads() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB2), MEO_OK, "f11: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB2);
+  if (!meo_t_check(p != 0, "f11: open")) { return 1; }
+  var f: MeoFeed* = meo_feed_new(65536);
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "f11: attach")) {
+    return 1;
+  }
+  var sh: FdShared* = new FdShared;
+  sh->feed = f;
+  sh->pager = p;
+  var hr: int64 = CreateThread(0, 0, &fd_reader, (cstring)sh, 0, 0);
+  var hw: int64 = CreateThread(0, 0, &fd_writer, (cstring)sh, 0, 0);
+  if (!meo_t_check(hr != 0 && hw != 0, "f11: threads started")) { return 1; }
+  thread_join_infinite(hw);
+  thread_join_infinite(hr);
+  thread_close(hw);
+  thread_close(hr);
+  if (!meo_t_check_i64(sh->writer_err, 0, "f11: the writer ran clean")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(sh->reader_err, 0,
+      "f11: every event once, in order, commit_seq nondecreasing")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(sh->gaps_seen, 0, "f11: no GAP")) { return 1; }
+  if (!meo_t_check_i64(sh->inserts_seen, F_TXNS * F_PER_TXN,
+      "f11: every insert seen")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var total: int32 = fd_read(f, &cur);
+  if (!meo_t_check_i64(sh->events_seen, total,
+      "f11: the reader saw every published event")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f), (int64)F_TXNS,
+      "f11: last_commit")) {
+    return 1;
+  }
+  free(sh);
+  fd_close(p);
+  meo_feed_free(f);
+  println("PASS f11_threads");
+  return 0;
+}
+
+fn main() -> int32 {
+  var outs: MeoChange[] = new MeoChange[F_OUT_CAP];
+  var kbs: uint8[] = new uint8[F_KEY_CAP];
+  g_out = outs.data;
+  g_kb = kbs.data;
+  var rc: int32 = f1_commit();
+  if (rc == 0) { rc = f2_rollback(); }
+  if (rc == 0) { rc = f3_close(); }
+  if (rc == 0) { rc = f4_free(); }
+  if (rc == 0) { rc = f5_replace(); }
+  if (rc == 0) { rc = f6_root_split(); }
+  if (rc == 0) { rc = f7_gap(); }
+  if (rc == 0) { rc = f8_two_readers(); }
+  if (rc == 0) { rc = f9_persist_peek(); }
+  if (rc == 0) { rc = f10_crash(); }
+  if (rc == 0) { rc = f11_threads(); }
+  free(outs.data);
+  free(kbs.data);
+  if (rc == 0) { println("PASS feed_self"); }
+  return meo_t_report();
+}
