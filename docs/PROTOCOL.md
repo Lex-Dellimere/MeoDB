@@ -27,7 +27,7 @@ The byte-exact contract between the `meosql` server and any client. A client can
 | Kind | Name | Dir | Payload | Reply |
 |---|---|---|---|---|
 | 0x01 | HELLO | C->S | hello | HELLO_OK or ERROR |
-| 0x02 | PING | C->S | empty | OK |
+| 0x02 | PING | C->S | empty | OK (`ERROR TX` in ABORTED) |
 | 0x03 | BEGIN | C->S | u8 mode | OK |
 | 0x04 | COMMIT | C->S | empty | OK |
 | 0x05 | ROLLBACK | C->S | empty | OK |
@@ -194,8 +194,8 @@ op in 1..10; term op in 0..8; each term `arg0 + n_args <= n_args(total)` (64-bit
 1. The client connects and sends HELLO with rid 1.
 2. The server checks the fields in this order:
    - Wrong magic or major != 1 -> `ERROR VERSION` fatal.
-   - If the server has a token and it is missing or wrong -> 200 ms delay, then `ERROR AUTH` fatal. The compare runs in constant time. A server without a token ignores any token sent.
    - Malformed -> `ERROR PROTO` fatal.
+   - If the server has a token and it is missing or wrong -> 200 ms delay, then `ERROR AUTH` fatal. The compare runs in constant time. A server without a token ignores any token sent.
 3. If all pass, the server replies HELLO_OK. Keep its `max_frame`, which is the largest request you may send, and its `caps`.
 
 | caps bit | Name | Meaning when set |
@@ -240,7 +240,7 @@ Append-only: numbers never change.
 | HELLO | 0 | HELLO | anything else -> PROTO fatal |
 | READY | 0 | all but HELLO | QUERY runs as autocommit |
 | TX | 1 | all but HELLO | the db lock is held across frames until COMMIT/ROLLBACK |
-| ABORTED | 2 | ROLLBACK -> OK and READY | QUERY/BEGIN/COMMIT -> `ERROR TX` |
+| ABORTED | 2 | ROLLBACK -> OK and READY | PING/QUERY/BEGIN/COMMIT -> `ERROR TX` |
 
 - **Fatal** (`fatal = 1`): the server closes after the frame, and any open transaction is rolled back. Fatal errors are PROTO, VERSION, AUTH, TIMEOUT, TOOBIG for an oversize received header, and BUSY at the connection cap.
 - **Non-fatal**: the session stays usable. This covers every query-layer error, USAGE from the server checks, UNSUPPORTED, BUSY on a lock wait, TX, and TOOBIG for a result that would not fit.

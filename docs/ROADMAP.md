@@ -8,7 +8,7 @@ Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback j
 
 ## M1 — Phase-3 gate (done)
 The b-tree is proven on top of the journal before tables depend on it.
-- [x] `phase3` bin: K1 commit is durable after reopen; K2 rollback restores the exact pre-txn key set and page_count; K3 a forked child dies after the journal fsync, and reopen shows the pre-txn tree; K4 the same crash after a root split, and the tree passes `meo_btn_check` with pre-txn keys; K5 a small journal cap gives `-MEO_ERR_NOSPC`, then rollback leaves the tree intact.
+- [x] `phase3` bin: a commit is durable after reopen; a rollback restores the exact pre-txn key set and page_count; a forked child that dies after the journal fsync leaves the pre-txn tree on reopen; the same crash after a root split leaves a tree that passes `meo_btn_check` with the pre-txn keys; a small journal cap gives `-MEO_ERR_NOSPC`, and rollback then leaves the tree intact.
 
 ## M2 — Embedded relational core + typed query API
 Layers 3, 4a, 5. Consumer: flux_orm.
@@ -64,7 +64,7 @@ Layers 8 and 11. Consumer: flux_orm, which reaches MeoSQL over TCP instead of co
 - [x] A client killed mid-transaction: its writes are gone, and another connection gets the lock within 1 s. A client that hangs mid-transaction is cut off after the transaction idle timeout (`srv_kill`).
 - [x] An oversize frame gets TOOBIG, a wrong version gets VERSION, a wrong token gets AUTH, and a result over the frame limit gets TOOBIG with the connection still usable (`srv_limits`).
 - [x] Stopping the server rolls back open transactions. Reopening shows only committed data (`srv_stop`).
-- [ ] flux_orm's network adapter passes its tests against a running server.
+- [x] flux_orm's network adapter passes its tests against a running server (flux_orm `tests/live_meosql.mettle`).
 - [ ] After M4: remote `SUBSCRIBE table` pushes events within 50 ms p99 on localhost, and raize can relay them to browsers.
 
 ## M8 — Replication + fault tolerance (log shipping)
