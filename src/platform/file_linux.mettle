@@ -10,7 +10,8 @@
 // Syscall numbers follow Linux x86-64. The set is exactly what the file API
 // needs: open(2), close(3), pread64(17), pwrite64(18), fsync(74),
 // ftruncate(77), plus lseek(8) for meo_file_size, rename(82) for
-// meo_file_rename and unlink(87) for meo_file_unlink.
+// meo_file_rename, unlink(87) for meo_file_unlink and flock(73) for
+// meo_file_lock.
 
 import "../error/status.mettle";
 import "file.mettle";
@@ -21,6 +22,7 @@ const MEO_SYS_CLOSE: int64 = 3;
 const MEO_SYS_LSEEK: int64 = 8;
 const MEO_SYS_PREAD64: int64 = 17;
 const MEO_SYS_PWRITE64: int64 = 18;
+const MEO_SYS_FLOCK: int64 = 73;
 const MEO_SYS_FSYNC: int64 = 74;
 const MEO_SYS_FTRUNCATE: int64 = 77;
 const MEO_SYS_RENAME: int64 = 82;
@@ -38,9 +40,15 @@ const MEO_SEEK_SET: int64 = 0;
 const MEO_SEEK_CUR: int64 = 1;
 const MEO_SEEK_END: int64 = 2;
 
+// flock(2) operation bits.
+const MEO_LOCK_SH: int64 = 1;
+const MEO_LOCK_EX: int64 = 2;
+const MEO_LOCK_NB: int64 = 4;
+
 // Errno values this backend distinguishes. Everything else -- ENOENT, EACCES,
 // ENOSPC, EIO, ... -- is a kernel refusal and becomes MEO_ERR_IO.
 const MEO_E_BADF: int64 = 9;
+const MEO_E_WOULDBLOCK: int64 = 11;
 const MEO_E_NOMEM: int64 = 12;
 const MEO_E_FAULT: int64 = 14;
 const MEO_E_ISDIR: int64 = 21;
@@ -183,6 +191,22 @@ export fn meo_file_truncate(f: MeoFile, size: int64) -> int32 {
   if (size < 0) { return -MEO_ERR_USAGE; }
   var rc: int64 = syscall(MEO_SYS_FTRUNCATE, f.handle, size);
   if (rc < 0) { return meo_file_err(rc); }
+  return MEO_OK;
+}
+
+// Take a whole-file lock without waiting: shared for readers, exclusive for a
+// writer. A conflicting holder is -MEO_ERR_BUSY. flock locks belong to the open
+// file description, so a second open in the same process is refused too. The
+// lock lasts until the descriptor closes, so there is no unlock call.
+export fn meo_file_lock(f: MeoFile, exclusive: bool) -> int32 {
+  if (!f.is_open || f.handle < 0) { return -MEO_ERR_USAGE; }
+  var op: int64 = MEO_LOCK_SH;
+  if (exclusive) { op = MEO_LOCK_EX; }
+  var rc: int64 = syscall(MEO_SYS_FLOCK, f.handle, op | MEO_LOCK_NB);
+  if (rc < 0) {
+    if (0 - rc == MEO_E_WOULDBLOCK) { return -MEO_ERR_BUSY; }
+    return meo_file_err(rc);
+  }
   return MEO_OK;
 }
 

@@ -1,0 +1,230 @@
+// flock_self: the whole-file lock a pager takes at open.
+//
+//   mbuild run flock_self        (and -r for release)
+//
+// Cases, each with the bug it exists to catch:
+//   f1_writers      a second writer on a held file is refused with BUSY.
+//                   Catches two writers sharing one database.
+//   f2_writer_reader  a read-only open beside a writer is BUSY. Catches a
+//                   reader that could see a half-committed state.
+//   f3_readers      two read-only opens both succeed. Catches a shared lock
+//                   taken exclusive.
+//   f4_reader_writer  a writer beside a read-only open is BUSY.
+//   f5_close        after close, a writer opens. Catches a lock that outlives
+//                   the pager.
+//   f6_process      a forked child opening the file the parent holds gets BUSY.
+//                   Catches a lock that only works inside one process.
+//   f7_db           meo_db_open on a held file is BUSY.
+//   f8_peek         meo_peek_commit_seq still reads a file a writer holds.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/db/db.mettle";
+import "tinytest.mettle";
+
+const FL_DB: string = "/dev/shm/meosql_flock_self.dat";
+
+fn fl_cleanup() {
+  meo_file_unlink(FL_DB);
+  var jpath: string = FL_DB + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+}
+
+fn fl_close(p: MeoPager*) {
+  meo_pager_close(p);
+  meo_pager_free(p);
+}
+
+// A fresh one-file database, closed again.
+fn fl_seed() -> bool {
+  fl_cleanup();
+  var p: MeoPager* = meo_pager_open(FL_DB, 8, MEO_PAGER_CREATE);
+  if (p == 0) { return false; }
+  var rc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  return rc == MEO_OK;
+}
+
+// Open `FL_DB` again; the pager on success, 0 on failure with the code left in
+// meo_pager_err(0).
+fn fl_open(flags: int32) -> MeoPager* {
+  return meo_pager_open(FL_DB, 8, flags);
+}
+
+fn f1_writers() -> int32 {
+  if (!meo_t_check(fl_seed(), "f1: seed")) { return 1; }
+  var a: MeoPager* = fl_open(0);
+  if (!meo_t_check(a != 0, "f1: first writer opens")) { return 1; }
+  var b: MeoPager* = fl_open(0);
+  if (!meo_t_check(b == 0, "f1: second writer refused")) {
+    fl_close(b);
+    fl_close(a);
+    return 1;
+  }
+  var code: int32 = meo_pager_err(0);
+  fl_close(a);
+  if (!meo_t_check_i64((int64)code, (int64)MEO_ERR_BUSY, "f1: refused with BUSY")) {
+    return 1;
+  }
+  println("PASS f1_writers");
+  return 0;
+}
+
+fn f2_writer_reader() -> int32 {
+  var a: MeoPager* = fl_open(0);
+  if (!meo_t_check(a != 0, "f2: writer opens")) { return 1; }
+  var b: MeoPager* = fl_open(MEO_PAGER_READONLY);
+  if (!meo_t_check(b == 0, "f2: reader refused")) {
+    fl_close(b);
+    fl_close(a);
+    return 1;
+  }
+  var code: int32 = meo_pager_err(0);
+  fl_close(a);
+  if (!meo_t_check_i64((int64)code, (int64)MEO_ERR_BUSY, "f2: refused with BUSY")) {
+    return 1;
+  }
+  println("PASS f2_writer_reader");
+  return 0;
+}
+
+fn f3_readers() -> int32 {
+  var a: MeoPager* = fl_open(MEO_PAGER_READONLY);
+  if (!meo_t_check(a != 0, "f3: first reader opens")) { return 1; }
+  var b: MeoPager* = fl_open(MEO_PAGER_READONLY);
+  if (!meo_t_check(b != 0, "f3: second reader opens")) {
+    fl_close(a);
+    return 1;
+  }
+  fl_close(b);
+  fl_close(a);
+  println("PASS f3_readers");
+  return 0;
+}
+
+fn f4_reader_writer() -> int32 {
+  var a: MeoPager* = fl_open(MEO_PAGER_READONLY);
+  if (!meo_t_check(a != 0, "f4: reader opens")) { return 1; }
+  var b: MeoPager* = fl_open(0);
+  if (!meo_t_check(b == 0, "f4: writer refused")) {
+    fl_close(b);
+    fl_close(a);
+    return 1;
+  }
+  var code: int32 = meo_pager_err(0);
+  fl_close(a);
+  if (!meo_t_check_i64((int64)code, (int64)MEO_ERR_BUSY, "f4: refused with BUSY")) {
+    return 1;
+  }
+  println("PASS f4_reader_writer");
+  return 0;
+}
+
+fn f5_close() -> int32 {
+  var a: MeoPager* = fl_open(0);
+  if (!meo_t_check(a != 0, "f5: writer opens")) { return 1; }
+  fl_close(a);
+  var b: MeoPager* = fl_open(0);
+  if (!meo_t_check(b != 0, "f5: writer opens after close")) { return 1; }
+  fl_close(b);
+  println("PASS f5_close");
+  return 0;
+}
+
+// Fork; the child opens `FL_DB` as a writer and exits 10 when refused with
+// BUSY, 11 when it got the file, 12 for any other refusal. The parent answers
+// the child's exit status, or a negative value when fork/wait failed.
+fn fl_child_open(flags: int32) -> int32 {
+  var pid: int64 = syscall(57);
+  if (pid < 0) { return -1; }
+  if (pid == 0) {
+    var p: MeoPager* = fl_open(flags);
+    if (p != 0) { syscall(60, (int64)11); }
+    if (meo_pager_err(0) == MEO_ERR_BUSY) { syscall(60, (int64)10); }
+    syscall(60, (int64)12);
+  }
+  var status: int32 = 0;
+  var w: int64 = syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  if (w < 0) { return -1; }
+  // WIFEXITED: the low seven bits are zero. WEXITSTATUS: bits 8..15.
+  if ((status & 0x7F) != 0) { return -2; }
+  return (status >> 8) & 0xFF;
+}
+
+fn f6_process() -> int32 {
+  var a: MeoPager* = fl_open(0);
+  if (!meo_t_check(a != 0, "f6: writer opens")) { return 1; }
+  var w: int32 = fl_child_open(0);
+  var r: int32 = fl_child_open(MEO_PAGER_READONLY);
+  fl_close(a);
+  if (!meo_t_check_i64((int64)w, 10, "f6: child writer got BUSY")) { return 1; }
+  if (!meo_t_check_i64((int64)r, 10, "f6: child reader got BUSY")) { return 1; }
+  // The parent's pager is closed, so the child now gets the file.
+  var free_rc: int32 = fl_child_open(0);
+  if (!meo_t_check_i64((int64)free_rc, 11, "f6: child opens once the parent closed")) {
+    return 1;
+  }
+  println("PASS f6_process");
+  return 0;
+}
+
+fn f7_db() -> int32 {
+  var a: MeoPager* = fl_open(0);
+  if (!meo_t_check(a != 0, "f7: writer opens")) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(FL_DB, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (db != 0) { meo_db_close(db); }
+  var ro: int32 = meo_db_open(FL_DB, MEO_OPEN_READ, 0, &db);
+  if (db != 0) { meo_db_close(db); }
+  fl_close(a);
+  if (!meo_t_check_i64((int64)rc, (int64)(0 - MEO_ERR_BUSY), "f7: db open is BUSY")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)ro, (int64)(0 - MEO_ERR_BUSY), "f7: read-only db open is BUSY")) {
+    return 1;
+  }
+  println("PASS f7_db");
+  return 0;
+}
+
+fn f8_peek() -> int32 {
+  var a: MeoPager* = fl_open(0);
+  if (!meo_t_check(a != 0, "f8: writer opens")) { return 1; }
+  var seq: uint64 = 0;
+  var rc: int32 = meo_peek_commit_seq(FL_DB, &seq);
+  fl_close(a);
+  if (!meo_t_check_i64((int64)rc, (int64)MEO_OK, "f8: the probe ignores the lock")) {
+    return 1;
+  }
+  println("PASS f8_peek");
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = f1_writers();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f2_writer_reader();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f3_readers();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f4_reader_writer();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f5_close();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f6_process();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f7_db();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  rc = f8_peek();
+  if (rc != 0) { fl_cleanup(); return meo_t_report(); }
+  fl_cleanup();
+  println("PASS flock_self");
+  return meo_t_report();
+}

@@ -43,6 +43,9 @@ fn project() {
 
   mb_bin("journal_self", "tests/journal_self.mettle");
 
+  // The whole-file lock a pager takes at open, in-process and across a fork.
+  mb_bin("flock_self", "tests/flock_self.mettle");
+
   // Order-preserving keys.
   mb_bin("key_self", "tests/key_self.mettle");
 

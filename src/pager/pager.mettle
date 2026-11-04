@@ -45,6 +45,9 @@
 //   meo_pager_err_arg(0) answer for the last failed meo_pager_open. A
 //   MEO_PAGER_CREATE|MEO_PAGER_READONLY open is treated as "no create": a
 //   read-only pager cannot initialise the file, so a zero-byte one is NOT_A_DB.
+// * open takes a whole-file lock before reading anything, hot-journal recovery
+//   included: exclusive for a writer, shared for MEO_PAGER_READONLY. A second
+//   opener that conflicts fails with -MEO_ERR_BUSY; the lock goes with close.
 //
 // COMMIT COUNTER AND COMMIT HOOK (the change feed, src/feed/feed.mettle).
 //
@@ -670,6 +673,13 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
   var file: MeoFile = meo_file_open(path, oflags);
   if (!file.is_open) {
     return meo_pager_open_failed((int32)(0 - file.handle), 0);
+  }
+  // Before page 0 or recovery: another process's half-finished commit must not
+  // be replayed under it, and two writers must never share a file.
+  var lrc: int32 = meo_file_lock(file, !read_only);
+  if (lrc != MEO_OK) {
+    meo_file_close(file);
+    return meo_pager_open_failed(0 - lrc, 0);
   }
 
   var p: MeoPager* = new MeoPager;
@@ -1637,7 +1647,8 @@ fn peek_page0(f: MeoFile, buf: uint8*, seq: uint64*, got: int32*) -> int32 {
 // Read commit_seq straight from page 0 on disk, with no pager: the cheap "did
 // anything commit?" probe for another handle or another process. Page 0 is
 // validated exactly as an open validates it (magic, version, page size, page
-// structure, CRC). No recovery is attempted and nothing is written.
+// structure, CRC). No recovery is attempted and nothing is written. It takes no
+// file lock, so it works while another process holds the database open.
 //
 // Positive answers mean "retry later", negative ones mean real damage:
 //   MEO_OK              out[0] is the committed value, no journal.
