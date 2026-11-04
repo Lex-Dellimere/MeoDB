@@ -11,7 +11,7 @@
 | B5 | table | An UPDATE that swaps unique values between two rows returns CONFLICT. | Valid swaps need two statements or a temporary value. | `src/table/table.mettle` (`meo_tbl_check_update`) | open |
 | B6 | btree | Nodes are never merged, so space from emptied leaves is not reclaimed. | Files only shrink by dropping tables. | `src/btree/btree.mettle` | open |
 | B7 | btree | Byte-balanced splits keep rows to 1280 encoded bytes; a larger row returns TOOBIG. | Apps must cap text sizes until overflow pages exist. | `src/catalog/schema.mettle` (`MEO_REC_MAX`) | open |
-| B8 | pager | No file locking: two processes on one database file corrupt it. | Run exactly one `meosql` per file. | `src/platform/file_linux.mettle` | open |
+| B8 | pager | No file locking: two processes on one database file corrupt it. | Run exactly one `meosql` per file until the file lock lands (missing.md M19, roadmap M3). | `src/platform/file_linux.mettle` | open |
 | B9 | perf | Every commit fsyncs, about 5 ms on disk, so roughly 200 committed writes per second. `query_mt` runs on `/dev/shm` to stay fast. | Write-heavy apps must batch writes in transactions. | `src/pager/pager.mettle` | open |
 | B10 | perf | COUNT and filters on non-indexed columns are full scans under the db lock. `srv_mt` takes about 2 minutes. | Slow lookups stall every client. | `src/query/exec.mettle` | open |
 | B11 | wire | A decoded result can take about 40 times its frame size in memory (40 bytes per cell, 1 byte for a NULL on the wire). | A client with a large `max_frame` can be made to allocate a lot. | `src/wire/msg.mettle` | open |

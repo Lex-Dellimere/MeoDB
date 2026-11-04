@@ -29,6 +29,7 @@ Layers 3, 4a, 5. Consumer: flux_orm.
 - [ ] Range predicates (`<`, `<=`, `>`, `>=`, BETWEEN) use an index.
 - [ ] `meo_tbl_scan_range(db, table, x_col, lo, hi, cb)` streams (x, y) float64 pairs. mistplot fills an `MpSeries` from 1M rows without a full-table materialization.
 - [ ] Opt-in streaming select: memory stays constant while reading all of a 1M-row table.
+- [ ] Opening a database takes an exclusive lock on the file; a second process (a second server, or an embedded open) gets BUSY instead of corrupting it.
 
 ## M4 — Change feed + in-process real-time
 Layer 6. Consumers: mistplot live push, raize notifications.
@@ -47,6 +48,7 @@ Layer 4b. Consumer: raize_web read-heavy load.
 - [ ] Readers take snapshots and do not take the writer's lock: 63 readers and 1 writer run with no reader blocking, and every reader sees a consistent snapshot.
 - [ ] The pager frame table is thread-safe (striped locks); reader throughput at 8 threads is at least 4x that at 1 thread.
 - [ ] Crash at every WAL write point (fork test) recovers to the last committed txn.
+- [ ] Group commit: concurrent commits share one fsync, so committed writes per second rise well above the ~200 of one fsync per commit.
 
 ## M6 — Graph engine
 Layer 7.
