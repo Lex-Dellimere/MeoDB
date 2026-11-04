@@ -530,7 +530,7 @@ export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   if (rc != MEO_OK) { return rc; }
   rc = tbl_del_row(db, t, rowid);
   if (rc == 1) { return -MEO_ERR_CORRUPT; }
-  return rc;
+  return tbl_finish(db, t, rc, dirty);
 }
 
 // Replace the row with this rowid by `vals` (n == t->n_cols), as accepted by
