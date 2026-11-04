@@ -26,8 +26,9 @@ up to 64 threads through a database-wide lock (one writer at a time). An
 in-process change feed reports committed writes (see
 [Change feed](#change-feed)).
 
-In progress: a network server, so flux_orm can reach MeoSQL over TCP. Not built
-yet: joins, distribution, replication, and concurrent readers.
+The `meosql` server serves one database over TCP for flux_orm and other
+clients (see [Server](#server)). Not built yet: joins, CREATE INDEX,
+distribution, replication, and concurrent readers.
 
 | Module | What it does |
 |---|---|
@@ -87,6 +88,20 @@ Values are passed in a `MeoValue`; each value a builder takes gets the next
 slot, so a query can be run again with `meo_q_reset` and `meo_q_set_value`.
 Write queries report `meo_q_changes` and `meo_q_last_insert_rowid`. Explicit
 transactions use `meo_db_begin`, `meo_db_commit` and `meo_db_rollback`.
+
+## Server
+
+```
+build/linux/release/meosql --db data.meo              # 127.0.0.1:5490
+build/linux/release/meosql --db data.meo --port 0     # any free port
+build/linux/release/meosql --db data.meo --listen 0.0.0.0:5490 --token-file token
+```
+
+It prints the port it bound, serves until SIGINT or SIGTERM, and rolls back
+any open transaction when a client disconnects, goes idle, or the server stops.
+A non-loopback address needs a token. `--help` lists the limits and timeouts.
+The wire format is in [docs/PROTOCOL.md](docs/PROTOCOL.md); `src/client/` is a
+client library for Mettle programs.
 
 ## Change feed
 
@@ -179,9 +194,10 @@ MeoSQL needs the head Mettle compiler; the v0.17.0 release has no `syscall()`.
 export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
 MB=/home/nox/Projects/mettle/mbuild/build/linux/release/mbuild
 $MB check && $MB test && $MB build -r
-$MB run meosql        # smoke test of the whole stack
+$MB run smoke         # the whole storage stack in one run
 $MB run phase2 -r     # one test program, release build
 ```
 
-Every `[bin.*]` in `mbuild.toml` is a test program, and each should print
-`PASS` in both debug and release with zero compiler warnings.
+Apart from `meosql` and `smoke`, every `[bin.*]` in `mbuild.toml` is a test
+program, and each should print `PASS` in both debug and release with zero
+compiler warnings.
