@@ -1,6 +1,457 @@
+// wal_group: group commit under load. Many threads commit autocommit inserts at
+// once; one fsync must cover many of them, no commit may be lost, and the
+// feed must publish each commit once, in order, only when it is durable.
+//
+// A program, not @test functions: it needs real files and threads. Run it with
+//
+//   mbuild run wal_group
+//
+// It prints "PASS wal_group" when every case passes and "FAIL G<n>: ..." per
+// failing check. Cases:
+//   G1  16 threads x 100 inserts with a 2 ms fsync delay: 1,600 rows (also
+//       after reopen), at most 400 WAL fsyncs, and a feed with 1,600 INSERT
+//       events, 1,600 consecutive commit_seq values, nondecreasing time_us.
+//   G2  commits per second with 1 and with 16 threads and no delay (printed,
+//       not checked).
+//   G3  the third fsync fails under 4 writer threads: some statements return
+//       IO, later begins return IO, selects still work, the feed publishes
+//       exactly the durable commits, and after a reopen every row whose insert
+//       returned OK is there and the reattached feed reports a GAP.
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/pager/wal.mettle";
+import "../src/feed/feed.mettle";
+import "../src/meodb.mettle";
+import "tinytest.mettle";
+
+const WG_JOIN_MS: uint32 = 120000;
+const WG_MAX_THREADS: int32 = 16;
+const WG_MAX_PER: int32 = 2048;     // slots per thread in g_res
+const WG_ID_STRIDE: int64 = 10000;  // thread t inserts ids t * stride + i
+const WG_OUT_CAP: int32 = 512;
+const WG_KEY_CAP: int32 = 1048576;
+
+fn eq(a: int64, b: int64, name: string) -> bool {
+  return meo_t_check_i64(a, b, name);
+}
+
+// --- files ------------------------------------------------------------------
+
+fn wg_unlink_side(db: string, suffix: string) {
+  var path: string = db + suffix;
+  meo_file_unlink(path);
+  free(path.chars);
+}
+
+// Remove the database and its journal and log.
+fn wg_remove(db: string) {
+  meo_file_unlink(db);
+  wg_unlink_side(db, "-journal");
+  wg_unlink_side(db, "-wal");
+}
+
+fn wg_open(path: string, create: bool, out: MeoDb**) -> int32 {
+  var flags: int32 = MEO_OPEN_READ | MEO_OPEN_WRITE;
+  if (create) { flags = flags | MEO_OPEN_CREATE | MEO_OPEN_WAL; }
+  return meo_db_open(path, flags, 0, out);
+}
+
+// --- queries ----------------------------------------------------------------
+
+// CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER).
+fn wg_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "v", MEO_T_INT, 0);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// One autocommit insert through the typed path, which waits for durability
+// after the db lock is released.
+fn wg_ins(db: MeoDb*, k: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_into(q, "id");
+  meo_q_into(q, "v");
+  var v: MeoValue;
+  meo_value_set_int(&v, k);
+  meo_q_value(q, &v);
+  meo_value_set_int(&v, k * 10);
+  meo_q_value(q, &v);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// COUNT(*): the count, or the negative code.
+fn wg_count(db: MeoDb*) -> int64 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_count(db, "t", &q);
+  if (rc != MEO_OK) { return (int64)rc; }
+  rc = meo_q_step(q);
+  var n: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW) { return (int64)rc; }
+  return n;
+}
+
+// Is there a row with this id?
+fn wg_has(db: MeoDb*, k: int64) -> bool {
+  var q: MeoQuery* = 0;
+  if (meo_q_select(db, "t", &q) != MEO_OK) { return false; }
+  meo_q_pick(q, "v");
+  var v: MeoValue;
+  meo_value_set_int(&v, k);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc == MEO_ROW;
+}
+
+// --- writer threads ---------------------------------------------------------
+
+var g_db: MeoDb* = 0;
+var g_per: int32 = 0;          // inserts per thread
+var g_res: int32* = 0;         // g_res[t * WG_MAX_PER + i]: that insert's result
+
+fn wg_writer(arg: cstring) -> uint32 {
+  var tid: int64 = (int64)arg;
+  var i: int32 = 0;
+  while (i < g_per) {
+    g_res[(int32)tid * WG_MAX_PER + i] = wg_ins(g_db, tid * WG_ID_STRIDE + (int64)i);
+    i += 1;
+  }
+  return 0;
+}
+
+// Run `threads` writers of g_per inserts each against g_db; false on a thread
+// that never finishes (a deadlock; the case stops).
+fn wg_run(threads: int32) -> bool {
+  var hs: int64[] = new int64[threads];
+  defer free(hs.data);
+  var i: int32 = 0;
+  while (i < threads) {
+    hs[i] = CreateThread(0, 0, &wg_writer, (cstring)(int64)i, 0, 0);
+    if (hs[i] == 0) { return false; }
+    i += 1;
+  }
+  i = 0;
+  while (i < threads) {
+    if (thread_join(hs[i], WG_JOIN_MS) != WAIT_OBJECT_0()) {
+      println("FAIL writer {i} still running (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  return true;
+}
+
+// How many of the threads x g_per results equal `want`.
+fn wg_tally(threads: int32, want: int32) -> int64 {
+  var n: int64 = 0;
+  var t: int32 = 0;
+  while (t < threads) {
+    var i: int32 = 0;
+    while (i < g_per) {
+      if (g_res[t * WG_MAX_PER + i] == want) { n += 1; }
+      i += 1;
+    }
+    t += 1;
+  }
+  return n;
+}
+
+// Every result is OK or -MEO_ERR_IO; the count of anything else.
+fn wg_other(threads: int32) -> int64 {
+  return (int64)threads * (int64)g_per - wg_tally(threads, MEO_OK)
+    - wg_tally(threads, -MEO_ERR_IO);
+}
+
+// --- feed reading -----------------------------------------------------------
+
+var g_out: MeoChange* = 0;
+var g_kb: uint8* = 0;
+
+// Drain the feed from `cur`; fills the tallies below.
+var g_ev_total: int64 = 0;
+var g_ev_insert: int64 = 0;
+var g_ev_gap: int64 = 0;
+var g_ev_dup: int64 = 0;         // an id seen twice
+var g_ev_order: int64 = 0;       // commit_seq or time_us went backwards
+var g_ev_hole: int64 = 0;        // a commit_seq skipped a value
+var g_ev_first: uint64 = 0;
+var g_ev_last: uint64 = 0;
+
+fn wg_drain(f: MeoFeed*, cur: MeoFeedCursor*, seen: uint8*, nseen: int64) {
+  g_ev_total = 0;
+  g_ev_insert = 0;
+  g_ev_gap = 0;
+  g_ev_dup = 0;
+  g_ev_order = 0;
+  g_ev_hole = 0;
+  g_ev_first = 0;
+  g_ev_last = 0;
+  var last_time: int64 = 0;
+  while (true) {
+    var n: int32 = meo_feed_read(f, cur, g_out, WG_OUT_CAP, g_kb, WG_KEY_CAP);
+    if (n <= 0) { break; }
+    var i: int32 = 0;
+    while (i < n) {
+      var c: MeoChange* = &g_out[i];
+      g_ev_total += 1;
+      if (c->kind == MEO_CHANGE_GAP) {
+        g_ev_gap += 1;
+      } else if (c->kind == MEO_CHANGE_INSERT) {
+        g_ev_insert += 1;
+        if (seen != 0 && (int64)c->rowid < nseen) {
+          if (seen[(int64)c->rowid] != 0) { g_ev_dup += 1; }
+          seen[(int64)c->rowid] = 1;
+        }
+        if (g_ev_first == 0) { g_ev_first = c->commit_seq; }
+        if (c->commit_seq < g_ev_last) { g_ev_order += 1; }
+        if (g_ev_last != 0 && c->commit_seq > g_ev_last + 1) { g_ev_hole += 1; }
+        if (c->time_us < last_time) { g_ev_order += 1; }
+        g_ev_last = c->commit_seq;
+        last_time = c->time_us;
+      }
+      i += 1;
+    }
+  }
+}
+
+// --- cases ------------------------------------------------------------------
+
+// G1: 1,600 commits share at most 400 fsyncs, and the feed saw each once.
+fn g1() -> int32 {
+  var path: string = "/dev/shm/meodb_wal_group_g1.dat";
+  wg_remove(path);
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  if (!eq(wg_open(path, true, &g_db), 0, "G1: open")) { return 1; }
+  if (!eq(wg_create(g_db), 0, "G1: create")) { return 1; }
+  meo_db_busy_timeout(g_db, 60000);
+  var f: MeoFeed* = meo_feed_new(65536);
+  if (!meo_t_check(f != 0, "G1: feed_new")) { return 1; }
+  if (!eq(meo_feed_attach(g_db->pager, f), 0, "G1: attach")) { return 1; }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+
+  // A 5 ms fsync, like a real disk: an autocommit insert costs about 0.6 ms
+  // before its commit, so a shorter fsync gathers too few commits to share.
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, 5000);
+  var s0: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0);
+  var t0: int64 = meo_clock_monotonic_us();
+  g_per = 100;
+  if (!meo_t_check(wg_run(16), "G1: threads")) { return 1; }
+  var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+  var syncs: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0) - s0;
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, 0);
+  println("G1: 1600 commits in {ms} ms with {syncs} WAL fsyncs");
+
+  if (!eq(wg_tally(16, MEO_OK), 1600, "G1: every insert returned OK")) { return 1; }
+  if (!eq(wg_count(g_db), 1600, "G1: rows")) { return 1; }
+  if (!meo_t_check(syncs <= 400, "G1: {syncs} fsyncs for 1600 commits (max 400)")) {
+    return 1;
+  }
+
+  var seen: uint8[] = new uint8[16 * WG_ID_STRIDE];
+  defer free(seen.data);
+  var k: int64 = 0;
+  while (k < 16 * WG_ID_STRIDE) {
+    seen[k] = 0;
+    k += 1;
+  }
+  wg_drain(f, &cur, seen.data, 16 * WG_ID_STRIDE);
+  if (!eq(g_ev_insert, 1600, "G1: INSERT events")) { return 1; }
+  if (!eq(g_ev_total, 1600, "G1: no other events")) { return 1; }
+  if (!eq(g_ev_dup, 0, "G1: no id published twice")) { return 1; }
+  if (!eq(g_ev_order, 0, "G1: commit_seq and time_us never go back")) { return 1; }
+  if (!eq(g_ev_hole, 0, "G1: no commit_seq skipped")) { return 1; }
+  if (!eq((int64)(g_ev_last - g_ev_first), 1599, "G1: 1600 consecutive commit_seq")) {
+    return 1;
+  }
+  var t: int32 = 0;
+  while (t < 16) {
+    var i: int32 = 0;
+    while (i < 100) {
+      if (seen[(int64)t * WG_ID_STRIDE + (int64)i] == 0) {
+        meo_t_check(false, "G1: event for id {t}/{i}");
+        return 1;
+      }
+      i += 1;
+    }
+    t += 1;
+  }
+  if (!eq((int64)meo_feed_last_commit(f), (int64)g_ev_last, "G1: last_commit")) {
+    return 1;
+  }
+
+  if (!eq(meo_db_close(g_db), 0, "G1: close")) { return 1; }
+  meo_feed_free(f);
+  var db2: MeoDb* = 0;
+  if (!eq(wg_open(path, false, &db2), 0, "G1: reopen")) { return 1; }
+  if (!eq(wg_count(db2), 1600, "G1: rows after reopen")) { return 1; }
+  if (!eq(meo_db_close(db2), 0, "G1: close 2")) { return 1; }
+  wg_remove(path);
+  println("PASS G1: group commit shares fsyncs and the feed is exact");
+  return 0;
+}
+
+// Commits per second for `threads` writers of `per` inserts each, no delay.
+fn wg_bench(path: string, threads: int32, per: int32) -> int64 {
+  wg_remove(path);
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  if (wg_open(path, true, &g_db) != MEO_OK) { return -1; }
+  if (wg_create(g_db) != MEO_OK) { return -1; }
+  meo_db_busy_timeout(g_db, 60000);
+  g_per = per;
+  var s0: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0);
+  var t0: int64 = meo_clock_monotonic_us();
+  if (!wg_run(threads)) { return -1; }
+  var us: int64 = meo_clock_monotonic_us() - t0;
+  var syncs: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0) - s0;
+  var total: int64 = (int64)threads * (int64)per;
+  var rows: int64 = wg_count(g_db);
+  var bad: int64 = total - wg_tally(threads, MEO_OK);
+  meo_db_close(g_db);
+  wg_remove(path);
+  if (bad != 0 || rows != total) { return -2; }
+  if (us < 1) { us = 1; }
+  println("G2: {threads} thread(s): {total} commits, {syncs} fsyncs");
+  return total * 1000000 / us;
+}
+
+// G2: throughput, for the log only.
+fn g2() -> int32 {
+  var one: int64 = wg_bench("/dev/shm/meodb_wal_group_g2a.dat", 1, 1000);
+  if (!meo_t_check(one >= 0, "G2: 1 thread ran ({one})")) { return 1; }
+  var many: int64 = wg_bench("/dev/shm/meodb_wal_group_g2b.dat", 16, 125);
+  if (!meo_t_check(many >= 0, "G2: 16 threads ran ({many})")) { return 1; }
+  println("G2: 1 thread {one} commits/s, 16 threads {many} commits/s");
+  println("PASS G2: throughput measured");
+  return 0;
+}
+
+// G3: a failed fsync under load loses nothing that returned OK.
+fn g3() -> int32 {
+  var path: string = "/dev/shm/meodb_wal_group_g3.dat";
+  wg_remove(path);
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  if (!eq(wg_open(path, true, &g_db), 0, "G3: open")) { return 1; }
+  if (!eq(wg_create(g_db), 0, "G3: create")) { return 1; }
+  meo_db_busy_timeout(g_db, 60000);
+  var f: MeoFeed* = meo_feed_new(65536);
+  if (!meo_t_check(f != 0, "G3: feed_new")) { return 1; }
+  if (!eq(meo_feed_attach(g_db->pager, f), 0, "G3: attach")) { return 1; }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+
+  var s0: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0);
+  meo_wal_test_ctl(MEO_WAL_T_FAIL_SYNC_AT, s0 + 3);
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, 500);
+  g_per = 50;
+  if (!meo_t_check(wg_run(4), "G3: threads")) { return 1; }
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, 0);
+  var ok: int64 = wg_tally(4, MEO_OK);
+  var io: int64 = wg_tally(4, -MEO_ERR_IO);
+  println("G3: {ok} inserts OK, {io} failed with IO of 200");
+  if (!eq(wg_other(4), 0, "G3: only OK or IO")) { return 1; }
+  if (!meo_t_check(ok >= 2, "G3: the two fsyncs before the failure committed ({ok})")) {
+    return 1;
+  }
+  if (!meo_t_check(io > 0, "G3: some statements failed")) { return 1; }
+  if (!eq(meo_db_begin(g_db, MEO_TX_DEFAULT), -MEO_ERR_IO, "G3: begin after the failure")) {
+    return 1;
+  }
+
+  // Readers keep their last durable snapshot.
+  var rows: int64 = wg_count(g_db);
+  if (!meo_t_check(rows >= ok && rows <= 200, "G3: select works ({rows} rows, {ok} OK)")) {
+    return 1;
+  }
+  // The feed holds the durable commits only.
+  wg_drain(f, &cur, 0, 0);
+  if (!eq(g_ev_insert, rows, "G3: feed events match the durable rows")) { return 1; }
+  if (!eq(g_ev_order, 0, "G3: feed order")) { return 1; }
+
+  var rc: int32 = meo_db_close(g_db);
+  println("G3: close of the failed db returned {rc}");
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+
+  // Reopen: recovery keeps every commit that was acknowledged.
+  var db2: MeoDb* = 0;
+  if (!eq(wg_open(path, false, &db2), 0, "G3: reopen")) { return 1; }
+  var rows2: int64 = wg_count(db2);
+  if (!meo_t_check(rows2 >= ok && rows2 <= 200, "G3: {rows2} rows after reopen, {ok} OK")) {
+    return 1;
+  }
+  var lost: int64 = 0;
+  var t: int32 = 0;
+  while (t < 4) {
+    var i: int32 = 0;
+    while (i < g_per) {
+      if (g_res[t * WG_MAX_PER + i] == MEO_OK) {
+        if (!wg_has(db2, (int64)t * WG_ID_STRIDE + (int64)i)) { lost += 1; }
+      }
+      i += 1;
+    }
+    t += 1;
+  }
+  if (!eq(lost, 0, "G3: acknowledged rows lost by the reopen")) { return 1; }
+
+  // The same feed on the reopened db: its next batch is a GAP.
+  if (!eq(meo_feed_attach(db2->pager, f), 0, "G3: reattach")) { return 1; }
+  if (!eq(wg_ins(db2, 900000), 0, "G3: insert after reopen")) { return 1; }
+  wg_drain(f, &cur, 0, 0);
+  if (!meo_t_check(g_ev_gap >= 1, "G3: the feed reports a GAP")) { return 1; }
+  if (!eq(wg_count(db2), rows2 + 1, "G3: new row counted")) { return 1; }
+  if (!eq(meo_db_close(db2), 0, "G3: close 2")) { return 1; }
+  meo_feed_free(f);
+  wg_remove(path);
+  println("PASS G3: a failed fsync loses no acknowledged commit");
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_group (stub)");
-  return 0;
+  var outs: MeoChange[] = new MeoChange[WG_OUT_CAP];
+  var kbs: uint8[] = new uint8[WG_KEY_CAP];
+  var res: int32[] = new int32[WG_MAX_THREADS * WG_MAX_PER];
+  g_out = outs.data;
+  g_kb = kbs.data;
+  g_res = res.data;
+  var i: int32 = 0;
+  while (i < WG_MAX_THREADS * WG_MAX_PER) {
+    res[i] = 0;
+    i += 1;
+  }
+  var rc: int32 = g1();
+  if (rc == 0) { rc = g2(); }
+  if (rc == 0) {
+    var j: int32 = 0;
+    while (j < WG_MAX_THREADS * WG_MAX_PER) {
+      res[j] = 0;
+      j += 1;
+    }
+    rc = g3();
+  }
+  free(outs.data);
+  free(kbs.data);
+  free(res.data);
+  var report: int32 = meo_t_report();
+  if (rc == 0 && report == 0) { println("PASS wal_group"); }
+  if (rc != 0 && report == 0) { return 1; }
+  return report;
 }
