@@ -20,6 +20,7 @@ Build order: [ROADMAP.md](ROADMAP.md).
 | 8a | Wire protocol (frame codec) | `src/wire/` | `meo_wire_` | 0, record values | server and client | M7 |
 | 8b | Server | `src/net/`, `src/server/` | `meo_sock_`, `meo_srv_` | 5, 8a | flux_orm over TCP, tools | M7 |
 | 8c | Client | `src/client/` | `meo_cli_` | 8a, `src/net/` | MeoSQL's own tests; reference for other clients | M7 |
+| 8d | Auth and access control | `src/auth/` | `meo_auth_` | 3, 8b, the separate security library | every network client | later (M7b) |
 | 9 | Replication + fault tolerance | `src/repl/`, `src/raft/` | `meo_repl_`, `meo_raft_` | 4b (WAL is the log), 8 | high availability | later (M8, M9) |
 | 10 | Distribution / sharding | `src/shard/` | `meo_shard_` | 8, 9 | data beyond one node | later (M10) |
 | 11 | Real-time access over the network | `src/server/` (push frames) | `meo_sub_` | 6, 8 | mistplot, browser dashboards via raize | later (M7, after M4) |
@@ -50,7 +51,7 @@ Rules: no circular imports (E0006 fails the build), no lower layer imports a hig
 
 ## The network server
 
-- **Process.** The `meosql` binary owns one database file. One thread accepts connections and each connection gets its own thread, up to 64. Bound to 127.0.0.1 unless told otherwise; an optional shared token is checked at HELLO. No TLS and no users yet.
+- **Process.** The `meosql` binary owns one database file. One thread accepts connections and each connection gets its own thread, up to 64. Bound to 127.0.0.1 unless told otherwise; an optional shared token is checked at HELLO. No users, permissions or encrypted transport yet; those come in M7b, with hashing and encryption from a separate security library.
 - **Transactions.** A connection that runs BEGIN holds the db lock until its COMMIT or ROLLBACK, so other connections wait (and get BUSY after the busy timeout). If the client disconnects, hangs past the transaction idle timeout or the server stops, the server rolls the transaction back on that connection's thread and the lock is free.
 - **Protocol.** Little-endian frames with a 12-byte header (length, kind, request id). A QUERY carries the same statement shape flux_orm builds: kind, table, columns, filter terms, order, limit, offset, typed values. Results come back whole; there are no server-side cursors.
 - **Clients.** flux_orm writes its own small codec from the protocol spec and does not compile MeoSQL. `src/client/` is MeoSQL's reference client.

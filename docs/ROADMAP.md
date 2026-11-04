@@ -67,6 +67,15 @@ Layers 8 and 11. Consumer: flux_orm, which reaches MeoSQL over TCP instead of co
 - [x] flux_orm's network adapter passes its tests against a running server (flux_orm `tests/live_meosql.mettle`).
 - [ ] After M4: remote `SUBSCRIBE table` pushes events within 50 ms p99 on localhost, and raize can relay them to browsers.
 
+## M7b — Authentication and access control
+Layer 8d. Consumers: every network client (flux_orm, raize_web apps). Hashing, key derivation and encryption come from a separate Mettle security library; MeoSQL calls it and implements no crypto of its own.
+- [ ] Users live in a system table in the database file. Passwords are stored only as salted, slow hashes from the security library. Creating, changing and removing users is an admin operation.
+- [ ] HELLO carries a user name and a credential (a protocol minor version bump). The shared token stays as the bootstrap credential for the first admin. A wrong user or password returns AUTH after the same delay as today, with no hint which part was wrong.
+- [ ] Permissions per user: read and write per table, and admin for DDL and user management. A denied query returns AUTH, non-fatal, and leaves the transaction state unchanged.
+- [ ] Repeated failed logins from one address are slowed down, then refused for a while. Logins and denials are logged.
+- [ ] Encrypted transport through the security library, required for any non-loopback bind.
+- [ ] Later: encryption at rest for the database file and journal, with keys from the security library.
+
 ## M8 — Replication + fault tolerance (log shipping)
 Layer 9, step 1.
 - [ ] The primary ships WAL frames to followers; followers apply them and serve read-only queries.
