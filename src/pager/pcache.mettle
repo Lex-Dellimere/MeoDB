@@ -196,7 +196,8 @@ fn meo_pc_victim(c: MeoPcache*) -> int32 {
 }
 
 export fn meo_pcache_get(c: MeoPcache*, page_no: uint32, src: uint64,
-    meo_fill_cb: fn(rawptr, uint32, uint64, uint8*) -> int32, ctx: rawptr, err: int32*) -> MeoPcFrame* {
+    meo_fill_cb: fn(rawptr, uint32, uint64, uint8*) -> int32 with alloc, syscall, asm,
+    ctx: rawptr, err: int32*) -> MeoPcFrame* {
   var b: int32 = meo_pc_bucket(c, page_no, src);
   var s: int32 = meo_pc_stripe(b);
   spin_lock(&c->locks[s]);

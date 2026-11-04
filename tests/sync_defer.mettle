@@ -1,0 +1,203 @@
+// sync_defer: commits whose fsync the caller waits for itself. Autocommit
+// statements of a deferred query and meo_db_commit_t hand back a ticket instead
+// of blocking, so one WAL fsync covers many commits and the db lock is free
+// while the sync runs. A program, not @test functions: it needs files and a
+// thread. Run it with
+//
+//   mbuild run sync_defer
+//
+// Cases:
+//   D1  100 autocommit inserts with meo_q_defer_sync: every ticket is nonzero
+//       and rising, and the inserts cost at most 5 WAL fsyncs before any wait.
+//   D2  after the last ticket is waited for, a read (it runs on a snapshot)
+//       sees all 100 rows.
+//   D3  BEGIN, insert, meo_db_commit_t: a ticket, no transaction open, another
+//       thread can BEGIN before the wait, and the wait succeeds.
+//   D4  after a reopen, 101 rows.
+//   D5  rollback mode: tickets are 0 and the rows survive a reopen.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/wal.mettle";
+import "../src/meodb.mettle";
+import "tinytest.mettle";
+
+const SD_DB: string = "/dev/shm/meodb_sync_defer.db";
+const SD_DB_RB: string = "/dev/shm/meodb_sync_defer_rb.db";
+const SD_ROWS: int32 = 100;
+const SD_SYNC_DELAY_US: int64 = 5000;
+const SD_JOIN_MS: uint32 = 30000;
+
+var g_db: MeoDb* = 0;
+var g_other_rc: int32 = 1;     // the other thread's BEGIN
+var g_other_end: int32 = 1;    // and its ROLLBACK
+
+fn sd_unlink(db: string) {
+  meo_file_unlink(db);
+  var w: string = db + "-wal";
+  meo_file_unlink(w);
+  free(w.chars);
+  var j: string = db + "-journal";
+  meo_file_unlink(j);
+  free(j.chars);
+}
+
+fn sd_open(path: string, wal: bool, create: bool, out: MeoDb**) -> int32 {
+  var flags: int32 = MEO_OPEN_READ | MEO_OPEN_WRITE;
+  if (create) { flags = flags | MEO_OPEN_CREATE; }
+  if (wal) { flags = flags | MEO_OPEN_WAL; } else { flags = flags | MEO_OPEN_NO_WAL; }
+  return meo_db_open(path, flags, 0, out);
+}
+
+fn sd_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// One insert of id k. With `ticket` set the query is deferred and *ticket gets
+// the commit to wait for.
+fn sd_ins(db: MeoDb*, k: int64, ticket: uint64*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_into(q, "id");
+  var v: MeoValue;
+  meo_value_set_int(&v, k);
+  meo_q_value(q, &v);
+  if (ticket != 0) { meo_q_defer_sync(q); }
+  rc = meo_q_step(q);
+  if (ticket != 0) { ticket[0] = meo_q_sync_ticket(q); }
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn sd_count(db: MeoDb*) -> int64 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_count(db, "t", &q);
+  if (rc != MEO_OK) { return (int64)rc; }
+  rc = meo_q_step(q);
+  var n: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW) { return (int64)rc; }
+  return n;
+}
+
+fn sd_other(arg: cstring) -> uint32 {
+  g_other_rc = meo_db_begin(g_db, MEO_TX_DEFAULT);
+  g_other_end = 1;
+  if (g_other_rc == MEO_OK) { g_other_end = meo_db_rollback(g_db); }
+  return 0;
+}
+
+fn sd_wal() -> int32 {
+  sd_unlink(SD_DB);
+  if (!meo_t_check_i64((int64)sd_open(SD_DB, true, true, &g_db), 0, "D1: open")) { return 1; }
+  if (!meo_t_check_i64((int64)sd_create(g_db), 0, "D1: create")) { return 1; }
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, SD_SYNC_DELAY_US);
+
+  var tickets: uint64[] = new uint64[SD_ROWS];
+  defer free(tickets.data);
+  var s0: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0);
+  var bad: int64 = 0;
+  var i: int32 = 0;
+  while (i < SD_ROWS) {
+    tickets[i] = 0;
+    if (sd_ins(g_db, (int64)i + 1, &tickets[i]) != MEO_OK) { bad += 1; }
+    if (tickets[i] == 0) { bad += 1; }
+    if (i > 0 && tickets[i] <= tickets[i - 1]) { bad += 1; }
+    i += 1;
+  }
+  var syncs: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0) - s0;
+  meo_t_check_i64(bad, 0, "D1: inserts with a rising nonzero ticket (failures)");
+  meo_t_check(syncs <= 5, "D1: at most 5 fsyncs before any wait");
+  println("D1  syncs before wait: {syncs}");
+  println("PASS D1");
+
+  var before: int64 = sd_count(g_db);
+  println("D2  rows a read sees before the wait: {before}");
+  meo_t_check_i64((int64)meo_db_commit_wait(g_db, tickets[SD_ROWS - 1]), 0, "D2: wait");
+  meo_t_check_i64(sd_count(g_db), (int64)SD_ROWS, "D2: rows after wait");
+  println("PASS D2");
+
+  var t: uint64 = 0;
+  meo_t_check_i64((int64)meo_db_begin(g_db, MEO_TX_DEFAULT), 0, "D3: begin");
+  meo_t_check_i64((int64)sd_ins(g_db, 1000, 0), 0, "D3: insert in tx");
+  meo_t_check_i64((int64)meo_db_commit_t(g_db, &t), 0, "D3: commit_t");
+  meo_t_check(t != 0, "D3: ticket nonzero");
+  meo_t_check_false(meo_db_in_tx(g_db), "D3: no tx open");
+  var h: int64 = CreateThread(0, 0, &sd_other, (cstring)0, 0, 0);
+  if (h == 0) {
+    println("FAIL D3: thread");
+    return 1;
+  }
+  if (thread_join(h, SD_JOIN_MS) != WAIT_OBJECT_0()) {
+    println("FAIL D3: other thread still running (deadlock?)");
+    return 1;
+  }
+  thread_close(h);
+  meo_t_check_i64((int64)g_other_rc, 0, "D3: other begin before the wait");
+  meo_t_check_i64((int64)g_other_end, 0, "D3: other rollback");
+  meo_t_check_i64((int64)meo_db_commit_wait(g_db, t), 0, "D3: wait");
+  meo_t_check_i64(sd_count(g_db), (int64)SD_ROWS + 1, "D3: rows");
+  println("PASS D3");
+
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, 0);
+  meo_t_check_i64((int64)meo_db_close(g_db), 0, "D4: close");
+  g_db = 0;
+  meo_t_check_i64((int64)sd_open(SD_DB, true, false, &g_db), 0, "D4: reopen");
+  meo_t_check_i64(sd_count(g_db), (int64)SD_ROWS + 1, "D4: rows after reopen");
+  meo_db_close(g_db);
+  g_db = 0;
+  sd_unlink(SD_DB);
+  println("PASS D4");
+  return 0;
+}
+
+fn sd_rollback_mode() -> int32 {
+  sd_unlink(SD_DB_RB);
+  var db: MeoDb* = 0;
+  if (!meo_t_check_i64((int64)sd_open(SD_DB_RB, false, true, &db), 0, "D5: open")) { return 1; }
+  meo_t_check_i64((int64)sd_create(db), 0, "D5: create");
+  var tickets: int64 = 0;
+  var i: int32 = 0;
+  while (i < 10) {
+    var t: uint64 = 7;
+    meo_t_check_i64((int64)sd_ins(db, (int64)i + 1, &t), 0, "D5: insert");
+    if (t != 0) { tickets += 1; }
+    i += 1;
+  }
+  var ct: uint64 = 7;
+  meo_t_check_i64((int64)meo_db_begin(db, MEO_TX_DEFAULT), 0, "D5: begin");
+  meo_t_check_i64((int64)sd_ins(db, 100, 0), 0, "D5: insert in tx");
+  meo_t_check_i64((int64)meo_db_commit_t(db, &ct), 0, "D5: commit_t");
+  meo_t_check_i64(tickets, 0, "D5: statement tickets");
+  meo_t_check_i64((int64)ct, 0, "D5: commit ticket");
+  meo_db_close(db);
+  db = 0;
+  meo_t_check_i64((int64)sd_open(SD_DB_RB, false, false, &db), 0, "D5: reopen");
+  meo_t_check_i64(sd_count(db), 11, "D5: rows after reopen");
+  meo_db_close(db);
+  sd_unlink(SD_DB_RB);
+  println("PASS D5");
+  return 0;
+}
+
+fn main() -> int32 {
+  if (sd_wal() != 0) { return 1; }
+  if (sd_rollback_mode() != 0) { return 1; }
+  var rc: int32 = meo_t_report();
+  if (rc == 0) { println("PASS sync_defer"); }
+  return rc;
+}

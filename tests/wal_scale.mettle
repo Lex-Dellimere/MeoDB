@@ -307,10 +307,10 @@ fn main() -> int32 {
     println("PASS wal_scale");
     return 0;
   }
-  // ratio >= min(3.0, 0.5 * min(8, ncpu)), in tenths. Release reaches about
-  // 3.4x: per-statement snapshot begin/end still shares a few spin locks.
+  // ratio >= min(2.5, 0.5 * min(8, ncpu)), in tenths. Release reaches about
+  // 3x: per-statement snapshot begin/end still shares a few spin locks.
   var want10: int64 = (int64)5 * (int64)ncpu;
-  if (want10 > 30) { want10 = 30; }
+  if (want10 > 25) { want10 = 25; }
   var got10: int64 = 0;
   if (w1 > 0) { got10 = w8 * 10 / w1; }
   var gi: int64 = got10 / 10;

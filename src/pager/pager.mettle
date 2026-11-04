@@ -162,8 +162,8 @@ export struct MeoPager {
   lock: rawptr;      // phase 9; always 0 in phase 1
   // Commit hook (see the header note). 0 = none.
   hook_ctx: rawptr;
-  hook_commit: fn(rawptr, uint64, int64) -> void;
-  hook_event: fn(rawptr, int32) -> void;
+  hook_commit: fn(rawptr, uint64, int64) -> void with alloc, syscall, asm;
+  hook_event: fn(rawptr, int32) -> void with alloc, syscall, asm;
   prepared: bool;    // commit_prepare has bumped commit_seq for this txn
   unflushed: bool;   // modified with no transaction open since the last flush
   // WAL mode (wal == 0 in rollback mode).
@@ -2203,8 +2203,8 @@ fn meo_pager_notify_event(p: MeoPager*, code: int32) {
 // next flush will count -- the new hook did not see them, so its owner should
 // treat the next commit as a gap.
 export fn meo_pager_set_hook(p: MeoPager*, ctx: rawptr,
-    meo_commit_cb: fn(rawptr, uint64, int64) -> void,
-    meo_event_cb: fn(rawptr, int32) -> void) -> int32 {
+    meo_commit_cb: fn(rawptr, uint64, int64) -> void with alloc, syscall, asm,
+    meo_event_cb: fn(rawptr, int32) -> void with alloc, syscall, asm) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }

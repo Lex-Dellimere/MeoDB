@@ -217,22 +217,31 @@ fn db_tx_mine(db: MeoDb*) -> bool {
 // Commit. None open, another thread's, or poisoned -> -MEO_ERR_TX; a poisoned
 // transaction stays open until rollback.
 export fn meo_db_commit(db: MeoDb*) -> int32 {
-  if (db == 0) { return -MEO_ERR_USAGE; }
+  var ticket: uint64 = 0;
+  var rc: int32 = meo_db_commit_t(db, &ticket);
+  if (rc != MEO_OK || ticket == 0) { return rc; }
+  return meo_pager_commit_wait(db->pager, ticket);
+}
+
+// meo_db_commit without the wait. In WAL mode the commit is appended under the
+// lock, the lock is released and *ticket names what meo_db_commit_wait must
+// wait for, so other writers can append and share the sync. Rollback mode
+// commits fully and sets *ticket to 0. A failure leaves the transaction open.
+export fn meo_db_commit_t(db: MeoDb*, ticket: uint64*) -> int32 {
+  if (db == 0 || ticket == 0) { return -MEO_ERR_USAGE; }
+  ticket[0] = 0;
   if (!db_tx_mine(db)) { return -MEO_ERR_TX; }
   if (db->poisoned) { return -MEO_ERR_TX; }
   if (db->wal) {
-    // Append under the lock, wait for the fsync after leaving it so other
-    // writers can append and share the sync.
-    var ticket: uint64 = 0;
-    var arc: int32 = meo_pager_commit_async(db->pager, &ticket);
-    if (arc != MEO_OK) { return arc; }   // still open, as below
-    db->in_tx = false;
-    db->tx_owner = 0;
-    meo_lock_leave(&db->lock);
-    return meo_pager_commit_wait(db->pager, ticket);
+    var arc: int32 = meo_pager_commit_async(db->pager, ticket);
+    if (arc != MEO_OK) {   // still open, as below
+      ticket[0] = 0;
+      return arc;
+    }
+  } else {
+    var rc: int32 = meo_pager_commit(db->pager);
+    if (rc != MEO_OK) { return rc; }   // still open: the caller may roll back
   }
-  var rc: int32 = meo_pager_commit(db->pager);
-  if (rc != MEO_OK) { return rc; }   // still open: the caller may roll back
   db->in_tx = false;
   db->tx_owner = 0;
   meo_lock_leave(&db->lock);

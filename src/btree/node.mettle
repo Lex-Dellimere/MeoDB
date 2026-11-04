@@ -149,7 +149,7 @@ export fn meo_btn_leaf_set_rowid(buf: uint8*, i: int32, v: uint64) -> int32 {
 // Index of the first leaf cell whose key is not less than `key` (lower bound),
 // 0..n_cells. An index equal to n_cells means every key in the leaf is smaller.
 export fn meo_btn_leaf_search(buf: uint8*, key: uint8*, klen: int32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32) -> int32 {
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm) -> int32 {
   var lo: int32 = 0;
   var hi: int32 = meo_page_n_cells(buf);
   while (lo < hi) {
@@ -169,7 +169,7 @@ export fn meo_btn_leaf_search(buf: uint8*, key: uint8*, klen: int32,
 // cell whose key is strictly greater than the target, or the right child when
 // no separator is greater. Returns 0..n_cells-1.
 export fn meo_btn_inner_child_index(buf: uint8*, key: uint8*, klen: int32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32) -> int32 {
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm) -> int32 {
   var n: int32 = meo_page_n_cells(buf);
   var lo: int32 = 0;
   var hi: int32 = n - 1; // the keyed cells are 0..n-2

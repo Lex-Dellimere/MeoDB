@@ -8,10 +8,17 @@
 //   mbuild run smoke      the whole storage stack in one run
 //   mbuild run <test>     one test program; each prints PASS or FAIL
 //
+// alph (../alph) is a path dependency: bins that run the engine on alph build
+// with -s (stack-trace), which alph's guide asks for.
+//
 // Needs the head compiler, not the v0.17.0 release (MeoDB uses syscall()):
 //   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
 
 import "mbuild/api";
+
+fn deps() {
+  mb_dep_path("alph", "../alph");
+}
 
 fn project() {
   mb_package("meodb", "0.1.0");
@@ -197,4 +204,36 @@ fn project() {
 
   // Client subscribe and scan.
   mb_bin("cli_sub", "tests/cli_sub.mettle");
+
+  // Commits whose fsync the caller waits for itself.
+  mb_bin("sync_defer", "tests/sync_defer.mettle");
+
+  // The engine called from alph actors and pool jobs.
+  mb_bin("alph_hello", "tests/alph_hello.mettle");
+
+  // Server and alph bins build with -s.
+  mb_for_bin("meodb");
+  mb_set("stack-trace", "true");
+  mb_for_bin("alph_hello");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_smoke");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_e2e");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_mt");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_kill");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_limits");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_stop");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_wal");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_sub");
+  mb_set("stack-trace", "true");
+  mb_for_bin("srv_scan");
+  mb_set("stack-trace", "true");
+  mb_for_bin("cli_sub");
+  mb_set("stack-trace", "true");
 }

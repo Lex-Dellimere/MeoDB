@@ -559,7 +559,8 @@ fn tbl_index_rec(db: MeoDb*, t: MeoTable*, rec: uint8*, rec_len: int32, rowid: i
       var kn: int32 = tbl_key_encode(&v, kbuf, MEO_REC_MAX);
       if (kn < 0) { return kn; }
       if (kn > 0) {
-        var cmp: fn(uint8*, int32, uint8*, int32) -> int32 = meo_key_compare;
+        var cmp: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm =
+            meo_key_compare;
         if (tbl_col_multi(t, c)) {
           kn += meo_key_rowid(kbuf + kn, 8, rowid);
           cmp = meo_idx_cmp;

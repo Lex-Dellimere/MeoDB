@@ -820,8 +820,8 @@ struct MeoCliScan {
 
 // Read frames of the scan with this rid up to last = 1.
 fn meo_cli_scan_read(c: MeoCli*, rid: uint32, sc: MeoCliScan*,
-                     cb: fn(rawptr, int64, float64, float64) -> int32, ctx: rawptr,
-                     seq_out: uint64*) -> int32 {
+                     cb: fn(rawptr, int64, float64, float64) -> int32 with alloc, syscall, asm,
+                     ctx: rawptr, seq_out: uint64*) -> int32 {
   var hb: uint8[12];
   var h: MeoWHdr;
   while (true) {
@@ -879,7 +879,8 @@ fn meo_cli_scan_read(c: MeoCli*, rid: uint32, sc: MeoCliScan*,
 // (SCHEMA for an unknown name) is returned as -MEO_ERR_*.
 export fn meo_cli_scan_xy(c: MeoCli*, table: string, x: string, y: string, group: string,
                           lo: float64, hi: float64, chunk: int32,
-                          meo_scan_cli_cb: fn(rawptr, int64, float64, float64) -> int32,
+                          meo_scan_cli_cb: fn(rawptr, int64, float64, float64) -> int32
+                              with alloc, syscall, asm,
                           ctx: rawptr, seq_out: uint64*) -> int32 {
   if (c == 0) { return -MEO_ERR_USAGE; }
   if (chunk < 1 || chunk > (int32)MEO_WIRE_CHUNK_MAX || meo_scan_cli_cb == 0) { return -MEO_ERR_USAGE; }

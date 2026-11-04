@@ -72,6 +72,7 @@ fn q_new(db: MeoDb*, kind: int32, table: string, out: MeoQuery**) -> int32 {
   q->changes = 0;
   q->last_rowid = 0;
   q->ticket = 0;
+  q->defer_sync = false;
   var rc: int32 = meo_qspec_name(&q->spec.table, table);
   if (rc == MEO_OK) {
     q->plan_arena = meo_arena_new(4096);
@@ -541,8 +542,8 @@ export fn meo_q_cell(q: MeoQuery*, row: int32, col: int32, out: MeoValue*) -> in
 
 // One scan: the callbacks, the column positions and the x window.
 struct QScan {
-  fn_xy: fn(rawptr, float64, float64) -> int32;
-  fn_xyg: fn(rawptr, int64, float64, float64) -> int32;
+  fn_xy: fn(rawptr, float64, float64) -> int32 with alloc, syscall, asm;
+  fn_xyg: fn(rawptr, int64, float64, float64) -> int32 with alloc, syscall, asm;
   ctx: rawptr;
   grouped: bool;
   xc: int32;
@@ -737,7 +738,8 @@ fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QS
 // runs on a snapshot, holding it (not the lock) for the whole scan. A db that
 // is a snapshot view (meo_db_snap_begin) is scanned as it stands, no lock.
 export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: float64,
-    hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32, ctx: rawptr) -> int32 {
+    hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32 with alloc, syscall, asm,
+    ctx: rawptr) -> int32 {
   return meo_q_scan_xy_seq(db, table, x, y, lo, hi, meo_scan_cb, ctx, 0);
 }
 
@@ -745,8 +747,8 @@ export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: flo
 // the snapshot's in WAL mode, the pager's under the lock otherwise (inside the
 // caller's own transaction, the value as of its last commit).
 export fn meo_q_scan_xy_seq(db: MeoDb*, table: string, x: string, y: string, lo: float64,
-    hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32, ctx: rawptr,
-    seq_out: uint64*) -> int32 {
+    hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32 with alloc, syscall, asm,
+    ctx: rawptr, seq_out: uint64*) -> int32 {
   if (db == 0 || meo_scan_cb == 0) { return -MEO_ERR_USAGE; }
   var sc: QScan;
   sc.fn_xy = meo_scan_cb;
@@ -762,7 +764,8 @@ export fn meo_q_scan_xy_seq(db: MeoDb*, table: string, x: string, y: string, lo:
 // group column must be INTEGER; a row whose group is NULL or not an INTEGER is
 // skipped. Same order, locking and stop rules.
 export fn meo_q_scan_xyg(db: MeoDb*, table: string, x: string, y: string, group: string,
-    lo: float64, hi: float64, meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32,
+    lo: float64, hi: float64,
+    meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32 with alloc, syscall, asm,
     ctx: rawptr) -> int32 {
   return meo_q_scan_xyg_seq(db, table, x, y, group, lo, hi, meo_scan_gcb, ctx, 0);
 }
@@ -771,8 +774,8 @@ export fn meo_q_scan_xyg(db: MeoDb*, table: string, x: string, y: string, group:
 // meo_q_scan_xy_seq does.
 export fn meo_q_scan_xyg_seq(db: MeoDb*, table: string, x: string, y: string,
     group: string, lo: float64, hi: float64,
-    meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32, ctx: rawptr,
-    seq_out: uint64*) -> int32 {
+    meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32 with alloc, syscall, asm,
+    ctx: rawptr, seq_out: uint64*) -> int32 {
   if (db == 0 || meo_scan_gcb == 0) { return -MEO_ERR_USAGE; }
   var sc: QScan;
   sc.fn_xy = 0;
@@ -782,4 +785,21 @@ export fn meo_q_scan_xyg_seq(db: MeoDb*, table: string, x: string, y: string,
   sc.lo = lo;
   sc.hi = hi;
   return q_scan(db, table, x, y, group, &sc, seq_out);
+}
+
+// From now on a run of q does not wait for its WAL commit to become durable:
+// meo_q_sync_ticket names the commit and the caller waits with
+// meo_db_commit_wait. No effect in rollback mode, where the commit is synchronous.
+export fn meo_q_defer_sync(q: MeoQuery*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  q->defer_sync = true;
+  return MEO_OK;
+}
+
+// The commit the last run appended and did not wait for, or 0: a read, rollback
+// mode, a failure, or a query that is not deferred. The caller must
+// meo_db_commit_wait on it before reporting success.
+export fn meo_q_sync_ticket(q: MeoQuery*) -> uint64 {
+  if (q == 0 || !q->defer_sync) { return 0; }
+  return q->ticket;
 }

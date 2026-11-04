@@ -55,6 +55,7 @@ export struct MeoQuery {
   changes: int32;         // rows written by the last run
   last_rowid: int64;      // last rowid inserted by the last run
   ticket: uint64;         // WAL commit the run waits for after the lock; 0 = none
+  defer_sync: bool;       // the caller waits for ticket itself (meo_q_defer_sync)
 }
 
 // Store a copy of *v in slot k (bytes into the slot's own buffer).
@@ -935,7 +936,8 @@ fn exec_body(q: MeoQuery*) -> int32 {
 // Run the query once (first step). In WAL mode a read on a thread that holds
 // no lock runs on a snapshot and never waits for a writer. Otherwise the lock
 // is held for the whole run, and a WAL commit is waited for after releasing it
-// so concurrent commits share one fsync.
+// so concurrent commits share one fsync. A deferred query leaves that wait to
+// its caller.
 fn exec_run(q: MeoQuery*) -> int32 {
   var db: MeoDb* = q->db;
   q->ticket = 0;
@@ -956,7 +958,7 @@ fn exec_run(q: MeoQuery*) -> int32 {
   if (rc != MEO_OK) { return rc; }
   rc = exec_body(q);
   meo_db_leave(db);
-  if (q->ticket != 0) {
+  if (q->ticket != 0 && !q->defer_sync) {
     var w: int32 = meo_db_commit_wait(db, q->ticket);
     if (w < 0) { return w; }
   }

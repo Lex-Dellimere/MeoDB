@@ -1,0 +1,150 @@
+// alph_hello: the engine called from alph actors. A bound actor creates a
+// table and inserts rows, a pool job counts them, and the node shuts down.
+// The node runs twice in one process over the same WAL database, so a second
+// node start after a full shutdown is covered too.
+
+import "std/io";
+import "std/mem";
+import "alph/alph";
+import "../src/meodb.mettle";
+
+const AH_DB: string = "/dev/shm/meodb_alph_hello.db";
+const AH_WAL: string = "/dev/shm/meodb_alph_hello.db-wal";
+const AH_ROWS: int64 = 100;
+const AH_TAG_GO: int64 = ALPH_TAG_USER;
+
+var g_db: MeoDb* = 0;
+var g_why: string = "";
+var g_failed: bool = false;
+
+struct AhBoss {
+  pool: int64;
+  ref: int64;
+  base: int64;       // ids already in the table before this run
+}
+
+fn ah_store(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag != AH_TAG_GO) { return ALPH_CONTINUE; }
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(g_db, "t", &q);
+  if (rc == MEO_OK) { rc = meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK); }
+  if (rc == MEO_OK) { rc = meo_q_if_not_exists(q); }
+  if (rc == MEO_OK) {
+    rc = meo_q_step(q);
+    if (rc == MEO_DONE) { rc = MEO_OK; }
+  }
+  meo_q_free(q);
+  var i: int64 = 0;
+  while (rc == MEO_OK && i < AH_ROWS) {
+    var v: MeoValue;
+    meo_value_set_int(&v, m->arg + i + 1);
+    q = 0;
+    rc = meo_q_insert(g_db, "t", &q);
+    if (rc == MEO_OK) { rc = meo_q_into(q, "id"); }
+    if (rc == MEO_OK) { rc = meo_q_value(q, &v); }
+    if (rc == MEO_OK) {
+      rc = meo_q_step(q);
+      if (rc == MEO_DONE) { rc = MEO_OK; }
+    }
+    meo_q_free(q);
+    i += 1;
+  }
+  alph_reply(ctx, m, AH_TAG_GO, (int64)rc);
+  return ALPH_CONTINUE;
+}
+
+fn ah_count(input: rawptr, size: int64, out: AlphOut*) -> int64 {
+  var q: MeoQuery* = 0;
+  if (meo_q_count(g_db, "t", &q) != MEO_OK) { return -1; }
+  var n: int64 = -2;
+  if (meo_q_step(q) == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+fn ah_boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: AhBoss* = (AhBoss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    b->pool = alph_spawn_pool(ctx, 2, 16);
+    var s: int64 = alph_spawn(ctx, ALPH_BOUND | ALPH_LINK, &ah_store);
+    if (b->pool == 0 || s == 0) {
+      g_why = "spawn failed";
+      g_failed = true;
+      alph_shutdown(ctx, 1000, 1);
+      return ALPH_CONTINUE;
+    }
+    alph_request(ctx, s, AH_TAG_GO, b->base, 5000);
+  } else if (m->tag == AH_TAG_GO) {
+    if (m->arg != 0) {
+      g_why = "insert failed: {m->arg}";
+      g_failed = true;
+      alph_shutdown(ctx, 1000, 1);
+      return ALPH_CONTINUE;
+    }
+    b->ref = alph_offload(ctx, b->pool, (rawptr)"x", 1, 5000, &ah_count);
+  } else if (m->tag == ALPH_TAG_DONE && m->ref == b->ref) {
+    var want: int64 = b->base + AH_ROWS;
+    if (m->arg != want) {
+      g_why = "count {m->arg}, want {want}";
+      g_failed = true;
+      alph_shutdown(ctx, 1000, 1);
+    } else {
+      alph_shutdown(ctx, 1000, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn ah_run(base: int64) -> int32 {
+  var node: AlphNode* = (AlphNode*)calloc(1, (int64)sizeof(AlphNode));
+  if (node == 0) { g_why = "no memory"; return 1; }
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  if (!alph_node_start(node, &cfg)) {
+    g_why = "node start failed";
+    free((rawptr)node);
+    return 1;
+  }
+  var b: AhBoss;
+  b.pool = 0;
+  b.ref = 0;
+  b.base = base;
+  alph_node_spawn_value<AhBoss>(node, 0, &b, &ah_boss);
+  var rc: int64 = alph_node_wait(node);
+  free((rawptr)node);
+  if (rc != 0) {
+    if (!g_failed) { g_why = "node exit {rc}"; }
+    return 1;
+  }
+  return 0;
+}
+
+fn ah_fail() -> int32 {
+  println("FAIL alph_hello: {g_why}");
+  return 1;
+}
+
+fn main() -> int32 {
+  syscall((int64)87, (int64)AH_DB);
+  syscall((int64)87, (int64)AH_WAL);
+  if (meo_db_open(AH_DB, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL, 0,
+                  &g_db) != MEO_OK) {
+    g_why = "db open failed";
+    return ah_fail();
+  }
+  var pass: int32 = 0;
+  while (pass < 2) {
+    if (ah_run(pass * AH_ROWS) != 0) {
+      meo_db_close(g_db);
+      return ah_fail();
+    }
+    pass += 1;
+  }
+  if (meo_db_close(g_db) != MEO_OK) {
+    g_why = "db close failed";
+    return ah_fail();
+  }
+  println("PASS alph_hello");
+  return 0;
+}

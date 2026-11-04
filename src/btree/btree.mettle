@@ -83,7 +83,7 @@ export struct MeoBtKey {
 export struct MeoBtCursor {
   pager: MeoPager*;
   root: uint32;
-  cmp: fn(uint8*, int32, uint8*, int32) -> int32;
+  cmp: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm;
   path: uint32[16];
   slot: int32[16];
   depth: int32;
@@ -139,7 +139,7 @@ fn bt_alloc(p: MeoPager*, err_out: int32*) -> MeoFrame* {
 // Descend from `root` to the leaf a search for `key` belongs in and leave that
 // leaf pinned in the cursor. Nothing is pinned on failure.
 fn bt_seek_leaf(p: MeoPager*, c: MeoBtCursor*, root: uint32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: uint8*,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm, key: uint8*,
     klen: int32) -> int32 {
   var page: uint32 = root;
   var level: int32 = 0;
@@ -317,7 +317,8 @@ export fn meo_bt_cursor_init(c: MeoBtCursor*) {
 // smaller (or the tree does not exist yet), negative = failure. A cursor may be
 // reused: whatever it held is released first.
 export fn meo_bt_seek(p: MeoPager*, c: MeoBtCursor*, root: uint32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey) -> int32 {
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm,
+    key: MeoBtKey) -> int32 {
   if (p == 0 || c == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
     return -MEO_ERR_USAGE;
   }
@@ -393,7 +394,7 @@ export fn meo_bt_close(p: MeoPager*, c: MeoBtCursor*) {
 // Look `key` up. MEO_OK and the rowid written when the key is present, 1 when it
 // is absent (rowid untouched), negative on failure.
 export fn meo_bt_lookup(p: MeoPager*, root: uint32,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm, key: MeoBtKey,
     rowid: uint64*) -> int32 {
   if (p == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0 || rowid == 0) {
     return -MEO_ERR_USAGE;
@@ -424,7 +425,7 @@ export fn meo_bt_lookup(p: MeoPager*, root: uint32,
 // the parent gains the separator (a leaf's first upper key, or an inner node's
 // middle key). No merge, no rebalance -- see the header note.
 export fn meo_bt_insert(p: MeoPager*, root: uint32*,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm, key: MeoBtKey,
     rowid: uint64) -> int32 {
   return bt_insert_impl(p, root, cmp_cb, key, rowid, 0);
 }
@@ -434,7 +435,7 @@ export fn meo_bt_insert(p: MeoPager*, root: uint32*,
 // first sep_max bytes (meo_tbl_cmp); a prefix-ordered comparator like
 // meo_key_compare must pass 0.
 export fn meo_bt_insert_sep(p: MeoPager*, root: uint32*,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm, key: MeoBtKey,
     rowid: uint64, sep_max: int32) -> int32 {
   if (sep_max < 0) { return -MEO_ERR_USAGE; }
   return bt_insert_impl(p, root, cmp_cb, key, rowid, sep_max);
@@ -486,7 +487,8 @@ export fn meo_bt_last(p: MeoPager*, root: uint32, rowid: uint64*) -> int32 {
 // changes: no merge, no parent update, so root* is never rewritten and an
 // emptied leaf (even an empty root leaf) stays in the tree.
 export fn meo_bt_delete(p: MeoPager*, root: uint32*,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey) -> int32 {
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm,
+    key: MeoBtKey) -> int32 {
   if (p == 0 || root == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
     return -MEO_ERR_USAGE;
   }
@@ -519,7 +521,7 @@ export fn meo_bt_delete(p: MeoPager*, root: uint32*,
 }
 
 fn bt_insert_impl(p: MeoPager*, root: uint32*,
-    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm, key: MeoBtKey,
     rowid: uint64, sep_max: int32) -> int32 {
   if (p == 0 || root == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
     return -MEO_ERR_USAGE;

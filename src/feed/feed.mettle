@@ -627,7 +627,7 @@ export fn meo_feed_detach(p: MeoPager*) -> int32 {
 // Outside a transaction the events stay pending until a counted autocommit
 // flush (meo_pager_flush / meo_pager_close) publishes them.
 export fn meo_feed_insert(f: MeoFeed*, p: MeoPager*, table_id: uint32,
-    root: uint32*, meo_cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32,
+    root: uint32*, meo_cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32 with alloc, syscall, asm,
     key: MeoBtKey, rowid: uint64) -> int32 {
   if (f == 0 || p == 0 || root == 0) { return -MEO_ERR_USAGE; }
   if (meo_pager_hook_ctx(p) != (rawptr)f) { return -MEO_ERR_USAGE; }

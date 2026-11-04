@@ -139,7 +139,7 @@ export struct MeoWal {
   ckpt_frames: int32;  // auto-checkpoint threshold, 0 = off
   pcache: rawptr;
   note_ctx: rawptr;
-  note_cb: fn(rawptr, int32, uint64) -> void;  // under sync_lock
+  note_cb: fn(rawptr, int32, uint64) -> void with alloc, syscall, asm;  // under sync_lock
   n_syncs: int64;      // WAL fsyncs (sync_lock)
 }
 
@@ -933,7 +933,7 @@ export fn meo_wal_set_pcache(w: MeoWal*, c: MeoPcache*) {
 }
 
 export fn meo_wal_set_note(w: MeoWal*, ctx: rawptr,
-    meo_note_cb: fn(rawptr, int32, uint64) -> void) {
+    meo_note_cb: fn(rawptr, int32, uint64) -> void with alloc, syscall, asm) {
   spin_lock(&w->sync_lock);
   w->note_ctx = ctx;
   w->note_cb = meo_note_cb;
