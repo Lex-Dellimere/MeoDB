@@ -8,6 +8,12 @@
 // returns OK locally: the server rolled back when the socket closed. Outside a
 // transaction the call returns -MEO_ERR_IO and the next call reconnects once
 // before sending. A request is never sent twice.
+//
+// SUBSCRIBE turns the connection into a push stream (protocol minor 1): until
+// meo_cli_unsubscribe only meo_cli_events, meo_cli_ack, meo_cli_unsubscribe and
+// meo_cli_close work on it, anything else returns -MEO_ERR_TX. A lost stream
+// is not reconnected for you: events returns -MEO_ERR_IO, and the caller scans
+// and subscribes again.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -16,7 +22,9 @@ import "../record/value.mettle";
 import "../wire/frame.mettle";
 import "../wire/stmt.mettle";
 import "../wire/msg.mettle";
+import "../wire/sub.mettle";
 import "../net/sock.mettle";
+import "../platform/clock_linux.mettle";
 
 export const MEO_CLI_TX_NONE: int32 = 0;
 export const MEO_CLI_TX_OPEN: int32 = 1;
@@ -25,6 +33,7 @@ export const MEO_CLI_TX_LOST: int32 = 2;   // went with the connection; only rol
 export const MEO_CLI_TIMEOUT_MS: int32 = 30000;
 
 const MEO_CLI_TOKEN_MAX: int32 = 256;
+const MEO_CLI_ALIGN: int64 = 8;
 
 export struct MeoCliOpts {
   recv_ms: int32;      // SO_RCVTIMEO per wait; 0 = none
@@ -59,6 +68,14 @@ export struct MeoCli {
   e_tx: int32;
   e_msg: uint8*;
   e_n: int32;
+  subbed: bool;        // the connection is SUBSCRIBED
+  info: MeoWSubOk;     // the last SUB_OK, a view into info_buf and info_a
+  info_buf: uint8*;
+  info_a: MeoArena*;
+  ev: MeoWEvents;      // the EVENTS frame being handed out, views into ev_buf and ev_a
+  ev_at: int32;        // events of ev already handed out
+  ev_buf: uint8*;
+  ev_a: MeoArena*;
 }
 
 // Cells are views into buf; valid until meo_cli_result_free.
@@ -115,6 +132,27 @@ fn meo_cli_set_err(c: MeoCli*, code: int32, fatal: bool, tx: int32, msg: string)
 fn meo_cli_drop(c: MeoCli*) {
   if (c->fd >= 0) { meo_sock_close(c->fd); }
   c->fd = -1;
+  c->subbed = false;
+}
+
+// Forget the EVENTS frame being handed out.
+fn meo_cli_ev_clear(c: MeoCli*) {
+  if (c->ev_buf != 0) { free((rawptr)c->ev_buf); }
+  c->ev_buf = 0;
+  meo_arena_reset(c->ev_a);
+  c->ev.n = 0;
+  c->ev.ev = 0;
+  c->ev_at = 0;
+}
+
+// Forget the SUB_OK and any events not yet handed out.
+fn meo_cli_sub_clear(c: MeoCli*) {
+  if (c->info_buf != 0) { free((rawptr)c->info_buf); }
+  c->info_buf = 0;
+  meo_arena_reset(c->info_a);
+  c->info.n_tables = 0;
+  c->info.tables = 0;
+  meo_cli_ev_clear(c);
 }
 
 // The connection is gone: rc is the local cause.
@@ -171,27 +209,51 @@ fn meo_cli_room(c: MeoCli*, n: int32) -> bool {
   return true;
 }
 
+// While subscribed, a reply can be preceded by pushed frames (rid 0, which the
+// events call has not read yet) or by the ERROR of an earlier ACK; those are
+// not the answer.
+fn meo_cli_stray(c: MeoCli*, h: MeoWHdr*, rid: uint32) -> bool {
+  if (!c->subbed) { return false; }
+  if (h->rid == 0 && meo_wire_kind_is_push(h->kind)) { return true; }
+  return h->kind == MEO_WIRE_K_ERROR && h->rid != 0 && h->rid != rid;
+}
+
+// Read and drop n payload bytes.
+fn meo_cli_skip(c: MeoCli*, n: int32) -> int32 {
+  if (n == 0) { return MEO_OK; }
+  if (!meo_cli_room(c, n + 1)) { return -MEO_ERR_NOMEM; }
+  var rc: int32 = meo_sock_recv_exact(c->fd, c->rbuf, n);
+  if (rc != n) { return rc; }
+  return MEO_OK;
+}
+
 // Send the n-byte frame in c->w and read its reply. A RESULT goes to out, which
 // then owns the payload buffer.
 fn meo_cli_exchange(c: MeoCli*, kind: int32, rid: uint32, n: int32, out: MeoCliResult*) -> int32 {
   var rc: int32 = meo_sock_send_all(c->fd, c->w.p, n);
   if (rc != n) { return meo_cli_lost(c, rc, kind); }
   var hb: uint8[12];
-  rc = meo_sock_recv_exact(c->fd, &hb[0], MEO_WIRE_HDR);
-  if (rc != MEO_WIRE_HDR) { return meo_cli_lost(c, rc, kind); }
   var h: MeoWHdr;
-  rc = meo_wire_hdr_get(&hb[0], c->max_frame, &h);
-  if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+  while (true) {
+    rc = meo_sock_recv_exact(c->fd, &hb[0], MEO_WIRE_HDR);
+    if (rc != MEO_WIRE_HDR) { return meo_cli_lost(c, rc, kind); }
+    rc = meo_wire_hdr_get(&hb[0], c->max_frame, &h);
+    if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+    if (!meo_cli_stray(c, &h, rid)) { break; }
+    rc = meo_cli_skip(c, h.len);
+    if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+  }
   var want: int32 = MEO_WIRE_K_OK;
   if (kind == MEO_WIRE_K_HELLO) { want = MEO_WIRE_K_HELLO_OK; }
   if (kind == MEO_WIRE_K_QUERY) { want = MEO_WIRE_K_RESULT; }
+  if (kind == MEO_WIRE_K_SUBSCRIBE) { want = MEO_WIRE_K_SUB_OK; }
   // A server-initiated ERROR (BUSY at accept, hello timeout) carries rid 0.
   var rid_ok: bool = h.rid == rid || (h.kind == MEO_WIRE_K_ERROR && h.rid == 0);
   if (!rid_ok || (h.kind != want && h.kind != MEO_WIRE_K_ERROR)) {
     return meo_cli_lost(c, -MEO_ERR_PROTO, kind);
   }
   var p: uint8* = 0;
-  var own: bool = h.kind == MEO_WIRE_K_RESULT;
+  var own: bool = h.kind == MEO_WIRE_K_RESULT || h.kind == MEO_WIRE_K_SUB_OK;
   if (own) {
     p = (uint8*)malloc((int64)h.len + 1);
     if (p == 0) { return meo_cli_lost(c, -MEO_ERR_NOMEM, kind); }
@@ -231,6 +293,19 @@ fn meo_cli_exchange(c: MeoCli*, kind: int32, rid: uint32, n: int32, out: MeoCliR
     out->a = a;
     return MEO_OK;
   }
+  if (h.kind == MEO_WIRE_K_SUB_OK) {
+    if (c->info_buf != 0) { free((rawptr)c->info_buf); }
+    c->info_buf = 0;
+    meo_arena_reset(c->info_a);
+    rc = meo_wire_sub_ok_get(&r, c->info_a, &c->info);
+    if (rc < 0) {
+      free((rawptr)p);
+      return meo_cli_lost(c, rc, kind);
+    }
+    c->info_buf = p;
+    c->subbed = true;
+    return MEO_OK;
+  }
   if (h.kind == MEO_WIRE_K_HELLO_OK) {
     var ok: MeoWHelloOk;
     rc = meo_wire_hello_ok_get(&r, &ok);
@@ -246,6 +321,10 @@ fn meo_cli_exchange(c: MeoCli*, kind: int32, rid: uint32, n: int32, out: MeoCliR
   if (rc < 0) { return meo_cli_lost(c, rc, kind); }
   if (kind == MEO_WIRE_K_BEGIN) { c->tx = MEO_CLI_TX_OPEN; }
   if (kind == MEO_WIRE_K_COMMIT || kind == MEO_WIRE_K_ROLLBACK) { c->tx = MEO_CLI_TX_NONE; }
+  if (kind == MEO_WIRE_K_UNSUBSCRIBE) {
+    c->subbed = false;
+    meo_cli_sub_clear(c);
+  }
   return MEO_OK;
 }
 
@@ -289,24 +368,47 @@ fn meo_cli_dial(c: MeoCli*) -> int32 {
   return rc;
 }
 
-fn meo_cli_call(c: MeoCli*, kind: int32, mode: int32, st: MeoWStmt*, out: MeoCliResult*) -> int32 {
-  if (c == 0) { return -MEO_ERR_USAGE; }
+// Start of a request that needs the connection ready: no error left over, no
+// lost transaction, not subscribed, connected.
+fn meo_cli_ready(c: MeoCli*) -> int32 {
   meo_cli_clear_err(c);
   if (c->tx == MEO_CLI_TX_LOST) {
-    if (kind == MEO_WIRE_K_ROLLBACK) {
-      c->tx = MEO_CLI_TX_NONE;
-      return MEO_OK;
-    }
     meo_cli_set_err(c, MEO_ERR_TX, false, MEO_WIRE_TX_NONE, "transaction lost; roll back");
+    return -MEO_ERR_TX;
+  }
+  if (c->subbed) {
+    meo_cli_set_err(c, MEO_ERR_TX, false, MEO_WIRE_TX_NONE, "subscribed; unsubscribe first");
     return -MEO_ERR_TX;
   }
   if (c->fd < 0) {
     if (meo_cli_dial(c) < 0) { return -MEO_ERR_IO; }
   }
+  return MEO_OK;
+}
+
+// The server's HELLO_OK promised this capability (bits 2 and 3 exist from
+// minor 1 on).
+fn meo_cli_has(c: MeoCli*, cap: uint32) -> bool {
+  return c->minor >= 1 && (c->caps & cap) != 0;
+}
+
+fn meo_cli_unsupported(c: MeoCli*, msg: string) -> int32 {
+  meo_cli_set_err(c, MEO_ERR_UNSUPPORTED, false, MEO_WIRE_TX_NONE, msg);
+  return -MEO_ERR_UNSUPPORTED;
+}
+
+fn meo_cli_call(c: MeoCli*, kind: int32, mode: int32, st: MeoWStmt*, out: MeoCliResult*) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  if (kind == MEO_WIRE_K_ROLLBACK && c->tx == MEO_CLI_TX_LOST) {
+    meo_cli_clear_err(c);
+    c->tx = MEO_CLI_TX_NONE;
+    return MEO_OK;
+  }
+  var rc: int32 = meo_cli_ready(c);
+  if (rc < 0) { return rc; }
   if (kind == MEO_WIRE_K_QUERY && st->op == MEO_WIRE_OP_COUNT
       && (c->caps & MEO_WIRE_CAP_COUNT) == 0) {
-    meo_cli_set_err(c, MEO_ERR_UNSUPPORTED, false, MEO_WIRE_TX_NONE, "server lacks COUNT");
-    return -MEO_ERR_UNSUPPORTED;
+    return meo_cli_unsupported(c, "server lacks COUNT");
   }
   c->w.max = c->srv_max;
   meo_wbuf_begin(&c->w);
@@ -361,12 +463,26 @@ export fn meo_cli_connect(ip: string, port: int32, token: uint8*, token_n: int32
   c->caps = 0;
   c->session = 0;
   c->minor = 0;
+  c->subbed = false;
+  c->info_buf = 0;
+  c->info_a = meo_arena_new(4096);
+  c->ev_buf = 0;
+  c->ev_a = meo_arena_new(4096);
+  c->ev_at = 0;
+  c->info.start_seq = 0;
+  c->info.commit_seq = 0;
+  c->info.heartbeat_ms = 0;
+  c->info.n_tables = 0;
+  c->info.tables = 0;
+  c->ev.n = 0;
+  c->ev.ev = 0;
   meo_wbuf_init(&c->w, MEO_WIRE_MIN_FRAME);
   c->rbuf = 0;
   c->rcap = 0;
   c->e_msg = (uint8*)malloc((int64)MEO_WIRE_MSG_MAX);
   meo_cli_clear_err(c);
-  if (c->ip == 0 || c->token == 0 || c->name == 0 || c->e_msg == 0) {
+  if (c->ip == 0 || c->token == 0 || c->name == 0 || c->e_msg == 0 || c->info_a == 0
+      || c->ev_a == 0) {
     meo_cli_free(c);
     return -MEO_ERR_NOMEM;
   }
@@ -382,6 +498,10 @@ export fn meo_cli_connect(ip: string, port: int32, token: uint8*, token_n: int32
 fn meo_cli_free(c: MeoCli*) {
   meo_cli_drop(c);
   meo_wbuf_free(&c->w);
+  if (c->info_buf != 0) { free((rawptr)c->info_buf); }
+  if (c->info_a != 0) { meo_arena_free(c->info_a); }
+  if (c->ev_buf != 0) { free((rawptr)c->ev_buf); }
+  if (c->ev_a != 0) { meo_arena_free(c->ev_a); }
   if (c->rbuf != 0) { free((rawptr)c->rbuf); }
   if (c->ip != 0) { free((rawptr)c->ip); }
   if (c->token != 0) { free((rawptr)c->token); }
@@ -427,6 +547,373 @@ export fn meo_cli_query(c: MeoCli*, st: MeoWStmt*, out: MeoCliResult*) -> int32 
   if (st == 0 || out == 0) { return -MEO_ERR_USAGE; }
   meo_cli_result_init(out);
   return meo_cli_call(c, MEO_WIRE_K_QUERY, 0, st, out);
+}
+
+// ---- subscribe ----
+
+// Make the connection a push stream over `tables` (n_tables names, 0 = every
+// table). from_seq 0 starts after the newest event; from_commit != 0 delivers
+// exactly the events of commits after it, so a scan's commit_seq closes the
+// gap between the scan and the stream. window (1..65536) is how many events
+// may be unacknowledged. A server that cannot honour the start sends a GAP as
+// the first event. info (may be 0) is a view valid until the next subscribe
+// or meo_cli_close: the schema of the covered tables as of now.
+export fn meo_cli_subscribe(c: MeoCli*, tables: string*, n_tables: int32, from_seq: uint64,
+                            from_commit: uint64, window: int32, info: MeoWSubOk*) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  if (n_tables < 0 || n_tables > 65535 || (n_tables > 0 && tables == 0)
+      || window < 1 || window > (int32)MEO_WIRE_WINDOW_MAX) {
+    return -MEO_ERR_USAGE;
+  }
+  var rc: int32 = meo_cli_ready(c);
+  if (rc < 0) { return rc; }
+  if (!meo_cli_has(c, MEO_WIRE_CAP_SUBSCRIBE)) { return meo_cli_unsupported(c, "server lacks SUBSCRIBE"); }
+  meo_cli_sub_clear(c);
+  var s: MeoWSub;
+  s.n_tables = n_tables;
+  s.tables = tables;
+  s.from_seq = from_seq;
+  s.from_commit = from_commit;
+  s.window = (uint32)window;
+  c->w.max = c->srv_max;
+  meo_wbuf_begin(&c->w);
+  meo_wire_sub_put(&c->w, &s);
+  if (c->w.err < 0) {
+    meo_cli_set_err(c, -c->w.err, false, MEO_WIRE_TX_NONE, "request not encoded");
+    return c->w.err;
+  }
+  var rid: uint32 = meo_cli_next_rid(c);
+  var n: int32 = meo_wbuf_finish(&c->w, MEO_WIRE_K_SUBSCRIBE, rid);
+  rc = meo_cli_exchange(c, MEO_WIRE_K_SUBSCRIBE, rid, n, 0);
+  if (rc < 0) { return rc; }
+  if (info != 0) {
+    info->start_seq = c->info.start_seq;
+    info->commit_seq = c->info.commit_seq;
+    info->heartbeat_ms = c->info.heartbeat_ms;
+    info->n_tables = c->info.n_tables;
+    info->tables = c->info.tables;
+  }
+  return MEO_OK;
+}
+
+// Hands out pieces of the caller's event buffer.
+struct MeoCliBump {
+  p: uint8*;
+  cap: int64;
+  at: int64;
+}
+
+fn meo_cli_bump(b: MeoCliBump*, n: int64) -> uint8* {
+  var at: int64 = (b->at + (MEO_CLI_ALIGN - 1)) & (~(MEO_CLI_ALIGN - 1));
+  if (at + n > b->cap) { return 0; }
+  b->at = at + n;
+  return b->p + at;
+}
+
+fn meo_cli_copy_str(b: MeoCliBump*, src: string, out: string*) -> bool {
+  out->chars = 0;
+  out->length = 0;
+  if (src.length == 0) { return true; }
+  var q: uint8* = meo_cli_bump(b, (int64)src.length + 1);
+  if (q == 0) { return false; }
+  memcpy((rawptr)q, (rawptr)src.chars, (int64)src.length);
+  q[src.length] = 0;
+  out->chars = q;
+  out->length = src.length;
+  return true;
+}
+
+fn meo_cli_copy_vals(b: MeoCliBump*, n: int32, src: MeoValue*, out: MeoValue**) -> bool {
+  out[0] = 0;
+  if (n == 0) { return true; }
+  var v: MeoValue* = (MeoValue*)meo_cli_bump(b, (int64)n * (int64)sizeof(MeoValue));
+  if (v == 0) { return false; }
+  var i: int32 = 0;
+  while (i < n) {
+    v[i] = src[i];
+    if (src[i].type == MEO_T_TEXT || src[i].type == MEO_T_BLOB) {
+      var q: uint8* = meo_cli_bump(b, (int64)src[i].n + 1);
+      if (q == 0) { return false; }
+      if (src[i].n > 0) { memcpy((rawptr)q, (rawptr)src[i].p, (int64)src[i].n); }
+      q[src[i].n] = 0;
+      v[i].p = q;
+    }
+    i += 1;
+  }
+  out[0] = v;
+  return true;
+}
+
+// A deep copy of e into b, so it outlives the frame it was decoded from.
+fn meo_cli_copy_event(b: MeoCliBump*, e: MeoWEvent*, out: MeoWEvent*) -> bool {
+  *out = *e;
+  if (!meo_cli_copy_vals(b, e->n_vals, e->vals, &out->vals)) { return false; }
+  if (!meo_cli_copy_vals(b, e->n_old, e->old, &out->old)) { return false; }
+  if (!meo_cli_copy_str(b, e->name, &out->name)) { return false; }
+  out->cols = 0;
+  if (e->n_cols > 0) {
+    var cols: MeoWSchemaCol* = (MeoWSchemaCol*)meo_cli_bump(b,
+      (int64)e->n_cols * (int64)sizeof(MeoWSchemaCol));
+    if (cols == 0) { return false; }
+    var i: int32 = 0;
+    while (i < e->n_cols) {
+      cols[i].ty = e->cols[i].ty;
+      if (!meo_cli_copy_str(b, e->cols[i].name, &cols[i].name)) { return false; }
+      i += 1;
+    }
+    out->cols = cols;
+  }
+  return true;
+}
+
+// Wait for the next EVENTS frame that carries events and decode it into
+// c->ev, answering heartbeats by waiting on. 1: a frame is ready. 0: the
+// deadline (monotonic us) passed. Else the error to return.
+fn meo_cli_pull(c: MeoCli*, deadline_us: int64) -> int32 {
+  var hb: uint8[12];
+  var h: MeoWHdr;
+  while (true) {
+    var left: int64 = (deadline_us - meo_clock_monotonic_us()) / (int64)1000;
+    if (left < 0) { left = 0; }
+    var rc: int32 = meo_sock_poll_in(c->fd, (int32)left);
+    if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS); }
+    if (rc == 0) { return 0; }
+    rc = meo_sock_recv_exact(c->fd, &hb[0], MEO_WIRE_HDR);
+    if (rc != MEO_WIRE_HDR) { return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS); }
+    rc = meo_wire_hdr_get(&hb[0], c->max_frame, &h);
+    if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS); }
+    if (h.kind == MEO_WIRE_K_ERROR) {
+      // The answer to an ACK the server refused, or the server ending the
+      // session; a non-fatal one leaves the stream running.
+      if (!meo_cli_room(c, h.len + 1)) { return meo_cli_lost(c, -MEO_ERR_NOMEM, MEO_WIRE_K_EVENTS); }
+      rc = meo_sock_recv_exact(c->fd, c->rbuf, h.len);
+      if (rc != h.len) { return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS); }
+      var er: MeoWRd;
+      meo_wrd_init(&er, c->rbuf, h.len);
+      var e: MeoWError;
+      rc = meo_wire_error_get(&er, &e);
+      if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS); }
+      return meo_cli_on_error(c, &e, MEO_WIRE_K_EVENTS);
+    }
+    if (h.kind != MEO_WIRE_K_EVENTS || h.rid != 0) {
+      return meo_cli_lost(c, -MEO_ERR_PROTO, MEO_WIRE_K_EVENTS);
+    }
+    meo_cli_ev_clear(c);
+    var p: uint8* = (uint8*)malloc((int64)h.len + 1);
+    if (p == 0) { return meo_cli_lost(c, -MEO_ERR_NOMEM, MEO_WIRE_K_EVENTS); }
+    rc = meo_sock_recv_exact(c->fd, p, h.len);
+    if (rc != h.len) {
+      free((rawptr)p);
+      return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS);
+    }
+    var r: MeoWRd;
+    meo_wrd_init(&r, p, h.len);
+    rc = meo_wire_events_get(&r, c->ev_a, &c->ev);
+    if (rc < 0) {
+      free((rawptr)p);
+      c->ev.n = 0;
+      c->ev.ev = 0;
+      return meo_cli_lost(c, rc, MEO_WIRE_K_EVENTS);
+    }
+    if (c->ev.n > 0) {
+      c->ev_buf = p;
+      return 1;
+    }
+    free((rawptr)p);
+  }
+  return 0;
+}
+
+// Wait up to timeout_ms for events and copy up to cap of them into out, with
+// every value, old value, TEXT/BLOB byte, table name and column name placed in
+// buf (8-byte aligned), so the events stay valid until buf is reused. Returns
+// the count, 0 when nothing came in time (heartbeats count as nothing), or a
+// negative code: -MEO_ERR_TOOBIG when the next event alone does not fit buf
+// (nothing is lost, call again with a bigger one); -MEO_ERR_IO when the stream
+// is gone, after the events already received are handed out; a non-fatal
+// server error (the ACK it refused) leaves the stream running. The caller
+// ACKs; the window is in events, so ACK the last seq of a batch.
+export fn meo_cli_events(c: MeoCli*, out: MeoWEvent*, cap: int32, buf: uint8*, buf_cap: int32,
+                         timeout_ms: int32) -> int32 {
+  if (c == 0 || out == 0 || cap < 1 || buf == 0 || buf_cap < 1 || timeout_ms < 0) {
+    return -MEO_ERR_USAGE;
+  }
+  meo_cli_clear_err(c);
+  var deadline: int64 = meo_clock_monotonic_us() + (int64)timeout_ms * (int64)1000;
+  while (c->ev_at >= c->ev.n) {
+    if (!c->subbed) {
+      if (c->fd < 0) {
+        meo_cli_set_err(c, MEO_ERR_IO, true, MEO_WIRE_TX_NONE, "connection lost");
+        return -MEO_ERR_IO;
+      }
+      meo_cli_set_err(c, MEO_ERR_USAGE, false, MEO_WIRE_TX_NONE, "not subscribed");
+      return -MEO_ERR_USAGE;
+    }
+    var rc: int32 = meo_cli_pull(c, deadline);
+    if (rc <= 0) { return rc; }
+  }
+  var b: MeoCliBump;
+  b.p = buf;
+  b.cap = (int64)buf_cap;
+  b.at = 0;
+  var n: int32 = 0;
+  while (n < cap && c->ev_at < c->ev.n) {
+    var mark: int64 = b.at;
+    if (!meo_cli_copy_event(&b, &c->ev.ev[c->ev_at], &out[n])) {
+      b.at = mark;
+      break;
+    }
+    n += 1;
+    c->ev_at += 1;
+  }
+  if (n == 0) {
+    meo_cli_set_err(c, MEO_ERR_TOOBIG, false, MEO_WIRE_TX_NONE, "event does not fit the buffer");
+    return -MEO_ERR_TOOBIG;
+  }
+  return n;
+}
+
+// seq: the last event processed. No reply; a seq beyond what was sent comes
+// back as a non-fatal error from the next meo_cli_events.
+export fn meo_cli_ack(c: MeoCli*, seq: uint64) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  meo_cli_clear_err(c);
+  if (!c->subbed) {
+    meo_cli_set_err(c, MEO_ERR_USAGE, false, MEO_WIRE_TX_NONE, "not subscribed");
+    return -MEO_ERR_USAGE;
+  }
+  c->w.max = c->srv_max;
+  meo_wbuf_begin(&c->w);
+  meo_wire_ack_put(&c->w, seq);
+  var rid: uint32 = meo_cli_next_rid(c);
+  var n: int32 = meo_wbuf_finish(&c->w, MEO_WIRE_K_ACK, rid);
+  var rc: int32 = meo_sock_send_all(c->fd, c->w.p, n);
+  if (rc != n) { return meo_cli_lost(c, rc, MEO_WIRE_K_ACK); }
+  return MEO_OK;
+}
+
+// Back to a normal connection. Events the server had pushed but the caller
+// has not taken are dropped.
+export fn meo_cli_unsubscribe(c: MeoCli*) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  meo_cli_clear_err(c);
+  if (!c->subbed) {
+    meo_cli_set_err(c, MEO_ERR_USAGE, false, MEO_WIRE_TX_NONE, "not subscribed");
+    return -MEO_ERR_USAGE;
+  }
+  c->w.max = c->srv_max;
+  meo_wbuf_begin(&c->w);
+  var rid: uint32 = meo_cli_next_rid(c);
+  var n: int32 = meo_wbuf_finish(&c->w, MEO_WIRE_K_UNSUBSCRIBE, rid);
+  return meo_cli_exchange(c, MEO_WIRE_K_UNSUBSCRIBE, rid, n, 0);
+}
+
+// ---- scan ----
+
+// What the SCAN_ROWS frames of one scan must agree on.
+struct MeoCliScan {
+  grouped: bool;
+  seq: uint64;
+  seen: bool;          // a frame has come
+  stop: int32;         // the callback's nonzero answer; later points are dropped
+}
+
+// Read frames of the scan with this rid up to last = 1.
+fn meo_cli_scan_read(c: MeoCli*, rid: uint32, sc: MeoCliScan*,
+                     cb: fn(rawptr, int64, float64, float64) -> int32, ctx: rawptr,
+                     seq_out: uint64*) -> int32 {
+  var hb: uint8[12];
+  var h: MeoWHdr;
+  while (true) {
+    var rc: int32 = meo_sock_recv_exact(c->fd, &hb[0], MEO_WIRE_HDR);
+    if (rc != MEO_WIRE_HDR) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+    rc = meo_wire_hdr_get(&hb[0], c->max_frame, &h);
+    if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+    if (h.rid != rid || (h.kind != MEO_WIRE_K_SCAN_ROWS && h.kind != MEO_WIRE_K_ERROR)) {
+      return meo_cli_lost(c, -MEO_ERR_PROTO, MEO_WIRE_K_SCAN);
+    }
+    if (!meo_cli_room(c, h.len + 1)) { return meo_cli_lost(c, -MEO_ERR_NOMEM, MEO_WIRE_K_SCAN); }
+    rc = meo_sock_recv_exact(c->fd, c->rbuf, h.len);
+    if (rc != h.len) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+    var r: MeoWRd;
+    meo_wrd_init(&r, c->rbuf, h.len);
+    if (h.kind == MEO_WIRE_K_ERROR) {
+      var e: MeoWError;
+      rc = meo_wire_error_get(&r, &e);
+      if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+      return meo_cli_on_error(c, &e, MEO_WIRE_K_SCAN);
+    }
+    var head: MeoWScanRows;
+    rc = meo_wire_scan_rows_head_get(&r, &head);
+    if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+    if (head.grouped != sc->grouped || (sc->seen && head.commit_seq != sc->seq)) {
+      return meo_cli_lost(c, -MEO_ERR_PROTO, MEO_WIRE_K_SCAN);
+    }
+    sc->seen = true;
+    sc->seq = head.commit_seq;
+    if (seq_out != 0) { seq_out[0] = head.commit_seq; }
+    var i: int32 = 0;
+    while (i < head.n) {
+      var pt: MeoWPoint;
+      rc = meo_wire_scan_point_get(&r, head.grouped, &pt);
+      if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+      if (sc->stop == 0) { sc->stop = cb(ctx, pt.g, pt.x, pt.y); }
+      i += 1;
+    }
+    rc = meo_wrd_end(&r);
+    if (rc < 0) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+    if (head.last) { return MEO_OK; }
+  }
+  return MEO_OK;
+}
+
+// Stream (group, x, y) of every row of table with lo <= x <= hi to cb, the
+// semantics of the engine's scan (x order when x is the rowid alias or
+// indexed; NaN y for NULL or non-numeric; group 0 and no group column when
+// `group` is empty). The server reads one snapshot and sends chunk points per
+// frame (1..1048576); seq_out (may be 0) gets that snapshot's commit_seq, the
+// value to give meo_cli_subscribe as from_commit. Works in a transaction (it
+// reads the transaction's own writes), not while subscribed. A nonzero cb
+// answer ends the delivery: the rest of the reply is read and dropped so the
+// connection stays usable, and the answer is returned. A server error
+// (SCHEMA for an unknown name) is returned as -MEO_ERR_*.
+export fn meo_cli_scan_xy(c: MeoCli*, table: string, x: string, y: string, group: string,
+                          lo: float64, hi: float64, chunk: int32,
+                          meo_scan_cli_cb: fn(rawptr, int64, float64, float64) -> int32,
+                          ctx: rawptr, seq_out: uint64*) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  if (chunk < 1 || chunk > (int32)MEO_WIRE_CHUNK_MAX || meo_scan_cli_cb == 0) { return -MEO_ERR_USAGE; }
+  if (seq_out != 0) { seq_out[0] = 0; }
+  var rc: int32 = meo_cli_ready(c);
+  if (rc < 0) { return rc; }
+  if (!meo_cli_has(c, MEO_WIRE_CAP_SCAN)) { return meo_cli_unsupported(c, "server lacks SCAN"); }
+  var s: MeoWScan;
+  s.table = table;
+  s.x = x;
+  s.y = y;
+  s.group = group;
+  s.lo = lo;
+  s.hi = hi;
+  s.chunk = (uint32)chunk;
+  c->w.max = c->srv_max;
+  meo_wbuf_begin(&c->w);
+  meo_wire_scan_put(&c->w, &s);
+  if (c->w.err < 0) {
+    meo_cli_set_err(c, -c->w.err, false, MEO_WIRE_TX_NONE, "request not encoded");
+    return c->w.err;
+  }
+  var rid: uint32 = meo_cli_next_rid(c);
+  var n: int32 = meo_wbuf_finish(&c->w, MEO_WIRE_K_SCAN, rid);
+  rc = meo_sock_send_all(c->fd, c->w.p, n);
+  if (rc != n) { return meo_cli_lost(c, rc, MEO_WIRE_K_SCAN); }
+  var sc: MeoCliScan;
+  sc.grouped = group.length > 0;
+  sc.seq = 0;
+  sc.seen = false;
+  sc.stop = 0;
+  rc = meo_cli_scan_read(c, rid, &sc, meo_scan_cli_cb, ctx, seq_out);
+  if (rc < 0) { return rc; }
+  return sc.stop;
 }
 
 // ---- state and last error ----
