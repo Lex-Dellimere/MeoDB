@@ -98,6 +98,7 @@
 // callback), not from the commit call. Rollback mode is unchanged.
 
 import "std/mem";
+import "std/thread";
 import "../error/status.mettle";
 import "../format/bytes.mettle";
 import "../format/page.mettle";
@@ -613,6 +614,12 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
   }
   // The log goes before the db file it checkpoints into; the cache it drops
   // entries from is freed after it.
+  while (p->pool != 0) {
+    var v: MeoPager* = p->pool;
+    p->pool = v->pool_next;
+    free(v);
+  }
+  p->pool_n = 0;
   if (p->wal != 0) {
     meo_wal_close((MeoWal*)p->wal, false);
     p->wal = 0;
@@ -961,6 +968,8 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
 // meo_pager_free is what releases it.
 export fn meo_pager_close(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
+  // A view is ended with meo_pager_snap_end, never closed.
+  if (p->snap != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   // Second close is MEO_OK; the handle outlives it.
   if (!meo_pager_is_live(p)) { return MEO_OK; }
 
@@ -1016,6 +1025,10 @@ export fn meo_pager_close(p: MeoPager*) -> int32 {
 // buffers and file handle back and nothing is written.
 export fn meo_pager_free(p: MeoPager*) {
   if (p == 0) { return; }
+  if (p->snap != 0) {
+    meo_pager_fail(p, -MEO_ERR_USAGE, 0);
+    return;
+  }
   if (!p->closed) {
     // Freeing without closing is a caller error, but it must not leave a hot
     // journal that would undo the next open. Roll back first, then release.
@@ -1058,6 +1071,12 @@ export fn meo_pager_get(p: MeoPager*, page_no: uint32, write: bool) -> MeoFrame*
   // A write intent on a read-only pager is refused before anything is pinned.
   if (write && p->read_only) {
     return meo_pager_fail_ptr(p, -MEO_ERR_READONLY, (int64)page_no);
+  }
+  if (p->snap != 0) {
+    if ((int64)page_no >= (int64)p->page_count) {
+      return meo_pager_fail_ptr(p, -MEO_ERR_RANGE, (int64)page_no);
+    }
+    return pager_view_get(p, page_no);
   }
 
   var fi: int32 = meo_pager_find(p, page_no);
@@ -1107,6 +1126,14 @@ export fn meo_pager_release(p: MeoPager*, f: MeoFrame*, dirty: bool) -> int32 {
   if (p == 0 || f == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) {
+    if (dirty) { return meo_pager_fail(p, -MEO_ERR_READONLY, (int64)f->page_no); }
+    if (p->n_pinned <= 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, (int64)f->page_no); }
+    var urc: int32 = meo_pcache_unpin((MeoPcache*)p->pcache, (MeoPcFrame*)f);
+    if (urc != MEO_OK) { return meo_pager_fail(p, urc, (int64)f->page_no); }
+    p->n_pinned -= 1;
+    return MEO_OK;
+  }
   if (f->pin <= 0) {
     // The bug this catches is a caller releasing a page it does not hold: the
     // pin count would go negative and the frame would become evictable while
@@ -1119,6 +1146,152 @@ export fn meo_pager_release(p: MeoPager*, f: MeoFrame*, dirty: bool) -> int32 {
   f->pin -= 1;
   if (dirty) { meo_pager_mark_dirty(p, f); }
   return MEO_OK;
+}
+
+// --- snapshot views ---------------------------------------------------------
+//
+// A view is a read-only MeoPager bound to one snapshot of a WAL-mode pager. It
+// shares the base's log, cache and db file handle and owns only its meta and
+// pin count, so any thread may begin one and the owner thread reads through it
+// without the db lock. Its pages come from the shared cache as immutable
+// versions keyed by where they were read from, which is what lets a view keep
+// reading while the writer commits, checkpoints and restarts the log.
+
+const MEO_VIEW_POOL_MAX: int32 = 64;
+
+// Cache fill: src 0 is the db file, otherwise the low 32 bits name a log frame
+// (the high 32 are the generation, there only to keep keys apart).
+fn pager_view_fill(ctx: rawptr, page_no: uint32, src: uint64, buf: uint8*) -> int32 {
+  var v: MeoPager* = (MeoPager*)ctx;
+  var rc: int32 = MEO_OK;
+  if (src == 0) {
+    var n: int32 = meo_file_read_at(v->file, (int64)page_no * (int64)MEO_PAGE_SIZE,
+      buf, (int64)MEO_PAGE_SIZE);
+    if (n < 0) { return n; }
+    if (n != MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
+  } else {
+    rc = meo_wal_read_page((MeoWal*)v->wal, (uint32)(src & (uint64)0xFFFFFFFF), buf);
+    if (rc != MEO_OK) { return rc; }
+  }
+  if (meo_page_verify(buf) != MEO_OK) { return -MEO_ERR_CORRUPT; }
+  return MEO_OK;
+}
+
+// Pin page_no as the view's snapshot sees it. No range check: snap_begin reads
+// page 0 before the view knows its page count.
+fn pager_view_get(v: MeoPager*, page_no: uint32) -> MeoFrame* {
+  var sn: MeoWalSnap* = (MeoWalSnap*)v->snap;
+  var fr: uint32 = meo_wal_find((MeoWal*)v->wal, page_no, sn->mx);
+  var src: uint64 = 0;
+  if (fr != 0) { src = ((uint64)sn->gen << 32) | (uint64)fr; }
+  var err: int32 = MEO_OK;
+  var f: MeoPcFrame* = meo_pcache_get((MeoPcache*)v->pcache, page_no, src,
+    &pager_view_fill, (rawptr)v, &err);
+  if (f == 0) { return meo_pager_fail_ptr(v, err, (int64)page_no); }
+  v->n_pinned += 1;
+  return (MeoFrame*)f;
+}
+
+// Open a snapshot of the committed state. Reads only the base's immutable
+// fields, so it needs no db lock and never records an error on the base.
+export fn meo_pager_snap_begin(p: MeoPager*, out: MeoPager**) -> int32 {
+  if (p == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  *out = 0;
+  if (p->snap != 0 || p->closed) { return -MEO_ERR_USAGE; }
+  if (p->wal == 0) { return -MEO_ERR_UNSUPPORTED; }
+
+  var v: MeoPager* = 0;
+  spin_lock(&p->pool_lock);
+  if (p->pool != 0) {
+    v = p->pool;
+    p->pool = v->pool_next;
+    p->pool_n -= 1;
+  }
+  spin_unlock(&p->pool_lock);
+  if (v == 0) {
+    v = (MeoPager*)calloc(1, (int64)sizeof(MeoPager));
+    if (v == 0) { return -MEO_ERR_NOMEM; }
+  }
+  var sn: MeoWalSnap* = (MeoWalSnap*)calloc(1, (int64)sizeof(MeoWalSnap));
+  if (sn == 0) {
+    free(v);
+    return -MEO_ERR_NOMEM;
+  }
+  v->pool_next = 0;
+  v->snap = (rawptr)sn;
+  v->base = p;
+  v->wal = p->wal;
+  v->pcache = p->pcache;
+  v->file = p->file;
+  v->page_size = p->page_size;
+  v->read_only = true;
+  v->closed = false;
+  v->n_frames = 0;
+  v->n_pinned = 0;
+  v->err = MEO_OK;
+  v->err_arg = 0;
+  var w: MeoWal* = (MeoWal*)p->wal;
+  meo_wal_snap_begin(w, sn);
+
+  var f: MeoFrame* = pager_view_get(v, 0);
+  if (f == 0) {
+    var ferr: int32 = v->err;
+    meo_wal_snap_end(w, sn);
+    pager_view_recycle(v);
+    return 0 - ferr;
+  }
+  var m: MeoMeta = meo_meta_read(f->data);
+  meo_pcache_unpin((MeoPcache*)v->pcache, (MeoPcFrame*)f);
+  v->n_pinned -= 1;
+  if (!m.valid) {
+    meo_wal_snap_end(w, sn);
+    pager_view_recycle(v);
+    return -MEO_ERR_CORRUPT;
+  }
+  v->meta = m;
+  v->page_count = m.page_count;
+  *out = v;
+  return MEO_OK;
+}
+
+// Give a view's block back: to the base's pool, or to free when the pool is
+// full. The snapshot record is freed here either way.
+fn pager_view_recycle(v: MeoPager*) {
+  var base: MeoPager* = v->base;
+  free(v->snap);
+  v->snap = 0;
+  v->closed = true;
+  v->base = 0;
+  spin_lock(&base->pool_lock);
+  if (base->pool_n < MEO_VIEW_POOL_MAX) {
+    v->pool_next = base->pool;
+    base->pool = v;
+    base->pool_n += 1;
+    spin_unlock(&base->pool_lock);
+    return;
+  }
+  spin_unlock(&base->pool_lock);
+  free(v);
+}
+
+// End the snapshot. BUSY, with nothing ended, while a page is still pinned.
+export fn meo_pager_snap_end(v: MeoPager*) -> int32 {
+  if (v == 0 || v->snap == 0) { return -MEO_ERR_USAGE; }
+  if (v->n_pinned != 0) { return meo_pager_fail(v, -MEO_ERR_BUSY, (int64)v->n_pinned); }
+  meo_wal_snap_end((MeoWal*)v->wal, (MeoWalSnap*)v->snap);
+  pager_view_recycle(v);
+  return MEO_OK;
+}
+
+export fn meo_pager_is_view(p: MeoPager*) -> bool {
+  if (p == 0) { return false; }
+  return p->snap != 0;
+}
+
+// Snapshots currently open on this pager's log.
+export fn meo_pager_snap_readers(p: MeoPager*) -> int32 {
+  if (p == 0 || p->wal == 0) { return 0; }
+  return meo_wal_readers((MeoWal*)p->wal);
 }
 
 // --- freelist ---------------------------------------------------------------
@@ -1643,6 +1816,7 @@ export fn meo_pager_flush(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) { return MEO_OK; }
   if (p->wal != 0 && !p->read_only) { return meo_pager_wal_flush(p); }
   if (pager_in_tx(p) || p->read_only || !p->unflushed) {
     return meo_pager_flush_raw(p);
@@ -1668,6 +1842,7 @@ export fn meo_pager_sync(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) { return MEO_OK; }
   if (p->wal != 0) {
     var wrc: int32 = meo_wal_wait_all((MeoWal*)p->wal);
     if (wrc != MEO_OK) { return meo_pager_fail(p, wrc, 0); }
@@ -1904,6 +2079,7 @@ export fn meo_pager_checkpoint(p: MeoPager*, mode: int32) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   if (p->wal == 0) { return MEO_OK; }
   var rc: int32 = meo_wal_checkpoint((MeoWal*)p->wal, mode);
   if (rc < 0) { return meo_pager_fail(p, rc, 0); }
@@ -1914,6 +2090,7 @@ export fn meo_pager_set_autocheckpoint(p: MeoPager*, frames: int32) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   if (p->wal == 0) { return MEO_OK; }
   var rc: int32 = meo_wal_set_autockpt((MeoWal*)p->wal, frames);
   if (rc != MEO_OK) { return meo_pager_fail(p, rc, (int64)frames); }
@@ -2031,6 +2208,7 @@ export fn meo_pager_set_hook(p: MeoPager*, ctx: rawptr,
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   if (ctx == 0 || meo_commit_cb == 0 || meo_event_cb == 0) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
   }
@@ -2057,6 +2235,7 @@ export fn meo_pager_clear_hook(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->snap != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   var w: MeoWal* = (MeoWal*)p->wal;
   if (w != 0) {
     meo_wal_wait_all(w);

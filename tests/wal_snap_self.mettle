@@ -1,6 +1,571 @@
+// wal_snap_self: snapshot views of a WAL-mode pager.
+//
+// A program, not @test functions: every case needs real files in build/ and S7
+// runs threads. Run it with
+//
+//   mbuild run wal_snap_self
+//
+// It prints "PASS wal_snap_self" when every case passes and "FAIL S<n>: ..."
+// per failing check. Cases, each with the bug it exists to catch:
+//   S1  a rollback-mode pager has no snapshots.
+//   S2  a view keeps its own root and rows while the writer commits and while
+//       a transaction is open; a new view sees the new commit.
+//   S3  a view refuses every write, close and free, and answers from its meta.
+//   S4  ending a view with a page pinned is BUSY and ends nothing; views pool.
+//   S5  a held view holds the checkpoint back to its mark.
+//   S6  a db-file-only view survives a log restart and blocks the checkpoint.
+//   S7  8 reader threads walk views while the writer commits and checkpoints:
+//       every walk is a whole number of transactions and never goes backwards.
+//   S8  a page cached from the db file is dropped when a checkpoint rewrites it.
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/platform/futex_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/pager/wal.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+import "tinytest.mettle";
+
+const SN_FRAMES: int32 = 16;
+
+fn eq(a: int64, b: int64, name: string) -> bool {
+  return meo_t_check_i64(a, b, name);
+}
+
+// --- file helpers -----------------------------------------------------------
+
+// A fresh, empty database: no file contents, no journal, no log.
+fn sn_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  var wpath: string = db + "-wal";
+  meo_file_unlink(jpath);
+  meo_file_unlink(wpath);
+  free(jpath.chars);
+  free(wpath.chars);
+  return rc;
+}
+
+// A new WAL-mode pager with the automatic checkpoint off, so a case decides
+// when frames move to the db file.
+fn sn_open(db: string, tag: string) -> MeoPager* {
+  if (sn_reset(db) != MEO_OK) {
+    println("FAIL {tag}: reset");
+    return 0;
+  }
+  var p: MeoPager* = meo_pager_open(db, SN_FRAMES, MEO_PAGER_CREATE | MEO_PAGER_WAL);
+  if (p == 0) {
+    println("FAIL {tag}: open err {meo_pager_err(p)}");
+    return 0;
+  }
+  meo_pager_set_autocheckpoint(p, 0);
+  return p;
+}
+
+// --- tree helpers -----------------------------------------------------------
+
+fn sn_insert(p: MeoPager*, root: uint32*, k: int32) -> int32 {
+  var kb: uint8[16];
+  var kn: int32 = meo_key_int(&kb[0], 16, (int64)k);
+  var bk: MeoBtKey = { data: &kb[0], len: kn };
+  return meo_bt_insert(p, root, &meo_key_compare, bk, (uint64)k);
+}
+
+// Insert keys from..from+n-1 and point the btree root at the result.
+fn sn_fill(p: MeoPager*, from: int32, n: int32) -> int32 {
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var rc: int32 = MEO_OK;
+  var k: int32 = from;
+  while (k < from + n && rc == MEO_OK) {
+    rc = sn_insert(p, &root, k);
+    k += 1;
+  }
+  if (rc == MEO_OK) { rc = meo_pager_set_root(p, MEO_ROOT_BTREE, root); }
+  return rc;
+}
+
+// One transaction of keys from..from+n-1.
+fn sn_commit_keys(p: MeoPager*, from: int32, n: int32) -> int32 {
+  var rc: int32 = meo_pager_begin(p);
+  if (rc == MEO_OK) { rc = sn_fill(p, from, n); }
+  if (rc == MEO_OK) { rc = meo_pager_commit(p); }
+  return rc;
+}
+
+// Walk from key 0 ascending; every row must be key i with rowid i. The number
+// of rows, -1 on a cursor error, -2 when a row is not the one expected. Silent,
+// so a thread can use it.
+fn sn_count(p: MeoPager*) -> int64 {
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var kb: uint8[16];
+  var want_buf: uint8[16];
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var kn0: int32 = meo_key_int(&kb[0], 16, 0);
+  var k0: MeoBtKey = { data: &kb[0], len: kn0 };
+  var wrc: int32 = meo_bt_seek(p, &c, root, &meo_key_compare, k0);
+  var walked: int64 = 0;
+  while (wrc == 0) {
+    var wn: int32 = meo_key_int(&want_buf[0], 16, walked);
+    var got_len: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+    var got_ptr: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
+    if (got_len != wn || !meo_bytes_equal(got_ptr, &want_buf[0], (int64)wn)) {
+      meo_bt_close(p, &c);
+      return -2;
+    }
+    var rid: uint64 = 0;
+    if (meo_bt_rowid(p, &c, &rid) != MEO_OK || rid != (uint64)walked) {
+      meo_bt_close(p, &c);
+      return -2;
+    }
+    walked += 1;
+    wrc = meo_bt_next(p, &c);
+  }
+  meo_bt_close(p, &c);
+  if (wrc < 0) { return -1; }
+  return walked;
+}
+
+fn sn_view(p: MeoPager*, tag: string) -> MeoPager* {
+  var v: MeoPager* = 0;
+  var rc: int32 = meo_pager_snap_begin(p, &v);
+  if (rc != MEO_OK || v == 0) {
+    println("FAIL {tag}: snap_begin rc {rc}");
+    return 0;
+  }
+  return v;
+}
+
+// The same pointer by another name. The checker follows snap_end and free as
+// frees, but a refused call frees nothing and the caller keeps using it.
+var sn_slot: MeoPager* = 0;
+
+fn sn_alias(p: MeoPager*) -> MeoPager* {
+  sn_slot = p;
+  return sn_slot;
+}
+
+fn sn_close(p: MeoPager*, tag: string) -> bool {
+  var rc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  return eq(rc, 0, "{tag}: close");
+}
+
+// --- cases ------------------------------------------------------------------
+
+// S1: rollback mode.
+fn s1() -> int32 {
+  var db: string = "build/wal_snap_s1.dat";
+  if (sn_reset(db) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, SN_FRAMES, MEO_PAGER_CREATE);
+  if (p == 0) { return 1; }
+  var v: MeoPager* = p;
+  if (!eq(meo_pager_snap_begin(p, &v), -MEO_ERR_UNSUPPORTED, "S1: snap_begin")) { return 1; }
+  if (!meo_t_check(v == 0, "S1: out cleared")) { return 1; }
+  if (!meo_t_check_false(meo_pager_is_view(p), "S1: not a view")) { return 1; }
+  if (!sn_close(p, "S1")) { return 1; }
+  println("PASS S1: a rollback-mode pager has no snapshots");
+  return 0;
+}
+
+// S2: isolation from later commits and from an open transaction.
+fn s2() -> int32 {
+  var db: string = "build/wal_snap_s2.dat";
+  var p: MeoPager* = sn_open(db, "S2");
+  if (p == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 0, 1000), 0, "S2: first commit")) { return 1; }
+  var v1: MeoPager* = sn_view(p, "S2: v1");
+  if (v1 == 0) { return 1; }
+  if (!meo_t_check(meo_pager_is_view(v1), "S2: is a view")) { return 1; }
+  var root1: uint32 = meo_pager_root(v1, MEO_ROOT_BTREE);
+  if (!eq(sn_commit_keys(p, 1000, 1000), 0, "S2: second commit")) { return 1; }
+  if (!eq(sn_count(v1), 1000, "S2: v1 walks its own rows")) { return 1; }
+  if (!meo_t_check(meo_pager_root(v1, MEO_ROOT_BTREE) == root1, "S2: v1 root fixed")) { return 1; }
+  var v2: MeoPager* = sn_view(p, "S2: v2");
+  if (v2 == 0) { return 1; }
+  if (!eq(sn_count(v2), 2000, "S2: v2 walks the new rows")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(v2), (int64)meo_pager_commit_seq(p), "S2: v2 commit_seq")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "S2: begin")) { return 1; }
+  if (!eq(sn_fill(p, 2000, 500), 0, "S2: uncommitted fill")) { return 1; }
+  if (!eq(meo_pager_flush(p), 0, "S2: spill")) { return 1; }
+  var v3: MeoPager* = sn_view(p, "S2: v3");
+  if (v3 == 0) { return 1; }
+  if (!eq(sn_count(v3), 2000, "S2: v3 sees only committed rows")) { return 1; }
+  if (!eq(sn_count(v1), 1000, "S2: v1 again")) { return 1; }
+  if (!eq(meo_pager_snap_readers(p), 3, "S2: three readers")) { return 1; }
+  if (!eq(meo_pager_rollback(p), 0, "S2: rollback")) { return 1; }
+  if (!eq(sn_count(v3), 2000, "S2: v3 after the rollback")) { return 1; }
+  if (!eq(meo_pager_snap_end(v1), 0, "S2: end v1")) { return 1; }
+  if (!eq(meo_pager_snap_end(v2), 0, "S2: end v2")) { return 1; }
+  if (!eq(meo_pager_snap_end(v3), 0, "S2: end v3")) { return 1; }
+  if (!eq(meo_pager_snap_readers(p), 0, "S2: no readers left")) { return 1; }
+  if (!sn_close(p, "S2")) { return 1; }
+  println("PASS S2: views keep their own rows while the writer commits and spills");
+  return 0;
+}
+
+fn sn_hook_commit(ctx: rawptr, seq: uint64, us: int64) {
+}
+
+fn sn_hook_event(ctx: rawptr, code: int32) {
+}
+
+// A check on the code a view answered and the error it recorded.
+fn sn_refused(rc: int32, v: MeoPager*, code: int32, name: string) -> bool {
+  if (!eq(rc, -code, name)) { return false; }
+  return eq(meo_pager_err(v), code, "{name}: err");
+}
+
+// S3: what a view refuses and what it answers.
+fn s3() -> int32 {
+  var db: string = "build/wal_snap_s3.dat";
+  var p: MeoPager* = sn_open(db, "S3");
+  if (p == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 0, 300), 0, "S3: commit")) { return 1; }
+  var v: MeoPager* = sn_view(p, "S3");
+  if (v == 0) { return 1; }
+  var root: uint32 = meo_pager_root(v, MEO_ROOT_BTREE);
+
+  var f: MeoFrame* = meo_pager_get(v, root, true);
+  if (!meo_t_check(f == 0, "S3: get(write) refused")) { return 1; }
+  if (!eq(meo_pager_err(v), MEO_ERR_READONLY, "S3: get(write) err")) { return 1; }
+  f = meo_pager_get(v, meo_pager_page_count(v), false);
+  if (!meo_t_check(f == 0, "S3: get beyond page_count")) { return 1; }
+  if (!eq(meo_pager_err(v), MEO_ERR_RANGE, "S3: get beyond err")) { return 1; }
+  f = meo_pager_get(v, root, false);
+  if (!meo_t_check(f != 0, "S3: get(read)")) { return 1; }
+  if (!sn_refused(meo_pager_release(v, f, true), v, MEO_ERR_READONLY, "S3: release(dirty)")) { return 1; }
+  if (!eq(meo_pager_release(v, f, false), 0, "S3: release keeps the pin after a refusal")) { return 1; }
+  if (!eq(meo_pager_release(v, f, false), -MEO_ERR_USAGE, "S3: release without a pin")) { return 1; }
+
+  if (!sn_refused(meo_pager_begin(v), v, MEO_ERR_READONLY, "S3: begin")) { return 1; }
+  if (!sn_refused(meo_pager_set_root(v, MEO_ROOT_BTREE, root), v, MEO_ERR_READONLY, "S3: set_root")) { return 1; }
+  if (!sn_refused(meo_free_put(v, root), v, MEO_ERR_READONLY, "S3: free_put")) { return 1; }
+  if (!sn_refused(meo_pager_schema_bump(v), v, MEO_ERR_READONLY, "S3: schema_bump")) { return 1; }
+  if (!meo_t_check(meo_free_take(v) == 0, "S3: free_take")) { return 1; }
+  if (!eq(meo_pager_err(v), MEO_ERR_READONLY, "S3: free_take err")) { return 1; }
+  if (!meo_t_check(meo_pager_alloc(v) == 0, "S3: alloc")) { return 1; }
+  if (!eq(meo_pager_err(v), MEO_ERR_READONLY, "S3: alloc err")) { return 1; }
+  meo_pager_set_txn_id(v, 7);
+  if (!eq(meo_pager_err(v), MEO_ERR_READONLY, "S3: set_txn_id err")) { return 1; }
+  if (!eq(meo_pager_commit(v), -MEO_ERR_USAGE, "S3: commit")) { return 1; }
+  if (!eq(meo_pager_rollback(v), -MEO_ERR_USAGE, "S3: rollback")) { return 1; }
+
+  if (!sn_refused(meo_pager_close(v), v, MEO_ERR_USAGE, "S3: close")) { return 1; }
+  var keep: MeoPager* = sn_alias(v);
+  meo_pager_free(v);
+  if (!eq(meo_pager_err(keep), MEO_ERR_USAGE, "S3: free err")) { return 1; }
+  v = keep;
+  if (!sn_refused(meo_pager_checkpoint(v, MEO_CKPT_PASSIVE), v, MEO_ERR_USAGE, "S3: checkpoint")) { return 1; }
+  if (!sn_refused(meo_pager_set_hook(v, (rawptr)v, &sn_hook_commit, &sn_hook_event), v,
+      MEO_ERR_USAGE, "S3: set_hook")) { return 1; }
+  if (!sn_refused(meo_pager_clear_hook(v), v, MEO_ERR_USAGE, "S3: clear_hook")) { return 1; }
+
+  if (!eq(meo_pager_flush(v), 0, "S3: flush")) { return 1; }
+  if (!eq(meo_pager_sync(v), 0, "S3: sync")) { return 1; }
+  if (!eq(meo_pager_frames(v), 0, "S3: frames")) { return 1; }
+  if (!eq(meo_pager_dirty_count(v), 0, "S3: dirty_count")) { return 1; }
+  if (!eq((int64)meo_pager_page_count(v), (int64)meo_pager_page_count(p), "S3: page_count")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(v), (int64)meo_pager_commit_seq(p), "S3: commit_seq")) { return 1; }
+  if (!eq((int64)meo_pager_schema_seq(v), (int64)meo_pager_schema_seq(p), "S3: schema_seq")) { return 1; }
+  if (!eq(sn_count(v), 300, "S3: still readable after the refusals")) { return 1; }
+  if (!eq(meo_pager_snap_end(v), 0, "S3: end")) { return 1; }
+  var base: MeoPager* = sn_alias(p);
+  if (!eq(meo_pager_snap_end(p), -MEO_ERR_USAGE, "S3: end on the base")) { return 1; }
+  if (!sn_close(base, "S3")) { return 1; }
+  println("PASS S3: a view refuses writes, close and free, and answers from its meta");
+  return 0;
+}
+
+// S4: pinned pages and the view pool.
+fn s4() -> int32 {
+  var db: string = "build/wal_snap_s4.dat";
+  var p: MeoPager* = sn_open(db, "S4");
+  if (p == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 0, 200), 0, "S4: commit")) { return 1; }
+  var v: MeoPager* = sn_view(p, "S4");
+  if (v == 0) { return 1; }
+  var f: MeoFrame* = meo_pager_get(v, meo_pager_root(v, MEO_ROOT_BTREE), false);
+  if (!meo_t_check(f != 0, "S4: get")) { return 1; }
+  var keep: MeoPager* = sn_alias(v);
+  if (!eq(meo_pager_snap_end(v), -MEO_ERR_BUSY, "S4: end while pinned")) { return 1; }
+  if (!eq(meo_pager_snap_readers(p), 1, "S4: still a reader")) { return 1; }
+  if (!eq(meo_pager_release(keep, f, false), 0, "S4: release")) { return 1; }
+  if (!eq(meo_pager_snap_end(keep), 0, "S4: end")) { return 1; }
+  if (!eq(meo_pager_snap_readers(p), 0, "S4: no readers")) { return 1; }
+
+  // More views at once than the pool keeps; every one is its own snapshot.
+  var vs: MeoPager*[] = new MeoPager*[70];
+  var i: int32 = 0;
+  while (i < 70) {
+    vs[i] = sn_view(p, "S4: many");
+    if (vs[i] == 0) { return 1; }
+    i += 1;
+  }
+  if (!eq(meo_pager_snap_readers(p), 70, "S4: 70 readers")) { return 1; }
+  i = 0;
+  while (i < 70) {
+    if (!eq(meo_pager_snap_end(vs[i]), 0, "S4: end many")) { return 1; }
+    i += 1;
+  }
+  free(vs.data);
+  i = 0;
+  while (i < 200) {
+    var w: MeoPager* = sn_view(p, "S4: reuse");
+    if (w == 0) { return 1; }
+    if (i % 50 == 0 && !eq(sn_count(w), 200, "S4: reused view")) { return 1; }
+    if (!eq(meo_pager_snap_end(w), 0, "S4: end reuse")) { return 1; }
+    i += 1;
+  }
+  if (!eq(meo_pager_snap_readers(p), 0, "S4: none left")) { return 1; }
+  if (!sn_close(p, "S4")) { return 1; }
+  println("PASS S4: ending with a page pinned is BUSY; views are pooled");
+  return 0;
+}
+
+// S5: a held view holds the checkpoint at its mark.
+fn s5() -> int32 {
+  var db: string = "build/wal_snap_s5.dat";
+  var p: MeoPager* = sn_open(db, "S5");
+  if (p == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 0, 500), 0, "S5: commit A")) { return 1; }
+  var a: uint32 = meo_pager_wal_committed(p);
+  var v1: MeoPager* = sn_view(p, "S5");
+  if (v1 == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 500, 500), 0, "S5: commit B")) { return 1; }
+  var b: uint32 = meo_pager_wal_committed(p);
+  if (!meo_t_check(b > a, "S5: B is past A")) { return 1; }
+  var left: int32 = meo_pager_checkpoint(p, MEO_CKPT_PASSIVE);
+  if (!eq(left, (int64)(b - a), "S5: frames left")) { return 1; }
+  if (!eq((int64)meo_pager_wal_backfilled(p), (int64)a, "S5: backfilled stops at A")) { return 1; }
+  if (!eq(sn_count(v1), 500, "S5: v1 after the partial checkpoint")) { return 1; }
+  if (!eq(meo_pager_snap_end(v1), 0, "S5: end v1")) { return 1; }
+  left = meo_pager_checkpoint(p, MEO_CKPT_PASSIVE);
+  if (!eq(left, 0, "S5: nothing left")) { return 1; }
+  if (!eq((int64)meo_pager_wal_backfilled(p), (int64)b, "S5: backfilled reaches B")) { return 1; }
+  var v2: MeoPager* = sn_view(p, "S5: v2");
+  if (v2 == 0) { return 1; }
+  if (!eq(sn_count(v2), 1000, "S5: v2 reads the db file")) { return 1; }
+  if (!eq(meo_pager_snap_end(v2), 0, "S5: end v2")) { return 1; }
+  if (!sn_close(p, "S5")) { return 1; }
+  println("PASS S5: a held view holds the checkpoint at its mark");
+  return 0;
+}
+
+// S6: a view that reads only the db file, across a log restart.
+fn s6() -> int32 {
+  var db: string = "build/wal_snap_s6.dat";
+  var p: MeoPager* = sn_open(db, "S6");
+  if (p == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 0, 1000), 0, "S6: commit")) { return 1; }
+  if (!eq(meo_pager_checkpoint(p, MEO_CKPT_FULL), 0, "S6: full checkpoint")) { return 1; }
+  if (!eq((int64)meo_pager_wal_backfilled(p), (int64)meo_pager_wal_committed(p), "S6: all backfilled")) { return 1; }
+  var vz: MeoPager* = sn_view(p, "S6");
+  if (vz == 0) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "S6: begin restarts the log")) { return 1; }
+  if (!eq((int64)meo_pager_wal_frames(p), 0, "S6: log is empty")) { return 1; }
+  if (!eq(sn_fill(p, 1000, 100), 0, "S6: fill")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "S6: commit 2")) { return 1; }
+  var c: uint32 = meo_pager_wal_committed(p);
+  var left: int32 = meo_pager_checkpoint(p, MEO_CKPT_PASSIVE);
+  if (!eq(left, (int64)c, "S6: no progress while vz is open")) { return 1; }
+  if (!eq((int64)meo_pager_wal_backfilled(p), 0, "S6: backfilled")) { return 1; }
+  if (!eq(sn_count(vz), 1000, "S6: vz walks its old set")) { return 1; }
+  if (!eq(meo_pager_snap_end(vz), 0, "S6: end vz")) { return 1; }
+  if (!eq(meo_pager_checkpoint(p, MEO_CKPT_PASSIVE), 0, "S6: checkpoint after vz")) { return 1; }
+  var v2: MeoPager* = sn_view(p, "S6: v2");
+  if (v2 == 0) { return 1; }
+  if (!eq(sn_count(v2), 1100, "S6: new view")) { return 1; }
+  if (!eq(meo_pager_snap_end(v2), 0, "S6: end v2")) { return 1; }
+  if (!sn_close(p, "S6")) { return 1; }
+  println("PASS S6: a db-file-only view survives a restart and blocks the checkpoint");
+  return 0;
+}
+
+// --- S7: readers against a committing writer --------------------------------
+
+const S7_DB: string = "/dev/shm/meodb_wal_snap_s7.db";
+const S7_READERS: int32 = 8;
+const S7_TXNS: int32 = 200;
+const S7_PER_TXN: int32 = 10;
+const S7_DEADLINE_MS: int64 = 120000;
+
+struct S7Arg {
+  pager: MeoPager*;
+  err: int32;        // first failing step, 0 = none
+  detail: int64;
+  walks: int32;
+  last: int64;       // rows of the last walk
+}
+
+var s7_stop: int32 = 0;
+
+fn s7_fail(a: S7Arg*, step: int32, detail: int64) {
+  if (a->err == 0) {
+    a->err = step;
+    a->detail = detail;
+  }
+}
+
+fn s7_reader(arg: cstring) -> uint32 {
+  var a: S7Arg* = (S7Arg*)arg;
+  var prev: int64 = 0;
+  var done: bool = false;
+  while (!done && a->err == 0) {
+    // A walk that starts after the writer finished must see everything.
+    done = meo_atomic_load_i32(&s7_stop) != 0;
+    var v: MeoPager* = 0;
+    var rc: int32 = meo_pager_snap_begin(a->pager, &v);
+    if (rc != MEO_OK) {
+      s7_fail(a, 1, (int64)rc);
+      break;
+    }
+    var n: int64 = sn_count(v);
+    if (n < 0) { s7_fail(a, 2, n); }
+    if (n >= 0 && n % (int64)S7_PER_TXN != 0) { s7_fail(a, 3, n); }
+    if (n >= 0 && n < prev) { s7_fail(a, 4, n); }
+    rc = meo_pager_snap_end(v);
+    if (rc != MEO_OK) { s7_fail(a, 5, (int64)rc); }
+    if (n >= 0) { prev = n; }
+    a->last = n;
+    a->walks += 1;
+  }
+  return 0;
+}
+
+fn s7() -> int32 {
+  var p: MeoPager* = sn_open(S7_DB, "S7");
+  if (p == 0) { return 1; }
+  meo_pager_set_autocheckpoint(p, 32);
+  if (!eq(sn_commit_keys(p, 0, S7_PER_TXN), 0, "S7: seed")) { return 1; }
+
+  var args: S7Arg*[] = new S7Arg*[8];
+  var hs: int64[] = new int64[8];
+  var i: int32 = 0;
+  var t0: int64 = meo_clock_realtime_us();
+  while (i < S7_READERS) {
+    args[i] = new S7Arg;
+    args[i]->pager = p;
+    args[i]->err = 0;
+    args[i]->detail = 0;
+    args[i]->walks = 0;
+    args[i]->last = 0;
+    hs[i] = CreateThread(0, 0, &s7_reader, (cstring)args[i], 0, 0);
+    if (hs[i] == 0) {
+      println("FAIL S7: thread {i} did not start");
+      return 1;
+    }
+    i += 1;
+  }
+
+  var rc: int32 = MEO_OK;
+  var t: int32 = 1;
+  while (t < S7_TXNS && rc == MEO_OK) {
+    rc = sn_commit_keys(p, t * S7_PER_TXN, S7_PER_TXN);
+    t += 1;
+  }
+  meo_atomic_store_i32(&s7_stop, 1);
+
+  i = 0;
+  while (i < S7_READERS) {
+    var left: int64 = S7_DEADLINE_MS - (meo_clock_realtime_us() - t0) / 1000;
+    if (left < 1) { left = 1; }
+    if (thread_join(hs[i], (uint32)left) != WAIT_OBJECT_0()) {
+      println("FAIL S7: reader {i} still running after {S7_DEADLINE_MS} ms (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  if (!eq(rc, 0, "S7: writer")) { return 1; }
+  var total: int64 = (int64)S7_TXNS * (int64)S7_PER_TXN;
+  var walks: int32 = 0;
+  i = 0;
+  while (i < S7_READERS) {
+    if (args[i]->err != 0) {
+      println("FAIL S7: reader {i} step {args[i]->err} detail {args[i]->detail}");
+      return 1;
+    }
+    if (!eq(args[i]->last, total, "S7: reader {i} final walk")) { return 1; }
+    walks += args[i]->walks;
+    free(args[i]);
+    i += 1;
+  }
+  free(args.data);
+  free(hs.data);
+  if (!eq(meo_pager_snap_readers(p), 0, "S7: no readers left")) { return 1; }
+  var v: MeoPager* = sn_view(p, "S7");
+  if (v == 0) { return 1; }
+  if (!eq(sn_count(v), total, "S7: final view")) { return 1; }
+  if (!eq(meo_pager_snap_end(v), 0, "S7: end")) { return 1; }
+  if (!sn_close(p, "S7")) { return 1; }
+  meo_file_unlink(S7_DB);
+  println("PASS S7: {S7_READERS} readers, {walks} walks over {S7_TXNS} commits");
+  return 0;
+}
+
+// S8: a page cached from the db file must not outlive its rewrite.
+fn s8() -> int32 {
+  var db: string = "build/wal_snap_s8.dat";
+  var p: MeoPager* = sn_open(db, "S8");
+  if (p == 0) { return 1; }
+  if (!eq(sn_commit_keys(p, 0, 50), 0, "S8: commit")) { return 1; }
+  if (!eq(meo_pager_checkpoint(p, MEO_CKPT_FULL), 0, "S8: full checkpoint")) { return 1; }
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var va: MeoPager* = sn_view(p, "S8: va");
+  if (va == 0) { return 1; }
+  if (!eq(sn_count(va), 50, "S8: va walk caches the db pages")) { return 1; }
+  if (!eq(meo_pager_snap_end(va), 0, "S8: end va")) { return 1; }
+
+  if (!eq(sn_commit_keys(p, 50, 50), 0, "S8: commit 2 rewrites the pages")) { return 1; }
+  if (!eq(meo_pager_checkpoint(p, MEO_CKPT_FULL), 0, "S8: full checkpoint 2")) { return 1; }
+  // The next begin restarts the log; ending it leaves the file as it was.
+  if (!eq(meo_pager_begin(p), 0, "S8: begin restarts")) { return 1; }
+  if (!eq(meo_pager_rollback(p), 0, "S8: rollback")) { return 1; }
+
+  var vb: MeoPager* = sn_view(p, "S8: vb");
+  if (vb == 0) { return 1; }
+  if (!eq(sn_count(vb), 100, "S8: vb walks the new rows")) { return 1; }
+  var fw: MeoFrame* = meo_pager_get(p, root, false);
+  var fv: MeoFrame* = meo_pager_get(vb, root, false);
+  if (!meo_t_check(fw != 0 && fv != 0, "S8: get the root twice")) { return 1; }
+  if (!meo_t_check_bytes(fv->data, fw->data, 4096, "S8: view page equals the writer's")) { return 1; }
+  meo_pager_release(p, fw, false);
+  meo_pager_release(vb, fv, false);
+  if (!eq(meo_pager_snap_end(vb), 0, "S8: end vb")) { return 1; }
+  if (!sn_close(p, "S8")) { return 1; }
+  println("PASS S8: a checkpoint drops the cached db-file version of a page");
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_snap_self (stub)");
+  var rc: int32 = s1();
+  if (rc == 0) { rc = s2(); }
+  if (rc == 0) { rc = s3(); }
+  if (rc == 0) { rc = s4(); }
+  if (rc == 0) { rc = s5(); }
+  if (rc == 0) { rc = s6(); }
+  if (rc == 0) { rc = s7(); }
+  if (rc == 0) { rc = s8(); }
+  var report: int32 = meo_t_report();
+  if (rc != 0 || report != 0) {
+    println("FAIL wal_snap_self");
+    return 1;
+  }
+  println("PASS wal_snap_self");
   return 0;
 }
