@@ -313,6 +313,10 @@ fn srv_session_handle(s: MeoSrvSession*, h: MeoWHdr*, body: uint8*) -> int32 {
     return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
   }
   if (h->kind == MEO_WIRE_K_PING) {
+    // An aborted transaction answers TX to everything until ROLLBACK.
+    if (s->state == MEO_SRV_S_ABORTED) {
+      return srv_after(s, srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+    }
     return srv_after(s, srv_reply_empty(s, MEO_WIRE_K_OK, h->rid));
   }
   if (h->kind == MEO_WIRE_K_COMMIT) {

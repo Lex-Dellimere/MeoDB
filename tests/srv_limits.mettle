@@ -524,6 +524,8 @@ fn lim_timeouts() -> int32 {
   if (lim_begin(x) != MEO_WIRE_K_OK) { return lim_fail("begin x"); }
   if (lim_insert(x, 500, 501, 3) != MEO_WIRE_K_RESULT) { return lim_fail("insert x"); }
   Sleep(500);
+  if (lim_expect_error(lim_call(x, MEO_WIRE_K_PING), MEO_ERR_TX, false, "ping past tx_max") != 0) { return 1; }
+  if (g_err.tx != MEO_WIRE_TX_ABORTED) { return lim_fail("ping past tx_max: tx {g_err.tx}"); }
   if (lim_expect_error(lim_insert(x, 501, 502, 3), MEO_ERR_TX, false, "query past tx_max") != 0) { return 1; }
   if (g_err.tx != MEO_WIRE_TX_ABORTED) { return lim_fail("past tx_max: tx {g_err.tx}"); }
   if (lim_expect_error(lim_call(x, MEO_WIRE_K_COMMIT), MEO_ERR_TX, false, "commit aborted") != 0) { return 1; }
@@ -540,6 +542,7 @@ fn lim_timeouts() -> int32 {
   if (lim_call(y, MEO_WIRE_K_ROLLBACK) != MEO_WIRE_K_OK) { return lim_fail("rollback y"); }
 
   if (lim_call(x, MEO_WIRE_K_ROLLBACK) != MEO_WIRE_K_OK) { return lim_fail("rollback aborted"); }
+  if (lim_call(x, MEO_WIRE_K_PING) != MEO_WIRE_K_OK) { return lim_fail("ping after rollback"); }
   if (lim_begin(x) != MEO_WIRE_K_OK) { return lim_fail("begin after aborted"); }
   if (lim_call(x, MEO_WIRE_K_COMMIT) != MEO_WIRE_K_OK) { return lim_fail("commit after aborted"); }
   meo_sock_close(x);

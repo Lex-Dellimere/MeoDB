@@ -303,6 +303,8 @@ fn stp_held_by_host(db: MeoDb*) -> int32 {
   if (stp_send_begin(fd) < 0) { return stp_fail("send begin"); }
   Sleep(100);
   var bad: int32 = stp_timed_stop(srv, -MEO_ERR_BUSY, "host holds the lock");
+  // Still BUSY while the waiter cannot finish.
+  if (bad == 0) { bad = stp_timed_stop(srv, -MEO_ERR_BUSY, "stop again, lock still held"); }
   meo_db_rollback(db);
   // Once the lock is free the session finishes on its own.
   if (bad == 0 && stp_recv(fd) != MEO_WIRE_K_OK) { bad = stp_fail("waiter's begin after host rollback"); }
@@ -315,8 +317,9 @@ fn stp_held_by_host(db: MeoDb*) -> int32 {
   }
   if (bad == 0 && meo_srv_n_sessions(srv) != 0) { bad = stp_fail("waiter session never ended"); }
   if (bad == 0 && meo_db_in_tx(db)) { bad = stp_fail("waiter's transaction left open"); }
-  // Not freed: after a missed deadline meo_srv_free stays BUSY even once the
-  // session has ended, so this server is left to the process exit.
+  // A later stop joins the session that ended since the missed deadline.
+  if (bad == 0) { bad = stp_timed_stop(srv, MEO_OK, "stop after the lock is free"); }
+  if (bad == 0 && meo_srv_free(srv) != MEO_OK) { bad = stp_fail("free after second stop"); }
   return bad;
 }
 
