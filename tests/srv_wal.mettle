@@ -1,6 +1,375 @@
+// srv_wal: the server embedded on 127.0.0.1 port 0 over a WAL database, driven
+// with raw frames. A reader gets the old data at once while another client
+// holds an open write transaction, and sees the new row once it commits; and
+// 16 autocommit clients share WAL fsyncs (group commit).
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/mem/arena.mettle";
+import "../src/pager/wal.mettle";
+import "../src/meo_server.mettle";
+
+const SWL_DB: string = "build/srv_wal.db";
+const SWL_IP: string = "127.0.0.1";
+const SWL_FRAME: int32 = 65536;
+const SWL_CLIENTS: int32 = 16;
+const SWL_PER: int32 = 50;               // autocommit inserts per client
+const SWL_ID_STRIDE: int64 = 1000;       // client c inserts ids 1000 + c * stride + i
+const SWL_SYNC_DELAY_US: int64 = 5000;   // an insert costs ~0.6 ms before its commit
+const SWL_JOIN_MS: uint32 = 120000;
+const SWL_READ_MS: int64 = 100;
+
+// One client connection with its own frame buffers, so threads do not share.
+struct SwlC {
+  fd: int64;
+  rid: uint32;
+  w: MeoWBuf;
+  buf: uint8*;
+  hdr: MeoWHdr;
+  rd: MeoWRd;
+  arena: MeoArena*;
+  err: MeoWError;
+  res: MeoWResult;
+  bad: int32;          // worker: statements that did not return RESULT
+  first: int64;        // worker: first id to insert
+}
+
+var g_port: int32 = 0;
+
+fn swl_fail(msg: string) -> int32 {
+  println("FAIL srv_wal: {msg}");
+  return 1;
+}
+
+fn swl_init(c: SwlC*) {
+  c->fd = -1;
+  c->rid = 0;
+  meo_wbuf_init(&c->w, 1048576);
+  c->buf = (uint8*)malloc(1048576 + 64);
+  c->arena = meo_arena_new(65536);
+  c->bad = 0;
+  c->first = 0;
+}
+
+fn swl_free(c: SwlC*) {
+  if (c->fd >= 0) { meo_sock_close(c->fd); }
+  meo_wbuf_free(&c->w);
+  free((rawptr)c->buf);
+  meo_arena_free(c->arena);
+}
+
+fn swl_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  var wpath: string = db + "-wal";
+  meo_file_unlink(wpath);
+  free(wpath.chars);
+  return rc;
+}
+
+fn swl_send(c: SwlC*, kind: int32) -> int32 {
+  c->rid += 1;
+  var n: int32 = meo_wbuf_finish(&c->w, kind, c->rid);
+  if (n < 0) { return n; }
+  var rc: int32 = meo_sock_send_all(c->fd, c->w.p, n);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// Read one frame into hdr / rd: its kind, 0 on EOF, or -MEO_ERR_*.
+fn swl_recv(c: SwlC*) -> int32 {
+  var rc: int32 = meo_sock_recv_exact(c->fd, c->buf, MEO_WIRE_HDR);
+  if (rc <= 0) { return rc; }
+  rc = meo_wire_hdr_get(c->buf, SWL_FRAME, &c->hdr);
+  if (rc < 0) { return rc; }
+  if (c->hdr.len > 0) {
+    rc = meo_sock_recv_exact(c->fd, c->buf + MEO_WIRE_HDR, c->hdr.len);
+    if (rc != c->hdr.len) { return -MEO_ERR_IO; }
+  }
+  meo_wrd_init(&c->rd, c->buf + MEO_WIRE_HDR, c->hdr.len);
+  return c->hdr.kind;
+}
+
+fn swl_reply(c: SwlC*) -> int32 {
+  var k: int32 = swl_recv(c);
+  if (k == MEO_WIRE_K_ERROR) {
+    if (meo_wire_error_get(&c->rd, &c->err) < 0) { return -MEO_ERR_PROTO; }
+  } else if (k == MEO_WIRE_K_RESULT) {
+    meo_arena_reset(c->arena);
+    if (meo_wire_result_get(&c->rd, c->arena, &c->res) < 0) { return -MEO_ERR_PROTO; }
+  }
+  if (k > 0 && c->hdr.rid != c->rid && c->hdr.rid != 0) { return -MEO_ERR_PROTO; }
+  return k;
+}
+
+// Send an empty request; the response kind.
+fn swl_call(c: SwlC*, kind: int32) -> int32 {
+  meo_wbuf_begin(&c->w);
+  var rc: int32 = swl_send(c, kind);
+  if (rc < 0) { return rc; }
+  return swl_reply(c);
+}
+
+// Connected and past HELLO (no token), or a negative code.
+fn swl_open(c: SwlC*) -> int32 {
+  c->fd = meo_sock_connect(SWL_IP, g_port);
+  if (c->fd < 0) { return (int32)c->fd; }
+  meo_sock_set_recv_timeout(c->fd, 5000);
+  var h: MeoWHello;
+  h.major = MEO_WIRE_MAJOR;
+  h.minor = MEO_WIRE_MINOR;
+  h.max_frame = SWL_FRAME;
+  h.token = "";
+  h.name = "srv_wal";
+  meo_wbuf_begin(&c->w);
+  meo_wire_hello_put(&c->w, &h);
+  var rc: int32 = swl_send(c, MEO_WIRE_K_HELLO);
+  if (rc < 0) { return rc; }
+  if (swl_reply(c) != MEO_WIRE_K_HELLO_OK) { return -MEO_ERR_PROTO; }
+  return MEO_OK;
+}
+
+fn swl_query(c: SwlC*, st: MeoWStmt*) -> int32 {
+  meo_wbuf_begin(&c->w);
+  var rc: int32 = meo_wire_stmt_put(&c->w, st);
+  if (rc < 0) { return rc; }
+  rc = swl_send(c, MEO_WIRE_K_QUERY);
+  if (rc < 0) { return rc; }
+  return swl_reply(c);
+}
+
+fn swl_begin(c: SwlC*) -> int32 {
+  meo_wbuf_begin(&c->w);
+  meo_wire_begin_put(&c->w, 0);
+  var rc: int32 = swl_send(c, MEO_WIRE_K_BEGIN);
+  if (rc < 0) { return rc; }
+  return swl_reply(c);
+}
+
+fn swl_col(col: MeoWCol*, name: string, ty: int32, flags: int32) {
+  col->name = name;
+  col->ty = ty;
+  col->flags = flags;
+}
+
+// INSERT INTO t(id, name) VALUES (id, 'x'): the response kind.
+fn swl_insert(c: SwlC*, id: int64) -> int32 {
+  var cols: MeoWCol[2];
+  swl_col(&cols[0], "id", 0, 0);
+  swl_col(&cols[1], "name", 0, 0);
+  var x: uint8[1];
+  x[0] = 120;
+  var args: MeoValue[2];
+  meo_value_set_int(&args[0], id);
+  meo_value_set_text(&args[1], &x[0], 1);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  st.n_rows = 1;
+  st.args = &args[0];
+  st.n_args = 2;
+  return swl_query(c, &st);
+}
+
+// SELECT id FROM t WHERE id = x: rows found, or a negative code.
+fn swl_find(c: SwlC*, x: int64) -> int32 {
+  var cols: MeoWCol[1];
+  swl_col(&cols[0], "id", 0, 0);
+  var terms: MeoWTerm[1];
+  terms[0].col = "id";
+  terms[0].op = MEO_WIRE_W_EQ;
+  terms[0].arg0 = 0;
+  terms[0].n_args = 1;
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  st.args = &v;
+  st.n_args = 1;
+  var k: int32 = swl_query(c, &st);
+  if (k != MEO_WIRE_K_RESULT) { return -MEO_ERR_PROTO; }
+  return c->res.n_rows;
+}
+
+// SELECT COUNT(*) FROM t: the count, or a negative code.
+fn swl_count(c: SwlC*) -> int64 {
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_COUNT;
+  st.table = "t";
+  if (swl_query(c, &st) != MEO_WIRE_K_RESULT || c->res.n_rows != 1) { return -1; }
+  return c->res.cells[0].i;
+}
+
+fn swl_create(c: SwlC*) -> int32 {
+  var cols: MeoWCol[2];
+  swl_col(&cols[0], "id", 1, MEO_WIRE_CF_PK);
+  swl_col(&cols[1], "name", 3, 0);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  if (swl_query(c, &st) != MEO_WIRE_K_RESULT) { return swl_fail("create"); }
+  if (swl_insert(c, 1) != MEO_WIRE_K_RESULT) { return swl_fail("insert 1"); }
+  return 0;
+}
+
+// Client A (already connected) holds BEGIN + INSERT open. B's SELECT answers within 100 ms with the
+// old data, A commits, and B then sees the new row.
+fn swl_reader_vs_writer(a: SwlC*, b: SwlC*) -> int32 {
+  if (swl_open(b) != MEO_OK) { return swl_fail("open b"); }
+  if (swl_begin(a) != MEO_WIRE_K_OK) { return swl_fail("begin a"); }
+  if (swl_insert(a, 2) != MEO_WIRE_K_RESULT) { return swl_fail("insert a"); }
+
+  var t0: int64 = meo_clock_monotonic_us();
+  var found: int32 = swl_find(b, 1);
+  var us: int64 = meo_clock_monotonic_us() - t0;
+  if (found != 1) { return swl_fail("b: old row 1: found {found}"); }
+  if (us > SWL_READ_MS * 1000) { return swl_fail("b's select took {us} us beside an open writer"); }
+  found = swl_find(b, 2);
+  if (found != 0) { return swl_fail("b saw uncommitted row 2: found {found}"); }
+  var n: int64 = swl_count(b);
+  if (n != 1) { return swl_fail("b: count {n} before commit"); }
+
+  if (swl_call(a, MEO_WIRE_K_COMMIT) != MEO_WIRE_K_OK) { return swl_fail("commit a"); }
+  found = swl_find(b, 2);
+  if (found != 1) { return swl_fail("b after commit: row 2 found {found}"); }
+  n = swl_count(b);
+  if (n != 2) { return swl_fail("b: count {n} after commit"); }
+  println("reader: old data in {us} us beside an open writer");
+  return 0;
+}
+
+fn swl_worker(arg: cstring) -> uint32 {
+  var c: SwlC* = (SwlC*)arg;
+  if (swl_open(c) != MEO_OK) {
+    c->bad = SWL_PER;
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < SWL_PER) {
+    if (swl_insert(c, c->first + (int64)i) != MEO_WIRE_K_RESULT) { c->bad += 1; }
+    i += 1;
+  }
+  swl_call(c, MEO_WIRE_K_BYE);
+  return 0;
+}
+
+// 16 clients insert autocommit rows against a slow fsync: the WAL fsyncs are at
+// most half the commits, and every row is there.
+fn swl_group_commit(srv: MeoSrv*, ctl: SwlC*) -> int32 {
+  var cs: SwlC* = (SwlC*)malloc((int64)SWL_CLIENTS * (int64)sizeof(SwlC));
+  var hs: int64[] = new int64[SWL_CLIENTS];
+  var i: int32 = 0;
+  while (i < SWL_CLIENTS) {
+    swl_init(&cs[i]);
+    cs[i].first = 1000 + (int64)i * SWL_ID_STRIDE;
+    i += 1;
+  }
+  var bad: int32 = 0;
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, SWL_SYNC_DELAY_US);
+  var s0: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0);
+  var t0: int64 = meo_clock_monotonic_us();
+  i = 0;
+  while (i < SWL_CLIENTS) {
+    hs[i] = CreateThread(0, 0, &swl_worker, (cstring)&cs[i], 0, 0);
+    if (hs[i] == 0) {
+      bad = swl_fail("thread {i}");
+      break;
+    }
+    i += 1;
+  }
+  var started: int32 = i;
+  i = 0;
+  while (i < started) {
+    if (thread_join(hs[i], SWL_JOIN_MS) != WAIT_OBJECT_0()) {
+      println("FAIL srv_wal: client {i} still running (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+  var syncs: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0) - s0;
+  meo_wal_test_ctl(MEO_WAL_T_SYNC_DELAY_US, 0);
+  var commits: int64 = (int64)SWL_CLIENTS * (int64)SWL_PER;
+  println("group commit: {commits} commits in {ms} ms with {syncs} WAL fsyncs");
+
+  var failed: int32 = 0;
+  i = 0;
+  while (i < SWL_CLIENTS) {
+    failed += cs[i].bad;
+    swl_free(&cs[i]);
+    i += 1;
+  }
+  free((rawptr)cs);
+  free(hs.data);
+  if (bad != 0) { return bad; }
+  if (failed != 0) { return swl_fail("{failed} inserts did not return RESULT"); }
+  if (syncs * 2 > commits) { return swl_fail("{syncs} fsyncs for {commits} commits (max {commits / 2})"); }
+  var n: int64 = swl_count(ctl);
+  if (n != commits + 2) { return swl_fail("rows {n}, want {commits + 2}"); }
+  return 0;
+}
+
+fn swl_run() -> int32 {
+  if (swl_reset(SWL_DB) != MEO_OK) { return swl_fail("reset db"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(SWL_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_WAL,
+    0, &db);
+  if (rc != MEO_OK) { return swl_fail("open db rc={rc}"); }
+  var cfg: MeoSrvConfig;
+  meo_srv_config_default(&cfg);
+  cfg.port = 0;
+  cfg.max_frame = SWL_FRAME;
+  var srv: MeoSrv* = 0;
+  rc = meo_srv_start(db, &cfg, &srv);
+  if (rc != MEO_OK) { return swl_fail("start rc={rc}"); }
+  g_port = meo_srv_port(srv);
+  if (g_port <= 0) { return swl_fail("port {g_port}"); }
+
+  var a: SwlC;
+  var b: SwlC;
+  swl_init(&a);
+  swl_init(&b);
+  var bad: int32 = 0;
+  if (swl_open(&a) != MEO_OK) { bad = swl_fail("open a"); }
+  if (bad == 0) { bad = swl_create(&a); }
+  if (bad == 0) { bad = swl_reader_vs_writer(&a, &b); }
+  if (bad == 0) { bad = swl_group_commit(srv, &b); }
+  swl_free(&a);
+  swl_free(&b);
+  meo_srv_stop(srv);
+  if (meo_srv_free(srv) != MEO_OK && bad == 0) { bad = swl_fail("free"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK && bad == 0) { bad = swl_fail("close rc={rc}"); }
+  return bad;
+}
 
 fn main() -> int32 {
-  println("PASS srv_wal (stub)");
+  if (swl_run() != 0) { return 1; }
+  println("PASS srv_wal");
   return 0;
 }

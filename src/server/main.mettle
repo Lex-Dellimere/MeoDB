@@ -28,6 +28,7 @@ fn usage() {
   println("  --busy-ms N         (10000)    --tx-idle-ms N    (5000)");
   println("  --tx-max-ms N       (60000)    --idle-ms N       (300000, 0 = none)");
   println("  --hello-ms N        (5000)     --stop-ms N       (10000)");
+  println("  --journal MODE      wal (default) or rollback; converts the file on open");
   println("Prints the bound port, then serves until SIGINT or SIGTERM.");
 }
 
@@ -102,6 +103,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   var token_path: string = "";
   var have_token: bool = false;
   var no_token: bool = false;
+  var jflag: int32 = MEO_OPEN_WAL;
   var i: int32 = 1;
   if (argc < 2) {
     usage();
@@ -150,6 +152,14 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     } else if (str_eq(a, "--port")) {
       c.port = n;
       bad = n < 0 || n > 65535;
+    } else if (str_eq(a, "--journal")) {
+      if (str_eq(v, "wal")) {
+        jflag = MEO_OPEN_WAL;
+      } else if (str_eq(v, "rollback")) {
+        jflag = MEO_OPEN_NO_WAL;
+      } else {
+        bad = true;
+      }
     } else if (str_eq(a, "--max-conns")) {
       c.max_conns = n;
       bad = n < 1;
@@ -201,7 +211,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   syscall(SYS_RT_SIGPROCMASK, SIG_BLOCK, (int64)&set, (int64)0, (int64)8);
 
   var db: MeoDb* = 0;
-  var rc: int32 = meo_db_open(db_path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE, 0, &db);
+  var rc: int32 = meo_db_open(db_path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | jflag, 0, &db);
   if (rc != MEO_OK) { return fail("cannot open {db_path}: {meo_status_name(-rc)}"); }
   var srv: MeoSrv* = 0;
   rc = meo_srv_start(db, &c, &srv);
@@ -220,8 +230,9 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     sig = syscall(SYS_RT_SIGTIMEDWAIT, (int64)&set, (int64)&info[0], (int64)&ts[0], (int64)8);
   }
   println("meodb: signal {sig}, stopping");
-  // A session that missed stop_ms still holds its transaction; the hot
-  // journal restores pre-transaction data on the next open.
+  // A session that missed stop_ms still holds its transaction; the next open
+  // discards it (rollback journal: restored from the hot journal; WAL: its
+  // frames were never committed).
   var st: int32 = meo_srv_stop(srv);
   if (st == MEO_OK) {
     meo_srv_free(srv);
