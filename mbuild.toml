@@ -99,3 +99,11 @@ main = "tests/parse_self.mettle"
 # sorted-array oracle.
 [bin.btdel_self]
 main = "tests/btdel_self.mettle"
+
+# Catalog persistence, rollback reload and the db transaction API.
+[bin.catalog_self]
+main = "tests/catalog_self.mettle"
+
+# Table rows, unique indexes, delete and update.
+[bin.table_self]
+main = "tests/table_self.mettle"

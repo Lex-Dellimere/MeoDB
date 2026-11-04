@@ -1,0 +1,435 @@
+// table_self: table rows with unique indexes, driven through meo_tbl_*
+// directly. Unique conflicts against the tree and within one statement, NULLs
+// in UNIQUE, a TEXT PRIMARY KEY, NULL-id rowids, delete and update freeing
+// unique values, strict typing, and 5000 indexed rows surviving a reopen with
+// every other row deleted.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meo_core.mettle";
+
+const TB_BIG: int32 = 5000;
+// Red-check switch: 1 expects one surviving row too many. Must be 0 when
+// committed.
+const TB_RED: int32 = 0;
+
+fn tb_fail(msg: string) -> int32 {
+  println("FAIL table_self: {msg}");
+  return 1;
+}
+
+fn tb_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn tb_col(c: MeoColumn*, name: string, aff: int32, flags: int32) {
+  c->name = name.chars;
+  c->name_len = (int32)name.length;
+  c->affinity = aff;
+  c->cflags = flags;
+  c->index_root = 0;
+}
+
+fn tb_create(db: MeoDb*, name: string, cols: MeoColumn*, n: int32, out: MeoTable**) -> int32 {
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_cat_create_table(db->cat, name.chars, (int32)name.length, cols, n, out);
+  if (rc != MEO_OK) {
+    meo_db_rollback(db);
+    return rc;
+  }
+  return meo_db_commit(db);
+}
+
+fn tb_text(v: MeoValue*, s: string) {
+  meo_value_set_text(v, s.chars, (int32)s.length);
+}
+
+// One INSERT statement of n rows in its own transaction: Phase A, then the
+// writes. A Phase-A failure is returned and the transaction rolled back.
+fn tb_insert(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n: int32, ids: int64*) -> int32 {
+  var arena: MeoArena* = meo_arena_new(4096);
+  if (arena == 0) { return -MEO_ERR_NOMEM; }
+  defer meo_arena_free(arena);
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_tbl_check_rows(db, t, rows, n, t->n_cols, arena, ids);
+  var r: int32 = 0;
+  while (rc == MEO_OK && r < n) {
+    rc = meo_tbl_write_row(db, t, &rows[(int64)r * (int64)t->n_cols], t->n_cols, ids[r]);
+    r += 1;
+  }
+  if (rc != MEO_OK) {
+    meo_db_rollback(db);
+    return rc;
+  }
+  return meo_db_commit(db);
+}
+
+// One UPDATE statement of n rows in its own transaction.
+fn tb_update(db: MeoDb*, t: MeoTable*, ids: int64*, rows: MeoValue*, n: int32) -> int32 {
+  var arena: MeoArena* = meo_arena_new(4096);
+  if (arena == 0) { return -MEO_ERR_NOMEM; }
+  defer meo_arena_free(arena);
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_tbl_check_update(db, t, ids, n, rows, t->n_cols, arena);
+  var r: int32 = 0;
+  while (rc == MEO_OK && r < n) {
+    rc = meo_tbl_update(db, t, ids[r], &rows[(int64)r * (int64)t->n_cols], t->n_cols);
+    r += 1;
+  }
+  if (rc != MEO_OK) {
+    meo_db_rollback(db);
+    return rc;
+  }
+  return meo_db_commit(db);
+}
+
+fn tb_count(db: MeoDb*, t: MeoTable*) -> int32 {
+  var sc: MeoTblScan;
+  if (meo_tbl_scan_open(db, t, &sc) != MEO_OK) { return -1; }
+  var row: MeoTblRow;
+  var n: int32 = 0;
+  while (true) {
+    var rc: int32 = meo_tbl_scan_next(&sc, &row);
+    if (rc == 1) { break; }
+    if (rc != 0) {
+      n = -1;
+      break;
+    }
+    n += 1;
+  }
+  meo_tbl_scan_close(&sc);
+  return n;
+}
+
+// The rowid the unique text column `col` maps s to, 0 when absent, -1 on error.
+fn tb_find(db: MeoDb*, t: MeoTable*, col: int32, s: string) -> int64 {
+  var v: MeoValue;
+  tb_text(&v, s);
+  var id: int64 = 0;
+  var rc: int32 = meo_tbl_index_lookup(db, t, col, &v, &id);
+  if (rc == 1) { return 0; }
+  if (rc != MEO_OK) { return -1; }
+  return id;
+}
+
+// users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, score REAL)
+fn tb_users(db: MeoDb*) -> int32 {
+  var cols: MeoColumn[3];
+  tb_col(&cols[0], "id", MEO_T_INT, MEO_COL_PK | MEO_COL_ROWID_ALIAS);
+  tb_col(&cols[1], "email", MEO_T_TEXT, MEO_COL_UNIQUE);
+  tb_col(&cols[2], "score", MEO_T_REAL, 0);
+  var t: MeoTable* = 0;
+  var rc: int32 = tb_create(db, "users", &cols[0], 3, &t);
+  if (rc != MEO_OK) { return tb_fail("create users rc={rc}"); }
+  var rows: MeoValue[12];
+  var ids: int64[4];
+
+  meo_value_set_null(&rows[0]);
+  tb_text(&rows[1], "a@x");
+  meo_value_set_int(&rows[2], 5);   // INTEGER into REAL converts
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != MEO_OK || ids[0] != 1) { return tb_fail("insert a@x rc={rc} id={ids[0]}"); }
+  if (t->columns[1].index_root == 0) { return tb_fail("no index root after the first insert"); }
+  if (tb_find(db, t, 1, "a@x") != 1) { return tb_fail("a@x not indexed"); }
+  var buf: uint8* = malloc((int64)MEO_REC_MAX);
+  defer free(buf);
+  var row: MeoTblRow;
+  var v: MeoValue;
+  rc = meo_tbl_lookup_rowid(db, t, 1, buf, MEO_REC_MAX, &row);
+  if (rc != MEO_OK) { return tb_fail("lookup 1 rc={rc}"); }
+  meo_tbl_row_get(t, &row, 2, &v);
+  if (v.type != MEO_T_REAL || v.f != 5.0) { return tb_fail("score not converted to REAL"); }
+
+  meo_value_set_null(&rows[0]);
+  tb_text(&rows[1], "a@x");
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_CONFLICT) { return tb_fail("duplicate a@x rc={rc}, want CONFLICT"); }
+
+  // Duplicate inside one statement: CONFLICT and nothing written.
+  meo_value_set_null(&rows[0]);
+  tb_text(&rows[1], "b@x");
+  meo_value_set_null(&rows[2]);
+  meo_value_set_null(&rows[3]);
+  tb_text(&rows[4], "c@x");
+  meo_value_set_null(&rows[5]);
+  meo_value_set_null(&rows[6]);
+  tb_text(&rows[7], "b@x");
+  meo_value_set_null(&rows[8]);
+  rc = tb_insert(db, t, &rows[0], 3, &ids[0]);
+  if (rc != -MEO_ERR_CONFLICT) { return tb_fail("in-statement dup rc={rc}, want CONFLICT"); }
+  if (tb_count(db, t) != 1) { return tb_fail("failed multi-row insert wrote rows"); }
+  if (tb_find(db, t, 1, "c@x") != 0) { return tb_fail("c@x indexed after a failed insert"); }
+
+  // NULL in UNIQUE, many times; NULL ids get max+1, max+2, ...
+  var r: int32 = 0;
+  while (r < 4) {
+    meo_value_set_null(&rows[r * 3]);
+    meo_value_set_null(&rows[r * 3 + 1]);
+    meo_value_set_real(&rows[r * 3 + 2], 1.5);
+    r += 1;
+  }
+  rc = tb_insert(db, t, &rows[0], 4, &ids[0]);
+  if (rc != MEO_OK) { return tb_fail("NULL emails rc={rc}"); }
+  if (ids[0] != 2 || ids[1] != 3 || ids[2] != 4 || ids[3] != 5) {
+    return tb_fail("NULL ids {ids[0]},{ids[1]},{ids[2]},{ids[3]}, want 2..5");
+  }
+  meo_value_set_null(&rows[0]);
+  meo_value_set_null(&rows[1]);
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != MEO_OK || ids[0] != 6) { return tb_fail("another NULL email rc={rc} id={ids[0]}"); }
+
+  // Strict typing and constraint codes.
+  meo_value_set_null(&rows[0]);
+  meo_value_set_int(&rows[1], 7);
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_MISMATCH) { return tb_fail("INTEGER into TEXT rc={rc}, want MISMATCH"); }
+  meo_value_set_null(&rows[0]);
+  meo_value_set_null(&rows[1]);
+  tb_text(&rows[2], "high");
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_MISMATCH) { return tb_fail("TEXT into REAL rc={rc}, want MISMATCH"); }
+  meo_value_set_int(&rows[0], 3);
+  tb_text(&rows[1], "d@x");
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_CONFLICT) { return tb_fail("existing id 3 rc={rc}, want CONFLICT"); }
+
+  // Delete frees the value; a second delete answers absent.
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc == MEO_OK) { rc = meo_tbl_delete(db, t, 1); }
+  if (rc != MEO_OK) { return tb_fail("delete 1 rc={rc}"); }
+  if (meo_tbl_delete(db, t, 1) != 1) { return tb_fail("second delete not absent"); }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return tb_fail("commit delete rc={rc}"); }
+  if (tb_find(db, t, 1, "a@x") != 0) { return tb_fail("a@x still indexed after delete"); }
+  meo_value_set_null(&rows[0]);
+  tb_text(&rows[1], "a@x");
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != MEO_OK || ids[0] != 7) { return tb_fail("re-insert a@x rc={rc} id={ids[0]}"); }
+  meo_value_set_null(&rows[0]);
+  tb_text(&rows[1], "e@x");
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != MEO_OK || ids[0] != 8) { return tb_fail("insert e@x rc={rc} id={ids[0]}"); }
+
+  // Update moves the indexed value; the old value becomes free.
+  var uid: int64[2];
+  uid[0] = 7;
+  meo_value_set_int(&rows[0], 7);
+  tb_text(&rows[1], "z@x");
+  meo_value_set_real(&rows[2], 2.0);
+  rc = tb_update(db, t, &uid[0], &rows[0], 1);
+  if (rc != MEO_OK) { return tb_fail("update 7 rc={rc}"); }
+  if (tb_find(db, t, 1, "z@x") != 7) { return tb_fail("z@x not mapped to 7"); }
+  if (tb_find(db, t, 1, "a@x") != 0) { return tb_fail("a@x still indexed after update"); }
+  rc = meo_tbl_lookup_rowid(db, t, 7, buf, MEO_REC_MAX, &row);
+  meo_tbl_row_get(t, &row, 2, &v);
+  if (rc != MEO_OK || v.type != MEO_T_REAL || v.f != 2.0) { return tb_fail("row 7 not rewritten"); }
+  meo_value_set_null(&rows[0]);
+  tb_text(&rows[1], "a@x");
+  meo_value_set_null(&rows[2]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != MEO_OK) { return tb_fail("insert of the freed a@x rc={rc}"); }
+  // Taking another row's value, or two rows taking one value: CONFLICT.
+  meo_value_set_int(&rows[0], 7);
+  tb_text(&rows[1], "e@x");
+  meo_value_set_null(&rows[2]);
+  rc = tb_update(db, t, &uid[0], &rows[0], 1);
+  if (rc != -MEO_ERR_CONFLICT) { return tb_fail("update onto e@x rc={rc}, want CONFLICT"); }
+  uid[1] = 2;
+  meo_value_set_int(&rows[3], 2);
+  tb_text(&rows[4], "q@x");
+  meo_value_set_null(&rows[5]);
+  tb_text(&rows[1], "q@x");
+  rc = tb_update(db, t, &uid[0], &rows[0], 2);
+  if (rc != -MEO_ERR_CONFLICT) { return tb_fail("two rows to q@x rc={rc}, want CONFLICT"); }
+  if (tb_find(db, t, 1, "z@x") != 7 || tb_find(db, t, 1, "q@x") != 0) {
+    return tb_fail("failed update changed the index");
+  }
+  meo_value_set_int(&rows[0], 7);
+  meo_value_set_null(&rows[1]);
+  rc = tb_update(db, t, &uid[0], &rows[0], 1);
+  if (rc != MEO_OK || tb_find(db, t, 1, "z@x") != 0) { return tb_fail("update to NULL rc={rc}"); }
+  meo_value_set_null(&rows[0]);
+  rc = tb_update(db, t, &uid[0], &rows[0], 1);
+  if (rc != -MEO_ERR_CONSTRAINT) { return tb_fail("NULL rowid alias rc={rc}, want CONSTRAINT"); }
+  println("  users: unique conflicts, NULLs, delete and update free values");
+  return 0;
+}
+
+// keys(code TEXT PRIMARY KEY, n INTEGER NOT NULL): the PK is an index.
+fn tb_keys(db: MeoDb*) -> int32 {
+  var cols: MeoColumn[2];
+  tb_col(&cols[0], "code", MEO_T_TEXT, MEO_COL_PK);
+  tb_col(&cols[1], "n", MEO_T_INT, MEO_COL_NOT_NULL);
+  var t: MeoTable* = 0;
+  var rc: int32 = tb_create(db, "keys", &cols[0], 2, &t);
+  if (rc != MEO_OK) { return tb_fail("create keys rc={rc}"); }
+  if (!meo_tbl_col_indexed(t, 0)) { return tb_fail("TEXT PRIMARY KEY not indexed"); }
+  var rows: MeoValue[2];
+  var ids: int64[1];
+  tb_text(&rows[0], "x");
+  meo_value_set_int(&rows[1], 1);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != MEO_OK) { return tb_fail("insert x rc={rc}"); }
+  meo_value_set_int(&rows[1], 2);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_CONFLICT) { return tb_fail("duplicate PK rc={rc}, want CONFLICT"); }
+  meo_value_set_null(&rows[0]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_CONSTRAINT) { return tb_fail("NULL PK rc={rc}, want CONSTRAINT"); }
+  tb_text(&rows[0], "y");
+  meo_value_set_null(&rows[1]);
+  rc = tb_insert(db, t, &rows[0], 1, &ids[0]);
+  if (rc != -MEO_ERR_CONSTRAINT) { return tb_fail("NULL in NOT NULL rc={rc}, want CONSTRAINT"); }
+  if (tb_find(db, t, 0, "x") != 1 || tb_count(db, t) != 1) { return tb_fail("keys content"); }
+  var nv: MeoValue;
+  meo_value_set_int(&nv, 1);
+  var got: int64 = 0;
+  if (meo_tbl_index_lookup(db, t, 1, &nv, &got) != -MEO_ERR_USAGE) {
+    return tb_fail("lookup on an unindexed column not USAGE");
+  }
+  println("  keys: TEXT PRIMARY KEY unique and NOT NULL");
+  return 0;
+}
+
+// big(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER UNIQUE)
+fn tb_big_write(db: MeoDb*) -> int32 {
+  var cols: MeoColumn[3];
+  tb_col(&cols[0], "id", MEO_T_INT, MEO_COL_PK | MEO_COL_ROWID_ALIAS);
+  tb_col(&cols[1], "u", MEO_T_TEXT, MEO_COL_UNIQUE);
+  tb_col(&cols[2], "v", MEO_T_INT, MEO_COL_UNIQUE);
+  var t: MeoTable* = 0;
+  var rc: int32 = tb_create(db, "big", &cols[0], 3, &t);
+  if (rc != MEO_OK) { return tb_fail("create big rc={rc}"); }
+  var arena: MeoArena* = meo_arena_new(4096);
+  defer meo_arena_free(arena);
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return tb_fail("begin big rc={rc}"); }
+  var rows: MeoValue[3];
+  var ids: int64[1];
+  var i: int32 = 1;
+  while (i <= TB_BIG) {
+    var s: string = "u-{i}-padding-padding";
+    meo_value_set_null(&rows[0]);
+    tb_text(&rows[1], s);
+    meo_value_set_int(&rows[2], (int64)i * 7);
+    rc = meo_tbl_check_rows(db, t, &rows[0], 1, 3, arena, &ids[0]);
+    if (rc == MEO_OK) { rc = meo_tbl_write_row(db, t, &rows[0], 3, ids[0]); }
+    free(s.chars);
+    if (rc != MEO_OK || ids[0] != (int64)i) { return tb_fail("big insert {i} rc={rc}"); }
+    meo_arena_reset(arena);
+    i += 1;
+  }
+  i = 2;
+  while (i <= TB_BIG) {
+    rc = meo_tbl_delete(db, t, (int64)i);
+    if (rc != MEO_OK) { return tb_fail("big delete {i} rc={rc}"); }
+    i += 2;
+  }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return tb_fail("commit big rc={rc}"); }
+  return 0;
+}
+
+fn tb_big_read(db: MeoDb*) -> int32 {
+  var nm: string = "big";
+  var t: MeoTable* = meo_cat_find(db->cat, nm.chars, 3);
+  if (t == 0) { return tb_fail("big missing after reopen"); }
+  if (t->columns[1].index_root == 0 || t->columns[2].index_root == 0) {
+    return tb_fail("index roots not persisted");
+  }
+  var rc: int32 = meo_db_enter(db);
+  if (rc != MEO_OK) { return tb_fail("enter rc={rc}"); }
+  defer meo_db_leave(db);
+  var sc: MeoTblScan;
+  rc = meo_tbl_scan_open(db, t, &sc);
+  if (rc != MEO_OK) { return tb_fail("scan open rc={rc}"); }
+  var row: MeoTblRow;
+  var v: MeoValue;
+  var n: int32 = 0;
+  var want: int64 = 1;
+  var bad: string = "";
+  while (bad.length == 0) {
+    rc = meo_tbl_scan_next(&sc, &row);
+    if (rc == 1) { break; }
+    if (rc != 0) {
+      bad = "scan rc";
+    } else if (row.rowid != want) {
+      bad = "scan order";
+    } else {
+      var s: string = "u-{want}-padding-padding";
+      meo_tbl_row_get(t, &row, 1, &v);
+      if (v.type != MEO_T_TEXT || (int64)v.n != (int64)s.length
+          || !meo_bytes_equal(v.p, s.chars, (int64)v.n)) {
+        bad = "row text";
+      }
+      free(s.chars);
+      n += 1;
+      want += 2;
+    }
+  }
+  meo_tbl_scan_close(&sc);
+  if (bad.length != 0) { return tb_fail("{bad} at rowid {want}"); }
+  var half: int32 = TB_BIG / 2;
+  if (n != half + TB_RED) { return tb_fail("{n} rows after reopen, want {half}"); }
+  var i: int32 = 1;
+  while (i <= TB_BIG) {
+    var s: string = "u-{i}-padding-padding";
+    var hit: int64 = tb_find(db, t, 1, s);
+    free(s.chars);
+    var iv: MeoValue;
+    meo_value_set_int(&iv, (int64)i * 7);
+    var got: int64 = 0;
+    rc = meo_tbl_index_lookup(db, t, 2, &iv, &got);
+    if (i % 2 == 1) {
+      if (hit != (int64)i || rc != MEO_OK || got != (int64)i) {
+        return tb_fail("index lookups for kept row {i}: {hit} {rc} {got}");
+      }
+    } else {
+      if (hit != 0 || rc != 1) { return tb_fail("index still maps deleted row {i}"); }
+    }
+    i += 1;
+  }
+  println("  big: {TB_BIG} rows, every other deleted, consistent after reopen");
+  return 0;
+}
+
+fn main() -> int32 {
+  var path: string = "build/table_self.dat";
+  if (tb_reset(path) != MEO_OK) { return tb_fail("reset"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return tb_fail("open rc={rc}"); }
+  if (tb_users(db) != 0) { return 1; }
+  if (tb_keys(db) != 0) { return 1; }
+  if (tb_big_write(db) != 0) { return 1; }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return tb_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db2);
+  if (rc != MEO_OK) { return tb_fail("reopen rc={rc}"); }
+  if (tb_big_read(db2) != 0) { return 1; }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return tb_fail("close 2 rc={rc}"); }
+  println("PASS table_self");
+  return 0;
+}

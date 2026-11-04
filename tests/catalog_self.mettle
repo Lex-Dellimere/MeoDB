@@ -1,0 +1,515 @@
+// catalog_self: the catalog and the transaction API through meo_db_* and
+// meo_cat_*. Root split + reopen, ids after a rolled-back CREATE, single-row
+// saves, TOOBIG, the TX/BUSY matrix across threads, poisoning, autocommit
+// rollback, and a failed reload that blocks writes.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+import "../src/types/key.mettle";
+import "../src/meo_core.mettle";
+
+const CS_TABLES: int32 = 40;
+// Red-check switch: 1 expects the rolled-back table to survive. Must be 0.
+const CS_RED: int32 = 0;
+
+var g_db: MeoDb* = 0;
+var g_mode: int32 = 0;
+var g_commit: int32 = 0;
+var g_rollback: int32 = 0;
+var g_begin: int32 = 0;
+var g_end: int32 = 0;
+
+fn cs_fail(msg: string) -> int32 {
+  println("FAIL catalog_self: {msg}");
+  return 1;
+}
+
+fn cs_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn cs_open(path: string, out: MeoDb**) -> int32 {
+  return meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, out);
+}
+
+fn cs_col_name(j: int32, pad: bool) -> string {
+  if (pad) { return "c{j}_padding_padding_padding_padding_padding"; }
+  return "c{j}";
+}
+
+fn cs_aff(j: int32) -> int32 {
+  return 1 + j % 4;   // INT, REAL, TEXT, BLOB
+}
+
+fn cs_cflags(j: int32) -> int32 {
+  if (j == 0) { return MEO_COL_PK | MEO_COL_ROWID_ALIAS; }
+  return 0;
+}
+
+// Create `name` with n columns, as its own write statement (autocommit, or
+// part of an open explicit transaction).
+fn cs_create(db: MeoDb*, name: string, n: int32, pad: bool, out: MeoTable**) -> int32 {
+  var cols: MeoColumn* = (MeoColumn*)malloc((int64)n * (int64)sizeof(MeoColumn) + 1);
+  if (cols == 0) { return -MEO_ERR_NOMEM; }
+  var j: int32 = 0;
+  while (j < n) {
+    var s: string = cs_col_name(j, pad);
+    cols[j].name = s.chars;
+    cols[j].name_len = (int32)s.length;
+    cols[j].affinity = cs_aff(j);
+    cols[j].cflags = cs_cflags(j);
+    cols[j].index_root = 0;
+    j += 1;
+  }
+  var rc: int32 = meo_db_enter(db);
+  if (rc == MEO_OK) {
+    var started: bool = false;
+    rc = meo_db_stmt_begin(db, &started);
+    if (rc == MEO_OK) {
+      rc = meo_cat_create_table(db->cat, name.chars, (int32)name.length, cols, n, out);
+      rc = meo_db_stmt_end(db, started, rc == MEO_OK, rc);
+    }
+    meo_db_leave(db);
+  }
+  j = 0;
+  while (j < n) {
+    free(cols[j].name);
+    j += 1;
+  }
+  free(cols);
+  return rc;
+}
+
+fn cs_find(db: MeoDb*, name: string) -> MeoTable* {
+  return meo_cat_find(db->cat, name.chars, (int32)name.length);
+}
+
+fn cs_name_is(p: uint8*, n: int32, s: string) -> bool {
+  if ((int64)n != s.length) { return false; }
+  return meo_bytes_equal(p, s.chars, (int64)n);
+}
+
+// The schema matches what cs_create(name, n, pad) made.
+fn cs_schema_ok(t: MeoTable*, n: int32, pad: bool) -> bool {
+  if (t == 0 || !t->live || t->n_cols != n) { return false; }
+  var j: int32 = 0;
+  var ok: bool = true;
+  while (j < n && ok) {
+    var s: string = cs_col_name(j, pad);
+    var c: MeoColumn* = &t->columns[j];
+    ok = cs_name_is(c->name, c->name_len, s) && c->affinity == cs_aff(j) &&
+      c->cflags == cs_cflags(j);
+    free(s.chars);
+    j += 1;
+  }
+  return ok;
+}
+
+fn cs_root_is_inner(db: MeoDb*) -> bool {
+  var root: uint32 = meo_pager_root(db->pager, MEO_ROOT_CATALOG);
+  if (root == 0) { return false; }
+  var f: MeoFrame* = meo_pager_get(db->pager, root, false);
+  if (f == 0) { return false; }
+  var inner: bool = !meo_btn_is_leaf(f->data);
+  meo_pager_release(db->pager, f, false);
+  return inner;
+}
+
+fn cs_tbl_name(i: int32) -> string {
+  return "tbl_{i}";
+}
+
+fn cs_ncols(i: int32) -> int32 {
+  return 2 + i % 5;
+}
+
+// Many tables until the catalog root splits; reopen; same ids and schemas.
+fn cs_split(path: string) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = cs_open(path, &db);
+  if (rc != MEO_OK) { return cs_fail("open rc={rc}"); }
+  if (db->busy_ms != 5000) { return cs_fail("default busy timeout {db->busy_ms}"); }
+  if (meo_db_ping(db) != MEO_OK) { return cs_fail("ping"); }
+  var ids: int64[40];
+  var i: int32 = 0;
+  while (i < CS_TABLES) {
+    var nm: string = cs_tbl_name(i);
+    var t: MeoTable* = 0;
+    rc = cs_create(db, nm, cs_ncols(i), true, &t);
+    free(nm.chars);
+    if (rc != MEO_OK) { return cs_fail("create table {i} rc={rc}"); }
+    ids[i] = t->id;
+    i += 1;
+  }
+  if (!cs_root_is_inner(db)) { return cs_fail("catalog root never split"); }
+  var dup: MeoTable* = 0;
+  var nm0: string = cs_tbl_name(3);
+  rc = cs_create(db, nm0, 2, false, &dup);
+  free(nm0.chars);
+  if (rc != -MEO_ERR_SQL) { return cs_fail("duplicate name rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = cs_open(path, &db2);
+  if (rc != MEO_OK) { return cs_fail("reopen rc={rc}"); }
+  if (db2->cat->n_tables != CS_TABLES) { return cs_fail("reopen has {db2->cat->n_tables} tables"); }
+  i = 0;
+  while (i < CS_TABLES) {
+    var nm: string = cs_tbl_name(i);
+    var t: MeoTable* = cs_find(db2, nm);
+    free(nm.chars);
+    if (t == 0 || t->id != ids[i]) { return cs_fail("table {i} missing or id changed"); }
+    if (!cs_schema_ok(t, cs_ncols(i), true)) { return cs_fail("table {i} schema differs"); }
+    if (meo_cat_get(db2->cat, ids[i]) != t) { return cs_fail("get by id {ids[i]}"); }
+    i += 1;
+  }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return cs_fail("close 2 rc={rc}"); }
+  println("  {CS_TABLES} tables, catalog root split, reopen identical");
+  return 0;
+}
+
+fn cs_count_rows(db: MeoDb*, t: MeoTable*, n_out: int32*) -> int32 {
+  var rc: int32 = meo_db_enter(db);
+  if (rc != MEO_OK) { return rc; }
+  var sc: MeoTblScan;
+  rc = meo_tbl_scan_open(db, t, &sc);
+  var n: int32 = 0;
+  if (rc == MEO_OK) {
+    var row: MeoTblRow;
+    while (true) {
+      rc = meo_tbl_scan_next(&sc, &row);
+      if (rc != 0) { break; }
+      n += 1;
+    }
+    meo_tbl_scan_close(&sc);
+  }
+  meo_db_leave(db);
+  n_out[0] = n;
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// begin; CREATE a; rollback; CREATE b; insert into b; reopen sees only b.
+fn cs_rollback_create(path: string) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = cs_open(path, &db);
+  if (rc != MEO_OK) { return cs_fail("open rc={rc}"); }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return cs_fail("begin rc={rc}"); }
+  var a: MeoTable* = 0;
+  rc = cs_create(db, "a", 2, false, &a);
+  if (rc != MEO_OK) { return cs_fail("create a rc={rc}"); }
+  var a_id: int64 = a->id;
+  rc = meo_db_rollback(db);
+  if (rc != MEO_OK) { return cs_fail("rollback rc={rc}"); }
+  var a_live: bool = cs_find(db, "a") != 0;
+  if (a_live != (CS_RED == 1)) { return cs_fail("a still found after rollback"); }
+  if (a->live || meo_cat_get(db->cat, a_id) != 0) { return cs_fail("dead a still returned"); }
+  var b: MeoTable* = 0;
+  rc = cs_create(db, "b", 2, false, &b);
+  if (rc != MEO_OK) { return cs_fail("create b rc={rc}"); }
+  if (b == a || b->id <= a_id) { return cs_fail("b id {b->id} not fresh (a was {a_id})"); }
+  var b_id: int64 = b->id;
+  var vals: MeoValue[2];
+  meo_value_set_int(&vals[0], 1);
+  meo_value_set_text(&vals[1], "x".chars, 1);
+  rc = meo_db_enter(db);
+  if (rc == MEO_OK) {
+    var started: bool = false;
+    rc = meo_db_stmt_begin(db, &started);
+    if (rc == MEO_OK) {
+      rc = meo_tbl_write_row(db, b, &vals[0], 2, 1);
+      rc = meo_db_stmt_end(db, started, true, rc);
+    }
+    meo_db_leave(db);
+  }
+  if (rc != MEO_OK) { return cs_fail("insert into b rc={rc}"); }
+  if (a->live) { return cs_fail("a came back after writing b"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = cs_open(path, &db2);
+  if (rc != MEO_OK) { return cs_fail("reopen rc={rc}"); }
+  if (cs_find(db2, "a") != 0) { return cs_fail("a after reopen"); }
+  var b2: MeoTable* = cs_find(db2, "b");
+  if (b2 == 0 || b2->id != b_id || !cs_schema_ok(b2, 2, false)) { return cs_fail("b after reopen"); }
+  if (db2->cat->next_id <= b_id) { return cs_fail("next_id {db2->cat->next_id} after reopen"); }
+  var n: int32 = 0;
+  rc = cs_count_rows(db2, b2, &n);
+  if (rc != MEO_OK || n != 1) { return cs_fail("b rows after reopen: rc={rc} n={n}"); }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return cs_fail("close 2 rc={rc}"); }
+  println("  rolled-back CREATE: fresh id {b_id} for b, reopen sees only b with its row");
+  return 0;
+}
+
+// Root changes go through one-row saves; a rollback restores them in place.
+fn cs_save(path: string) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = cs_open(path, &db);
+  if (rc != MEO_OK) { return cs_fail("open rc={rc}"); }
+  var r: MeoTable* = 0;
+  rc = cs_create(db, "r", 3, false, &r);
+  if (rc != MEO_OK) { return cs_fail("create r rc={rc}"); }
+  var other: MeoTable* = cs_find(db, "tbl_7");
+  if (other == 0) { return cs_fail("tbl_7 missing"); }
+  var other_root: uint32 = other->root;
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc == MEO_OK) {
+    r->columns[2].index_root = 99;
+    rc = meo_cat_save_table(db->cat, r);
+  }
+  if (rc != MEO_OK) { return cs_fail("save in txn rc={rc}"); }
+  rc = meo_db_rollback(db);
+  if (rc != MEO_OK) { return cs_fail("rollback rc={rc}"); }
+  if (cs_find(db, "r") != r || r->columns[2].index_root != 0) {
+    return cs_fail("rollback did not restore r in place");
+  }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc == MEO_OK) {
+    r->root = 77;
+    r->columns[1].index_root = 55;
+    r->columns[2].index_root = 66;
+    rc = meo_cat_save_table(db->cat, r);
+  }
+  if (rc == MEO_OK) { rc = meo_db_commit(db); }
+  if (rc != MEO_OK) { return cs_fail("save + commit rc={rc}"); }
+  var r_id: int64 = r->id;
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = cs_open(path, &db2);
+  if (rc != MEO_OK) { return cs_fail("reopen rc={rc}"); }
+  var r2: MeoTable* = cs_find(db2, "r");
+  if (r2 == 0 || r2->id != r_id || r2->root != 77 || r2->columns[0].index_root != 0 ||
+      r2->columns[1].index_root != 55 || r2->columns[2].index_root != 66) {
+    return cs_fail("saved roots lost on reopen");
+  }
+  var o2: MeoTable* = cs_find(db2, "tbl_7");
+  if (o2 == 0 || o2->root != other_root || !cs_schema_ok(o2, cs_ncols(7), true)) {
+    return cs_fail("an unrelated row changed");
+  }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return cs_fail("close 2 rc={rc}"); }
+  println("  save_table: root + index roots survive reopen, rollback restores in place");
+  return 0;
+}
+
+// Oversized catalog row and too many columns: refused, nothing written.
+fn cs_limits(path: string) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = cs_open(path, &db);
+  if (rc != MEO_OK) { return cs_fail("open rc={rc}"); }
+  var n_before: int32 = db->cat->n_tables;
+  var next_before: int64 = db->cat->next_id;
+  var t: MeoTable* = 0;
+  rc = cs_create(db, "big", MEO_MAX_COLS, true, &t);
+  if (rc != -MEO_ERR_TOOBIG) { return cs_fail("64 padded columns rc={rc}, want TOOBIG"); }
+  rc = cs_create(db, "wide", MEO_MAX_COLS + 1, false, &t);
+  if (rc != -MEO_ERR_USAGE) { return cs_fail("65 columns rc={rc}, want USAGE"); }
+  if (db->cat->n_tables != n_before || db->cat->next_id != next_before) {
+    return cs_fail("a refused CREATE changed the catalog");
+  }
+  rc = cs_create(db, "narrow64", MEO_MAX_COLS, false, &t);
+  if (rc != MEO_OK) { return cs_fail("64 short columns rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = cs_open(path, &db2);
+  if (rc != MEO_OK) { return cs_fail("reopen rc={rc}"); }
+  if (cs_find(db2, "big") != 0 || !cs_schema_ok(cs_find(db2, "narrow64"), MEO_MAX_COLS, false)) {
+    return cs_fail("limits after reopen");
+  }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return cs_fail("close 2 rc={rc}"); }
+  println("  TOOBIG for an oversized catalog row, USAGE for 65 columns");
+  return 0;
+}
+
+fn cs_worker(arg: cstring) -> uint32 {
+  if (g_mode == 1) {
+    g_commit = meo_db_commit(g_db);
+    g_rollback = meo_db_rollback(g_db);
+    g_begin = meo_db_begin(g_db, MEO_TX_DEFAULT);
+    if (g_begin == MEO_OK) { meo_db_rollback(g_db); }
+  } else {
+    g_begin = meo_db_begin(g_db, MEO_TX_DEFAULT);
+    if (g_begin == MEO_OK) { g_end = meo_db_rollback(g_db); }
+  }
+  return 0;
+}
+
+fn cs_run_worker(mode: int32) {
+  g_mode = mode;
+  var h: int64 = CreateThread(0, 0, &cs_worker, 0, 0, 0);
+  if (mode == 2) {
+    thread_sleep_ms(100);
+    meo_db_commit(g_db);
+  }
+  thread_join_infinite(h);
+  thread_close(h);
+}
+
+// A close that must be refused; `fake_stmts` pretends that many are live.
+fn cs_close_refused(h: int64, fake_stmts: int32) -> int32 {
+  var db: MeoDb* = (MeoDb*)h;
+  var cnt: int32* = &db->n_stmts;
+  cnt[0] = cnt[0] + fake_stmts;
+  var rc: int32 = meo_db_close(db);
+  cnt[0] = cnt[0] - fake_stmts;
+  return rc;
+}
+
+fn cs_tx(path: string) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = cs_open(path, &db);
+  if (rc != MEO_OK) { return cs_fail("open rc={rc}"); }
+  g_db = db;
+  if (meo_db_commit(db) != -MEO_ERR_TX) { return cs_fail("commit without begin"); }
+  if (meo_db_rollback(db) != -MEO_ERR_TX) { return cs_fail("rollback without begin"); }
+  if (meo_db_begin(db, 7) != -MEO_ERR_USAGE) { return cs_fail("bad mode"); }
+  rc = meo_db_begin(db, MEO_TX_IMMEDIATE);
+  if (rc != MEO_OK) { return cs_fail("begin rc={rc}"); }
+  if (meo_db_begin(db, MEO_TX_DEFAULT) != -MEO_ERR_TX) { return cs_fail("nested begin"); }
+  rc = meo_db_busy_timeout(db, 100);
+  if (rc != MEO_OK) { return cs_fail("busy_timeout rc={rc}"); }
+  cs_run_worker(1);
+  if (g_commit != -MEO_ERR_TX) { return cs_fail("commit from another thread rc={g_commit}"); }
+  if (g_rollback != -MEO_ERR_TX) { return cs_fail("rollback from another thread rc={g_rollback}"); }
+  if (g_begin != -MEO_ERR_BUSY) { return cs_fail("second thread begin rc={g_begin}, want BUSY"); }
+  if (!meo_db_in_tx(db)) { return cs_fail("txn lost after the other thread"); }
+  rc = cs_close_refused((int64)db, 0);
+  if (rc != -MEO_ERR_TX) { return cs_fail("close with open txn rc={rc}"); }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return cs_fail("owner commit rc={rc}"); }
+  if (meo_db_in_tx(db)) { return cs_fail("in_tx after commit"); }
+  // A waiter gets the lock once the owner commits.
+  meo_db_busy_timeout(db, 5000);
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return cs_fail("begin 2 rc={rc}"); }
+  g_end = 1;
+  cs_run_worker(2);
+  if (g_begin != MEO_OK || g_end != MEO_OK) { return cs_fail("waiter begin {g_begin} end {g_end}"); }
+  // Poisoned explicit txn: commit refuses, rollback clears.
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return cs_fail("begin 3 rc={rc}"); }
+  var started: bool = true;
+  meo_db_enter(db);
+  rc = meo_db_stmt_begin(db, &started);
+  if (rc == MEO_OK && !started) { rc = meo_db_stmt_end(db, started, true, -MEO_ERR_IO); }
+  meo_db_leave(db);
+  if (rc != -MEO_ERR_IO || !db->poisoned) { return cs_fail("poison rc={rc}"); }
+  meo_db_enter(db);
+  rc = meo_db_stmt_begin(db, &started);
+  meo_db_leave(db);
+  if (rc != -MEO_ERR_TX) { return cs_fail("statement in poisoned txn rc={rc}"); }
+  if (meo_db_commit(db) != -MEO_ERR_TX) { return cs_fail("commit of poisoned txn"); }
+  if (!meo_db_in_tx(db)) { return cs_fail("poisoned commit closed the txn"); }
+  rc = meo_db_rollback(db);
+  if (rc != MEO_OK || meo_db_in_tx(db) || db->poisoned) { return cs_fail("rollback of poisoned txn rc={rc}"); }
+  // Autocommit statement failing after a write rolls back.
+  var t: MeoTable* = 0;
+  rc = meo_db_enter(db);
+  if (rc == MEO_OK) {
+    rc = meo_db_stmt_begin(db, &started);
+    if (rc == MEO_OK) {
+      var cols: MeoColumn[1];
+      cols[0].name = "v".chars;
+      cols[0].name_len = 1;
+      cols[0].affinity = MEO_T_INT;
+      cols[0].cflags = 0;
+      cols[0].index_root = 0;
+      rc = meo_cat_create_table(db->cat, "auto".chars, 4, &cols[0], 1, &t);
+      if (rc == MEO_OK) { rc = meo_db_stmt_end(db, started, true, -MEO_ERR_IO); }
+    }
+    meo_db_leave(db);
+  }
+  if (rc != -MEO_ERR_IO || !started) { return cs_fail("autocommit failure rc={rc}"); }
+  if (cs_find(db, "auto") != 0 || t->live) { return cs_fail("autocommit failure kept the table"); }
+  // Live statements block close.
+  rc = cs_close_refused((int64)db, 1);
+  if (rc != -MEO_ERR_BUSY) { return cs_fail("close with live statements rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = cs_open(path, &db2);
+  if (rc != MEO_OK) { return cs_fail("reopen rc={rc}"); }
+  if (cs_find(db2, "auto") != 0) { return cs_fail("auto after reopen"); }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return cs_fail("close 2 rc={rc}"); }
+  println("  TX matrix, cross-thread BUSY and hand-over, poison, autocommit rollback");
+  return 0;
+}
+
+// A committed undecodable catalog row: the next reload fails and the handle
+// refuses writes; reopen reports CORRUPT.
+fn cs_broken(path: string) -> int32 {
+  var rc: int32 = cs_reset(path);
+  if (rc != MEO_OK) { return cs_fail("reset rc={rc}"); }
+  var db: MeoDb* = 0;
+  rc = cs_open(path, &db);
+  if (rc != MEO_OK) { return cs_fail("open rc={rc}"); }
+  var t: MeoTable* = 0;
+  rc = cs_create(db, "k", 2, false, &t);
+  if (rc != MEO_OK) { return cs_fail("create k rc={rc}"); }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return cs_fail("begin rc={rc}"); }
+  // Row 999 = record [INT 1]: a table name must be TEXT.
+  var buf: uint8[11];
+  meo_key_rowid(&buf[0], 8, 999);
+  buf[8] = 1;
+  buf[9] = 1;
+  buf[10] = 2;
+  var key: MeoBtKey = { data: &buf[0], len: 11 };
+  var root: uint32 = meo_pager_root(db->pager, MEO_ROOT_CATALOG);
+  rc = meo_bt_insert_sep(db->pager, &root, meo_cat_cmp, key, 999, 8);
+  if (rc == MEO_OK) { rc = meo_pager_set_root(db->pager, MEO_ROOT_CATALOG, root); }
+  if (rc == MEO_OK) { rc = meo_db_commit(db); }
+  if (rc != MEO_OK) { return cs_fail("plant bad row rc={rc}"); }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return cs_fail("begin 2 rc={rc}"); }
+  rc = meo_db_rollback(db);
+  if (rc != -MEO_ERR_CORRUPT) { return cs_fail("rollback with bad catalog rc={rc}"); }
+  if (meo_db_ping(db) != -MEO_ERR_CORRUPT) { return cs_fail("ping after failed reload"); }
+  if (meo_db_begin(db, MEO_TX_DEFAULT) != -MEO_ERR_CORRUPT) { return cs_fail("begin after failed reload"); }
+  rc = cs_create(db, "k2", 2, false, &t);
+  if (rc != -MEO_ERR_CORRUPT) { return cs_fail("create after failed reload rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
+  var db2: MeoDb* = 0;
+  rc = cs_open(path, &db2);
+  if (rc != -MEO_ERR_CORRUPT) { return cs_fail("reopen of bad catalog rc={rc}"); }
+  println("  failed reload: ping, begin, create -> CORRUPT; reopen -> CORRUPT");
+  return 0;
+}
+
+fn main() -> int32 {
+  var path: string = "build/catalog_self.db";
+  if (cs_reset(path) != MEO_OK) { return cs_fail("reset"); }
+  if (cs_split(path) != 0) { return 1; }
+  if (cs_rollback_create(path) != 0) { return 1; }
+  if (cs_save(path) != 0) { return 1; }
+  if (cs_limits(path) != 0) { return 1; }
+  if (cs_tx(path) != 0) { return 1; }
+  if (cs_broken("build/catalog_self_bad.db") != 0) { return 1; }
+  println("PASS catalog_self");
+  return 0;
+}

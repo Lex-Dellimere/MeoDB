@@ -1,7 +1,11 @@
-// db/db: the database handle (pager + catalog + lock) and the transaction
-// API (D8, D9), plus the per-statement write bracket (autocommit, D5 poison).
-// db/ never calls table/ or sql/ (D1).
-// WS5: harden reload-on-rollback and the error matrix (catalog_self).
+// db/db: the database handle (pager + catalog + lock), the transaction API,
+// and the per-statement write bracket (autocommit, poisoned transactions).
+// db/ never calls table/ or anything above it.
+//
+// One lock guards everything. Public calls enter and leave it before
+// returning, except meo_db_begin, which keeps it until the same thread's
+// commit or rollback. After a failed catalog reload the handle refuses
+// writes with -MEO_ERR_CORRUPT; close it and reopen.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -20,10 +24,10 @@ export struct MeoDb {
   lock: MeoLock;
   busy_ms: int32;
   in_tx: bool;           // an explicit meo_db_begin is open
-  tx_owner: int32;       // WS4: thread id that began it
+  tx_owner: int32;       // lock owner id of the thread that began it
   poisoned: bool;        // a write failed inside the explicit transaction
-  last_rowid: int64;     // db-wide last insert rowid (racy by design, D5)
-  n_stmts: int32;        // live prepared statements; sql/api changes it atomically
+  last_rowid: int64;     // db-wide last insert rowid (racy by design)
+  n_stmts: int32;        // live statements; changed atomically, never under the lock
   read_only: bool;
 }
 
@@ -79,6 +83,8 @@ export fn meo_db_open(path: string, flags: int32, n_frames: int32, out: MeoDb**)
 // while statements are live (nothing is closed then).
 export fn meo_db_close(db: MeoDb*) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
+  // Checked before waiting: another thread's transaction would only time out.
+  if (db->in_tx) { return -MEO_ERR_TX; }
   var rc: int32 = meo_lock_enter(&db->lock, db->busy_ms);
   if (rc != MEO_OK) { return rc; }
   if (db->in_tx) {
@@ -127,6 +133,10 @@ export fn meo_db_begin(db: MeoDb*, mode: int32) -> int32 {
     meo_lock_leave(&db->lock);
     return -MEO_ERR_READONLY;
   }
+  if (db->cat->broken) {
+    meo_lock_leave(&db->lock);
+    return -MEO_ERR_CORRUPT;
+  }
   rc = meo_pager_begin(db->pager);
   if (rc != MEO_OK) {
     meo_lock_leave(&db->lock);
@@ -138,7 +148,8 @@ export fn meo_db_begin(db: MeoDb*, mode: int32) -> int32 {
   return MEO_OK;   // the lock stays held
 }
 
-// Undo the pager transaction and reload the catalog in place. Lock held.
+// Undo the pager transaction and reload the catalog in place. Lock held. A
+// failed reload leaves the catalog broken, which blocks further writes.
 fn db_rollback_locked(db: MeoDb*) -> int32 {
   var rc: int32 = meo_pager_rollback(db->pager);
   var rl: int32 = meo_cat_reload(db->cat);
@@ -146,10 +157,16 @@ fn db_rollback_locked(db: MeoDb*) -> int32 {
   return rl;
 }
 
-// Commit. None open, another thread's, or poisoned -> -MEO_ERR_TX.
+// The calling thread began the open transaction. Checked without waiting.
+fn db_tx_mine(db: MeoDb*) -> bool {
+  return db->in_tx && meo_lock_held(&db->lock) && db->tx_owner == db->lock.owner;
+}
+
+// Commit. None open, another thread's, or poisoned -> -MEO_ERR_TX; a poisoned
+// transaction stays open until rollback.
 export fn meo_db_commit(db: MeoDb*) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
-  if (!db->in_tx || !meo_lock_held(&db->lock)) { return -MEO_ERR_TX; }
+  if (!db_tx_mine(db)) { return -MEO_ERR_TX; }
   if (db->poisoned) { return -MEO_ERR_TX; }
   var rc: int32 = meo_pager_commit(db->pager);
   if (rc != MEO_OK) { return rc; }   // still open: the caller may roll back
@@ -162,7 +179,7 @@ export fn meo_db_commit(db: MeoDb*) -> int32 {
 // Roll back. None open or another thread's -> -MEO_ERR_TX.
 export fn meo_db_rollback(db: MeoDb*) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
-  if (!db->in_tx || !meo_lock_held(&db->lock)) { return -MEO_ERR_TX; }
+  if (!db_tx_mine(db)) { return -MEO_ERR_TX; }
   var rc: int32 = db_rollback_locked(db);
   db->in_tx = false;
   db->poisoned = false;
@@ -176,9 +193,11 @@ export fn meo_db_in_tx(db: MeoDb*) -> bool {
   return db->in_tx;
 }
 
-// MEO_OK while the handle is open and usable.
+// MEO_OK while the handle is open and usable; -MEO_ERR_CORRUPT once a
+// catalog reload failed (discard the handle).
 export fn meo_db_ping(db: MeoDb*) -> int32 {
-  if (db == 0 || db->pager == 0) { return -MEO_ERR_USAGE; }
+  if (db == 0 || db->pager == 0 || db->cat == 0) { return -MEO_ERR_USAGE; }
+  if (db->cat->broken) { return -MEO_ERR_CORRUPT; }
   return MEO_OK;
 }
 
@@ -195,11 +214,13 @@ export fn meo_db_last_insert_rowid(db: MeoDb*) -> int64 {
 
 // Start one write statement; the caller holds the lock. Outside an explicit
 // transaction this begins an autocommit pager transaction and sets *started.
-// Inside a poisoned one it answers -MEO_ERR_TX.
+// Inside a poisoned one it answers -MEO_ERR_TX; after a failed reload
+// -MEO_ERR_CORRUPT.
 export fn meo_db_stmt_begin(db: MeoDb*, started: bool*) -> int32 {
   if (db == 0 || started == 0) { return -MEO_ERR_USAGE; }
   started[0] = false;
   if (db->read_only) { return -MEO_ERR_READONLY; }
+  if (db->cat->broken) { return -MEO_ERR_CORRUPT; }
   if (db->in_tx) {
     if (db->poisoned) { return -MEO_ERR_TX; }
     return MEO_OK;

@@ -1,9 +1,8 @@
-// catalog/catalog: the persisted table list (D4), a D2 table tree at
+// catalog/catalog: the persisted table list, a table tree at
 // meta.catalog_root. Rowid 0 = header ["meocat", 1]; rowid k = table id k:
 // [name, root, n_cols, tflags, then per column: name, affinity, cflags,
 // index_root]. MeoTable pointers stay valid while open; reload updates them
 // in place and marks vanished tables live = false.
-// WS5: save one row via meo_bt_delete + insert (draft rewrites the tree).
 
 import "std/mem";
 import "../error/status.mettle";
@@ -25,7 +24,8 @@ export struct MeoCatalog {
   tables: MeoTable**;    // n_tables stable pointers, in id order of discovery
   n_tables: int32;
   cap_tables: int32;
-  next_id: int64;        // id the next CREATE TABLE gets
+  next_id: int64;        // id the next CREATE TABLE gets; never decreases
+  broken: bool;          // a reload failed: memory may not match disk
 }
 
 // The table-tree comparator: the first 8 bytes (the encoded rowid) decide.
@@ -186,18 +186,30 @@ fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int3
   return MEO_OK;
 }
 
-// Merge a decoded table into the catalog: update the existing object with the
-// same id in place (its pointer stays valid), or append the new one.
+// Same id, name and columns: the decoded row describes this object.
+fn cat_same(old: MeoTable*, t: MeoTable*) -> bool {
+  if (old->id != t->id || old->n_cols != t->n_cols) { return false; }
+  if (!meo_cat_name_eq(old->name, old->name_len, t->name, t->name_len)) { return false; }
+  var k: int32 = 0;
+  while (k < old->n_cols) {
+    var a: MeoColumn* = &old->columns[k];
+    var b: MeoColumn* = &t->columns[k];
+    if (!meo_cat_name_eq(a->name, a->name_len, b->name, b->name_len)) { return false; }
+    if (a->affinity != b->affinity || a->cflags != b->cflags) { return false; }
+    k += 1;
+  }
+  return true;
+}
+
+// Merge a decoded table into the catalog: update the matching object in place
+// (its pointer stays valid), or append the new one. A dead object that shares
+// only the id stays dead, so a statement prepared against it cannot reach the
+// new table.
 fn cat_merge(cat: MeoCatalog*, t: MeoTable*) -> int32 {
   var i: int32 = 0;
   while (i < cat->n_tables) {
     var old: MeoTable* = cat->tables[i];
-    if (old->id == t->id) {
-      // v1 has no ALTER: the shape cannot change, only the roots.
-      if (old->n_cols != t->n_cols) {
-        cat_free_table(t);
-        return -MEO_ERR_CORRUPT;
-      }
+    if (cat_same(old, t)) {
       old->root = t->root;
       old->tflags = t->tflags;
       old->live = true;
@@ -218,16 +230,22 @@ fn cat_merge(cat: MeoCatalog*, t: MeoTable*) -> int32 {
 
 // Re-read the catalog tree into `cat` in place (see the header). MEO_OK,
 // -MEO_ERR_VERSION for a foreign header version, -MEO_ERR_CORRUPT for an
-// undecodable row, or a pager/b-tree error.
+// undecodable row, or a pager/b-tree error. A failure marks the catalog
+// broken: every later save or create answers -MEO_ERR_CORRUPT.
 export fn meo_cat_reload(cat: MeoCatalog*) -> int32 {
   if (cat == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = cat_reload(cat);
+  if (rc != MEO_OK) { cat->broken = true; }
+  return rc;
+}
+
+fn cat_reload(cat: MeoCatalog*) -> int32 {
   var p: MeoPager* = cat->pager;
   var i: int32 = 0;
   while (i < cat->n_tables) {
     cat->tables[i]->live = false;
     i += 1;
   }
-  cat->next_id = 1;
   var root: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
   if (root == 0) { return MEO_OK; }
   var k0: uint8[8];
@@ -280,6 +298,7 @@ export fn meo_cat_open(p: MeoPager*, out: MeoCatalog**) -> int32 {
   cat->n_tables = 0;
   cat->cap_tables = 0;
   cat->next_id = 1;
+  cat->broken = false;
   var rc: int32 = meo_cat_reload(cat);
   if (rc != MEO_OK) {
     meo_cat_close(cat);
@@ -313,12 +332,13 @@ export fn meo_cat_find(cat: MeoCatalog*, name: uint8*, n: int32) -> MeoTable* {
   return 0;
 }
 
-// The table with this id, live or not, or 0.
+// The live table with this id, or 0.
 export fn meo_cat_get(cat: MeoCatalog*, id: int64) -> MeoTable* {
   if (cat == 0) { return 0; }
   var i: int32 = 0;
   while (i < cat->n_tables) {
-    if (cat->tables[i]->id == id) { return cat->tables[i]; }
+    var t: MeoTable* = cat->tables[i];
+    if (t->live && t->id == id) { return t; }
     i += 1;
   }
   return 0;
@@ -326,7 +346,7 @@ export fn meo_cat_get(cat: MeoCatalog*, id: int64) -> MeoTable* {
 
 // --- encode / save ---------------------------------------------------------
 
-// Insert one row (rowid, values) into the catalog tree under construction.
+// Insert one row (rowid, values) into the catalog tree.
 fn cat_put_row(p: MeoPager*, root: uint32*, rowid: int64, vals: MeoValue*, n: int32) -> int32 {
   var sz: int32 = meo_rec_size(vals, n);
   if (sz < 0) { return sz; }
@@ -340,11 +360,8 @@ fn cat_put_row(p: MeoPager*, root: uint32*, rowid: int64, vals: MeoValue*, n: in
   return meo_bt_insert_sep(p, root, meo_cat_cmp, key, (uint64)rowid, 8);
 }
 
-fn cat_put_table(p: MeoPager*, root: uint32*, t: MeoTable*) -> int32 {
-  var n: int32 = 4 + 4 * t->n_cols;
-  var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
-  if (vals == 0) { return -MEO_ERR_NOMEM; }
-  defer free(vals);
+// Fill vals (4 + 4 * n_cols entries) with t's catalog row. Borrows t's names.
+fn cat_row_vals(t: MeoTable*, vals: MeoValue*) {
   meo_value_set_text(&vals[0], t->name, t->name_len);
   meo_value_set_int(&vals[1], (int64)t->root);
   meo_value_set_int(&vals[2], (int64)t->n_cols);
@@ -358,63 +375,79 @@ fn cat_put_table(p: MeoPager*, root: uint32*, t: MeoTable*) -> int32 {
     meo_value_set_int(&vals[b + 3], (int64)t->columns[i].index_root);
     i += 1;
   }
+}
+
+// Encoded size of t's catalog row. Roots are sized at their widest so a row
+// that fits now still fits after any root change.
+fn cat_row_size(t: MeoTable*) -> int32 {
+  var n: int32 = 4 + 4 * t->n_cols;
+  var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
+  if (vals == 0) { return -MEO_ERR_NOMEM; }
+  defer free(vals);
+  cat_row_vals(t, vals);
+  meo_value_set_int(&vals[1], (int64)4294967295);
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    meo_value_set_int(&vals[4 + i * 4 + 3], (int64)4294967295);
+    i += 1;
+  }
+  return meo_rec_size(vals, n);
+}
+
+fn cat_put_table(p: MeoPager*, root: uint32*, t: MeoTable*) -> int32 {
+  var n: int32 = 4 + 4 * t->n_cols;
+  var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
+  if (vals == 0) { return -MEO_ERR_NOMEM; }
+  defer free(vals);
+  cat_row_vals(t, vals);
   return cat_put_row(p, root, t->id, vals, n);
 }
 
-// Return every page of the tree under `page` to the freelist.
-fn cat_free_tree(p: MeoPager*, page: uint32, depth: int32) -> int32 {
-  if (page == 0) { return MEO_OK; }
-  if (depth >= MEO_BT_MAX_DEPTH) { return -MEO_ERR_CORRUPT; }
-  var f: MeoFrame* = meo_pager_get(p, page, false);
-  if (f == 0) { return -MEO_ERR_CORRUPT; }
-  var rc: int32 = MEO_OK;
-  if (!meo_btn_is_leaf(f->data)) {
-    var n: int32 = meo_page_n_cells(f->data);
-    var i: int32 = 0;
-    while (i < n && rc == MEO_OK) {
-      rc = cat_free_tree(p, meo_btn_inner_child(f->data, i), depth + 1);
-      i += 1;
-    }
-  }
-  meo_pager_release(p, f, false);
-  if (rc != MEO_OK) { return rc; }
-  return meo_pager_free_page(p, page);
-}
-
-// Persist `t`'s current row (name, roots, columns) in the caller's pager
-// transaction. DRAFT: rewrites the whole catalog tree; see the header.
+// Persist t's current row (name, table root, every column's index root) in
+// the caller's pager transaction: delete the old row, insert the new one.
+// Creates the catalog tree with its header row on first use. -MEO_ERR_SQL for
+// a dead table, -MEO_ERR_CORRUPT once a reload has failed.
 export fn meo_cat_save_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
   if (cat == 0 || t == 0) { return -MEO_ERR_USAGE; }
+  if (cat->broken) { return -MEO_ERR_CORRUPT; }
+  if (!t->live) { return -MEO_ERR_SQL; }
   var p: MeoPager* = cat->pager;
-  var root: uint32 = 0;
-  var hv: MeoValue[2];
-  var magic: string = "meocat";
-  meo_value_set_text(&hv[0], magic.chars, 6);
-  meo_value_set_int(&hv[1], (int64)MEO_CAT_VERSION);
-  var rc: int32 = cat_put_row(p, &root, 0, &hv[0], 2);
-  var i: int32 = 0;
-  while (rc == MEO_OK && i < cat->n_tables) {
-    if (cat->tables[i]->live) { rc = cat_put_table(p, &root, cat->tables[i]); }
-    i += 1;
+  var start: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
+  var root: uint32 = start;
+  var rc: int32 = MEO_OK;
+  if (root == 0) {
+    var hv: MeoValue[2];
+    var magic: string = "meocat";
+    meo_value_set_text(&hv[0], magic.chars, 6);
+    meo_value_set_int(&hv[1], (int64)MEO_CAT_VERSION);
+    rc = cat_put_row(p, &root, 0, &hv[0], 2);
+  } else {
+    var k: uint8[8];
+    meo_key_rowid(&k[0], 8, t->id);
+    var key: MeoBtKey = { data: &k[0], len: 8 };
+    rc = meo_bt_delete(p, &root, meo_cat_cmp, key);
+    if (rc == 1) { rc = MEO_OK; }   // first save of a new table
   }
+  if (rc == MEO_OK) { rc = cat_put_table(p, &root, t); }
   if (rc != MEO_OK) { return rc; }
-  var old: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
-  rc = meo_pager_set_root(p, MEO_ROOT_CATALOG, root);
-  if (rc != MEO_OK) { return rc; }
-  return cat_free_tree(p, old, 0);
+  if (root != start) { return meo_pager_set_root(p, MEO_ROOT_CATALOG, root); }
+  return MEO_OK;
 }
 
 // Create a table: validate, copy name and columns, give it the next id and
 // root 0 (its tree is created by the first insert), and save it. MEO_OK and
 // *out set; -MEO_ERR_SQL when a live table has the name or two columns share
 // one; -MEO_ERR_USAGE for 0 or more than MEO_MAX_COLS columns or a bad
-// affinity. The caller holds the db lock and a pager transaction.
+// affinity; -MEO_ERR_TOOBIG when the catalog row would exceed MEO_REC_MAX;
+// -MEO_ERR_CORRUPT once a reload has failed. Nothing is written on any of
+// these. The caller holds the db lock and a pager transaction.
 export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
     cols: MeoColumn*, n_cols: int32, out: MeoTable**) -> int32 {
   if (cat == 0 || name == 0 || name_len <= 0 || cols == 0 || out == 0) {
     return -MEO_ERR_USAGE;
   }
   if (n_cols < 1 || n_cols > MEO_MAX_COLS) { return -MEO_ERR_USAGE; }
+  if (cat->broken) { return -MEO_ERR_CORRUPT; }
   if (meo_cat_find(cat, name, name_len) != 0) { return -MEO_ERR_SQL; }
   var i: int32 = 0;
   while (i < n_cols) {
@@ -432,7 +465,7 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
   }
   var t: MeoTable* = new MeoTable;
   if (t == 0) { return -MEO_ERR_NOMEM; }
-  t->id = cat->next_id;
+  t->id = 0;
   t->root = 0;
   t->tflags = 0;
   t->live = true;
@@ -458,19 +491,27 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
     }
     i += 1;
   }
+  var sz: int32 = cat_row_size(t);
+  if (sz < 0 || sz > MEO_REC_MAX) {
+    cat_free_table(t);
+    if (sz < 0) { return sz; }
+    return -MEO_ERR_TOOBIG;
+  }
   var rc: int32 = cat_push(cat, t);
   if (rc != MEO_OK) {
     cat_free_table(t);
     return rc;
   }
+  // Ids are never reused while open, even after a rollback or a failed save.
+  t->id = cat->next_id;
+  cat->next_id += 1;
   rc = meo_cat_save_table(cat, t);
   if (rc != MEO_OK) {
     // Not saved: hide it. The object stays (pointers are stable); the caller
-    // rolls the transaction back, and reload would drop it anyway.
+    // rolls the transaction back.
     t->live = false;
     return rc;
   }
-  cat->next_id += 1;
   out[0] = t;
   return MEO_OK;
 }

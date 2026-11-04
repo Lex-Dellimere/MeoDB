@@ -1,8 +1,14 @@
-// table/table: unlocked row primitives over one table b-tree (D1, D2, D5).
-// Key = 8-byte rowid ++ record, separators truncated to 8; the rowid alias is
-// stored NULL and filled from the key. Caller holds the db lock; a root change
-// is saved through meo_cat_save_table in the same transaction.
-// WS6: index maintenance, Phase A/B, delete, update, index lookup.
+// table/table: unlocked row primitives over one table b-tree plus one unique
+// index b-tree per UNIQUE column and per non-INTEGER PRIMARY KEY.
+//
+// Table key = 8-byte rowid ++ record, separators truncated to 8; the rowid
+// alias is stored NULL and filled from the key. Index key = types/key
+// encoding of the value, u64 = rowid, whole-key separators; NULLs are not
+// indexed. Writes are two-phase: meo_tbl_check_rows / meo_tbl_check_update
+// find every constraint failure without writing, then write_row / update /
+// delete only write. The caller holds the db lock and a pager transaction; a
+// root change of the table or an index is saved through meo_cat_save_table in
+// that transaction.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -34,7 +40,7 @@ export struct MeoTblScan {
   done: bool;
 }
 
-// The table-tree comparator (D2): the 8-byte rowid prefix decides.
+// The table-tree comparator: the 8-byte rowid prefix decides.
 export fn meo_tbl_cmp(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
   return meo_cat_cmp(a, an, b, bn);
 }
@@ -50,14 +56,14 @@ export fn meo_tbl_alias_col(t: MeoTable*) -> int32 {
   return -1;
 }
 
-// True when column `i` has (or needs) a secondary index (D5).
+// True when column `i` has (or needs) a unique index.
 export fn meo_tbl_col_indexed(t: MeoTable*, i: int32) -> bool {
   var f: int32 = t->columns[i].cflags;
   if ((f & MEO_COL_ROWID_ALIAS) != 0) { return false; }
   return (f & (MEO_COL_UNIQUE | MEO_COL_PK)) != 0;
 }
 
-// Coerce / check one value against column `i` (D5 strict typing): NULL or the
+// Coerce / check one value against column `i` (strict typing): NULL or the
 // affinity, INTEGER into REAL converts; NOT NULL / PK -> CONSTRAINT.
 fn tbl_check_value(t: MeoTable*, i: int32, v: MeoValue*) -> int32 {
   var rc: int32 = meo_value_check(v);
@@ -142,13 +148,160 @@ fn tbl_row_size(t: MeoTable*, vals: MeoValue*, n: int32) -> int32 {
   return sz;
 }
 
-// Phase A for a whole INSERT (D5), no writes: `rows` holds n_rows rows of
-// n_cols values, row-major (coerced in place, INTEGER -> REAL). Checks arity,
-// types, NOT NULL, rowid conflicts with the tree and within the statement, and
-// record size. rowids_out[r] gets row r's rowid: the alias value, or for a
-// NULL/omitted alias the next of max+1, max+2, ... as if inserted in order.
-// MEO_OK, or SQL, MISMATCH, CONSTRAINT, CONFLICT, TOOBIG, FULL, UNSUPPORTED
-// (indexed table, WS6), or a storage error.
+// One encoded index key, kept in the statement arena for the duplicate check.
+struct TblKeyRef {
+  p: uint8*;
+  n: int32;
+}
+
+// Index key length for a value: 0 for NULL (not indexed).
+fn tbl_key_len(v: MeoValue*) -> int32 {
+  if (v->type == MEO_T_INT || v->type == MEO_T_REAL) { return 9; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) { return v->n + 1; }
+  return 0;
+}
+
+// Encode the index key of `v` into buf[0..cap). Its length, 0 for NULL,
+// -MEO_ERR_TOOBIG past MEO_REC_MAX.
+fn tbl_key_encode(v: MeoValue*, buf: uint8*, cap: int32) -> int32 {
+  var n: int32 = tbl_key_len(v);
+  if (n == 0) { return 0; }
+  if (n > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+  if (n > cap) { return -MEO_ERR_FULL; }
+  if (v->type == MEO_T_INT) { return meo_key_int(buf, cap, v->i); }
+  if (v->type == MEO_T_REAL) { return meo_key_real(buf, cap, v->f); }
+  if (v->type == MEO_T_BLOB) { return meo_key_blob(buf, cap, v->p, v->n); }
+  // meo_key_text wants a string; the layout is the tag then the raw bytes.
+  buf[0] = (uint8)MEO_KEY_TEXT;
+  if (v->n > 0) { meo_bytes_copy(buf + 1, v->p, (int64)v->n); }
+  return n;
+}
+
+// The rowid index `col` maps key to: MEO_OK, 1 absent, negative on failure.
+fn tbl_index_get(db: MeoDb*, t: MeoTable*, col: int32, k: uint8*, kn: int32,
+    out: int64*) -> int32 {
+  var root: uint32 = t->columns[col].index_root;
+  if (root == 0) { return 1; }
+  var key: MeoBtKey = { data: k, len: kn };
+  var got: uint64 = 0;
+  var rc: int32 = meo_bt_lookup(db->pager, root, meo_key_compare, key, &got);
+  if (rc == MEO_OK) { out[0] = (int64)got; }
+  return rc;
+}
+
+fn tbl_ksift(a: TblKeyRef*, root: int32, n: int32) {
+  var r: int32 = root;
+  while (r * 2 + 1 < n) {
+    var c: int32 = r * 2 + 1;
+    if (c + 1 < n && meo_key_compare(a[c + 1].p, a[c + 1].n, a[c].p, a[c].n) > 0) { c += 1; }
+    if (meo_key_compare(a[r].p, a[r].n, a[c].p, a[c].n) >= 0) { return; }
+    var x: TblKeyRef = a[r];
+    a[r] = a[c];
+    a[c] = x;
+    r = c;
+  }
+}
+
+fn tbl_sort_keys(a: TblKeyRef*, n: int32) {
+  var i: int32 = n / 2 - 1;
+  while (i >= 0) {
+    tbl_ksift(a, i, n);
+    i -= 1;
+  }
+  var end: int32 = n - 1;
+  while (end > 0) {
+    var x: TblKeyRef = a[0];
+    a[0] = a[end];
+    a[end] = x;
+    tbl_ksift(a, 0, end);
+    end -= 1;
+  }
+}
+
+// True when two of the n sorted rowids are equal.
+fn tbl_dup_rowids(arena: MeoArena*, ids: int64*, n: int32, err: int32*) -> bool {
+  err[0] = MEO_OK;
+  if (n < 2) { return false; }
+  var sorted: int64* = (int64*)meo_arena_alloc(arena, (int64)n * 8);
+  if (sorted == 0) {
+    err[0] = -MEO_ERR_NOMEM;
+    return false;
+  }
+  var r: int32 = 0;
+  while (r < n) {
+    sorted[r] = ids[r];
+    r += 1;
+  }
+  tbl_sort_i64(sorted, n);
+  r = 1;
+  while (r < n) {
+    if (sorted[r] == sorted[r - 1]) { return true; }
+    r += 1;
+  }
+  return false;
+}
+
+// The unique-index part of Phase A for n rows (row r owns rowid own[r]): a
+// value already indexed under another rowid, or the same value twice among
+// the rows, is a CONFLICT. An existing entry under the row's own rowid is the
+// row itself (UPDATE keeping its value).
+fn tbl_check_indexes(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n: int32, n_cols: int32,
+    own: int64*, arena: MeoArena*) -> int32 {
+  var c: int32 = 0;
+  while (c < n_cols) {
+    if (meo_tbl_col_indexed(t, c)) {
+      var refs: TblKeyRef* = 0;
+      if (n > 1) {
+        refs = (TblKeyRef*)meo_arena_alloc(arena, (int64)n * (int64)sizeof(TblKeyRef));
+        if (refs == 0) { return -MEO_ERR_NOMEM; }
+      }
+      var k: int32 = 0;
+      var r: int32 = 0;
+      while (r < n) {
+        var v: MeoValue* = &rows[(int64)r * (int64)n_cols + (int64)c];
+        var kn: int32 = tbl_key_len(v);
+        if (kn > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+        if (kn > 0) {
+          var kb: uint8* = meo_arena_alloc(arena, (int64)kn);
+          if (kb == 0) { return -MEO_ERR_NOMEM; }
+          var w: int32 = tbl_key_encode(v, kb, kn);
+          if (w < 0) { return w; }
+          var hit: int64 = 0;
+          var rc: int32 = tbl_index_get(db, t, c, kb, w, &hit);
+          if (rc < 0) { return rc; }
+          if (rc == MEO_OK && hit != own[r]) { return -MEO_ERR_CONFLICT; }
+          if (refs != 0) {
+            refs[k].p = kb;
+            refs[k].n = w;
+            k += 1;
+          }
+        }
+        r += 1;
+      }
+      if (k > 1) {
+        tbl_sort_keys(refs, k);
+        var i: int32 = 1;
+        while (i < k) {
+          if (meo_key_compare(refs[i].p, refs[i].n, refs[i - 1].p, refs[i - 1].n) == 0) {
+            return -MEO_ERR_CONFLICT;
+          }
+          i += 1;
+        }
+      }
+    }
+    c += 1;
+  }
+  return MEO_OK;
+}
+
+// Phase A for a whole INSERT, no writes: `rows` holds n_rows rows of n_cols
+// values, row-major (coerced in place, INTEGER -> REAL). Checks arity, types,
+// NOT NULL, rowid conflicts with the tree and within the statement, record
+// size, and every unique index against the tree and within the statement.
+// rowids_out[r] gets row r's rowid: the alias value, or for a NULL/omitted
+// alias the next of max+1, max+2, ... as if inserted in order.
+// MEO_OK, or SQL, MISMATCH, CONSTRAINT, CONFLICT, TOOBIG, FULL, or a storage
+// error.
 export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: int32,
     n_cols: int32, arena: MeoArena*, rowids_out: int64*) -> int32 {
   if (db == 0 || t == 0 || arena == 0 || rowids_out == 0 || n_rows < 0) {
@@ -158,12 +311,6 @@ export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: 
   if (rows == 0) { return -MEO_ERR_USAGE; }
   if (!t->live) { return -MEO_ERR_SQL; }
   if (n_cols != t->n_cols) { return -MEO_ERR_SQL; }
-  var c: int32 = 0;
-  while (c < n_cols) {
-    if (meo_tbl_col_indexed(t, c)) { return -MEO_ERR_UNSUPPORTED; }
-    c += 1;
-  }
-  // WS6: unique index checks
   var alias: int32 = meo_tbl_alias_col(t);
   var int64_max: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
   var hi: int64 = 0;
@@ -172,7 +319,7 @@ export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: 
   var r: int32 = 0;
   while (r < n_rows) {
     var vals: MeoValue* = rows + (int64)r * (int64)n_cols;
-    c = 0;
+    var c: int32 = 0;
     while (c < n_cols) {
       rc = tbl_check_value(t, c, &vals[c]);
       if (rc != MEO_OK) { return rc; }
@@ -196,37 +343,64 @@ export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: 
     rowids_out[r] = rowid;
     r += 1;
   }
-  if (n_rows > 1) {
-    var sorted: int64* = (int64*)meo_arena_alloc(arena, (int64)n_rows * 8);
-    if (sorted == 0) { return -MEO_ERR_NOMEM; }
-    r = 0;
-    while (r < n_rows) {
-      sorted[r] = rowids_out[r];
-      r += 1;
-    }
-    tbl_sort_i64(sorted, n_rows);
-    r = 1;
-    while (r < n_rows) {
-      if (sorted[r] == sorted[r - 1]) { return -MEO_ERR_CONFLICT; }
-      r += 1;
-    }
-  }
-  return MEO_OK;
+  var err: int32 = MEO_OK;
+  if (tbl_dup_rowids(arena, rowids_out, n_rows, &err)) { return -MEO_ERR_CONFLICT; }
+  if (err != MEO_OK) { return err; }
+  return tbl_check_indexes(db, t, rows, n_rows, n_cols, rowids_out, arena);
 }
 
-// Phase A for an UPDATE of n rows (rowids[i] gets new_vals row i, n_cols
-// values each). Same codes as meo_tbl_check_rows. WS6.
+// Phase A for an UPDATE of n rows: rowids[i] gets new_vals row i (n_cols
+// values each, coerced in place). Same codes as meo_tbl_check_rows; a NULL
+// rowid alias is CONSTRAINT. A unique value (or a new rowid alias) that some
+// other row holds now is a CONFLICT even when that row is in the update set
+// and would give it up: v1 does not reorder writes, so swapping or shifting
+// unique values between updated rows fails.
 export fn meo_tbl_check_update(db: MeoDb*, t: MeoTable*, rowids: int64*, n: int32,
     new_vals: MeoValue*, n_cols: int32, arena: MeoArena*) -> int32 {
-  return -MEO_ERR_UNSUPPORTED;  // WS6: types, NOT NULL, unique swaps, size
+  if (db == 0 || t == 0 || arena == 0 || n < 0) { return -MEO_ERR_USAGE; }
+  if (n == 0) { return MEO_OK; }
+  if (rowids == 0 || new_vals == 0) { return -MEO_ERR_USAGE; }
+  if (!t->live) { return -MEO_ERR_SQL; }
+  if (n_cols != t->n_cols) { return -MEO_ERR_SQL; }
+  var alias: int32 = meo_tbl_alias_col(t);
+  var new_ids: int64* = (int64*)meo_arena_alloc(arena, (int64)n * 8);
+  if (new_ids == 0) { return -MEO_ERR_NOMEM; }
+  var rc: int32 = MEO_OK;
+  var r: int32 = 0;
+  while (r < n) {
+    var vals: MeoValue* = new_vals + (int64)r * (int64)n_cols;
+    var c: int32 = 0;
+    while (c < n_cols) {
+      rc = tbl_check_value(t, c, &vals[c]);
+      if (rc != MEO_OK) { return rc; }
+      c += 1;
+    }
+    new_ids[r] = rowids[r];
+    if (alias >= 0) {
+      if (vals[alias].type != MEO_T_INT) { return -MEO_ERR_CONSTRAINT; }
+      var nid: int64 = vals[alias].i;
+      if (nid != rowids[r]) {
+        var ex: int32 = tbl_rowid_exists(db, t, nid);
+        if (ex < 0) { return ex; }
+        if (ex == MEO_OK) { return -MEO_ERR_CONFLICT; }
+      }
+      new_ids[r] = nid;
+    }
+    var sz: int32 = tbl_row_size(t, vals, n_cols);
+    if (sz < 0) { return sz; }
+    if (sz > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+    r += 1;
+  }
+  var err: int32 = MEO_OK;
+  if (tbl_dup_rowids(arena, new_ids, n, &err)) { return -MEO_ERR_CONFLICT; }
+  if (err != MEO_OK) { return err; }
+  return tbl_check_indexes(db, t, new_vals, n, n_cols, rowids, arena);
 }
 
-// Phase B: write one row that meo_tbl_check_rows accepted, under `rowid`. No
-// re-check, so no Phase-A code: any failure here is a storage failure and the
-// caller treats the statement as having written.
-export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
-    rowid: int64) -> int32 {
-  if (db == 0 || t == 0 || vals == 0 || n != t->n_cols) { return -MEO_ERR_USAGE; }
+// Encode a row into a fresh buffer: 8-byte rowid ++ record with the alias
+// stored NULL. *out (free it) and *out_len.
+fn tbl_encode_row(t: MeoTable*, vals: MeoValue*, n: int32, rowid: int64, out: uint8**,
+    out_len: int32*) -> int32 {
   var alias: int32 = meo_tbl_alias_col(t);
   var saved: MeoValue;
   if (alias >= 0) {
@@ -250,39 +424,169 @@ export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
     free(buf);
     return w;
   }
-  var key: MeoBtKey = { data: buf, len: w + 8 };
+  out[0] = buf;
+  out_len[0] = w + 8;
+  return MEO_OK;
+}
+
+// Insert an encoded row (rowid ++ record) into the table tree.
+fn tbl_put_row(db: MeoDb*, t: MeoTable*, buf: uint8*, len: int32, rowid: int64,
+    dirty: bool*) -> int32 {
+  var key: MeoBtKey = { data: buf, len: len };
   var root: uint32 = t->root;
   var rc: int32 = meo_bt_insert_sep(db->pager, &root, meo_tbl_cmp, key, (uint64)rowid, 8);
-  free(buf);
-  if (rc != MEO_OK) { return rc; }
   if (root != t->root) {
     t->root = root;
-    rc = meo_cat_save_table(db->cat, t);
-    if (rc != MEO_OK) { return rc; }
+    dirty[0] = true;
   }
-  // WS6: index writes
+  return rc;
+}
+
+fn tbl_del_row(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
+  var k: uint8[8];
+  meo_key_rowid(&k[0], 8, rowid);
+  var key: MeoBtKey = { data: &k[0], len: 8 };
+  var root: uint32 = t->root;
+  return meo_bt_delete(db->pager, &root, meo_tbl_cmp, key);
+}
+
+// Add (put) or remove every index entry of one record. kbuf holds
+// MEO_REC_MAX bytes. Values come from the record, so they stay valid while
+// the trees change.
+fn tbl_index_rec(db: MeoDb*, t: MeoTable*, rec: uint8*, rec_len: int32, rowid: int64,
+    put: bool, kbuf: uint8*, dirty: bool*) -> int32 {
+  var c: int32 = 0;
+  while (c < t->n_cols) {
+    if (meo_tbl_col_indexed(t, c)) {
+      var v: MeoValue;
+      var rc: int32 = meo_rec_get(rec, rec_len, c, &v);
+      if (rc != MEO_OK) { return rc; }
+      var kn: int32 = tbl_key_encode(&v, kbuf, MEO_REC_MAX);
+      if (kn < 0) { return kn; }
+      if (kn > 0) {
+        var key: MeoBtKey = { data: kbuf, len: kn };
+        var root: uint32 = t->columns[c].index_root;
+        if (put) {
+          rc = meo_bt_insert(db->pager, &root, meo_key_compare, key, (uint64)rowid);
+          if (root != t->columns[c].index_root) {
+            t->columns[c].index_root = root;
+            dirty[0] = true;
+          }
+        } else {
+          rc = meo_bt_delete(db->pager, &root, meo_key_compare, key);
+          if (rc == 1) { rc = -MEO_ERR_CORRUPT; }   // index lost the row's entry
+        }
+        if (rc != MEO_OK) { return rc; }
+      }
+    }
+    c += 1;
+  }
+  return MEO_OK;
+}
+
+fn tbl_finish(db: MeoDb*, t: MeoTable*, rc: int32, dirty: bool) -> int32 {
+  if (rc != MEO_OK) { return rc; }
+  if (dirty) { return meo_cat_save_table(db->cat, t); }
+  return MEO_OK;
+}
+
+// Phase B: write one row that meo_tbl_check_rows accepted, under `rowid`, and
+// its index entries. No re-check, so no Phase-A code: any failure here is a
+// storage failure and the caller treats the statement as having written.
+export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
+    rowid: int64) -> int32 {
+  if (db == 0 || t == 0 || vals == 0 || n != t->n_cols) { return -MEO_ERR_USAGE; }
+  var buf: uint8* = 0;
+  var len: int32 = 0;
+  var rc: int32 = tbl_encode_row(t, vals, n, rowid, &buf, &len);
+  if (rc != MEO_OK) { return rc; }
+  var kbuf: uint8* = malloc((int64)MEO_REC_MAX);
+  if (kbuf == 0) {
+    free(buf);
+    return -MEO_ERR_NOMEM;
+  }
+  var dirty: bool = false;
+  rc = tbl_put_row(db, t, buf, len, rowid, &dirty);
+  if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, rowid, true, kbuf, &dirty); }
+  free(kbuf);
+  free(buf);
+  rc = tbl_finish(db, t, rc, dirty);
+  if (rc != MEO_OK) { return rc; }
   db->last_rowid = rowid;
   return MEO_OK;
 }
 
 // Delete the row with this rowid and its index entries. MEO_OK, 1 absent.
-// WS6 (needs WS2's meo_bt_delete).
 export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
-  return -MEO_ERR_UNSUPPORTED;  // WS6: delete row + index entries
+  if (db == 0 || t == 0) { return -MEO_ERR_USAGE; }
+  var old: uint8* = malloc((int64)MEO_REC_MAX * 2);
+  if (old == 0) { return -MEO_ERR_NOMEM; }
+  defer free(old);
+  var row: MeoTblRow;
+  var rc: int32 = meo_tbl_lookup_rowid(db, t, rowid, old, MEO_REC_MAX, &row);
+  if (rc != MEO_OK) { return rc; }
+  var dirty: bool = false;
+  rc = tbl_index_rec(db, t, row.rec, row.rec_len, rowid, false, old + MEO_REC_MAX, &dirty);
+  if (rc != MEO_OK) { return rc; }
+  rc = tbl_del_row(db, t, rowid);
+  if (rc == 1) { return -MEO_ERR_CORRUPT; }
+  return rc;
 }
 
-// Replace the row with this rowid by `vals` (n == t->n_cols, same rowid; a
-// changed rowid alias is delete + insert). MEO_OK, 1 absent. WS6.
+// Replace the row with this rowid by `vals` (n == t->n_cols), as accepted by
+// meo_tbl_check_update. A new rowid alias value moves the row. The new record
+// is encoded before any tree changes, so vals may borrow from a scan leaf.
+// MEO_OK, 1 absent.
 export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*,
     n: int32) -> int32 {
-  return -MEO_ERR_UNSUPPORTED;  // WS6: delete + insert with index maintenance
+  if (db == 0 || t == 0 || vals == 0 || n != t->n_cols) { return -MEO_ERR_USAGE; }
+  var old: uint8* = malloc((int64)MEO_REC_MAX * 2);
+  if (old == 0) { return -MEO_ERR_NOMEM; }
+  defer free(old);
+  var kbuf: uint8* = old + MEO_REC_MAX;
+  var row: MeoTblRow;
+  var rc: int32 = meo_tbl_lookup_rowid(db, t, rowid, old, MEO_REC_MAX, &row);
+  if (rc != MEO_OK) { return rc; }
+  var nid: int64 = rowid;
+  var alias: int32 = meo_tbl_alias_col(t);
+  if (alias >= 0 && vals[alias].type == MEO_T_INT) { nid = vals[alias].i; }
+  var buf: uint8* = 0;
+  var len: int32 = 0;
+  rc = tbl_encode_row(t, vals, n, nid, &buf, &len);
+  if (rc != MEO_OK) { return rc; }
+  defer free(buf);
+  var dirty: bool = false;
+  rc = tbl_index_rec(db, t, row.rec, row.rec_len, rowid, false, kbuf, &dirty);
+  // An equal-key insert keeps the old bytes, so the row key goes first.
+  if (rc == MEO_OK) {
+    rc = tbl_del_row(db, t, rowid);
+    if (rc == 1) { rc = -MEO_ERR_CORRUPT; }
+  }
+  if (rc == MEO_OK) { rc = tbl_put_row(db, t, buf, len, nid, &dirty); }
+  if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, nid, true, kbuf, &dirty); }
+  return tbl_finish(db, t, rc, dirty);
 }
 
 // The rowid a unique index maps `v` to: MEO_OK and *rowid_out, 1 absent
-// (NULL is never indexed), -MEO_ERR_USAGE when column `col` has no index. WS6.
+// (NULL is never indexed, and a value of another type cannot be stored),
+// -MEO_ERR_USAGE when column `col` has no index.
 export fn meo_tbl_index_lookup(db: MeoDb*, t: MeoTable*, col: int32, v: MeoValue*,
     rowid_out: int64*) -> int32 {
-  return -MEO_ERR_UNSUPPORTED;  // WS6: meo_key_* encode + meo_bt_lookup
+  if (db == 0 || t == 0 || v == 0 || rowid_out == 0 || col < 0 || col >= t->n_cols) {
+    return -MEO_ERR_USAGE;
+  }
+  if (!meo_tbl_col_indexed(t, col)) { return -MEO_ERR_USAGE; }
+  var q: MeoValue = v[0];
+  var aff: int32 = t->columns[col].affinity;
+  if (q.type == MEO_T_INT && aff == MEO_T_REAL) { meo_value_set_real(&q, (float64)v->i); }
+  if (q.type != aff) { return 1; }
+  var kbuf: uint8* = malloc((int64)MEO_REC_MAX);
+  if (kbuf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(kbuf);
+  var kn: int32 = tbl_key_encode(&q, kbuf, MEO_REC_MAX);
+  if (kn == -MEO_ERR_TOOBIG) { return 1; }
+  if (kn < 0) { return kn; }
+  return tbl_index_get(db, t, col, kbuf, kn, rowid_out);
 }
 
 // Point lookup: copy the record of `rowid` into buf[0..cap) (cap >=
