@@ -1,0 +1,362 @@
+// record_self: the record codec's own tests.
+//
+//   r_ints        INT64 min/max, 0, -1 round-trip
+//   r_reals       0.0, -0.0, +/-inf and a NaN with a payload round-trip bit
+//                 for bit (a numeric compare would call -0.0 == 0.0 and miss a
+//                 lost sign or payload)
+//   r_empty       empty TEXT and BLOB round-trip with n = 0
+//   r_rec_max     a record of exactly MEO_REC_MAX bytes; cap one short is FULL
+//                 and writes nothing
+//   r_cols        MEO_REC_MAX_VALS values round-trip; one more is USAGE
+//   r_missing     columns past n_cols read NULL
+//   r_trunc       every prefix of a sample record gives CORRUPT or the right
+//                 value, decoded from an exact-size heap copy
+//   r_bad_tag     an unknown tag is CORRUPT for that column and those after it
+//   r_huge_len    a TEXT length or n_cols past the buffer is CORRUPT
+//   r_random      1000 seeded random records round-trip
+//
+// Prints PASS per case, FAIL <label> on a failure, and exits non-zero if
+// anything failed.
+
+import "std/io";
+import "std/mem";
+import "../src/catalog/schema.mettle";
+import "../src/error/status.mettle";
+import "../src/record/codec.mettle";
+import "../src/record/value.mettle";
+
+const R_SEED: uint32 = 20261104;
+
+var r_failures: int32 = 0;
+
+fn r_ok(cond: bool, label: string) -> bool {
+  if (cond) { return true; }
+  println("FAIL {label}");
+  r_failures += 1;
+  return false;
+}
+
+fn r_i32(got: int32, want: int32, label: string) -> bool {
+  if (got == want) { return true; }
+  println("FAIL {label}: expected {want}, got {got}");
+  r_failures += 1;
+  return false;
+}
+
+fn r_bits(f: float64) -> uint64 {
+  var x: float64 = f;
+  var pf: float64* = &x;
+  var pu: uint64* = (uint64*)pf;
+  return *pu;
+}
+
+fn r_from_bits(u: uint64) -> float64 {
+  var x: uint64 = u;
+  var pu: uint64* = &x;
+  var pf: float64* = (float64*)pu;
+  return *pf;
+}
+
+// Same type and same bits; REAL compares bits so -0.0 and NaN payloads count.
+fn r_same(a: MeoValue*, b: MeoValue*) -> bool {
+  if (a->type != b->type) { return false; }
+  if (a->type == MEO_T_INT) { return a->i == b->i; }
+  if (a->type == MEO_T_REAL) { return r_bits(a->f) == r_bits(b->f); }
+  if (a->type == MEO_T_TEXT || a->type == MEO_T_BLOB) {
+    if (a->n != b->n) { return false; }
+    var i: int32 = 0;
+    while (i < a->n) {
+      if (a->p[i] != b->p[i]) { return false; }
+      i += 1;
+    }
+  }
+  return true;
+}
+
+// Encode, check size/ncols, decode every column and compare. TEXT/BLOB views
+// must point inside the record buffer.
+fn r_round(vals: MeoValue*, n: int32, label: string) -> bool {
+  var sz: int32 = meo_rec_size(vals, n);
+  if (!r_ok(sz > 0, "{label}: size {sz}")) { return false; }
+  var buf: uint8* = malloc((int64)sz);
+  defer free(buf);
+  var w: int32 = meo_rec_encode(buf, sz, vals, n);
+  if (!r_i32(w, sz, "{label}: encode")) { return false; }
+  if (!r_i32(meo_rec_ncols(buf, w), n, "{label}: ncols")) { return false; }
+  var out: MeoValue = { type: 0, i: 0, f: 0.0, p: 0, n: 0 };
+  var c: int32 = 0;
+  while (c < n) {
+    if (!r_i32(meo_rec_get(buf, w, c, &out), MEO_OK, "{label}: get col {c}")) { return false; }
+    if (!r_ok(r_same(&out, &vals[c]), "{label}: value col {c}")) { return false; }
+    if (out.type == MEO_T_TEXT || out.type == MEO_T_BLOB) {
+      if (out.n > 0) {
+        var at: int64 = (int64)(out.p - buf);
+        var inside: bool = at >= 0 && at + (int64)out.n <= (int64)w;
+        if (!r_ok(inside, "{label}: view col {c} outside buf")) { return false; }
+      }
+    }
+    c += 1;
+  }
+  return true;
+}
+
+fn r_ints() {
+  var v: MeoValue[4];
+  meo_value_set_int(&v[0], -9223372036854775807 - 1);
+  meo_value_set_int(&v[1], 9223372036854775807);
+  meo_value_set_int(&v[2], 0);
+  meo_value_set_int(&v[3], -1);
+  if (r_round(&v[0], 4, "r_ints")) { println("PASS r_ints"); }
+}
+
+fn r_reals() {
+  var v: MeoValue[5];
+  meo_value_set_real(&v[0], 0.0);
+  meo_value_set_real(&v[1], r_from_bits((uint64)1 << 63));
+  meo_value_set_real(&v[2], r_from_bits((uint64)0x7FF8DEADBEEF1234));
+  meo_value_set_real(&v[3], r_from_bits((uint64)0x7FF0000000000000));
+  meo_value_set_real(&v[4], r_from_bits((uint64)0xFFF0000000000000));
+  if (r_round(&v[0], 5, "r_reals")) { println("PASS r_reals"); }
+}
+
+fn r_empty() {
+  var v: MeoValue[3];
+  meo_value_set_text(&v[0], 0, 0);
+  meo_value_set_blob(&v[1], 0, 0);
+  meo_value_set_null(&v[2]);
+  if (r_round(&v[0], 3, "r_empty")) { println("PASS r_empty"); }
+}
+
+fn r_rec_max() {
+  // 1 (n_cols) + 1 (tag) + 2 (varint 1276) + 1276 = MEO_REC_MAX.
+  var bn: int32 = MEO_REC_MAX - 4;
+  var data: uint8* = malloc((int64)bn);
+  defer free(data);
+  var i: int32 = 0;
+  while (i < bn) {
+    data[i] = (uint8)((i * 31 + 7) & 255);
+    i += 1;
+  }
+  var v: MeoValue[1];
+  meo_value_set_blob(&v[0], data, bn);
+  if (!r_i32(meo_rec_size(&v[0], 1), MEO_REC_MAX, "r_rec_max: size")) { return; }
+  if (!r_round(&v[0], 1, "r_rec_max")) { return; }
+  // One byte short: FULL, and the buffer is untouched.
+  var buf: uint8* = malloc((int64)MEO_REC_MAX + 8);
+  defer free(buf);
+  i = 0;
+  while (i < MEO_REC_MAX + 8) {
+    buf[i] = (uint8)0xAA;
+    i += 1;
+  }
+  if (!r_i32(meo_rec_encode(buf, MEO_REC_MAX - 1, &v[0], 1), -MEO_ERR_FULL, "r_rec_max: short cap")) { return; }
+  i = 0;
+  while (i < MEO_REC_MAX + 8) {
+    if (!r_ok(buf[i] == (uint8)0xAA, "r_rec_max: byte {i} written on FULL")) { return; }
+    i += 1;
+  }
+  println("PASS r_rec_max");
+}
+
+fn r_cols() {
+  var txt: uint8[3] = [(uint8)'a', (uint8)'b', (uint8)'c'];
+  var v: MeoValue[261];
+  var i: int32 = 0;
+  while (i < MEO_REC_MAX_VALS + 1) {
+    var k: int32 = i % 5;
+    if (k == 0) { meo_value_set_null(&v[i]); }
+    if (k == 1) { meo_value_set_int(&v[i], (int64)i * 1000003 - 40000000); }
+    if (k == 2) { meo_value_set_real(&v[i], (float64)i / 3.0); }
+    if (k == 3) { meo_value_set_text(&v[i], &txt[0], i % 4); }
+    if (k == 4) { meo_value_set_blob(&v[i], &txt[0], 3); }
+    i += 1;
+  }
+  if (!r_round(&v[0], MEO_REC_MAX_VALS, "r_cols")) { return; }
+  if (!r_i32(meo_rec_size(&v[0], MEO_REC_MAX_VALS + 1), -MEO_ERR_USAGE, "r_cols: too many size")) { return; }
+  var buf: uint8[4096];
+  if (!r_i32(meo_rec_encode(&buf[0], 4096, &v[0], MEO_REC_MAX_VALS + 1), -MEO_ERR_USAGE, "r_cols: too many encode")) { return; }
+  println("PASS r_cols");
+}
+
+fn r_missing() {
+  var v: MeoValue[2];
+  meo_value_set_int(&v[0], 7);
+  meo_value_set_real(&v[1], 2.5);
+  var buf: uint8[64];
+  var w: int32 = meo_rec_encode(&buf[0], 64, &v[0], 2);
+  if (!r_ok(w > 0, "r_missing: encode")) { return; }
+  var out: MeoValue = { type: 0, i: 0, f: 0.0, p: 0, n: 0 };
+  var cols: int32[3] = [2, 63, 1000];
+  var j: int32 = 0;
+  while (j < 3) {
+    meo_value_set_int(&out, 99);
+    if (!r_i32(meo_rec_get(&buf[0], w, cols[j], &out), MEO_OK, "r_missing: get {cols[j]}")) { return; }
+    if (!r_i32(out.type, MEO_T_NULL, "r_missing: col {cols[j]} type")) { return; }
+    j += 1;
+  }
+  if (!r_i32(meo_rec_get(&buf[0], w, -1, &out), -MEO_ERR_USAGE, "r_missing: col -1")) { return; }
+  println("PASS r_missing");
+}
+
+// A sample with every tag; varints of 1 and 2 bytes.
+fn r_sample(v: MeoValue*, txt: uint8*) {
+  meo_value_set_int(&v[0], 300);
+  meo_value_set_null(&v[1]);
+  meo_value_set_real(&v[2], 1.5);
+  meo_value_set_text(&v[3], txt, 5);
+  meo_value_set_blob(&v[4], txt + 5, 3);
+  meo_value_set_int(&v[5], -1);
+}
+
+fn r_trunc() {
+  var txt: uint8[8] = [(uint8)'h', (uint8)'e', (uint8)'l', (uint8)'l', (uint8)'o', (uint8)1, (uint8)0, (uint8)255];
+  var v: MeoValue[6];
+  r_sample(&v[0], &txt[0]);
+  var full: uint8[64];
+  var fl: int32 = meo_rec_encode(&full[0], 64, &v[0], 6);
+  if (!r_ok(fl > 0, "r_trunc: encode")) { return; }
+  var out: MeoValue = { type: 0, i: 0, f: 0.0, p: 0, n: 0 };
+  var len: int32 = 0;
+  while (len <= fl) {
+    // An exact-size heap copy, so a read past len lands outside the block.
+    var cp: uint8* = malloc((int64)len + 1);
+    var i: int32 = 0;
+    while (i < len) {
+      cp[i] = full[i];
+      i += 1;
+    }
+    var nc: int32 = meo_rec_ncols(cp, len);
+    var good: bool = nc == -MEO_ERR_CORRUPT || nc == 6;
+    if (len == fl) { good = nc == 6; }
+    if (!r_ok(good, "r_trunc: len {len} ncols {nc}")) { free(cp); return; }
+    var c: int32 = 0;
+    while (c < 7) {
+      var rc: int32 = meo_rec_get(cp, len, c, &out);
+      if (rc == MEO_OK) {
+        var right: bool = out.type == MEO_T_NULL;
+        if (c < 6) { right = r_same(&out, &v[c]); }
+        if (!r_ok(right, "r_trunc: len {len} col {c} wrong value")) { free(cp); return; }
+      } else {
+        var ok_rc: bool = rc == -MEO_ERR_CORRUPT && len < fl;
+        if (!r_ok(ok_rc, "r_trunc: len {len} col {c} rc {rc}")) { free(cp); return; }
+      }
+      c += 1;
+    }
+    free(cp);
+    len += 1;
+  }
+  println("PASS r_trunc");
+}
+
+fn r_bad_tag() {
+  var txt: uint8[8] = [(uint8)'h', (uint8)'e', (uint8)'l', (uint8)'l', (uint8)'o', (uint8)1, (uint8)0, (uint8)255];
+  var v: MeoValue[6];
+  r_sample(&v[0], &txt[0]);
+  var buf: uint8[64];
+  var w: int32 = meo_rec_encode(&buf[0], 64, &v[0], 6);
+  if (!r_ok(w > 0, "r_bad_tag: encode")) { return; }
+  var out: MeoValue = { type: 0, i: 0, f: 0.0, p: 0, n: 0 };
+  var bad: int32[2] = [5, 255];
+  var j: int32 = 0;
+  while (j < 2) {
+    // Tag of column 2 is at offset 1 (n_cols) + 2.
+    buf[3] = (uint8)bad[j];
+    if (!r_i32(meo_rec_get(&buf[0], w, 1, &out), MEO_OK, "r_bad_tag {bad[j]}: col 1")) { return; }
+    if (!r_i32(meo_rec_get(&buf[0], w, 2, &out), -MEO_ERR_CORRUPT, "r_bad_tag {bad[j]}: col 2")) { return; }
+    if (!r_i32(meo_rec_get(&buf[0], w, 5, &out), -MEO_ERR_CORRUPT, "r_bad_tag {bad[j]}: col 5")) { return; }
+    j += 1;
+  }
+  println("PASS r_bad_tag");
+}
+
+fn r_huge_len() {
+  var out: MeoValue = { type: 0, i: 0, f: 0.0, p: 0, n: 0 };
+  // n_cols 1, TEXT, length u64 max (10-byte varint), then a few bytes.
+  var a: uint8[16] = [(uint8)1, (uint8)3, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF,
+                      (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0x01, (uint8)'x', (uint8)'y',
+                      (uint8)'z', (uint8)'w'];
+  if (!r_i32(meo_rec_get(&a[0], 16, 0, &out), -MEO_ERR_CORRUPT, "r_huge_len: u64 max")) { return; }
+  // Length 2^31 (wraps negative as int32).
+  var b: uint8[10] = [(uint8)1, (uint8)4, (uint8)0x80, (uint8)0x80, (uint8)0x80, (uint8)0x80, (uint8)0x08,
+                      (uint8)'x', (uint8)'y', (uint8)'z'];
+  if (!r_i32(meo_rec_get(&b[0], 10, 0, &out), -MEO_ERR_CORRUPT, "r_huge_len: 2^31")) { return; }
+  // Length one past the end.
+  var c: uint8[6] = [(uint8)1, (uint8)3, (uint8)4, (uint8)'x', (uint8)'y', (uint8)'z'];
+  if (!r_i32(meo_rec_get(&c[0], 6, 0, &out), -MEO_ERR_CORRUPT, "r_huge_len: one past")) { return; }
+  // n_cols far larger than the buffer.
+  var d: uint8[6] = [(uint8)0xFF, (uint8)0xFF, (uint8)0xFF, (uint8)0x7F, (uint8)0, (uint8)0];
+  if (!r_i32(meo_rec_ncols(&d[0], 6), -MEO_ERR_CORRUPT, "r_huge_len: n_cols")) { return; }
+  if (!r_i32(meo_rec_get(&d[0], 6, 0, &out), -MEO_ERR_CORRUPT, "r_huge_len: n_cols get")) { return; }
+  println("PASS r_huge_len");
+}
+
+// Deterministic xorshift, so debug and release see the same records.
+fn r_rand(s: uint32*) -> uint32 {
+  var x: uint32 = s[0];
+  x = x ^ (x << 13);
+  x = x ^ (x >> 17);
+  x = x ^ (x << 5);
+  s[0] = x;
+  return x;
+}
+
+fn r_rand64(s: uint32*) -> uint64 {
+  var hi: uint64 = (uint64)r_rand(s);
+  var lo: uint64 = (uint64)r_rand(s);
+  return (hi << 32) | lo;
+}
+
+fn r_random() {
+  var pool: uint8[256];
+  var st: uint32[1] = [R_SEED];
+  var i: int32 = 0;
+  while (i < 256) {
+    pool[i] = (uint8)(r_rand(&st[0]) & 255);
+    i += 1;
+  }
+  var v: MeoValue[64];
+  var rec: int32 = 0;
+  while (rec < 1000) {
+    var n: int32 = (int32)(r_rand(&st[0]) % (uint32)(MEO_MAX_COLS + 1));
+    var c: int32 = 0;
+    while (c < n) {
+      var k: int32 = (int32)(r_rand(&st[0]) % (uint32)5);
+      if (k == 0) { meo_value_set_null(&v[c]); }
+      if (k == 1) {
+        // Shift by 0..63 so small and large magnitudes both appear.
+        var sh: int32 = (int32)(r_rand(&st[0]) % (uint32)64);
+        meo_value_set_int(&v[c], (int64)(r_rand64(&st[0]) >> sh));
+      }
+      if (k == 2) { meo_value_set_real(&v[c], r_from_bits(r_rand64(&st[0]))); }
+      if (k >= 3) {
+        var ln: int32 = (int32)(r_rand(&st[0]) % (uint32)40);
+        var at: int32 = (int32)(r_rand(&st[0]) % (uint32)(256 - 40));
+        if (k == 3) { meo_value_set_text(&v[c], &pool[at], ln); }
+        if (k == 4) { meo_value_set_blob(&v[c], &pool[at], ln); }
+      }
+      c += 1;
+    }
+    if (!r_round(&v[0], n, "r_random rec {rec} n {n}")) { return; }
+    rec += 1;
+  }
+  println("PASS r_random");
+}
+
+fn main() -> int32 {
+  r_ints();
+  r_reals();
+  r_empty();
+  r_rec_max();
+  r_cols();
+  r_missing();
+  r_trunc();
+  r_bad_tag();
+  r_huge_len();
+  r_random();
+  if (r_failures != 0) {
+    println("FAIL record_self: {r_failures} failure(s)");
+    return 1;
+  }
+  println("PASS record_self");
+  return 0;
+}

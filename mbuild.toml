@@ -82,3 +82,7 @@ main = "tests/phase3_child.mettle"
 # SELECT * -- one thin path through every new layer (DECISIONS.md D10).
 [bin.draft]
 main = "tests/draft.mettle"
+
+# Record codec round trips and corrupt-input checks.
+[bin.record_self]
+main = "tests/record_self.mettle"

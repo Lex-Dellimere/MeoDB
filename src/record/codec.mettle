@@ -1,12 +1,22 @@
 // record/codec: a row's values <-> the record bytes after the rowid in a
-// table leaf key (D3). Column past n_cols reads NULL; any overrun is CORRUPT.
-// Size limits (MEO_REC_MAX, MEO_MAX_COLS) are enforced by table/, not here.
-// WS3: round-trip test (int64 min/max, -0.0, NaN, empty, 1280-byte record).
+// table leaf key.
+//
+//   record := varint n_cols | n_cols tag bytes | bodies in column order
+//   tag 0 NULL (no body), 1 INT varint(zigzag), 2 REAL 8 bytes IEEE LE,
+//   3 TEXT / 4 BLOB varint len | bytes
+//
+// A column past n_cols reads NULL, so a row written before ADD COLUMN still
+// decodes. Decoding never reads past len: any overrun is CORRUPT. MEO_REC_MAX
+// and the user column limit are enforced by table/ and the catalog.
 
+import "../catalog/schema.mettle";
 import "../error/status.mettle";
 import "../format/bytes.mettle";
 import "../format/varint.mettle";
 import "value.mettle";
+
+// A catalog row holds 4 table fields plus 4 per column.
+export const MEO_REC_MAX_VALS: int32 = 4 + 4 * MEO_MAX_COLS;
 
 // Bytes one value's body takes (the tag byte is counted by the caller).
 fn rec_body_size(v: MeoValue*) -> int32 {
@@ -18,10 +28,11 @@ fn rec_body_size(v: MeoValue*) -> int32 {
   return 0;
 }
 
-// The encoded size of `n` values, or -MEO_ERR_USAGE / -MEO_ERR_MISMATCH for a
-// bad argument or a value meo_value_check rejects.
+// The encoded size of `n` values, or -MEO_ERR_USAGE for a bad argument or more
+// than MEO_REC_MAX_VALS values, -MEO_ERR_MISMATCH for a value meo_value_check
+// rejects.
 export fn meo_rec_size(vals: MeoValue*, n: int32) -> int32 {
-  if (n < 0 || (n > 0 && vals == 0)) { return -MEO_ERR_USAGE; }
+  if (n < 0 || n > MEO_REC_MAX_VALS || (n > 0 && vals == 0)) { return -MEO_ERR_USAGE; }
   var total: int64 = (int64)meo_varint_len((uint64)n) + (int64)n;
   var i: int32 = 0;
   while (i < n) {
@@ -35,7 +46,7 @@ export fn meo_rec_size(vals: MeoValue*, n: int32) -> int32 {
 }
 
 // Encode `n` values into buf[0..cap). Returns the byte count, -MEO_ERR_FULL
-// when cap is too small (buf may be partly written), or meo_rec_size's errors.
+// when cap is too small (nothing written), or meo_rec_size's errors.
 export fn meo_rec_encode(buf: uint8*, cap: int32, vals: MeoValue*, n: int32) -> int32 {
   if (buf == 0 || cap < 0) { return -MEO_ERR_USAGE; }
   var need: int32 = meo_rec_size(vals, n);
