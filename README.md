@@ -188,16 +188,17 @@ journals with `MEOJ`.
 
 ## Build
 
-MeoSQL needs the head Mettle compiler; the v0.17.0 release has no `syscall()`.
+MeoSQL needs the head Mettle compiler (the v0.17.0 release has no `syscall()`)
+and mbuild 0.2 or later, which reads `mbuild.mettle`.
 
 ```
 export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
-MB=/home/nox/Projects/mettle/mbuild/build/linux/release/mbuild
+MB=mbuild
 $MB check && $MB test && $MB build -r
 $MB run smoke         # the whole storage stack in one run
 $MB run phase2 -r     # one test program, release build
 ```
 
-Apart from `meosql` and `smoke`, every `[bin.*]` in `mbuild.toml` is a test
+Apart from `meosql` and `smoke`, every `mb_bin` in `mbuild.mettle` is a test
 program, and each should print `PASS` in both debug and release with zero
 compiler warnings.

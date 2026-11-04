@@ -3,3 +3,5 @@ build/
 .compiler/
 *.o
 .pi/
+/mettle.deps
+/mbuild.local.mettle
