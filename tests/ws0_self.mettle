@@ -1,6 +1,6 @@
-// ws0_self: the WS0 shared contract -- status codes, f64 bytes, frozen constants.
+// ws0_self: the shared contract -- status codes, f64 bytes, frozen constants.
 //
-// Every later workstream compiles against these numbers and types, so this bin
+// Every later module compiles against these numbers and types, so this bin
 // pins them: a renumbered code or a changed tag breaks the on-disk format or
 // the flux_orm mapping silently, and only an exact-value test notices.
 //

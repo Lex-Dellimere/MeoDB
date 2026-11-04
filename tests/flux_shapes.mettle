@@ -1,9 +1,9 @@
 // flux_shapes: every statement shape flux_orm produces, run through meo_q_*
 // the way its adapter will. A local copy of flux's RcStmt (FsStmt: op, table,
 // cols, terms over argv ranges, order, limit/offset, argv) goes through one
-// translator (fs_run, the adapter body of DECISIONS.md D11e): SET values first,
+// translator (fs_run, the flux_orm adapter body): SET values first,
 // then term values, INSERT cells row-major. Each case checks rows, changes and
-// last insert rowid. Cases follow the D11e call-site table plus the newer
+// last insert rowid. Cases follow the adapter's call sites plus the newer
 // shapes: versioned save and delete, created/updated INT timestamps,
 // update_all / delete_all with terms, count with terms, the migration ledger,
 // and the relation preload IN query. Joins are refused by the adapter itself

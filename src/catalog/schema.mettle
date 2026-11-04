@@ -1,16 +1,15 @@
 // catalog/schema: the in-memory shape of a table, and nothing else.
 //
 // Types and constants only, no functions that touch the pager: query/plan reads
-// schemas without depending on storage (DECISIONS.md D1), while
-// catalog/catalog loads and saves them. The fields mirror the catalog row of
-// D4 one to one:
+// schemas without depending on storage, while catalog/catalog loads and
+// saves them. The fields mirror the catalog row one to one:
 //
 //   [name TEXT, root INT, n_cols INT, tflags INT,
 //    then per column: name TEXT, affinity INT, cflags INT, index_root INT]
 //
 // Names are (pointer, byte length), stored as written and compared ASCII
 // case-insensitively. The catalog owns every name buffer and the columns
-// array. A MeoTable is never freed while the db is open (D4): after a
+// array. A MeoTable is never freed while the db is open: after a
 // rollback the catalog reloads in place and a table that vanished gets
 // live = false, so a query holding its id fails with -MEO_ERR_SCHEMA instead
 // of reading freed memory.
@@ -23,7 +22,7 @@ export const MEO_COL_NOT_NULL: int32 = 2;
 export const MEO_COL_UNIQUE: int32 = 4;
 export const MEO_COL_ROWID_ALIAS: int32 = 8;   // INTEGER PRIMARY KEY: value is the rowid
 
-// Limits (D2, D3): columns per table, and encoded record / index key bytes.
+// Limits: columns per table, and encoded record / index key bytes.
 export const MEO_MAX_COLS: int32 = 64;
 export const MEO_REC_MAX: int32 = 1280;
 

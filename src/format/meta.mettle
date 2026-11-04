@@ -1,7 +1,7 @@
 // format/meta: page 0's body — magic, version, page size, page count, roots,
 // and the transaction/write-version/commit counters.
 //
-// PHASE1.md sections 4 and 5.8. The body starts at offset 16 and the free area
+// The body starts at offset 16 and the free area
 // of the meta page starts at MEO_META_BODY (128). As everywhere in format/, the
 // page is explicit encode/decode at fixed offsets; no struct is overlaid.
 //
@@ -81,7 +81,7 @@ export fn meo_meta_read(p: uint8*) -> MeoMeta {
 // Validate page 0 as a database header. Magic is tested first, so a foreign
 // file is NOT_A_DB even when its bytes would also fail the structural check;
 // then a known-magic file with a version or page size we do not speak is
-// VERSION; then the page structure itself is CORRUPT (PHASE1.md section 7).
+// VERSION; then the page structure itself is CORRUPT.
 export fn meo_meta_check(p: uint8*) -> int32 {
   if (meo_get_u32le(p, META_OFF_MAGIC) != MEO_MAGIC) {
     return -MEO_ERR_NOT_A_DB;

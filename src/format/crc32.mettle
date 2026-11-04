@@ -4,7 +4,7 @@
 // Implemented bitwise, deliberately: no 256-entry table, no module global, no
 // init call, no lazy-init flag. Eight shift/xor rounds per byte is fast enough
 // for a 4096-byte page, is thread-safe by construction, and can be exercised
-// directly from a test. PHASE1.md section 5.5.
+// directly from a test.
 
 // CRC of one buffer, from scratch.
 export fn meo_crc32(data: uint8*, len: int64) -> uint32 {

@@ -1,5 +1,4 @@
-// phase1: the phase-1 integration suite (PHASE1.md section 8 plus the
-// cross-feature cases below).
+// phase1: the phase-1 integration suite, plus the cross-feature cases below.
 //
 // A program, not @test functions: the cases need real files in build/, a
 // 4096-byte page on the heap, and a working directory at the repo root.
@@ -21,7 +20,7 @@
 //                                BUSY and no held page changes identity
 //   t5_alloc_zeroes_and_extends  pager/: alloc zeroes all 4096 bytes even over
 //                                a reused frame; page_count and size are exact
-//   t6_corruption_and_rejection  pager/: the PHASE1.md section 7 rows, each
+//   t6_corruption_and_rejection  pager/: the error-boundary rows, each
 //                                with its specific MEO_ERR_*, plus a foreign file
 //   t7_flush_plan_order          pager/: dirty 5,1,3 and the meta -> [1,3,5,0]
 //   x0_file_level_open_create_reopen
@@ -71,7 +70,7 @@ fn p1_pass(name: string) {
   println("PASS {name}");
 }
 
-// Truncate `path` to zero bytes. CREATE never truncates (PHASE1.md 5.3), so a
+// Truncate `path` to zero bytes. CREATE never truncates, so a
 // rerun has to start from an empty file explicitly or it would open the
 // database the previous run left behind.
 fn p1_reset_file(path: string) -> int32 {
@@ -99,8 +98,7 @@ fn p1_pattern_byte(seed: int32, cell_index: int32, k: int32) -> uint8 {
 }
 
 // A zeroed MeoMeta for a fresh database. Bound to a local before returning:
-// a struct literal in a `return` is an IR-lowering ICE on this compiler
-// (notes/03-gotchas G1).
+// a struct literal in a `return` is an IR-lowering ICE on this compiler.
 fn p1_meta_base() -> MeoMeta {
   var m: MeoMeta;
   m.valid = true;
@@ -199,7 +197,7 @@ fn p1_verify_built(p: uint8*, page_type: int32, sizes: int32*, n: int32,
   while (i < n) {
     // Cell i's BODY starts where the packing rule puts it: 4096 minus the
     // size and the two-byte length prefix of every cell allocated before it,
-    // minus its own size (PHASE2.md section 2A). No stored length is
+    // minus its own size. No stored length is
     // consulted; meo_page_alloc writes it.
     var want: int32 = MEO_PAGE_SIZE - sizes[i];
     var j: int32 = 0;
@@ -376,7 +374,7 @@ fn p1_expect_open_err(path: string, want: int32, name: string) -> bool {
 
 
 // Five cells of 1, 7, 2, 33, 64 bytes: 107 bytes of bodies plus a two-byte
-// length prefix each (PHASE2.md section 2A), so free_end must be
+// length prefix each, so free_end must be
 // 4096 - 107 - 10 and the pointer array must be dense at 16 + 2*5.
 //
 // The bug this catches: an allocator that moves the frontier by the wrong
@@ -438,7 +436,7 @@ fn p1_t1_cells() -> int32 {
       return 1;
     }
 
-    // The raw header bytes at the PHASE1 section 3.1 offsets, not just the
+    // The raw header bytes at their fixed offsets, not just the
     // accessors: the on-disk layout is the contract.
     if (!meo_t_check_i64((int64)meo_get_u16le(p, 2), 5, "t1: raw n_cells at 2")) {
       return 1;
@@ -501,7 +499,7 @@ fn p1_t1_cells() -> int32 {
     t += 1;
   }
 
-  // PHASE1 section 5.7: an out-of-range page type is refused and does not
+  // An out-of-range page type is refused and does not
   // touch the page. The bug this catches: an init that writes whatever type
   // the caller passed, so a corrupt type reaches the disk and page_check is
   // the only thing standing between it and a decoder that switches on it.
@@ -516,12 +514,11 @@ fn p1_t1_cells() -> int32 {
   return 0;
 }
 
-// The nine structural invariants of PHASE1.md section 3.2, one negative case
+// The nine structural header invariants, one negative case
 // each, on a page with two 8-byte cells (free_start 20, free_end 4076).
 //
-// Offsets are in phase-2 terms: every cell carries a two-byte length prefix
-// (PHASE2.md section 2A), so the bodies sit at 4088 and 4078, with the
-// prefixes at 4086 and 4076.
+// Offsets are in phase-2 terms: every cell carries a two-byte length prefix so
+// the bodies sit at 4088 and 4078, with the prefixes at 4086 and 4076.
 //
 // The bug this catches: a meo_page_check that trusts one persisted field it
 // should cross-check, so a corrupt page is accepted here and handed to a b-tree
@@ -679,7 +676,7 @@ fn p1_t1_page_check() -> int32 {
 // Defrag must reclaim the stranded bytes, must leave every live body
 // byte-identical, must not invent space it cannot know is free, and must be
 // idempotent. In phase 2 it reclaims EVERY hole, not just the tail below the
-// lowest live body (PHASE2.md section 2A).
+// lowest live body.
 //
 // The bug this catches: a defrag that shifts bodies down without rewriting the
 // pointer array (silent corruption that only shows up on the next read), one
@@ -1063,7 +1060,7 @@ fn p1_x0_file_level_open_create_reopen() -> int32 {
     if (!meo_t_check(fc.is_open, "x0: create open")) { return 1; }
     defer meo_file_close(fc);
 
-    // CREATE never truncates (PHASE1 section 5.3), so a rerun of this test
+    // CREATE never truncates, so a rerun of this test
     // starts from an empty file explicitly.
     if (!meo_t_check_i64(meo_file_truncate(fc, 0), MEO_OK, "x0: truncate to empty")) {
       return 1;
@@ -1089,7 +1086,7 @@ fn p1_x0_file_level_open_create_reopen() -> int32 {
       return 1;
     }
     // write_at returns MEO_OK, not the byte count: comparing to len reads a
-    // correct write as a failure (notes/03-gotchas G4).
+    // correct write as a failure.
     if (!meo_t_check_i64(meo_file_write_at(fc, 0, pg, (int64)MEO_PAGE_SIZE), MEO_OK,
         "x0: write page 0")) {
       return 1;
@@ -1148,7 +1145,7 @@ fn p1_x0_file_level_open_create_reopen() -> int32 {
     if (!meo_t_check_i64((int64)m.page_count, 4, "x0: page_count on disk")) {
       return 1;
     }
-    // The same fields at their normative absolute offsets (PHASE1 section 4),
+    // The same fields at their absolute on-disk offsets,
     // read byte-wise: an encoder and a decoder that agree on the WRONG offset
     // would otherwise both look correct here.
     if (!meo_t_check_i64((int64)meo_get_u32le(back, 16), (int64)(uint32)MEO_MAGIC,
@@ -1166,7 +1163,7 @@ fn p1_x0_file_level_open_create_reopen() -> int32 {
     // write_version, not page_count a second time: a raw page_count check
     // followed by "raw and decoded agree" cannot fail independently of the
     // decoded check above it, so this pair pins a field no other check reads.
-    // The raw read fixes the normative offset 48 (section 4); the decoded read
+    // The raw read fixes the on-disk offset 48; the decoded read
     // fixes the decoder.
     if (!meo_t_check_i64((int64)meo_get_u64le(back, 48), 1,
         "x0: raw write_version at 48")) {
@@ -1643,7 +1640,7 @@ fn p1_t5_alloc_zeroes_and_extends() -> int32 {
   return 0;
 }
 
-// --- T6: the pager-reachable rows of the PHASE1.md section 7 table ----------
+// --- T6: the pager-reachable rows of the error-boundary table ---------------
 
 // Every row open/get/alloc/flush_plan can reach, asserting its specific
 // MEO_ERR_*, plus a foreign 4096-byte text file and a flipped byte inside page
@@ -2084,7 +2081,7 @@ fn p1_t7_flush_plan_order() -> int32 {
 // page_count written into the frame.
 //
 // The root and txn values are read back twice: once through meo_meta_read and
-// once as raw bytes at PHASE1.md section 4's absolute offsets (28 freelist, 32
+// once as raw bytes at their absolute offsets (28 freelist, 32
 // catalog, 36 btree, 40 txn_id) with meo_get_u32le/meo_get_u64le. The raw read is
 // the independent oracle: meo_meta_write and meo_meta_read share one offset
 // table, so a bug in that table moves both sides together and only a literal
@@ -2136,7 +2133,7 @@ fn p1_x2_meta_through_page0_frame() -> int32 {
       "x2: meo_meta_write into the page-0 frame")) {
     return 1;
   }
-  // Raw offsets in the frame that was just encoded: section 4's table, not
+  // Raw offsets in the frame that was just encoded: the on-disk layout, not
   // meo_meta_read's opinion of it.
   if (!meo_t_check_i64((int64)meo_get_u32le(mf->data, 28), 3,
       "x2: raw offset 28 is the freelist root")) {
@@ -2205,7 +2202,7 @@ fn p1_x2_meta_through_page0_frame() -> int32 {
       "x2: the write version survived")) {
     return 1;
   }
-  // The durable page on disk, at section 4's offsets, independent of
+  // The durable page on disk, at its fixed offsets, independent of
   // meo_meta_read.
   if (!meo_t_check_i64((int64)meo_get_u32le(back->data, 28), 3,
       "x2: the disk's offset 28 is the freelist root")) {

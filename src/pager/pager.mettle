@@ -1,22 +1,19 @@
 // pager/pager: the frame table, the page-number hash, clock eviction, pin
 // accounting, page allocation and the flush that makes those pages durable.
 //
-// PHASE1.md sections 5.9, 6, 6b and 7. This module sits on platform/file.mettle
-// for I/O and format/{page,meta}.mettle for bytes; it knows nothing about
-// errnos, about what a page means, or about any layer above it.
+// This module sits on platform/file.mettle for I/O and format/{page,meta}.mettle
+// for bytes; it knows nothing about errnos, about what a page means, or about
+// any layer above it.
 //
-// NO ATOMICITY IN PHASE 1. Eviction writes a dirty page back in place, so a
-// torn write leaves a page half old and half new, and a crash between writing a
-// page and writing the meta leaves the file with more pages than page_count
-// records. Nothing above this layer may assume that a flush, a write-back or a
-// crash leaves the database consistent; the page-level journal that fixes it is
-// phase 3. The one ordering guarantee phase 1 does give -- page 0 last, then
-// fsync -- is the one that stops a durable page_count from running ahead of the
+// Atomicity comes from the rollback journal. Inside meo_pager_begin/commit a
+// page's before-image is journaled before the page is overwritten, so a crash
+// rolls the transaction back at the next open. Outside a transaction, eviction
+// and flush write pages in place with no journal: a crash can leave a page
+// half written, or more pages on disk than page_count records. Flush writes
+// page 0 last, then fsyncs, so a durable page_count never runs ahead of the
 // pages it counts.
 //
-// journal and lock stay 0: no journal, no locking, no threads.
-//
-// PHASE2.md section 2C adds the freelist: a freed page becomes reusable, and
+// The freelist: a freed page becomes reusable, and
 // the chain of MEO_PAGE_FREELIST pages lives entirely on disk (meta.freelist_root
 // is the head, 0 = none), so it survives close/reopen with no in-memory state.
 // The page format and the chain algorithm over page bytes are in
@@ -26,46 +23,28 @@
 // meo_free_init/take/put/count are therefore defined here rather than in
 // freelist.mettle; every program that imports the pager sees them either way.
 //
-// Five things PHASE1.md 5.9 does not spell out, and why each is what it is:
+// Design choices worth knowing:
 //
-// * `meta_dirty` and `closed` are documented fields of MeoPager in PHASE1.md
-//   5.9 and 6b.12 states the rule they serve. Page 0 is an ordinary evictable
-//   frame (section 6b and test T4 require it: with n_frames frames a caller may
-//   hold n_frames-1 pages pinned and still expect a successful get, so page 0
-//   cannot be permanently pinned), but an `alloc` must make the new page_count
-//   durable and `get(0)` must never hand back what the disk still said when
-//   p->meta has moved on. `meta_dirty` carries both obligations while page 0 is
-//   not resident; meo_pager_meta_refresh encodes p->meta into the frame every
-//   time page 0 is installed while the flag is set. flush_plan reports page 0
-//   exactly once: from this flag, or from the meta frame's dirty bit when page
-//   0 is resident and was written through.
-// * `meo_pager_close` frees every buffer and array and sets `closed`, but not
-//   the MeoPager itself; meo_pager_free releases the block. PHASE1.md section 7
-//   requires a second close of the same handle to answer MEO_OK, which is only
-//   definable while the handle is still allocated, so the struct outlives the
-//   close and `closed` is what makes it not live. The cost is one small struct
-//   per open/close cycle; phase 1 accepts it rather than trade a defined double
-//   close for a use-after-free.
-// * open validates identity before integrity: meo_meta_check runs before
-//   meo_page_verify, which is the reverse of 5.9's step 5 then 6. Section 7 and
-//   T6 require a foreign file and a flipped magic byte at offset 16 to be
-//   NOT_A_DB, and either also breaks the CRC, so checksum-first would answer
-//   CORRUPT to a test that is written for NOT_A_DB. A bad checksum on a
-//   structurally sound page 0 is still CORRUPT, so section 7's checksum row is
-//   reachable either way.
-// * get verifies a page's checksum as it enters the cache (5.9 only says to
-//   read the page). This is the one place page bytes come off the disk, so it
-//   is the one place corruption can be caught before a caller reads it; a page
-//   that fails is not installed. Section 6b.11 makes the other half of that
-//   promise: everything this pager writes is sealed first, so a page that came
-//   through the pager always verifies.
+// * Page 0 is an ordinary evictable frame: with n_frames frames a caller may
+//   hold n_frames-1 pages pinned and still expect a get to succeed, so page 0
+//   cannot stay pinned. `meta_dirty` records that p->meta is ahead of the disk
+//   while page 0 is not resident; meo_pager_meta_refresh encodes p->meta into
+//   the frame whenever page 0 is installed with the flag set, and flush_plan
+//   reports page 0 exactly once.
+// * meo_pager_close frees every buffer but not the MeoPager itself, so a
+//   second close of the same handle answers MEO_OK instead of being a
+//   use-after-free; `closed` marks it not live and meo_pager_free releases it.
+// * open checks identity before integrity: meo_meta_check runs before
+//   meo_page_verify, because a foreign file or a flipped magic byte also
+//   breaks the CRC and must be reported as NOT_A_DB, not CORRUPT. A bad
+//   checksum on a sound page 0 is still CORRUPT.
+// * get verifies a page's checksum as it enters the cache, the one place page
+//   bytes come off the disk; a page that fails is not installed. Everything
+//   this pager writes is sealed first, so a page it wrote always verifies.
 // * a failed open has no pager to record the code in, so meo_pager_err(0) and
-//   meo_pager_err_arg(0) answer for the last failed meo_pager_open. Section 7 and
-//   T6 ask for the specific code after a refused open, and that is the only
-//   channel a null return leaves. Phase 1 has no threads, so one slot is
-//   enough. A MEO_PAGER_CREATE|MEO_PAGER_READONLY open is treated as "no create"
-//   for the same reason it is refused nothing else: a read-only pager could not
-//   initialise the file, so a zero-byte one is NOT_A_DB.
+//   meo_pager_err_arg(0) answer for the last failed meo_pager_open. A
+//   MEO_PAGER_CREATE|MEO_PAGER_READONLY open is treated as "no create": a
+//   read-only pager cannot initialise the file, so a zero-byte one is NOT_A_DB.
 //
 // COMMIT COUNTER AND COMMIT HOOK (the change feed, src/feed/feed.mettle).
 //
@@ -114,7 +93,7 @@ import "../platform/clock_linux.mettle" if linux;
 import "freelist.mettle";
 import "journal.mettle";
 
-// --- constants (PHASE1.md section 2) ---------------------------------------
+// --- constants --------------------------------------------------------------
 
 export const MEO_PAGER_CREATE: int32 = 1;
 export const MEO_PAGER_READONLY: int32 = 2;
@@ -126,7 +105,7 @@ export const MEO_HOOK_ROLLBACK: int32 = 1;  // the open transaction was undone
 export const MEO_HOOK_UNCERTAIN: int32 = 2; // changes dropped, disk state unknown
 export const MEO_HOOK_DETACH: int32 = 3;    // pager closing; last call
 
-// --- types (PHASE1.md section 5.9) -----------------------------------------
+// --- types ------------------------------------------------------------------
 
 export struct MeoFrame {
   data: uint8*;      // MEO_PAGE_SIZE bytes, owned by the pager
@@ -167,18 +146,18 @@ export struct MeoPager {
 }
 
 // The open-failure channel. meo_pager_open answers 0, so there is no pager to
-// record the code in; PHASE1.md section 7 and T6 still require the specific
-// code to be readable, so meo_pager_err(0) and meo_pager_err_arg(0) report the
-// last failed open. Two opens must not interleave -- phase 1 is single-threaded
-// by construction (no locking, no threads).
+// record the code in, yet the caller still needs the specific code, so
+// meo_pager_err(0) and meo_pager_err_arg(0) report the last failed open. Two
+// opens must not interleave -- phase 1 is single-threaded by construction (no
+// locking, no threads).
 var meo_pager_last_open_err: int32 = MEO_OK;
 var meo_pager_last_open_err_arg: int64 = 0;
 
 // --- status helpers --------------------------------------------------------
 
 // Record a failure. `rc` is the negative form a meo_* function returns;
-// meo_pager_err reports the positive MEO_ERR_* constant that section 7's table is
-// written in. Returns `rc` so a caller can `return meo_pager_fail(...)`.
+// meo_pager_err reports the positive MEO_ERR_* constant. Returns `rc` so a
+// caller can `return meo_pager_fail(...)`.
 fn meo_pager_fail(p: MeoPager*, rc: int32, arg: int64) -> int32 {
   var code: int32 = rc;
   if (code > 0) { code = 0 - code; }
@@ -285,7 +264,7 @@ fn meo_pager_index_insert(p: MeoPager*, page_no: uint32, fi: int32) {
   p->index[slot] = fi + 1;
 }
 
-// Backward-shift deletion (PHASE1.md section 6): empty the slot, then re-seat
+// Backward-shift deletion: empty the slot, then re-seat
 // every entry of the probe cluster that lost its path to its home slot. No
 // tombstone is ever left, and none is needed: the table is fixed at
 // index_cap >= 2 * n_frames, so tombstones could fill it permanently.
@@ -339,7 +318,7 @@ fn meo_pager_meta_pending(p: MeoPager*) -> bool {
   return p->frames[fi].dirty;
 }
 
-// Page 0 is never allowed to go stale (PHASE1.md 5.9 and 6b.12). Whenever a
+// Page 0 is never allowed to go stale. Whenever a
 // frame is about to hold page 0 and p->meta is ahead of the bytes in it, encode
 // p->meta before the caller can decode the frame: the disk copy left behind by
 // an eviction carries whatever page_count, roots and txn_id it had at that
@@ -380,7 +359,7 @@ fn meo_pager_plan_count(p: MeoPager*) -> int32 {
 
 // --- eviction --------------------------------------------------------------
 
-// Clock second-chance scan (PHASE1.md section 6), bounded by 2 * n_frames. An
+// Clock second-chance scan, bounded by 2 * n_frames. An
 // unused frame is taken at once; a pinned frame is NEVER a candidate; a
 // referenced frame loses its second chance and is looked at again next pass.
 // Returns -1 when everything in reach is pinned.
@@ -403,8 +382,8 @@ fn meo_pager_pick_victim(p: MeoPager*) -> int32 {
   return -1;
 }
 
-// The one place a page reaches the disk (PHASE3.md 3A). Sealing happens here,
-// so no caller can write an unsealed page, and 3B's before-image append hangs
+// The one place a page reaches the disk. Sealing happens here, so no caller
+// can write an unsealed page, and the journal's before-image append hangs
 // off the journal hook below. Exactly MEO_PAGE_SIZE bytes at
 // page_no * MEO_PAGE_SIZE, all-or-error: the file write primitive writes all of
 // len or fails. Every writer -- eviction, flush, and anything added later -- goes
@@ -412,7 +391,7 @@ fn meo_pager_pick_victim(p: MeoPager*) -> int32 {
 fn meo_pager_write_page(p: MeoPager*, page_no: uint32, page: uint8*) -> int32 {
   meo_page_seal(page);
   // The before-image is appended and fsynced before the page it protects is
-  // written (PHASE3.md 3B). The old bytes come from the disk, not from the
+  // written. The old bytes come from the disk, not from the
   // frame: the frame already holds the new content. meo_jrn_needs is false for
   // a page allocated after begin and for a page already journaled, so a page
   // that is evicted, re-read and written again keeps its first before-image.
@@ -591,9 +570,9 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
 // Read and validate page 0 of an existing file and leave it resident, unpinned.
 //
 // Identity before integrity: a foreign file and a flipped magic byte both break
-// the CRC as well, and PHASE1.md section 7 (and T6) require NOT_A_DB for
-// exactly those two cases, so meo_meta_check runs before meo_page_verify. A bad
-// checksum on a structurally sound page 0 is still CORRUPT.
+// the CRC as well, and both must be reported as NOT_A_DB, so meo_meta_check
+// runs before meo_page_verify. A bad checksum on a structurally sound page 0 is
+// still CORRUPT.
 fn meo_pager_load_page_zero(p: MeoPager*) -> int32 {
   var f: MeoFrame* = meo_pager_frame_at(p, 0);
   var rc: int32 = meo_file_read_at(p->file, 0, f->data, (int64)MEO_PAGE_SIZE);
@@ -621,7 +600,7 @@ fn meo_pager_load_page_zero(p: MeoPager*) -> int32 {
 }
 
 // A zero-byte file opened with MEO_PAGER_CREATE: page 0 only, on disk before
-// open returns (PHASE1.md section 5.9 step 2).
+// open returns.
 fn meo_pager_init_new(p: MeoPager*) -> int32 {
   var f: MeoFrame* = meo_pager_frame_at(p, 0);
   var rc: int32 = meo_page_init(f->data, MEO_PAGE_META);
@@ -747,7 +726,7 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
     i += 1;
   }
 
-  // A hot journal is replayed before anything else (PHASE3.md 3B): before
+  // A hot journal is replayed before anything else: before
   // page 0 is read, before the size is trusted, before a new database is
   // created. Recovery may truncate the file back to the journal's page count.
   var jrc: int32 = meo_jrn_recover(path, p->file, read_only, MEO_MAX_PAGES);
@@ -805,11 +784,11 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
 }
 
 // Flush, sync, close the file and free every buffer and array. The MeoPager
-// block survives so a second close can be answered MEO_OK (PHASE1.md section 7);
+// block survives so a second close can be answered MEO_OK;
 // meo_pager_free is what releases it.
 export fn meo_pager_close(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
-  // Second close is MEO_OK (PHASE1.md section 7); the handle outlives it.
+  // Second close is MEO_OK; the handle outlives it.
   if (!meo_pager_is_live(p)) { return MEO_OK; }
 
   var first: int32 = MEO_OK;
@@ -898,7 +877,7 @@ export fn meo_pager_get(p: MeoPager*, page_no: uint32, write: bool) -> MeoFrame*
   }
 
   // A cached page is reachable even before the meta that counts it is durable
-  // (PHASE1.md section 5.9: alloc caches first, flushes later).
+  // (alloc caches first, flushes later).
   if ((int64)page_no >= (int64)p->page_count) {
     return meo_pager_fail_ptr(p, -MEO_ERR_RANGE, (int64)page_no);
   }
@@ -948,7 +927,7 @@ export fn meo_pager_release(p: MeoPager*, f: MeoFrame*, dirty: bool) -> int32 {
   return MEO_OK;
 }
 
-// --- freelist (PHASE2.md section 2C) ---------------------------------------
+// --- freelist ---------------------------------------------------------------
 //
 // The chain lives on disk: meta.freelist_root is the head, every freelist page
 // links to the next, and every page the chain names is reusable. There is no
@@ -986,8 +965,8 @@ fn meo_pager_free_get(p: MeoPager*, page_no: uint32, write: bool) -> MeoFrame* {
 
 // What the freelist can see of `page_no`: 0 = nothing, 1 = it is listed as
 // free, 2 = it is one of the chain's own pages, negative = failure. Freeing a
-// listed page twice and freeing a chain page are both CORRUPT (PHASE2.md
-// section 2C); telling them apart here keeps the walk in one place.
+// listed page twice and freeing a chain page are both CORRUPT;
+// telling them apart here keeps the walk in one place.
 fn meo_pager_free_probe(p: MeoPager*, page_no: uint32) -> int32 {
   var root: uint32 = p->meta.freelist_root;
   var walked: uint32 = 0;
@@ -1008,7 +987,7 @@ fn meo_pager_free_probe(p: MeoPager*, page_no: uint32) -> int32 {
   return 0;
 }
 
-// Validate the whole chain without changing it. Phase 2C keeps no in-memory
+// Validate the whole chain without changing it. The pager keeps no in-memory
 // freelist state, so this is not how take/put start up: it is the check a
 // caller (or a test) runs before trusting a file, and it is what proves the
 // chain read back after a reopen is sound. -MEO_ERR_CORRUPT for a chain that
@@ -1052,8 +1031,8 @@ export fn meo_free_init(p: MeoPager*) -> int32 {
 
 // Take the newest free page number, or 0 when the freelist is empty. LIFO, so
 // a reuse returns the pages in the order they were freed, newest first.
-// 0 is both the empty answer and the failure answer (PHASE2.md names the
-// return uint32), so a caller checks meo_pager_err: it is MEO_OK for an empty
+// 0 is both the empty answer and the failure answer (the return is a page
+// number), so a caller checks meo_pager_err: it is MEO_OK for an empty
 // freelist and the failure code otherwise.
 export fn meo_free_take(p: MeoPager*) -> uint32 {
   if (p == 0) { return 0; }
@@ -1093,7 +1072,7 @@ fn meo_pager_page_pinned(p: MeoPager*, page_no: uint32) -> bool {
   return p->frames[fi].pin > 0;
 }
 
-// Push `page_no` onto the freelist. -MEO_ERR_USAGE for page 0 (PHASE2.md 2C),
+// Push `page_no` onto the freelist. -MEO_ERR_USAGE for page 0,
 // -MEO_ERR_RANGE for a page the file does not have, -MEO_ERR_USAGE for a page the
 // caller still has pinned, -MEO_ERR_CORRUPT for a page the freelist can already
 // see (a double free, or a freelist page itself).
@@ -1110,7 +1089,7 @@ export fn meo_free_put(p: MeoPager*, page_no: uint32) -> int32 {
   if ((int64)page_no >= (int64)p->page_count) {
     return meo_pager_fail(p, -MEO_ERR_RANGE, (int64)page_no);
   }
-  // A page the caller still has pinned is refused (PHASE2.md section 2C). The
+  // A page the caller still has pinned is refused. The
   // frame table is the only record of who owns a buffer: the next alloc hands
   // this page to a new owner and zeroes it under the stale frame pointer, and
   // nothing later can tell that it happened.
@@ -1196,7 +1175,7 @@ export fn meo_pager_alloc(p: MeoPager*) -> MeoFrame* {
   if (p->read_only) {
     return meo_pager_fail_ptr(p, -MEO_ERR_READONLY, (int64)p->page_count);
   }
-  // A free page is reused before the file grows (PHASE2.md section 2C).
+  // A free page is reused before the file grows.
   // meo_free_take answers 0 both for an empty freelist and for a failure, so
   // the recorded error is what tells the two apart.
   var reuse: uint32 = meo_free_take(p);
@@ -1207,12 +1186,12 @@ export fn meo_pager_alloc(p: MeoPager*) -> MeoFrame* {
     var r: MeoFrame* = meo_pager_get(p, reuse, true);
     if (r == 0) { return 0; }
     // Every byte, for the same reason the extend path below zeroes: the page
-    // still holds whatever its last owner left there (PHASE1.md 6b.9).
+    // still holds whatever its last owner left there.
     meo_bytes_zero(r->data, (int64)MEO_PAGE_SIZE);
     meo_pager_mark_dirty(p, r);
     return r;
   }
-  // The hard cap of PHASE1.md section 2: the page number is uint32 and the file
+  // The hard cap: the page number is uint32 and the file
   // is page_count * 4096, so 4 GiB is the phase-1 ceiling.
   if (p->page_count >= MEO_MAX_PAGES) {
     return meo_pager_fail_ptr(p, -MEO_ERR_NOSPC, (int64)p->page_count);
@@ -1228,7 +1207,7 @@ export fn meo_pager_alloc(p: MeoPager*) -> MeoFrame* {
   }
   var f: MeoFrame* = meo_pager_frame_at(p, fi);
   // Every one of the 4096 bytes, whatever this frame held before: stale bytes
-  // are an information leak (PHASE1.md section 6b.9).
+  // are an information leak.
   meo_bytes_zero(f->data, (int64)MEO_PAGE_SIZE);
   meo_pager_index_insert(p, page_no, fi);
   p->page_count += 1;
@@ -1239,7 +1218,7 @@ export fn meo_pager_alloc(p: MeoPager*) -> MeoFrame* {
   return f;
 }
 
-// PHASE2.md section 2C: a freed page is pushed onto the persistent freelist,
+// A freed page is pushed onto the persistent freelist,
 // and the validation (page 0, a page the file does not have, a page the caller
 // still has pinned, a double free, a read-only pager) lives in meo_free_put so
 // there is exactly one copy of it. Refusing a pinned page is what keeps the
@@ -1383,7 +1362,7 @@ export fn meo_pager_sync(p: MeoPager*) -> int32 {
   return MEO_OK;
 }
 
-// --- transactions (PHASE3.md 3B) -------------------------------------------
+// --- transactions -----------------------------------------------------------
 //
 // A transaction is a rollback journal attached to the pager. begin writes and
 // fsyncs the journal header; every page write through meo_pager_write_page
@@ -1719,7 +1698,7 @@ export fn meo_pager_dirty_count(p: MeoPager*) -> int32 {
 
 // How many pages have gone through meo_pager_write_page. A test uses it to
 // prove an eviction write-back and a flush both take the chokepoint rather
-// than a private path to the file write primitive (PHASE3.md 3A).
+// than a private path to the file write primitive.
 export fn meo_pager_write_count(p: MeoPager*) -> int64 {
   if (p == 0) { return 0; }
   return p->write_count;
@@ -1735,7 +1714,7 @@ export fn meo_pager_txn_id(p: MeoPager*) -> uint64 {
   return p->meta.txn_id;
 }
 
-// No return channel in PHASE1.md 5.9, so a refused write is reported through
+// No return channel, so a refused write is reported through
 // meo_pager_err like every other failure.
 export fn meo_pager_set_txn_id(p: MeoPager*, id: uint64) {
   if (p == 0) { return; }

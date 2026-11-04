@@ -7,7 +7,7 @@
 // meo_file_err and becomes -MEO_ERR_IO / -MEO_ERR_NOMEM / -MEO_ERR_USAGE; callers
 // above the platform layer only ever see those three codes.
 //
-// Syscall numbers follow Linux x86-64. The set is exactly what PHASE1.md 5.3
+// Syscall numbers follow Linux x86-64. The set is exactly what the file API
 // needs: open(2), close(3), pread64(17), pwrite64(18), fsync(74),
 // ftruncate(77), plus lseek(8) for meo_file_size, rename(82) for
 // meo_file_rename and unlink(87) for meo_file_unlink.
@@ -186,9 +186,8 @@ export fn meo_file_truncate(f: MeoFile, size: int64) -> int32 {
   return MEO_OK;
 }
 
-// PHASE1.md 5.3 schedules rename for phase 3, but the pager's atomic-replace
-// path cannot exist without it, and it is one syscall: same contract, same
-// errno mapping, nothing else changes.
+// The pager's atomic-replace path needs rename. Same contract and errno
+// mapping as the other calls.
 export fn meo_file_rename(from: string, to: string) -> int32 {
   if ((int64)from.length <= 0 || (int64)to.length <= 0) { return -MEO_ERR_USAGE; }
   var cfrom: cstring = meo_file_cpath(from);
@@ -205,7 +204,7 @@ export fn meo_file_rename(from: string, to: string) -> int32 {
   return MEO_OK;
 }
 
-// Remove a path (PHASE1.md 5.3, phase 3). The journal is the only caller: it
+// Remove a path. The journal is the only caller: it
 // is the one way a journal file can delete itself. A missing path is
 // -MEO_ERR_IO, which the caller decides whether to care about.
 export fn meo_file_unlink(path: string) -> int32 {

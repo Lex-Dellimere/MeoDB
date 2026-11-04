@@ -1,7 +1,7 @@
 // pager/journal: the rollback journal FILE FORMAT, its records, and the
 // append/replay operations over raw bytes.
 //
-// PHASE3.md 3B. A journal is a separate file, `<db>-journal`, holding the
+// A journal is a separate file, `<db>-journal`, holding the
 // before-image of every page a transaction is about to change. It is the undo
 // log that makes an interrupted commit recoverable at the next open.
 //
@@ -12,7 +12,7 @@
 // the import graph acyclic (pager imports journal, journal imports only
 // error/, format/ and platform/).
 //
-// Layout (PHASE3.md 3B), little-endian through format/bytes.mettle:
+// Layout, little-endian through format/bytes.mettle:
 //
 //   header, 64 bytes used:
 //     0   u32  magic        0x4A4F454D
@@ -35,7 +35,7 @@
 // 28 header bytes without re-reading the records. Recomputing the whole region
 // on every append would be O(n^2) I/O on a journal that can hold 65536 records.
 //
-// Capacity (PHASE3.md 3B): the file grows on demand. begin sets the record cap
+// Capacity: the file grows on demand. begin sets the record cap
 // to min(db_size_pages + 64, cap); each append truncates the file to one more
 // record and writes it. The hard cap is MEO_JRN_MAX_RECORDS = 65536 (256 MiB at
 // 4100 bytes a record). Exceeding it is -MEO_ERR_NOSPC, never a dropped
@@ -56,7 +56,7 @@ import "../format/crc32.mettle";
 import "../platform/file.mettle";
 import "../platform/file_linux.mettle" if linux;
 
-// --- constants (PHASE3.md 3B) ----------------------------------------------
+// --- constants --------------------------------------------------------------
 
 export const MEO_JRN_MAGIC: uint32 = 0x4A4F454D; // on disk the bytes read "MEOJ"
 export const MEO_JRN_VERSION: int32 = 1;

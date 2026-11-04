@@ -1,6 +1,6 @@
 // format/varint: unsigned LEB128 plus zigzag for signed values.
 //
-// PHASE1.md section 5.6. Not order-preserving: these are for record payloads
+// Not order-preserving: these are for record payloads
 // only, never for b-tree keys. Every failure is a negative MEO_ERR_*.
 
 import "../error/status.mettle";

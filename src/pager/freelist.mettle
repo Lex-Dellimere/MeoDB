@@ -1,8 +1,7 @@
 // pager/freelist: the freelist PAGE, and the chain algorithm over its bytes.
 //
-// PHASE2.md section 2C. A freelist is a chain of MEO_PAGE_FREELIST pages whose
-// cells are 4-byte page numbers. meta.freelist_root is the chain head and 0
-// means "none".
+// A freelist is a chain of MEO_PAGE_FREELIST pages whose cells are 4-byte page
+// numbers. meta.freelist_root is the chain head and 0 means "none".
 //
 //     page A (head)                page B                     page C
 //     cell 0: link -> B            cell 0: link -> C          cell 0: link -> 0
@@ -13,18 +12,14 @@
 // page number and the page keeps the ordinary format/page.mettle header, cell
 // array and gap. Cells 1..n-1 are the free page numbers, in the order they
 // were pushed: push appends at index n-1 and pop removes index n-1, so the
-// chain as a whole hands pages back LIFO (newest first), which is what
-// PHASE2.md section 2E's E4 asserts.
+// chain as a whole hands pages back LIFO (newest first).
 //
 // This module deliberately knows nothing about MeoPager or about file I/O: it
 // takes a raw MEO_PAGE_SIZE buffer and never allocates. pager/pager.mettle owns
 // the frame pinning, the meta root, the error matrix and the walking of the
 // chain (meo_free_init/take/put/count and meo_pager_free_page live there). That
 // split is what keeps the import graph acyclic -- pager imports freelist, and
-// freelist imports only error/status and format/{bytes,page} -- and it is the
-// one place 2C departs from PHASE2.md's file list: the four contract entry
-// points are defined one file over, still in the import graph of every
-// program that imports the pager.
+// freelist imports only error/status and format/{bytes,page}.
 //
 // Capacity, derived from the page constants rather than written down: a cell
 // costs its 4-byte body, the u16 length prefix format/page.mettle puts in
@@ -42,7 +37,7 @@ import "../error/status.mettle";
 import "../format/bytes.mettle";
 import "../format/page.mettle";
 
-// A freelist cell body is one u32 page number (PHASE2.md section 2C).
+// A freelist cell body is one u32 page number.
 export const MEO_FREE_CELL_BODY: int32 = 4;
 
 // What one cell costs the page: the body, its u16 length prefix, and its two
@@ -117,7 +112,7 @@ fn free_push_cell(buf: uint8*, page_no: uint32) -> int32 {
 // A FULL page is not necessarily out of bytes. meo_page_free_cell leaves a
 // popped cell's [len][body] extent where it is, so a page that has been popped
 // from strands one cell's worth per pop -- ~3054 bytes on a filled-then-drained
-// page -- and a pop/push cycle never reuses them. PHASE2.md section 2A's rule
+// page -- and a pop/push cycle never reuses them. The defrag rule
 // decides the case: defrag when the holes would give more room than
 // free_bytes already has, and retry once. Without it a churned page reports
 // FULL with its own bytes reclaimable, and the pager answers FULL by making a
@@ -135,7 +130,7 @@ export fn meo_free_page_push(buf: uint8*, page_no: uint32) -> int32 {
 
 // Remove and return the newest free page number in `buf`, or 0 when the page
 // holds only its link. 0 is a safe sentinel because page 0 is never freed
-// (PHASE2.md section 2C: freeing page 0 is -MEO_ERR_USAGE).
+// (freeing page 0 is -MEO_ERR_USAGE).
 export fn meo_free_page_pop(buf: uint8*) -> uint32 {
   if (!free_page_is_ours(buf)) { return 0; }
   var n: int32 = meo_page_n_cells(buf);
@@ -164,9 +159,9 @@ export fn meo_free_page_count(buf: uint8*) -> int32 {
 }
 
 // The free page number at index i (1..count), or 0 when i is not one. Freeing
-// the same page twice is -MEO_ERR_CORRUPT if the freelist can see it
-// (PHASE2.md section 2C), so the pager needs to read these values; keeping the
-// decode here is what lets the page format stay private to this module.
+// the same page twice is -MEO_ERR_CORRUPT if the freelist can see it, so the
+// pager needs to read these values; keeping the decode here is what lets the
+// page format stay private to this module.
 export fn meo_free_page_at(buf: uint8*, i: int32) -> uint32 {
   if (!free_page_is_ours(buf)) { return 0; }
   var off: int32 = free_cell_off(buf, i);

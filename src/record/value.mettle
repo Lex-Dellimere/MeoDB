@@ -1,8 +1,8 @@
 // record/value: the one in-memory value type every layer above storage shares.
 //
 // A MeoValue is a tagged scalar: `type` is a MEO_T_* tag and says which field
-// is meaningful. The tags are also the on-disk record tags (DECISIONS.md D3)
-// and the public column types (D8), so their numbers are frozen.
+// is meaningful. The tags are also the on-disk record tags and the public
+// column types, so their numbers are frozen.
 //
 //   MEO_T_NULL  nothing else is read
 //   MEO_T_INT   i

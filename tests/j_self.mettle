@@ -1,4 +1,4 @@
-// j_self: the write chokepoint (PHASE3.md 3A).
+// j_self: the write chokepoint.
 //
 // A program, not @test functions: every case needs real files in build/ and a
 // pager, neither of which the compile-time interpreter provides.
@@ -14,7 +14,7 @@
 //   j1_eviction_writeback  a dirty page evicted by cache pressure grows
 //                          meo_pager_write_count. Catches an eviction path that
 //                          still calls meo_file_write_at directly, which a
-//                          journal added in 3B would never see.
+//                          journal would never see.
 //   j2_flush               a flush grows meo_pager_write_count, and a flush with
 //                          nothing dirty does not. Catches a flush that bypasses
 //                          the chokepoint, and a counter that counts syncs
@@ -111,7 +111,7 @@ fn j1_eviction_writeback() -> int32 {
     return 1;
   }
   // The regression: an eviction that writes the page itself leaves the counter
-  // at zero, and 3B's journal would never see the before-image.
+  // at zero, and the journal would never see the before-image.
   if (!meo_t_check(meo_pager_write_count(p) > 0, "j1: the eviction write-back took the chokepoint")) {
     return 1;
   }

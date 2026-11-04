@@ -1,6 +1,6 @@
 // s0 self-test: the error-code contract. Pure, no files.
 //
-// Every code in PHASE1.md section 2 must map to its fixed name and be
+// Every status code must map to its fixed name and be
 // non-ok except MEO_OK, including through the negative form meo_* functions
 // return. meo_status_str must produce the documented lowercase form and
 // allocate exactly one string per call.
@@ -49,7 +49,7 @@ fn s0_scan_cases() -> int32 {
   ];
   for i in 0..13 {
     var c: int32 = cases[i].code;
-    // Values are pinned by PHASE1.md; this is what later stages rely on.
+    // Values are frozen; this is what later stages rely on.
     if (c != i) { failures += 1; }
     if (!s0_str_eq(meo_status_name(c), cases[i].name)) { failures += 1; }
     if (c == MEO_OK) {

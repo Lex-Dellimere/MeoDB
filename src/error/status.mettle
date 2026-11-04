@@ -1,7 +1,7 @@
 // error/status: the single status-code contract.
 //
-// Codes 1..12 are fixed by PHASE1.md section 2; 13..18 were appended for the
-// tables and queries (.apex/DECISIONS.md D8), 19..21 for the network server.
+// Codes 1..12 are the storage core's; 13..18 were appended for the tables and
+// queries, 19..21 for the network server.
 // The set is APPEND-ONLY: a new code takes the next free number, and no
 // existing code is ever removed, renumbered or reordered, because on-disk/API
 // compatibility and the flux_orm RC mapping depend on the numbers. Every meo_*
@@ -93,7 +93,7 @@ export fn meo_status_name(code: int32) -> string {
   return "UNKNOWN";
 }
 
-// Success in the UNIVERSAL return convention of PHASE1.md section 1: any
+// Success in the universal return convention: any
 // non-negative return is a success, whether it is MEO_OK (0), a byte count from
 // a read, a page count, or the cell offset meo_page_alloc returns. A failure is
 // the negative form, -MEO_ERR_*.

@@ -1,4 +1,4 @@
-// db/flags: the public flag and step-result constants (DECISIONS.md D8).
+// db/flags: the public flag and step-result constants.
 //
 // They sit in their own module so that db/, query/ and every consumer can name
 // them without pulling in the engine. The open and transaction values equal
@@ -7,7 +7,7 @@
 //
 // meo_db_open flags: MEO_OPEN_READ 1, MEO_OPEN_WRITE 2, MEO_OPEN_CREATE 4 are
 // NOT defined here. platform/file already exports them with exactly these
-// values (PHASE1.md 5.3), and Mettle rejects a second export of the same name
+// values, and Mettle rejects a second export of the same name
 // anywhere in one import graph (E0003). platform/file holds only a struct and
 // constants and imports nothing, so importing it re-exports the flags to every
 // importer of db/flags at no cost. db/db passes them straight to the pager.

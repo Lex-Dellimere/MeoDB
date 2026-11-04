@@ -1,4 +1,4 @@
-// journal_self: the rollback journal and recovery (PHASE3.md 3B/3C).
+// journal_self: the rollback journal and recovery.
 //
 // A program, not @test functions: every case needs real files in build/ and a
 // pager, neither of which the compile-time interpreter provides.

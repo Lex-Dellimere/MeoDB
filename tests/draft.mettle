@@ -44,7 +44,7 @@ fn dr_table(db: MeoDb*) -> MeoTable* {
   return meo_cat_find(db->cat, nm.chars, 1);
 }
 
-// Every separator of the (inner) root is at most 8 bytes: D2's truncation.
+// Every separator of the (inner) root is at most 8 bytes: separator truncation.
 fn dr_root_keys_ok(db: MeoDb*, root: uint32) -> int32 {
   var f: MeoFrame* = meo_pager_get(db->pager, root, false);
   if (f == 0) { return -1; }

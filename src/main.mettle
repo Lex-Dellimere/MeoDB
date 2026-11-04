@@ -150,7 +150,7 @@ fn main() -> int32 {
   meo_pager_free(ro);
 
   // b-tree: 1000 keys inserted through the pager, the root stored in the meta,
-  // closed, reopened and walked ascending. This is the phase-2D shape the
+  // closed, reopened and walked ascending. This is the shape the
   // storage layer serves: the tree keeps its root where the caller puts it
   // (meta.btree_root) and takes its ordering from the caller's comparator --
   // btree/ does not import types/key.mettle, this entry does.

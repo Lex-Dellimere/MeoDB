@@ -1,4 +1,4 @@
-// phase2: the phase-2 gate -- the whole stack in one run (PHASE2.md, I1..I4).
+// phase2: the phase-2 gate -- the whole stack in one run (cases I1..I4).
 //
 // A program, not @test functions: it needs real files in build/, a pager and
 // page-sized buffers, none of which the compile-time interpreter provides.
@@ -34,13 +34,13 @@
 //   I4  corruption: a single flipped byte in a leaf cell's length prefix,
 //       reopened, and a seek into that leaf must answer -MEO_ERR_CORRUPT rather
 //       than a wrong row. Two shapes: the prefix flipped together with a
-//       repaired checksum (only PHASE2.md 2A's extent rules can catch it --
-//       this is the case that proves 2A paid for itself), and the bare flip
-//       whose checksum no longer matches (the phase-1 integrity layer).
+//       repaired checksum (only the cell-extent rules can catch it), and the
+//       bare flip whose checksum no longer matches (the phase-1 integrity
+//       layer).
 //
 // Every case names the bug it catches, and each was watched failing under a
 // deliberate mutation of src/ bounded by `timeout 15`, with the mutant
-// reverted and hash-checked immediately; the record is in PHASE2-RESULT.md.
+// reverted and hash-checked immediately.
 
 import "std/io";
 import "std/mem";
@@ -123,7 +123,7 @@ fn p2_pass(name: string) {
   println("PASS {name}");
 }
 
-// Frames the pager currently has pinned. PHASE2.md 2D's cursor contract is
+// Frames the pager currently has pinned. The cursor contract is
 // "exactly one leaf frame at a time", and the pin count is the only observable
 // form of it: a leak is invisible until the frame table runs out.
 fn p2_pins(p: MeoPager*) -> int32 {
@@ -741,8 +741,8 @@ fn p2_i3() -> int32 {
   }
   meo_pager_free(p);
 
-  // Reopen: the freelist is on disk, not in memory. PHASE2.md 2C's E4 property,
-  // checked here at the seam the tree cares about.
+  // Reopen: the freelist is on disk, not in memory. The freelist
+  // suite's reopen property, checked here at the seam the tree cares about.
   var q: MeoPager* = meo_pager_open(P2_FREE, P2_FRAMES, 0);
   if (!meo_t_check(q != 0, "I3: reopen")) { return 1; }
   if (!meo_t_check_i64(meo_free_init(q), MEO_OK,
@@ -798,7 +798,7 @@ fn p2_i3() -> int32 {
     return 1;
   }
   // The tree the frees destroyed is not reclaimed, only the pages that were
-  // handed back are. Phase 2 has no delete and no page walker (PHASE2.md 2F),
+  // handed back are. Phase 2 has no delete and no page walker,
   // so the old root is still a live b-tree page in this file; saying so keeps
   // the "known gap" in the gate report checkable instead of narrated.
   var stale: MeoFrame* = meo_pager_get(q, root, false);
@@ -809,7 +809,7 @@ fn p2_i3() -> int32 {
   }
   if (!meo_t_check_i64((int64)meo_page_type(stale->data),
       (int64)MEO_PAGE_BTREE_INNER,
-      "I3: the discarded root stays allocated (no delete, PHASE2.md 2F)")) {
+      "I3: the discarded root stays allocated")) {
     meo_pager_release(q, stale, false);
     meo_pager_close(q);
     meo_pager_free(q);
@@ -845,9 +845,9 @@ fn p2_i3() -> int32 {
 
 // Case A: the length prefix is lengthened so cell 1's extent runs into cell 0's
 // prefix, and the page is resealed. The checksum therefore agrees with the
-// corrupted bytes -- meo_page_verify passes -- and only PHASE2.md 2A's extent
-// rules can refuse it. Without them the leaf's search reads keys of the wrong
-// length and answers a wrong row, which is the corruption class 2A exists for.
+// corrupted bytes -- meo_page_verify passes -- and only the cell-extent rules
+// can refuse it. Without them the leaf's search reads keys of the wrong length
+// and answers a wrong row, which is the corruption class those rules exist for.
 fn p2_i4_extent() -> int32 {
   var order: int32[] = new int32[P2_I4_KEYS];
   if (!meo_t_check(order.data != 0, "I4a: order buffer")) { return 1; }

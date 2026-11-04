@@ -1,10 +1,10 @@
 // btree/btree: one b-tree for tables and indexes.
 //
-// PHASE2.md section 2D. The trees share everything: a tree is a root page
-// number (the caller keeps it in meta.btree_root or the catalog), leaf cells
-// carry (key, rowid), inner cells carry (key, left_child), and the key order is
-// whatever comparator the caller passes in. This module therefore does NOT
-// import src/types/ -- the encoding and the comparison are the caller's
+// The trees share everything: a tree is a root page number (the caller keeps
+// it in meta.btree_root or the catalog), leaf cells carry (key, rowid), inner
+// cells carry (key, left_child), and the key order is whatever comparator
+// the caller passes in. This module therefore does NOT import src/types/ --
+// the encoding and the comparison are the caller's
 // (format/page.mettle owns the page, btree/node.mettle owns the cell bytes).
 //
 // Shape of a node (btree/node.mettle has the byte-level detail):
@@ -20,10 +20,10 @@
 // PINNING. The pager's frame table is the only record of who owns a buffer, so
 // every frame this module holds is pinned, and a cursor pins exactly ONE leaf
 // frame at a time: meo_bt_next releases the current leaf before it pins the next
-// (PHASE2.md 2D), and meo_bt_close always releases. An insert never holds more
+// and meo_bt_close always releases. An insert never holds more
 // than three frames (a node, its new sibling, and the parent it is inserting
 // into), so it works with n_frames = 8 while splits are forcing eviction and
-// write-back -- which is exactly what PHASE2.md 2E's E6 measures.
+// write-back.
 //
 // KNOWN GAP, deliberately not hidden: there is no merge and no rebalance. A
 // node that a split left underfull stays underfull, and delete only removes the
@@ -40,7 +40,7 @@
 // DEPTH. A root-to-leaf chain may be at most MEO_BT_MAX_DEPTH levels, the leaf
 // included, because MeoBtCursor describes a position with a 16-entry path. A
 // seventeenth level is -MEO_ERR_CORRUPT, never a write past the end of the path
-// (PHASE2.md 2D; E7 is the test).
+// (test b5_e7 in tests/btree_self.mettle).
 //
 // Return convention: MEO_OK / a count is success, -MEO_ERR_* is failure.
 // meo_bt_lookup answers MEO_OK (found, rowid written) or 1 (absent); meo_bt_seek
@@ -146,7 +146,7 @@ fn bt_seek_leaf(p: MeoPager*, c: MeoBtCursor*, root: uint32,
   while (true) {
     if (level >= MEO_BT_MAX_DEPTH) {
       // A chain deeper than the cursor can describe. Refuse it; do not write
-      // past path[15] and do not recurse into it (PHASE2.md 2D, E7).
+      // past path[15] and do not recurse into it.
       return -MEO_ERR_CORRUPT;
     }
     var rc: int32 = MEO_OK;
@@ -234,7 +234,7 @@ fn bt_successor(p: MeoPager*, c: MeoBtCursor*, level_out: int32*,
 
 // Release the cursor's leaf and position it on the leftmost leaf under `page`
 // at `level`. The release happens BEFORE the next pin: one leaf frame at a
-// time is the cursor's contract (PHASE2.md 2D).
+// time is the cursor's contract.
 fn bt_move_to(p: MeoPager*, c: MeoBtCursor*, level: int32,
     page: uint32) -> int32 {
   if (c->leaf != 0) {
@@ -297,7 +297,7 @@ fn bt_descend_right(p: MeoPager*, c: MeoBtCursor*, level: int32,
   return -MEO_ERR_CORRUPT;
 }
 
-// --- public API (PHASE2.md 2D) ---------------------------------------------
+// --- public API -------------------------------------------------------------
 
 // Reset a cursor to "holds nothing". Call this once on a fresh MeoBtCursor
 // before its first meo_bt_seek; after that the cursor is reused through
@@ -414,7 +414,7 @@ export fn meo_bt_lookup(p: MeoPager*, root: uint32,
 }
 
 // Insert `key` with `rowid`. An existing key takes the new rowid and the call
-// still answers MEO_OK (PHASE2.md 2D). When a split reaches the root, the new
+// still answers MEO_OK. When a split reaches the root, the new
 // root page number is written through root* and the CALLER must store it in the
 // meta/catalog and flush: the tree cannot write a root it does not own.
 //
@@ -429,9 +429,10 @@ export fn meo_bt_insert(p: MeoPager*, root: uint32*,
   return bt_insert_impl(p, root, cmp_cb, key, rowid, 0);
 }
 
-// meo_bt_insert, but a leaf split copies at most sep_max key bytes up (D2;
-// 0 = whole key). Only for a comparator decided by the first sep_max bytes
-// (meo_tbl_cmp); a prefix-ordered comparator like meo_key_compare must pass 0.
+// meo_bt_insert, but a leaf split copies at most sep_max key bytes up (0 =
+// whole key), keeping separators short. Only for a comparator decided by the
+// first sep_max bytes (meo_tbl_cmp); a prefix-ordered comparator like
+// meo_key_compare must pass 0.
 export fn meo_bt_insert_sep(p: MeoPager*, root: uint32*,
     cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey,
     rowid: uint64, sep_max: int32) -> int32 {
@@ -575,7 +576,7 @@ fn bt_insert_impl(p: MeoPager*, root: uint32*,
   // fence order and a later descent would not find it.
   c.slot_in_leaf = at;
 
-  // Keys are unique (PHASE2.md 2D): an existing key replaces its rowid. The
+  // Keys are unique: an existing key replaces its rowid. The
   // body length is unchanged, so the cell does not move.
   if (at < n && cmp_cb(meo_btn_leaf_key_ptr(c.leaf->data, at),
       meo_btn_leaf_key_len(c.leaf->data, at), key.data, key.len) == 0) {
@@ -599,7 +600,7 @@ fn bt_insert_impl(p: MeoPager*, root: uint32*,
   }
 
   // A split here would carry a separator toward the root, and a split of the
-  // root would build a seventeenth level. PHASE2.md 2D caps a chain at
+  // root would build a seventeenth level. The cursor caps a chain at
   // MEO_BT_MAX_DEPTH levels, the leaf included, and every reader (bt_seek_leaf,
   // bt_descend_left) refuses a deeper one: writing it would let this insert
   // answer MEO_OK and leave the tree unreadable. Refuse BEFORE the sibling

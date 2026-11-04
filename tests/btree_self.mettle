@@ -1,4 +1,4 @@
-// btree_self: the phase-2D b-tree suite (PHASE2.md sections 2D and 2E).
+// btree_self: the b-tree suite.
 //
 // A program, not @test functions: every case needs real files in build/, a
 // pager and page-sized buffers, none of which the compile-time interpreter
@@ -23,12 +23,12 @@
 //   b2_root_split      enough keys to split leaves and then the root. Catches a
 //                      split that loses a key, a root that is never replaced
 //                      through root*, and a scan that walks off the last leaf.
-//   b3_e5              PHASE2.md 2E E5: 1000 keys in pseudo-random order at
+//   b3_e5              1000 keys in pseudo-random order at
 //                      n_frames = 256, look every one up, then seek and walk
 //                      asserting ascending order and exactly 1000 rows. Every
 //                      key is then re-inserted and the walk repeats: a rewrite
 //                      must replace, not add a second row (unique keys).
-//   b4_e6              PHASE2.md 2E E6: 1000 inserts with n_frames = 8, so the
+//   b4_e6              1000 inserts with n_frames = 8, so the
 //                      tree has far more pages than the cache and splits force
 //                      eviction and write-back, then flush, close, reopen and
 //                      walk comparing every key. Catches a split whose write is
@@ -40,7 +40,7 @@
 //                      Catches an inner split that keeps the moved key, drops a
 //                      child pointer, or leaves an outer separator naming a key
 //                      its subtree no longer starts at.
-//   b5_e7              PHASE2.md 2E E7: a root-to-leaf chain at the depth cap is
+//   b5_e7              a root-to-leaf chain at the depth cap is
 //                      walked; one level deeper is -MEO_ERR_CORRUPT for lookup,
 //                      insert and seek, not a crash or a stack overflow. A FULL
 //                      16-level chain also refuses the insert whose split would
@@ -122,7 +122,7 @@ fn b_pass(name: string) {
   println("PASS {name}");
 }
 
-// Frames the pager currently has pinned. The cursor contract (PHASE2.md 2D) is
+// Frames the pager currently has pinned. The cursor contract is
 // "exactly one leaf frame at a time", and the pin count is the only observable
 // form of it: a leaked pin is invisible until the frame table runs out.
 fn b_pins(p: MeoPager*) -> int32 {
@@ -250,7 +250,7 @@ fn b_scan(p: MeoPager*, root: uint32, first: int64, expect: int32,
 
 // Insert one key of a tree of integer keys: the encoding is types/key.mettle's,
 // the ordering the tree uses is meo_key_compare, passed in as a parameter
-// because btree/ must not import types/ (PHASE2.md 2D).
+// because btree/ must not import types/.
 fn b_insert(p: MeoPager*, root: uint32*, v: int64, rowid: uint64,
     klen: int32, label: string) -> int32 {
   var kb: uint8[B_WIDE];
@@ -523,7 +523,7 @@ fn b3_e5() -> int32 {
   if (b_scan(p, root, 0, B_E5_KEYS, (int64)B_ROWID_BASE, B_KEY, "b3") != 0) {
     return 1;
   }
-  // Uniqueness (PHASE2.md 2D): a second insert of an existing key replaces its
+  // Uniqueness: a second insert of an existing key replaces its
   // rowid and adds no row. Some of these keys are inner separators, so this is
   // the assertion that catches a descent taking the LEFT child on a key equal
   // to the separator: that writes the duplicate into the left subtree while the
@@ -850,7 +850,7 @@ fn b5_e7() -> int32 {
   var kk: MeoBtKey = { data: &kb[0], len: meo_key_int(&kb[0], 16, 5) };
   var rid: uint64 = 0;
 
-  // The depths here are the literals PHASE2.md 2D names, not the constant: a
+  // The depths here are literals, not the constant: a
   // test written in terms of MEO_BT_MAX_DEPTH would move with it, so a cap of 15
   // would still pass. The cursor's path array holds 16 page numbers and 16 is
   // the number the contract names, so 16 levels must work and 17 must not.

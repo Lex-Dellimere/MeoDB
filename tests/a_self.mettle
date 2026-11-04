@@ -280,7 +280,7 @@ fn a_page_header() -> int32 {
     z += 1;
   }
 
-  // Raw header bytes at the section 3.1 offsets, not just accessor output.
+  // Raw header bytes at their fixed offsets, not just accessor output.
   meo_page_init(p, MEO_PAGE_BTREE_LEAF);
   if (p[0] != 2) { return a_fail("page: raw type offset 0"); }
   if (p[1] != 0) { return a_fail("page: raw flags offset 1"); }
@@ -345,7 +345,7 @@ fn a_page_cells() -> int32 {
   if (meo_page_init(p, MEO_PAGE_BTREE_LEAF) != MEO_OK) { return a_fail("page: init cells"); }
 
   var sizes: int32[5] = [1, 7, 2, 33, 64];
-  // Each cell also takes a two-byte length prefix (PHASE2.md 2A), so the
+  // Each cell also takes a two-byte length prefix, so the
   // bodies start 2 bytes lower per cell than the phase-1 packing did.
   var want: int32[5] = [4095, 4086, 4082, 4047, 3981];
   var offs: int32[5];
@@ -478,7 +478,7 @@ fn a_page_check_rejects() -> int32 {
   meo_put_u16le(p, 16, (uint16)4096);
   if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: pointer past page"); }
   // 9/10. a body may not start below free_end, which is free_end + 2 now that
-  // every cell carries its length prefix (PHASE2.md 2A).
+  // every cell carries its length prefix.
   meo_put_u16le(p, 16, (uint16)4094);
   if (meo_page_check(p) != -MEO_ERR_CORRUPT) { return a_fail("check: body in gap"); }
   meo_put_u16le(p, 16, (uint16)4095);
@@ -537,7 +537,7 @@ fn a_page_free_defrag() -> int32 {
     return a_fail("page: reclaimable counts the dead extent");
   }
 
-  // Defrag reclaims the interior hole too (PHASE2.md 2A): the 4-byte cell
+  // Defrag reclaims the interior hole too: the 4-byte cell
   // moves from 4080 to 4089 so the page is packed against the end.
   if (meo_page_defrag(p) != MEO_OK) { return a_fail("page: defrag middle"); }
   if (meo_page_free_end(p) != 4087) { return a_fail("page: defrag reclaimed the hole"); }
@@ -579,7 +579,7 @@ fn a_page_free_defrag() -> int32 {
 
   // A full page -- one live cell whose body fills everything above its
   // pointer, so free_start == free_end == 18 and free_bytes is 0 -- defrags to
-  // itself: MEO_OK, not one byte moved (PHASE1.md section 7).
+  // itself: MEO_OK, not one byte moved.
   var snap: uint8* = malloc((int64)MEO_PAGE_SIZE);
   if (snap == 0) { return a_fail("page: malloc full snapshot"); }
   defer free(snap);
@@ -602,7 +602,7 @@ fn a_page_free_defrag() -> int32 {
   return 0;
 }
 
-// --- PHASE2.md 2A: cell extents (test E1) ------------------------------------
+// --- cell extents (test E1) --------------------------------------------------
 
 // Every cell says how long it is, and defrag reclaims EVERY hole, not only the
 // tail below the newest cell. The bug this catches: a defrag that reclaims the
@@ -710,7 +710,7 @@ fn a_page_extents() -> int32 {
   return 0;
 }
 
-// --- PHASE2.md 2A: overlapping cells (test E2) ------------------------------
+// --- overlapping cells (test E2) --------------------------------------------
 
 // No cell's extent [off - 2, off + len) may cross another's. The bug this
 // catches: a meo_page_check that only compares offsets, so a page whose cells
@@ -877,8 +877,8 @@ fn a_meta() -> int32 {
 
   // A real phase-1 file carries version 1. Its body fields sit at the same
   // offsets and its page is structurally sound, so the version check alone
-  // stops a phase-2 decoder from reading phase-1 cell pointers (PHASE2.md
-  // section 2A: refused rather than misread).
+  // stops a phase-2 decoder from reading phase-1 cell pointers (refused
+  // rather than misread).
   var v1: MeoMeta = a_meta_base();
   v1.version = 1;
   meo_meta_write(p, v1);

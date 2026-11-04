@@ -1,4 +1,4 @@
-// freelist_self: the phase-2C freelist suite (PHASE2.md sections 2C and 2E).
+// freelist_self: the freelist suite.
 //
 // A program, not @test functions: every case needs real files in build/ and a
 // pager, neither of which the compile-time interpreter provides.
@@ -35,14 +35,13 @@
 //                      page. Catches a lost next pointer, an empty head that is
 //                      dropped from the chain without being reused, and a head
 //                      page that leaks the bytes of its own popped cells.
-//   f5_e4_reopen       PHASE2.md 2E E4: take 5, free 3, close, reopen,
+//   f5_e4_reopen       take 5, free 3, close, reopen,
 //                      meo_free_count == 3, then the three pages come back LIFO.
 //                      Catches a freelist that is in-memory only or that loses
 //                      its root across close/reopen.
 //
-// Every case was watched failing under a deliberate mutation; the mutants,
-// their observed first failure and the revert are recorded in
-// notes/05-mutation-watch.md.
+// Every case was watched failing under a deliberate mutation of the code it
+// tests.
 
 import "../src/error/status.mettle";
 import "../src/format/bytes.mettle";
@@ -159,7 +158,7 @@ fn f1_page_format() -> int32 {
     return 1;
   }
 
-  // Push order 9, 4, 7; pop order must be 7, 4, 9 (PHASE2.md 2E E4's LIFO).
+  // Push order 9, 4, 7; pop order must be 7, 4, 9 (LIFO).
   if (!meo_t_check_i64(meo_free_page_push(buf, 9), MEO_OK, "f1: push 9")) {
     return 1;
   }
@@ -289,7 +288,7 @@ fn f1_page_format() -> int32 {
   // The space leak that no count assertion can see: every pop leaves its
   // [len][body] extent where it is, so a filled-then-drained page reports FULL
   // with ~3054 bytes of its own holes reclaimable, and the pager answers FULL
-  // by adding a chain page to the file. PHASE2.md 2A's rule is what the push
+  // by adding a chain page to the file. The defrag rule is what the push
   // uses, so a refill must reach the same capacity as the first fill instead of
   // stranding the page after 127 pushes.
   pushed = 0;
@@ -697,7 +696,7 @@ fn f3_free_errors() -> int32 {
   meo_pager_free(c);
 
   // A page the caller still has pinned is refused: the alloc that reuses it
-  // zeroes the buffer the stale frame pointer still names (PHASE2.md 2C).
+  // zeroes the buffer the stale frame pointer still names.
   if (!meo_t_check_i64(f_reset(F_CORRUPT), MEO_OK, "f3: reset the pinned case")) {
     return 1;
   }
@@ -944,7 +943,7 @@ fn f4_chain_growth() -> int32 {
   return 0;
 }
 
-// --- f5: PHASE2.md 2E E4 --------------------------------------------------
+// --- f5: freelist survives reopen ------------------------------------------
 
 fn f5_e4_reopen() -> int32 {
   if (!meo_t_check_i64(f_reset(F_E4), MEO_OK, "e4: reset")) { return 1; }

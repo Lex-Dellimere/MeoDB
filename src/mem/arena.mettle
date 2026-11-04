@@ -1,5 +1,5 @@
 // mem/arena: bump-pointer scratch memory for one statement's worth of
-// temporary allocations (PHASE1.md 5.2).
+// temporary allocations.
 //
 // There is no per-object free and no thread safety. An arena is owned by one
 // statement at a time: allocate freely, then meo_arena_free the whole thing,

@@ -1,4 +1,4 @@
-// key_self: the key encoding's own tests -- PHASE2.md 2B and E3.
+// key_self: the key encoding's own tests.
 //
 // The b-tree sorts keys with meo_key_compare, a byte comparison, so these cases
 // assert byte order and exact bytes, not just that an encoding round-trips: an
@@ -12,7 +12,7 @@
 //                  bytes and not merely inferred from a comparison.
 //   k_text_order   "" < "a" < "ab" < "b", plus "ab" < "abc" and "A" < "a". A
 //                  comparator that compares lengths first puts "b" before
-//                  "ab", which is the bug E3 names.
+//                  "ab", which is the bug this case catches.
 //   k_tags         each field starts with its MEO_KEY_* tag, except the rowid,
 //                  which starts with its payload.
 //   k_composite    fields concatenate in index order: (1,5) < (1,6) < (2,0)

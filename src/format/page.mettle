@@ -1,17 +1,16 @@
 // format/page: the 16-byte page header, the dense cell-pointer array, the
 // free gap, sealing and the structural checks.
 //
-// PHASE1.md sections 3 and 5.7, amended by PHASE2.md section 2A (cell
-// extents, format version 2). Every function takes a raw pointer to
-// MEO_PAGE_SIZE bytes and never allocates. No struct is overlaid on a page:
-// fields are encoded and decoded at the offsets below, little-endian, through
-// format/bytes.mettle.
+// Format version 2: every cell carries its own length. Every function takes a
+// raw pointer to MEO_PAGE_SIZE bytes and never allocates. No struct is overlaid
+// on a page: fields are encoded and decoded at the offsets below,
+// little-endian, through format/bytes.mettle.
 //
-// Header (PHASE1.md section 3.1), fixed offsets, on every page:
+// Header, fixed offsets, on every page:
 //   0  type(1)  1 flags(1)  2 n_cells(u16)  4 cell_start(u16)
 //   6  free_start(u16)  8 free_end(u16)  10 reserved(u16)  12 crc32(u32)
 //
-// Cell region (PHASE2.md section 2A): every cell body is preceded by its own
+// Cell region: every cell body is preceded by its own
 // two-byte little-endian length, so a cell's extent is known without the
 // caller:
 //   ... | free gap | [len0][body0] [len1][body1] | end of page
@@ -26,7 +25,7 @@ import "../error/status.mettle";
 import "bytes.mettle";
 import "crc32.mettle";
 
-// --- constants (PHASE1.md section 2) ---------------------------------------
+// --- constants --------------------------------------------------------------
 
 export const MEO_PAGE_SIZE: int32 = 4096;
 export const MEO_PAGE_HDR: int32 = 16;
@@ -41,10 +40,10 @@ export const MEO_PAGE_OVERFLOW: int32 = 4;
 export const MEO_PAGE_FREELIST: int32 = 5;
 export const MEO_PAGE_COUNT_TYPES: int32 = 6; // meo_page_type must be < this
 
-// MEO_META_BODY belongs to the meta page's contract (PHASE1.md section 2 and
-// section 4) but is defined here because meo_page_init needs it and
-// format/meta.mettle imports this module for meo_page_seal: a cycle would be a
-// build error. There is exactly one definition of the value.
+// MEO_META_BODY belongs to the meta page's contract but is defined here because
+// meo_page_init needs it and format/meta.mettle imports this module for
+// meo_page_seal: a cycle would be a build error. There is exactly one
+// definition of the value.
 export const MEO_META_BODY: int32 = 128; // first free byte of the meta page
 
 // Header field offsets. Named once and used everywhere; never write a bare
@@ -61,7 +60,7 @@ const PAGE_OFF_CRC32: int32 = 12;
 // A u16 pointer array cannot exceed this many cells and still fit the page.
 const PAGE_MAX_CELLS: int32 = (MEO_PAGE_SIZE - MEO_PAGE_HDR) / 2;
 
-// Largest body a u16 length prefix can name (PHASE2.md section 2A: n <= 65533).
+// Largest body a u16 length prefix can name (n <= 65533).
 const PAGE_CELL_MAX_BODY: int32 = 65533;
 
 // A cell's length prefix sits immediately in front of its body.
@@ -126,10 +125,9 @@ export fn meo_page_init(p: uint8*, page_type: int32) -> int32 {
   return MEO_OK;
 }
 
-// Enforce the nine relationships in PHASE1.md section 3.2 plus the three
-// extent rules of PHASE2.md section 2A. Now that every cell carries its length
-// this can prove that no two cells overlap, which is the corruption class the
-// phase-1 format could only be surprised by.
+// Enforce the nine header relationships plus the three cell-extent rules. Now
+// that every cell carries its length this can prove that no two cells overlap,
+// which is the corruption class the phase-1 format could only be surprised by.
 export fn meo_page_check(p: uint8*) -> int32 {
   var t: int32 = meo_page_type(p);
   // 1. known page type.
@@ -215,8 +213,8 @@ export fn meo_page_verify(p: uint8*) -> int32 {
 
 // --- cells ------------------------------------------------------------------
 
-// Offset of cell i, or -1 when i is not a cell index. (This is a sentinel per
-// PHASE1.md section 5.7, not a MEO_ERR_* failure.)
+// Offset of cell i, or -1 when i is not a cell index. (This is a sentinel, not
+// a MEO_ERR_* failure.)
 export fn meo_page_cell_off(p: uint8*, i: int32) -> int32 {
   if (i < 0 || i >= meo_page_n_cells(p)) { return -1; }
   return (int32)meo_get_u16le(p, (int64)MEO_PAGE_HDR + 2 * (int64)i);
@@ -229,8 +227,8 @@ export fn meo_page_cell_ptr(p: uint8*, i: int32) -> uint8* {
   return p + (int64)off;
 }
 
-// Length of cell i's body, read from the u16 in front of it (PHASE2.md section
-// 2A). -1 when i is not a cell index, the same sentinel meo_page_cell_off uses.
+// Length of cell i's body, read from the u16 in front of it.
+// -1 when i is not a cell index, the same sentinel meo_page_cell_off uses.
 export fn meo_page_cell_len(p: uint8*, i: int32) -> int32 {
   var off: int32 = meo_page_cell_off(p, i);
   if (off < 0) { return -1; }
@@ -323,7 +321,7 @@ fn page_cell_move(p: uint8*, dst: int32, src: int32, n: int32) {
 // Reclaim EVERY hole: walk the cells in pointer order and copy each
 // [len][body] extent downward from MEO_PAGE_SIZE, rewriting the pointers. On a
 // page that is already compact nothing moves and the second call is a no-op,
-// so this is idempotent (PHASE2.md section 2A).
+// so this is idempotent.
 //
 // The loop reads cell i's offset before it rewrites pointer i, and offsets
 // descend in pointer order, so the repack keeps every pointer strictly
@@ -368,7 +366,7 @@ export fn meo_page_defrag(p: uint8*) -> int32 {
 
 // Free bytes plus the bytes the dead cells still occupy: the gap a defrag
 // would produce. A caller short of space defrags when
-// reclaimable >= needed + 2 and free_bytes < needed + 2 (PHASE2.md 2A).
+// reclaimable >= needed + 2 and free_bytes < needed + 2.
 export fn meo_page_reclaimable(p: uint8*) -> int32 {
   var n: int32 = meo_page_n_cells(p);
   var live: int32 = 0;

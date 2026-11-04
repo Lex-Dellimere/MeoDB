@@ -1,5 +1,5 @@
 // c_self: the pager's own tests -- frame table, hash, clock eviction, pin
-// accounting, allocation, flush order and the PHASE1.md section 7 boundary
+// accounting, allocation, flush order and the error-boundary
 // table. A program, not a @test: it needs real files, a 4096-byte page on the
 // heap and a predictable working directory. Run it from the repo root:
 //
@@ -18,7 +18,7 @@
 //   c_eviction    a pinned page is never evicted; BUSY; write-back on eviction
 //   c_alloc       every alloc'd page is 4096 zeroed bytes; page_count / size
 //   c_flush_plan  non-zero pages ascending, meta last, FULL, dirty_count
-//   c_boundaries  the pager-reachable rows of the PHASE1.md section 7 table
+//   c_boundaries  the pager-reachable rows of the error-boundary table
 //   c_max_pages   the MEO_MAX_PAGES cap is NOSPC and does not move page_count
 
 import "std/io";
@@ -262,7 +262,7 @@ fn c_lifecycle() -> int32 {
     return 1;
   }
   // A closed pager is not live: the second close is MEO_OK because `closed`
-  // says so, and nothing else may be done with the handle (PHASE1.md 6b.12).
+  // says so, and nothing else may be done with the handle.
   if (!c_ok(meo_pager_get(p, 0, false) == 0, "lifecycle: get on a closed pager is null")) {
     return 1;
   }
@@ -954,7 +954,7 @@ fn c_flush_plan() -> int32 {
 
 // --- the page-number hash --------------------------------------------------
 
-// No page may ever be in two frames (PHASE1.md section 6b.7). The table is open
+// No page may ever be in two frames. The table is open
 // addressed with index_cap 16 at 8 frames, so page numbers that differ by 16
 // share a probe cluster: page 1 sits at its home slot and page 17 sits one
 // probe further on. Evicting page 1 therefore has to re-seat page 17 -- a table
@@ -1092,7 +1092,7 @@ fn c_hash_cluster() -> int32 {
   return 0;
 }
 
-// --- the PHASE1.md section 7 boundary table --------------------------------
+// --- the error-boundary table -----------------------------------------------
 
 fn c_boundaries() -> int32 {
   // n_frames < MEO_MIN_FRAMES
@@ -1150,7 +1150,7 @@ fn c_boundaries() -> int32 {
 
   // bad magic. The CRC is broken in the same file on purpose: a foreign file
   // and a flipped byte at offset 16 both fail the checksum too, and both must
-  // still be reported as NOT_A_DB (PHASE1.md section 7, T6).
+  // still be reported as NOT_A_DB.
   if (!c_ok(c_reset(C_CORRUPT) == MEO_OK, "boundary: reset magic")) { return 1; }
   if (!c_ok(c_craft_page0(C_CORRUPT, 1, (uint32)0, MEO_FORMAT_VERSION, MEO_PAGE_SIZE, true) == MEO_OK, "boundary: craft bad magic")) {
     return 1;
@@ -1213,7 +1213,7 @@ fn c_boundaries() -> int32 {
   if (!c_ok(meo_pager_err_arg(p) == 1, "boundary: RANGE names the page")) {
     return 1;
   }
-  // free_page is real since PHASE2.md 2C: page 1 is not in this file yet
+  // free_page is real now: page 1 is not in this file yet
   // (page_count is 1), so it is out of range rather than unsupported.
   if (!c_ok(meo_pager_free_page(p, 1) == -MEO_ERR_RANGE, "boundary: freeing a page the file does not have is RANGE")) {
     return 1;

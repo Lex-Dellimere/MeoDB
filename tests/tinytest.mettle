@@ -1,6 +1,6 @@
 // tinytest: the reporting layer for the phase-1 integration suite.
 //
-// The phase-1 tests are programs, not @test functions (PHASE1.md section 8):
+// The phase-1 tests are programs, not @test functions:
 // they need real files, a 4096-byte page on the heap and a predictable working
 // directory, none of which the compile-time interpreter gives them. This module
 // is only the reporting half; tests/phase1.mettle owns the cases.

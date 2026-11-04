@@ -1,8 +1,8 @@
 // types/key: order-preserving key encoding for the b-tree.
 //
-// PHASE2.md 2B. A b-tree keeps keys sorted by comparing bytes
-// (meo_key_compare), so an encoded key must compare the way its value sorts
-// logically -- not merely round-trip. A signed int64 therefore cannot be
+// A b-tree keeps keys sorted by comparing bytes (meo_key_compare), so an
+// encoded key must compare the way its value sorts logically -- not merely
+// round-trip. A signed int64 therefore cannot be
 // stored as a plain big-endian uint64: that puts -1 at 0xFFFF...FF, above 0,
 // and puts every negative above every non-negative.
 //

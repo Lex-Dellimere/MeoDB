@@ -1,9 +1,9 @@
 // btree/node: what the bytes in a b-tree node cell mean.
 //
-// PHASE2.md section 2D. A node is a MEO_PAGE_BTREE_LEAF or a
-// MEO_PAGE_BTREE_INNER page; the header, the dense cell-pointer array, the u16
-// length prefix in front of every body and the free gap all belong to
-// format/page.mettle. This module owns only the cell layout:
+// A node is a MEO_PAGE_BTREE_LEAF or a MEO_PAGE_BTREE_INNER page; the header,
+// the dense cell-pointer array, the u16 length prefix in front of every body
+// and the free gap all belong to format/page.mettle. This module owns only the
+// cell layout:
 //
 //   inner cell:  [len:u16] [child:u32] [key bytes...]
 //   leaf  cell:  [len:u16] [key bytes...] [rowid:u64]
@@ -26,7 +26,7 @@
 //
 // Keys are opaque bytes here: ordering is the caller's comparator
 // (fn(uint8*, int32, uint8*, int32) -> int32) and this module must not import
-// src/types/ (PHASE2.md 2D).
+// src/types/: the b-tree stays independent of key encoding.
 //
 // No struct is overlaid on a page, nothing here allocates, and every
 // multi-byte read or write goes through format/bytes.mettle. The `src` argument

@@ -1,8 +1,8 @@
 // format/bytes: the single home of little-endian byte access.
 //
-// Nothing outside this module may index a uint8* to build or read a
-// multi-byte integer. PHASE1.md section 1: endianness is decided here and
-// nowhere else. Offsets are the caller's contract: no bounds checking.
+// Nothing outside this module may index a uint8* to build or read a multi-byte
+// integer: endianness is decided here and nowhere else. Offsets are the
+// caller's contract: no bounds checking.
 
 // Read a little-endian u16 at byte offset `off`.
 @inline export fn meo_get_u16le(p: uint8*, off: int64) -> uint16 {
