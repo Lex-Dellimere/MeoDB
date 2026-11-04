@@ -1,6 +1,642 @@
+// wal_pager_self: the pager in WAL mode, through the b-tree.
+//
+// A program, not @test functions: every case needs real files in build/, and
+// the crash cases fork. Run it with
+//
+//   mbuild run wal_pager_self
+//
+// It prints "PASS wal_pager_self" when every case passes and "FAIL W<n>: ..."
+// per failing check. Cases, each with the bug it exists to catch:
+//   W1  one transaction of 2,000 keys on a new WAL file spills uncommitted frames,
+//       leaves the db file alone, and reads back through the log.
+//   W2  a clean close checkpoints, fits the db file and deletes the log.
+//   W3  a process that commits and dies without closing: the log holds the
+//       commits, and a reopen replays them with page_count from the log.
+//   W4  rollback truncates the spilled frames; a later commit survives a reopen.
+//   W5  a process that spills and dies mid-transaction leaves nothing behind.
+//   W6  rollback -> WAL -> rollback conversions keep the data, bump commit_seq,
+//       and remove the log (also when the log still holds frames).
+//   W7  meo_peek_commit_seq follows the log, also with a damaged db page 0.
+//   W8  a PASSIVE checkpoint makes the db file hold exactly the pager's pages.
+//   W9  a read-only open replays the log and never writes it.
+//   W10 two async commits are both durable once the second ticket is waited on.
+//   W11 an autocommit flush, and a begin that owes one, each bump commit_seq.
+//   W12 a failed WAL fsync fails commit, begin and close; a reopen recovers.
+//   W13 schema_bump counts once per transaction in both modes.
+//
+// CRASH MECHANISM: raw fork (57) with no execve. The parent has no pager open at
+// the fork, so the child shares nothing with it but the files on disk; the child
+// ends with exit_group (231) and the parent reaps it with wait4 (61).
+
 import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/pager/wal.mettle";
+import "../src/pager/journal.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+import "tinytest.mettle";
+
+const WP_FRAMES: int32 = 16;
+const WP_PAGE: int64 = 4096;
+
+fn eq(a: int64, b: int64, name: string) -> bool {
+  return meo_t_check_i64(a, b, name);
+}
+
+// A failed open: report the pager's code (p is 0 here, so it is the open's).
+fn wp_nopen(name: string, p: MeoPager*) -> int32 {
+  println("FAIL {name}: open err {meo_pager_err(p)}");
+  return 1;
+}
+
+// --- file helpers -----------------------------------------------------------
+
+fn wp_unlink(path: string) {
+  meo_file_unlink(path);
+}
+
+// A fresh, empty database: no file contents, no journal, no log.
+fn wp_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  var wpath: string = db + "-wal";
+  wp_unlink(jpath);
+  wp_unlink(wpath);
+  free(jpath.chars);
+  free(wpath.chars);
+  return rc;
+}
+
+// Size of a file, -1 when it does not exist.
+fn wp_size(path: string) -> int64 {
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return -1; }
+  var n: int64 = meo_file_size(f);
+  meo_file_close(f);
+  return n;
+}
+
+fn wp_wal_size(db: string) -> int64 {
+  var wpath: string = db + "-wal";
+  var n: int64 = wp_size(wpath);
+  free(wpath.chars);
+  return n;
+}
+
+// The whole log, or 0 when there is none. The caller frees it.
+fn wp_wal_bytes(db: string, len: int64*) -> uint8* {
+  var wpath: string = db + "-wal";
+  var f: MeoFile = meo_file_open(wpath, MEO_OPEN_READ);
+  free(wpath.chars);
+  if (!f.is_open) { return 0; }
+  var n: int64 = meo_file_size(f);
+  var buf: uint8* = malloc(n + 1);
+  var got: int32 = meo_file_read_at(f, 0, buf, n);
+  meo_file_close(f);
+  *len = n;
+  if ((int64)got != n) {
+    free(buf);
+    return 0;
+  }
+  return buf;
+}
+
+// Flip one byte of the db file at `off`.
+fn wp_flip(db: string, off: int64) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var b: uint8[1];
+  var rc: int32 = meo_file_read_at(f, off, &b[0], 1);
+  if (rc == 1) {
+    b[0] = b[0] ^ (uint8)0x5A;
+    rc = meo_file_write_at(f, off, &b[0], 1);
+  } else {
+    rc = -MEO_ERR_IO;
+  }
+  if (rc == MEO_OK) { rc = meo_file_sync(f); }
+  meo_file_close(f);
+  return rc;
+}
+
+// --- tree helpers -----------------------------------------------------------
+
+fn wp_insert(p: MeoPager*, root: uint32*, k: int32) -> int32 {
+  var kb: uint8[16];
+  var kn: int32 = meo_key_int(&kb[0], 16, (int64)k);
+  var bk: MeoBtKey = { data: &kb[0], len: kn };
+  return meo_bt_insert(p, root, &meo_key_compare, bk, (uint64)k);
+}
+
+// Insert keys from..from+n-1 and point the btree root at the result.
+fn wp_fill(p: MeoPager*, from: int32, n: int32) -> int32 {
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var rc: int32 = MEO_OK;
+  var k: int32 = from;
+  while (k < from + n && rc == MEO_OK) {
+    rc = wp_insert(p, &root, k);
+    k += 1;
+  }
+  if (rc == MEO_OK) { rc = meo_pager_set_root(p, MEO_ROOT_BTREE, root); }
+  return rc;
+}
+
+// Walk from key 0 ascending; every row must be key i with rowid i. The number of
+// rows, or -1 after printing why.
+fn wp_walk(p: MeoPager*, tag: string) -> int64 {
+  var root: uint32 = meo_pager_root(p, MEO_ROOT_BTREE);
+  var kb: uint8[16];
+  var want_buf: uint8[16];
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var kn0: int32 = meo_key_int(&kb[0], 16, 0);
+  var k0: MeoBtKey = { data: &kb[0], len: kn0 };
+  var wrc: int32 = meo_bt_seek(p, &c, root, &meo_key_compare, k0);
+  var walked: int64 = 0;
+  while (wrc == 0) {
+    var wn: int32 = meo_key_int(&want_buf[0], 16, walked);
+    var got_len: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+    var got_ptr: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
+    if (got_len != wn || !meo_bytes_equal(got_ptr, &want_buf[0], (int64)wn)) {
+      println("FAIL {tag}: walk order at {walked}");
+      meo_bt_close(p, &c);
+      return -1;
+    }
+    var rid: uint64 = 0;
+    if (meo_bt_rowid(p, &c, &rid) != MEO_OK || rid != (uint64)walked) {
+      println("FAIL {tag}: walk rowid at {walked} = {(int64)rid}");
+      meo_bt_close(p, &c);
+      return -1;
+    }
+    walked += 1;
+    wrc = meo_bt_next(p, &c);
+  }
+  meo_bt_close(p, &c);
+  if (wrc < 0) {
+    println("FAIL {tag}: walk next {wrc}");
+    return -1;
+  }
+  return walked;
+}
+
+// Open, check the walk, close. The row count, or -1 after printing why.
+fn wp_reopen_walk(db: string, flags: int32, tag: string) -> int64 {
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, flags);
+  if (p == 0) {
+    println("FAIL {tag}: reopen err {meo_pager_err(p)}");
+    return -1;
+  }
+  var n: int64 = wp_walk(p, tag);
+  var rc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  if (rc != MEO_OK) {
+    println("FAIL {tag}: close rc {rc}");
+    return -1;
+  }
+  return n;
+}
+
+// A committed WAL-mode file of n keys, closed (so the log is gone).
+fn wp_build_wal(db: string, n: int32) -> int32 {
+  var rc: int32 = wp_reset(db);
+  if (rc != MEO_OK) { return rc; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_CREATE | MEO_PAGER_WAL);
+  if (p == 0) { return -MEO_ERR_IO; }
+  rc = meo_pager_begin(p);
+  if (rc == MEO_OK) { rc = wp_fill(p, 0, n); }
+  if (rc == MEO_OK) { rc = meo_pager_commit(p); }
+  var crc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  if (rc == MEO_OK) { rc = crc; }
+  return rc;
+}
+
+// --- crash child ------------------------------------------------------------
+
+// kind 1: commit keys from..from+n-1, then die without closing. kind 2: begin,
+// insert, flush (spilling frames), then die. Exit 0 means it got to the kill.
+fn wp_child(kind: int32, db: string, from: int32, n: int32) {
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (p == 0) { syscall(231, (int64)2); }
+  if (meo_pager_begin(p) != MEO_OK) { syscall(231, (int64)3); }
+  if (wp_fill(p, from, n) != MEO_OK) { syscall(231, (int64)4); }
+  if (kind == 1) {
+    if (meo_pager_commit(p) != MEO_OK) { syscall(231, (int64)5); }
+  } else {
+    if (meo_pager_flush(p) != MEO_OK) { syscall(231, (int64)6); }
+  }
+  syscall(231, (int64)0);
+}
+
+// Fork, run wp_child in the child, wait. The child's exit status, -1 on a fork
+// or wait failure, -2 when it died on a signal.
+fn wp_run_child(kind: int32, db: string, from: int32, n: int32) -> int32 {
+  var pid: int64 = syscall(57);
+  if (pid == 0) {
+    wp_child(kind, db, from, n);
+    syscall(231, (int64)99);
+  }
+  if (pid < 0) { return -1; }
+  var status: int32 = 0;
+  var w: int64 = syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  if (w < 0) { return -1; }
+  if ((status & 0x7F) != 0) { return -2; }
+  return (status >> 8) & 0xFF;
+}
+
+// --- cases ------------------------------------------------------------------
+
+const WP_DB: string = "build/wal_pager_self.dat";
+
+// W1 + W2: a big transaction on a new WAL file, then a clean close.
+fn w1_w2() -> int32 {
+  var db: string = WP_DB;
+  if (wp_reset(db) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_CREATE | MEO_PAGER_WAL);
+  if (p == 0) { return wp_nopen("W1: open", p); }
+  if (!meo_t_check(meo_pager_wal_mode(p), "W1: wal mode")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "W1: begin")) { return 1; }
+  if (!meo_t_check(meo_pager_in_tx(p), "W1: in tx")) { return 1; }
+  if (!eq(wp_fill(p, 0, 2000), 0, "W1: fill")) { return 1; }
+  if (!meo_t_check((int64)meo_pager_wal_frames(p) > (int64)meo_pager_wal_committed(p),
+      "W1: spills before commit")) { return 1; }
+  if (!eq((int64)meo_pager_wal_committed(p), 0, "W1: nothing committed yet")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W1: commit")) { return 1; }
+  if (!meo_t_check_false(meo_pager_in_tx(p), "W1: tx closed")) { return 1; }
+  if (!eq(wp_size(db), WP_PAGE, "W1: db file untouched")) { return 1; }
+  if (!meo_t_check(wp_wal_size(db) > 0, "W1: log exists")) { return 1; }
+  if (!eq(wp_walk(p, "W1"), 2000, "W1: walk")) { return 1; }
+  var pages: uint32 = meo_pager_page_count(p);
+  if (!eq(meo_pager_close(p), 0, "W2: close")) { return 1; }
+  meo_pager_free(p);
+  if (!eq(wp_wal_size(db), -1, "W2: log deleted")) { return 1; }
+  if (!eq(wp_size(db), (int64)pages * WP_PAGE, "W2: db size")) { return 1; }
+  var q: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_WAL);
+  if (q == 0) { return wp_nopen("W2: reopen", q); }
+  if (!meo_t_check(meo_pager_wal_mode(q), "W2: reopened in wal mode")) { return 1; }
+  var n: int64 = wp_walk(q, "W2");
+  meo_pager_close(q);
+  meo_pager_free(q);
+  if (!eq(n, 2000, "W2: walk")) { return 1; }
+  println("PASS W1 W2: 2,000 keys spilled and committed, log removed at close");
+  return 0;
+}
+
+// W3 + W4 + W5: crashes and rollback on the file W1/W2 left (2,000 keys).
+fn w3_w4_w5() -> int32 {
+  var db: string = WP_DB;
+  var st: int32 = wp_run_child(1, db, 2000, 500);
+  if (!eq(st, 0, "W3: child status")) { return 1; }
+  if (!meo_t_check(wp_wal_size(db) > 0, "W3: log present after the crash")) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (p == 0) { return wp_nopen("W3: reopen", p); }
+  if (!meo_t_check(meo_pager_wal_mode(p), "W3: wal mode kept")) { return 1; }
+  if (!eq(wp_walk(p, "W3"), 2500, "W3: walk")) { return 1; }
+  if (!meo_t_check((int64)meo_pager_page_count(p) * WP_PAGE > wp_size(db),
+      "W3: page_count comes from the log")) { return 1; }
+  println("PASS W3: 500 keys committed by a dead child replayed from the log");
+
+  // W4: rollback of a transaction that spilled.
+  if (!eq(meo_pager_begin(p), 0, "W4: begin")) { return 1; }
+  if (!eq(wp_fill(p, 2500, 4000), 0, "W4: fill")) { return 1; }
+  if (!meo_t_check(meo_pager_wal_frames(p) > meo_pager_wal_committed(p),
+      "W4: spills")) { return 1; }
+  if (!eq(meo_pager_rollback(p), 0, "W4: rollback")) { return 1; }
+  if (!eq(wp_walk(p, "W4"), 2500, "W4: walk after rollback")) { return 1; }
+  if (!eq((int64)meo_pager_wal_frames(p), (int64)meo_pager_wal_committed(p),
+      "W4: frames == committed")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "W4: begin 2")) { return 1; }
+  if (!eq(wp_fill(p, 2500, 10), 0, "W4: fill 10")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W4: commit")) { return 1; }
+  if (!eq(meo_pager_close(p), 0, "W4: close")) { return 1; }
+  meo_pager_free(p);
+  if (!eq(wp_reopen_walk(db, 0, "W4"), 2510, "W4: walk after reopen")) { return 1; }
+  println("PASS W4: rollback truncated the spills, the next commit survived a reopen");
+
+  // W5: a child that spills and dies.
+  st = wp_run_child(2, db, 2510, 1000);
+  if (!eq(st, 0, "W5: child status")) { return 1; }
+  if (!meo_t_check(wp_wal_size(db) > 0, "W5: log present after the crash")) { return 1; }
+  if (!eq(wp_reopen_walk(db, 0, "W5"), 2510, "W5: walk")) { return 1; }
+  println("PASS W5: frames of a dead transaction were not replayed");
+  return 0;
+}
+
+// W6: conversions between the two modes.
+fn w6() -> int32 {
+  var db: string = "build/wal_pager_w6.dat";
+  if (wp_reset(db) != MEO_OK) { return 1; }
+  // A rollback-mode file with 100 keys.
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_CREATE);
+  if (p == 0) { return wp_nopen("W6: open", p); }
+  if (!meo_t_check_false(meo_pager_wal_mode(p), "W6: rollback mode by default")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "W6: begin")) { return 1; }
+  if (!eq(wp_fill(p, 0, 100), 0, "W6: fill")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W6: commit")) { return 1; }
+  var seq0: uint64 = meo_pager_commit_seq(p);
+  meo_pager_close(p);
+  meo_pager_free(p);
+
+  // -> WAL
+  p = meo_pager_open(db, WP_FRAMES, MEO_PAGER_WAL);
+  if (p == 0) { return wp_nopen("W6: open wal", p); }
+  if (!meo_t_check(meo_pager_wal_mode(p), "W6: converted to wal")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(p), (int64)seq0 + 1, "W6: commit_seq + 1")) { return 1; }
+  if (!eq(wp_walk(p, "W6"), 100, "W6: keys intact")) { return 1; }
+  if (!eq(meo_pager_close(p), 0, "W6: close")) { return 1; }
+  meo_pager_free(p);
+  if (!eq(wp_wal_size(db), -1, "W6: no log")) { return 1; }
+
+  // -> rollback
+  p = meo_pager_open(db, WP_FRAMES, MEO_PAGER_NO_WAL);
+  if (p == 0) { return wp_nopen("W6: open no_wal", p); }
+  if (!meo_t_check_false(meo_pager_wal_mode(p), "W6: converted back")) { return 1; }
+  if (!eq(wp_walk(p, "W6"), 100, "W6: keys intact after")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "W6: journal begin")) { return 1; }
+  if (!meo_t_check(meo_pager_journal_attached(p), "W6: journal in use")) { return 1; }
+  if (!eq(wp_fill(p, 100, 1), 0, "W6: fill 1")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W6: journal commit")) { return 1; }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (!eq(wp_wal_size(db), -1, "W6: still no log")) { return 1; }
+  if (!eq(wp_reopen_walk(db, 0, "W6"), 101, "W6: walk 101")) { return 1; }
+
+  // A log that still holds frames: a child commits in WAL mode and dies, then
+  // the file is opened as rollback mode.
+  p = meo_pager_open(db, WP_FRAMES, MEO_PAGER_WAL);
+  if (p == 0) { return wp_nopen("W6: open wal 2", p); }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (!eq(wp_run_child(1, db, 101, 400), 0, "W6: child")) { return 1; }
+  if (!meo_t_check(wp_wal_size(db) > 0, "W6: log has frames")) { return 1; }
+  p = meo_pager_open(db, WP_FRAMES, MEO_PAGER_NO_WAL);
+  if (p == 0) { return wp_nopen("W6: open no_wal 2", p); }
+  if (!meo_t_check_false(meo_pager_wal_mode(p), "W6: rollback after crash")) { return 1; }
+  if (!eq(wp_walk(p, "W6"), 501, "W6: keys of the log kept")) { return 1; }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (!eq(wp_wal_size(db), -1, "W6: log deleted by the conversion")) { return 1; }
+  if (!eq(wp_reopen_walk(db, 0, "W6"), 501, "W6: walk 501")) { return 1; }
+
+  // Both flags together are a usage error.
+  p = meo_pager_open(db, WP_FRAMES, MEO_PAGER_WAL | MEO_PAGER_NO_WAL);
+  if (!meo_t_check(p == 0, "W6: both flags refused")) { return 1; }
+  if (!eq(meo_pager_err(p), MEO_ERR_USAGE, "W6: usage code")) { return 1; }
+  println("PASS W6: rollback -> WAL -> rollback kept 501 keys, logs removed");
+  return 0;
+}
+
+// W7: peek follows the log.
+fn w7() -> int32 {
+  var db: string = "build/wal_pager_w7.dat";
+  if (wp_build_wal(db, 100) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (p == 0) { return wp_nopen("W7: open", p); }
+  if (!eq(meo_pager_begin(p), 0, "W7: begin")) { return 1; }
+  if (!eq(wp_fill(p, 100, 50), 0, "W7: fill")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W7: commit")) { return 1; }
+  var want: uint64 = meo_pager_commit_seq(p);
+  var got: uint64 = 0;
+  if (!eq(meo_peek_commit_seq(db, &got), MEO_OK, "W7: peek")) { return 1; }
+  if (!eq((int64)got, (int64)want, "W7: peek == commit_seq (unbackfilled)")) { return 1; }
+  if (!eq((int64)meo_pager_wal_backfilled(p), 0, "W7: nothing backfilled")) { return 1; }
+
+  // The db file's page 0 is stale; damage it. The log still has the truth.
+  if (!eq(wp_flip(db, 200), MEO_OK, "W7: flip")) { return 1; }
+  got = 0;
+  if (!eq(meo_peek_commit_seq(db, &got), MEO_OK, "W7: peek with a bad db page 0")) { return 1; }
+  if (!eq((int64)got, (int64)want, "W7: peek from the log")) { return 1; }
+
+  if (!eq(meo_pager_checkpoint(p, MEO_CKPT_FULL), 0, "W7: checkpoint full")) { return 1; }
+  got = 0;
+  if (!eq(meo_peek_commit_seq(db, &got), MEO_OK, "W7: peek after checkpoint")) { return 1; }
+  if (!eq((int64)got, (int64)want, "W7: peek == commit_seq (after checkpoint)")) { return 1; }
+  if (!eq(meo_pager_close(p), 0, "W7: close")) { return 1; }
+  meo_pager_free(p);
+  got = 0;
+  if (!eq(meo_peek_commit_seq(db, &got), MEO_OK, "W7: peek after close")) { return 1; }
+  if (!eq((int64)got, (int64)want, "W7: peek == commit_seq (after close)")) { return 1; }
+  println("PASS W7: peek answered {(int64)want} from the log, a damaged db page 0 and the db file");
+  return 0;
+}
+
+// W8: after a checkpoint the db file holds the pager's pages.
+fn w8() -> int32 {
+  var db: string = "build/wal_pager_w8.dat";
+  if (wp_reset(db) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_CREATE | MEO_PAGER_WAL);
+  if (p == 0) { return wp_nopen("W8: open", p); }
+  meo_pager_set_autocheckpoint(p, 0);
+  if (!eq(meo_pager_begin(p), 0, "W8: begin")) { return 1; }
+  if (!eq(wp_fill(p, 0, 1500), 0, "W8: fill")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W8: commit")) { return 1; }
+  if (!eq(meo_pager_checkpoint(p, MEO_CKPT_PASSIVE), 0, "W8: checkpoint")) { return 1; }
+  if (!eq((int64)meo_pager_wal_backfilled(p), (int64)meo_pager_wal_committed(p),
+      "W8: backfilled == committed")) { return 1; }
+  var pages: uint32 = meo_pager_page_count(p);
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ);
+  if (!f.is_open) { return 1; }
+  var raw: uint8[] = new uint8[4096];
+  var i: uint32 = 0;
+  var bad: bool = false;
+  while (i < pages && !bad) {
+    var rc: int32 = meo_file_read_at(f, (int64)i * WP_PAGE, raw.data, WP_PAGE);
+    var fr: MeoFrame* = meo_pager_get(p, i, false);
+    if (rc != MEO_PAGE_SIZE || fr == 0) {
+      println("FAIL W8: page {(int64)i}: raw read {rc}, get {meo_pager_err(p)}");
+      bad = true;
+    } else {
+      if (!meo_t_check_bytes(raw.data, fr->data, WP_PAGE, "W8: page bytes")) { bad = true; }
+      meo_pager_release(p, fr, false);
+    }
+    i += 1;
+  }
+  meo_file_close(f);
+  free(raw.data);
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (bad) { return 1; }
+  println("PASS W8: {(int64)pages} db pages equal the pager's pages after a passive checkpoint");
+  return 0;
+}
+
+// W9: a read-only open reads the log and leaves it alone.
+fn w9() -> int32 {
+  var db: string = "build/wal_pager_w9.dat";
+  if (wp_build_wal(db, 1000) != MEO_OK) { return 1; }
+  if (!eq(wp_run_child(1, db, 1000, 500), 0, "W9: child")) { return 1; }
+  var len0: int64 = 0;
+  var before: uint8* = wp_wal_bytes(db, &len0);
+  if (!meo_t_check(before != 0 && len0 > 0, "W9: log present")) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_READONLY);
+  if (p == 0) { return wp_nopen("W9: open", p); }
+  if (!meo_t_check(meo_pager_wal_mode(p), "W9: wal mode")) { return 1; }
+  var n: int64 = wp_walk(p, "W9");
+  var rc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  if (!eq(n, 1500, "W9: walk")) { return 1; }
+  if (!eq(rc, 0, "W9: close")) { return 1; }
+  var len1: int64 = 0;
+  var after: uint8* = wp_wal_bytes(db, &len1);
+  if (!eq(len1, len0, "W9: log size")) { return 1; }
+  if (!meo_t_check_bytes(after, before, len0, "W9: log bytes")) { return 1; }
+  free(before);
+  free(after);
+  println("PASS W9: read-only open walked 1500 keys and left the {len0}-byte log untouched");
+  return 0;
+}
+
+// W10: asynchronous commits.
+fn w10() -> int32 {
+  var db: string = "build/wal_pager_w10.dat";
+  if (wp_build_wal(db, 100) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (p == 0) { return wp_nopen("W10: open", p); }
+  var w: MeoWal* = (MeoWal*)p->wal;
+  var t1: uint64 = 0;
+  var t2: uint64 = 0;
+  if (!eq(meo_pager_begin(p), 0, "W10: begin 1")) { return 1; }
+  if (!eq(wp_fill(p, 100, 10), 0, "W10: fill 1")) { return 1; }
+  if (!eq(meo_pager_commit_async(p, &t1), 0, "W10: async 1")) { return 1; }
+  var f1: uint32 = meo_pager_wal_committed(p);
+  if (!eq(meo_pager_begin(p), 0, "W10: begin 2")) { return 1; }
+  if (!eq(wp_fill(p, 110, 10), 0, "W10: fill 2")) { return 1; }
+  if (!eq(meo_pager_commit_async(p, &t2), 0, "W10: async 2")) { return 1; }
+  var f2: uint32 = meo_pager_wal_committed(p);
+  if (!meo_t_check(t1 != 0 && t2 != 0 && f2 > f1, "W10: tickets")) { return 1; }
+  if (!meo_t_check(meo_wal_durable(w) < f2, "W10: not durable before the wait")) { return 1; }
+  if (!eq(meo_pager_commit_wait(p, 0), 0, "W10: wait(0)")) { return 1; }
+  if (!eq(meo_pager_commit_wait(p, t2), 0, "W10: wait(t2)")) { return 1; }
+  if (!meo_t_check(meo_wal_durable(w) >= f2, "W10: second commit durable")) { return 1; }
+  if (!meo_t_check(meo_wal_durable(w) >= f1, "W10: first commit durable")) { return 1; }
+  if (!eq(meo_pager_commit_wait(p, t1), 0, "W10: wait(t1)")) { return 1; }
+  // Without a transaction there is nothing to commit.
+  var t3: uint64 = 0;
+  if (!eq(meo_pager_commit_async(p, &t3), -MEO_ERR_USAGE, "W10: async outside tx")) { return 1; }
+  if (!eq(wp_walk(p, "W10"), 120, "W10: walk")) { return 1; }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (!eq(wp_reopen_walk(db, 0, "W10"), 120, "W10: walk after reopen")) { return 1; }
+  println("PASS W10: two async commits durable after waiting on the second ticket");
+  return 0;
+}
+
+// W11: autocommit flush, and begin with changes outside a transaction.
+fn w11() -> int32 {
+  var db: string = "build/wal_pager_w11.dat";
+  if (wp_build_wal(db, 100) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (p == 0) { return wp_nopen("W11: open", p); }
+  var seq0: uint64 = meo_pager_commit_seq(p);
+  if (!eq(wp_fill(p, 100, 5), 0, "W11: fill outside a tx")) { return 1; }
+  if (!eq(meo_pager_flush(p), 0, "W11: flush")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(p), (int64)seq0 + 1, "W11: flush bumps commit_seq")) { return 1; }
+  if (!eq((int64)meo_pager_wal_committed(p), (int64)meo_pager_wal_frames(p), "W11: all committed")) { return 1; }
+  // A second flush has nothing to commit.
+  if (!eq(meo_pager_flush(p), 0, "W11: flush again")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(p), (int64)seq0 + 1, "W11: idle flush does not bump")) { return 1; }
+
+  if (!eq(wp_fill(p, 105, 5), 0, "W11: fill 2 outside a tx")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "W11: begin")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(p), (int64)seq0 + 2, "W11: begin committed the changes")) { return 1; }
+  if (!eq(meo_pager_rollback(p), 0, "W11: rollback")) { return 1; }
+  if (!eq((int64)meo_pager_commit_seq(p), (int64)seq0 + 2, "W11: rollback keeps them")) { return 1; }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  if (!eq(wp_reopen_walk(db, 0, "W11"), 110, "W11: walk")) { return 1; }
+  println("PASS W11: autocommit flush and begin each bumped commit_seq once");
+  return 0;
+}
+
+// W12: a failed WAL fsync.
+fn w12() -> int32 {
+  var db: string = "build/wal_pager_w12.dat";
+  if (wp_build_wal(db, 100) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (p == 0) { return wp_nopen("W12: open", p); }
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  meo_wal_test_ctl(MEO_WAL_T_FAIL_SYNC_AT, 1);
+  if (!eq(meo_pager_begin(p), 0, "W12: begin")) { return 1; }
+  if (!eq(wp_fill(p, 100, 10), 0, "W12: fill")) { return 1; }
+  if (!eq(meo_pager_commit(p), -MEO_ERR_IO, "W12: commit")) { return 1; }
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  if (!eq(meo_pager_begin(p), -MEO_ERR_IO, "W12: begin after the failure")) { return 1; }
+  if (!eq(meo_pager_close(p), -MEO_ERR_IO, "W12: close")) { return 1; }
+  meo_pager_free(p);
+  if (!meo_t_check(wp_wal_size(db) > 0, "W12: log kept")) { return 1; }
+  // The frames reached the file even though the fsync was refused.
+  if (!eq(wp_reopen_walk(db, 0, "W12"), 110, "W12: walk after reopen")) { return 1; }
+  println("PASS W12: fsync failure failed commit, begin and close; reopen recovered");
+  return 0;
+}
+
+// W13: schema_bump, in both modes.
+fn w13_mode(db: string, flags: int32, tag: string) -> int32 {
+  if (wp_reset(db) != MEO_OK) { return 1; }
+  var p: MeoPager* = meo_pager_open(db, WP_FRAMES, MEO_PAGER_CREATE | flags);
+  if (p == 0) { return wp_nopen("W13: open", p); }
+  var s0: uint64 = meo_pager_schema_seq(p);
+  if (!eq(meo_pager_begin(p), 0, "W13: begin")) { return 1; }
+  if (!eq(meo_pager_schema_bump(p), 0, "W13: bump")) { return 1; }
+  if (!eq(meo_pager_schema_bump(p), 0, "W13: bump twice")) { return 1; }
+  if (!eq((int64)meo_pager_schema_seq(p), (int64)s0 + 1, "{tag}: once per txn")) { return 1; }
+  if (!eq(meo_pager_rollback(p), 0, "W13: rollback")) { return 1; }
+  if (!eq((int64)meo_pager_schema_seq(p), (int64)s0, "{tag}: rollback restores")) { return 1; }
+  if (!eq(meo_pager_begin(p), 0, "W13: begin 2")) { return 1; }
+  if (!eq(meo_pager_schema_bump(p), 0, "W13: bump 2")) { return 1; }
+  if (!eq(meo_pager_schema_bump(p), 0, "W13: bump 2 again")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W13: commit")) { return 1; }
+  if (!eq((int64)meo_pager_schema_seq(p), (int64)s0 + 1, "{tag}: commit keeps")) { return 1; }
+  // The next transaction may bump again.
+  if (!eq(meo_pager_begin(p), 0, "W13: begin 3")) { return 1; }
+  if (!eq(meo_pager_schema_bump(p), 0, "W13: bump 3")) { return 1; }
+  if (!eq(meo_pager_commit(p), 0, "W13: commit 3")) { return 1; }
+  if (!eq((int64)meo_pager_schema_seq(p), (int64)s0 + 2, "{tag}: second txn bumps")) { return 1; }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  var q: MeoPager* = meo_pager_open(db, WP_FRAMES, 0);
+  if (q == 0) { return wp_nopen("W13: reopen", q); }
+  var s1: uint64 = meo_pager_schema_seq(q);
+  meo_pager_close(q);
+  meo_pager_free(q);
+  if (!eq((int64)s1, (int64)s0 + 2, "{tag}: reopen keeps")) { return 1; }
+  return 0;
+}
+
+fn w13() -> int32 {
+  if (w13_mode("build/wal_pager_w13.dat", MEO_PAGER_WAL, "W13 wal") != 0) { return 1; }
+  if (w13_mode("build/wal_pager_w13r.dat", 0, "W13 rollback") != 0) { return 1; }
+  println("PASS W13: schema_bump counts once per transaction in both modes");
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_pager_self (stub)");
+  var rc: int32 = w1_w2();
+  if (rc == 0) { rc = w3_w4_w5(); }
+  if (rc == 0) { rc = w6(); }
+  if (rc == 0) { rc = w7(); }
+  if (rc == 0) { rc = w8(); }
+  if (rc == 0) { rc = w9(); }
+  if (rc == 0) { rc = w10(); }
+  if (rc == 0) { rc = w11(); }
+  if (rc == 0) { rc = w12(); }
+  if (rc == 0) { rc = w13(); }
+  var report: int32 = meo_t_report();
+  if (rc != 0 || report != 0) {
+    println("FAIL wal_pager_self");
+    return 1;
+  }
+  println("PASS wal_pager_self");
   return 0;
 }

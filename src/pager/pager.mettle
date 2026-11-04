@@ -84,6 +84,18 @@
 // * One writer thread per pager. The pager is not thread-safe; the hook runs on
 //   the writer's thread. Only the feed's reader side is meant for other
 //   threads.
+//
+// WAL MODE (pager/wal.mettle). A file whose page 0 carries MEO_META_F_WAL is
+// written through `<db>-wal` instead of the journal. The write chokepoint
+// appends a sealed page as a non-commit frame, so a dirty frame evicted
+// anywhere, inside a transaction or not, spills to the log. A commit appends
+// the remaining dirty pages and then page 0 as the commit frame; the group
+// fsync that makes it durable is the caller's to wait for (commit_async and
+// commit_wait), so commit_seq in memory can run ahead of durability. The writer
+// reads its own misses from the log's newest frame (end), falling back to the
+// db file; readers use snapshots. In this mode the hook gets MEO_HOOK_STAGE at
+// append and hook_commit from whichever thread leads the fsync (the WAL's note
+// callback), not from the commit call. Rollback mode is unchanged.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -95,11 +107,15 @@ import "../platform/file_linux.mettle" if linux;
 import "../platform/clock_linux.mettle" if linux;
 import "freelist.mettle";
 import "journal.mettle";
+import "pcache.mettle";
+import "wal.mettle";
 
 // --- constants --------------------------------------------------------------
 
 export const MEO_PAGER_CREATE: int32 = 1;
 export const MEO_PAGER_READONLY: int32 = 2;
+export const MEO_PAGER_WAL: int32 = 4;     // open (or convert) in WAL mode
+export const MEO_PAGER_NO_WAL: int32 = 8;  // open (or convert) in rollback mode
 export const MEO_MIN_FRAMES: int32 = 8;
 export const MEO_MAX_PAGES: uint32 = 1048576; // 4 GiB at 4096; the phase-1 cap
 
@@ -107,6 +123,7 @@ export const MEO_MAX_PAGES: uint32 = 1048576; // 4 GiB at 4096; the phase-1 cap
 export const MEO_HOOK_ROLLBACK: int32 = 1;  // the open transaction was undone
 export const MEO_HOOK_UNCERTAIN: int32 = 2; // changes dropped, disk state unknown
 export const MEO_HOOK_DETACH: int32 = 3;    // pager closing; last call
+export const MEO_HOOK_STAGE: int32 = 4;     // WAL: a commit frame is written, not yet durable
 
 // --- types ------------------------------------------------------------------
 
@@ -148,6 +165,19 @@ export struct MeoPager {
   hook_event: fn(rawptr, int32) -> void;
   prepared: bool;    // commit_prepare has bumped commit_seq for this txn
   unflushed: bool;   // modified with no transaction open since the last flush
+  // WAL mode (wal == 0 in rollback mode).
+  wal: rawptr;       // MeoWal*
+  pcache: rawptr;    // MeoPcache* shared with snapshot views
+  wal_tx: bool;      // a WAL transaction is open (the WAL's counterpart of journal)
+  schema_bumped: bool; // meo_pager_schema_bump already ran in this transaction
+  // Snapshot views (see meo_pager_snap_begin); all 0 on a writer.
+  snap: rawptr;
+  base: MeoPager*;
+  n_pinned: int32;
+  pool_lock: int32;
+  pool: MeoPager*;
+  pool_n: int32;
+  pool_next: MeoPager*;
 }
 
 // The open-failure channel. meo_pager_open answers 0, so there is no pager to
@@ -184,6 +214,11 @@ fn meo_pager_fail_ptr(p: MeoPager*, rc: int32, arg: int64) -> MeoFrame* {
 fn meo_pager_clear_err(p: MeoPager*) {
   p->err = MEO_OK;
   p->err_arg = 0;
+}
+
+// A transaction is open: a journal is attached, or a WAL transaction is.
+fn pager_in_tx(p: MeoPager*) -> bool {
+  return p->journal != 0 || p->wal_tx;
 }
 
 // A pager is live until meo_pager_close runs on it. After that every buffer is
@@ -307,7 +342,7 @@ fn meo_pager_index_remove(p: MeoPager*, page_no: uint32) {
 // --- dirty accounting ------------------------------------------------------
 
 fn meo_pager_mark_dirty(p: MeoPager*, f: MeoFrame*) {
-  if (p->journal == 0) { p->unflushed = true; }
+  if (!pager_in_tx(p)) { p->unflushed = true; }
   if (!f->dirty) {
     f->dirty = true;
     p->n_dirty += 1;
@@ -342,7 +377,7 @@ fn meo_pager_meta_refresh(p: MeoPager*, f: MeoFrame*) -> int32 {
 // back a body that disagrees with the pager's own copy.
 fn meo_pager_meta_touch(p: MeoPager*) {
   p->meta_dirty = true;
-  if (p->journal == 0) { p->unflushed = true; }
+  if (!pager_in_tx(p)) { p->unflushed = true; }
   var fi: int32 = meo_pager_find(p, 0);
   if (fi < 0) { return; }
   meo_pager_meta_refresh(p, meo_pager_frame_at(p, fi));
@@ -395,6 +430,14 @@ fn meo_pager_pick_victim(p: MeoPager*) -> int32 {
 // through this function and nothing else.
 fn meo_pager_write_page(p: MeoPager*, page_no: uint32, page: uint8*) -> int32 {
   meo_page_seal(page);
+  // WAL mode: every page, committed or spilled, is a frame; the db file only
+  // changes in a checkpoint.
+  if (p->wal != 0) {
+    var arc: int32 = meo_wal_append((MeoWal*)p->wal, page_no, page);
+    if (arc != MEO_OK) { return arc; }
+    p->write_count += 1;
+    return MEO_OK;
+  }
   // The before-image is appended and fsynced before the page it protects is
   // written. The old bytes come from the disk, not from the
   // frame: the frame already holds the new content. meo_jrn_needs is false for
@@ -464,17 +507,30 @@ fn meo_pager_take_frame(p: MeoPager*, fi: int32, page_no: uint32) -> int32 {
   return MEO_OK;
 }
 
+// The newest bytes of a page as the writer sees them: its newest WAL frame (any
+// frame, committed or not) in WAL mode, else the db file. A short db read means
+// the file is shorter than page_count claims: a torn write or a file touched
+// underneath us, never a page we may hand out.
+fn pager_read_latest(p: MeoPager*, page_no: uint32, buf: uint8*) -> int32 {
+  if (p->wal != 0) {
+    var w: MeoWal* = (MeoWal*)p->wal;
+    var fr: uint32 = meo_wal_find(w, page_no, meo_wal_end(w));
+    if (fr != 0) { return meo_wal_read_page(w, fr, buf); }
+  }
+  var off: int64 = (int64)page_no * (int64)MEO_PAGE_SIZE;
+  var rc: int32 = meo_file_read_at(p->file, off, buf, (int64)MEO_PAGE_SIZE);
+  if (rc < 0) { return rc; }
+  if (rc != MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
+  return MEO_OK;
+}
+
 // Read page_no into frame fi and verify it. get is the one path by which page
 // bytes enter the cache, so it is the one place a corrupt page can be caught
 // before a caller sees it.
 fn meo_pager_load_page(p: MeoPager*, fi: int32, page_no: uint32) -> int32 {
   var f: MeoFrame* = meo_pager_frame_at(p, fi);
-  var off: int64 = (int64)page_no * (int64)MEO_PAGE_SIZE;
-  var rc: int32 = meo_file_read_at(p->file, off, f->data, (int64)MEO_PAGE_SIZE);
-  if (rc < 0) { return rc; }
-  // A short read means the file is shorter than page_count claims: a torn
-  // write or a file touched underneath us, never a page we may hand out.
-  if (rc != MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
+  var rc: int32 = pager_read_latest(p, page_no, f->data);
+  if (rc != MEO_OK) { return rc; }
   if (meo_page_verify(f->data) != MEO_OK) { return -MEO_ERR_CORRUPT; }
   // Page 0 has just been installed after an eviction: replace the bytes the
   // disk still has with p->meta before the caller can decode them.
@@ -555,6 +611,16 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
     p->path.chars = 0;
     p->path.length = 0;
   }
+  // The log goes before the db file it checkpoints into; the cache it drops
+  // entries from is freed after it.
+  if (p->wal != 0) {
+    meo_wal_close((MeoWal*)p->wal, false);
+    p->wal = 0;
+  }
+  if (p->pcache != 0) {
+    meo_pcache_free((MeoPcache*)p->pcache);
+    p->pcache = 0;
+  }
   var rc: int32 = meo_file_close(p->file);
   p->file.is_open = false;
   p->n_frames = 0;
@@ -568,6 +634,8 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
   p->hook_event = 0;
   p->prepared = false;
   p->unflushed = false;
+  p->wal_tx = false;
+  p->schema_bumped = false;
   p->closed = true;
   return rc;
 }
@@ -580,9 +648,8 @@ fn meo_pager_release_all(p: MeoPager*) -> int32 {
 // still CORRUPT.
 fn meo_pager_load_page_zero(p: MeoPager*) -> int32 {
   var f: MeoFrame* = meo_pager_frame_at(p, 0);
-  var rc: int32 = meo_file_read_at(p->file, 0, f->data, (int64)MEO_PAGE_SIZE);
-  if (rc < 0) { return rc; }
-  if (rc != MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
+  var rc: int32 = pager_read_latest(p, 0, f->data);
+  if (rc != MEO_OK) { return rc; }
   var mrc: int32 = meo_meta_check(f->data);
   if (mrc != MEO_OK) { return mrc; }
   var m: MeoMeta = meo_meta_read(f->data);
@@ -606,7 +673,7 @@ fn meo_pager_load_page_zero(p: MeoPager*) -> int32 {
 
 // A zero-byte file opened with MEO_PAGER_CREATE: page 0 only, on disk before
 // open returns.
-fn meo_pager_init_new(p: MeoPager*) -> int32 {
+fn meo_pager_init_new(p: MeoPager*, wal: bool) -> int32 {
   var f: MeoFrame* = meo_pager_frame_at(p, 0);
   var rc: int32 = meo_page_init(f->data, MEO_PAGE_META);
   if (rc != MEO_OK) { return rc; }
@@ -623,6 +690,9 @@ fn meo_pager_init_new(p: MeoPager*) -> int32 {
   m.txn_id = 0;
   m.write_version = 1;
   m.commit_seq = 0;
+  m.flags = 0;
+  if (wal) { m.flags = MEO_META_F_WAL; }
+  m.schema_seq = 0;
   p->meta = m;
   p->page_count = 1;
 
@@ -652,6 +722,33 @@ fn meo_pager_open_failed(code: int32, arg: int64) -> MeoPager* {
   return 0;
 }
 
+// Give up an open that got as far as owning a pager (and maybe a log not yet
+// handed to it).
+fn meo_pager_open_abort(p: MeoPager*, w: MeoWal*, code: int32, arg: int64) -> MeoPager* {
+  if (w != 0 && p->wal == 0) { meo_wal_close(w, false); }
+  meo_pager_release_all(p);
+  free(p);
+  return meo_pager_open_failed(code, arg);
+}
+
+// Set or clear the WAL flag in one rollback-journal transaction.
+fn meo_pager_flip_wal_flag(p: MeoPager*, on: bool) -> int32 {
+  var rc: int32 = meo_pager_begin(p);
+  if (rc != MEO_OK) { return rc; }
+  if (on) {
+    p->meta.flags = p->meta.flags | MEO_META_F_WAL;
+  } else {
+    p->meta.flags = p->meta.flags & ~MEO_META_F_WAL;
+  }
+  meo_pager_meta_touch(p);
+  rc = meo_pager_commit(p);
+  if (rc != MEO_OK) {
+    meo_pager_rollback(p);
+    return rc;
+  }
+  return MEO_OK;
+}
+
 export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPager* {
   meo_pager_last_open_err = MEO_OK;
   meo_pager_last_open_err_arg = 0;
@@ -665,6 +762,11 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
 
   var read_only: bool = (flags & MEO_PAGER_READONLY) != 0;
   var want_create: bool = (flags & MEO_PAGER_CREATE) != 0;
+  // A read-only pager cannot change the mode, so it ignores both flags.
+  if (!read_only && (flags & MEO_PAGER_WAL) != 0
+      && (flags & MEO_PAGER_NO_WAL) != 0) {
+    return meo_pager_open_failed(MEO_ERR_USAGE, (int64)flags);
+  }
   // A read-only pager is opened read-only: it must not create a file it could
   // never initialise, so a zero-byte file is NOT_A_DB to it, not a new db.
   var oflags: int32 = MEO_OPEN_READ;
@@ -710,6 +812,17 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
   p->prepared = false;
   p->unflushed = false;
   p->meta_dirty = false;
+  p->wal = 0;
+  p->pcache = 0;
+  p->wal_tx = false;
+  p->schema_bumped = false;
+  p->snap = 0;
+  p->base = 0;
+  p->n_pinned = 0;
+  p->pool_lock = 0;
+  p->pool = 0;
+  p->pool_n = 0;
+  p->pool_next = 0;
   p->path = meo_pager_copy_string(path);
   if (p->path.chars == 0) {
     meo_pager_release_all(p);
@@ -748,50 +861,98 @@ export fn meo_pager_open(path: string, n_frames: int32, flags: int32) -> MeoPage
     return meo_pager_open_failed(0 - jrc, 0);
   }
 
+  // The log is read next (it never creates a file). A committed frame means the
+  // file is in WAL mode whatever the db file says: a checkpoint may have been cut
+  // short, so the db file can be torn or short.
+  var w: MeoWal* = 0;
+  var wrc: int32 = meo_wal_open(path, p->file, read_only, &w);
+  if (wrc != MEO_OK) {
+    return meo_pager_open_abort(p, 0, 0 - wrc, 0);
+  }
+
   var size: int64 = meo_file_size(p->file);
   if (size < 0) {
-    var code: int32 = (int32)(0 - size);
-    meo_pager_release_all(p);
-    free(p);
-    return meo_pager_open_failed(code, size);
+    return meo_pager_open_abort(p, w, (int32)(0 - size), size);
   }
-  if (size == 0) {
+  var rc: int32 = MEO_OK;
+  if (meo_wal_last_commit(w) > 0) {
+    // Page 0 is the newest page-0 frame; every later miss reads the log too.
+    p->wal = (rawptr)w;
+    rc = meo_pager_load_page_zero(p);
+    if (rc != MEO_OK) {
+      return meo_pager_open_abort(p, w, 0 - rc, size);
+    }
+    if ((p->meta.flags & MEO_META_F_WAL) == 0) {
+      return meo_pager_open_abort(p, w, MEO_ERR_CORRUPT, size);
+    }
+  } else if (size == 0) {
     // A read-only pager never creates: it could not write page 0 even if the
     // file were ours to initialise, so CREATE is ignored and a zero-byte file
     // is simply not a database yet.
     if (!want_create || read_only) {
-      meo_pager_release_all(p);
-      free(p);
-      return meo_pager_open_failed(MEO_ERR_NOT_A_DB, size);
+      return meo_pager_open_abort(p, w, MEO_ERR_NOT_A_DB, size);
     }
-    var irc: int32 = meo_pager_init_new(p);
+    var irc: int32 = meo_pager_init_new(p, (flags & MEO_PAGER_WAL) != 0);
     if (irc != MEO_OK) {
-      meo_pager_release_all(p);
-      free(p);
-      return meo_pager_open_failed(0 - irc, size);
+      return meo_pager_open_abort(p, w, 0 - irc, size);
     }
+  } else {
+    // Phase 1 never truncates the file, so a partial page is never ours.
+    if (size % (int64)MEO_PAGE_SIZE != 0) {
+      return meo_pager_open_abort(p, w, MEO_ERR_CORRUPT, size);
+    }
+    rc = meo_pager_load_page_zero(p);
+    if (rc != MEO_OK) {
+      return meo_pager_open_abort(p, w, 0 - rc, size);
+    }
+    // A page_count that disagrees with the file's length is a torn write or a
+    // foreign file. Trusting either number would be a repair, and repairing is
+    // not this layer's job.
+    if (size / (int64)MEO_PAGE_SIZE != (int64)p->meta.page_count) {
+      return meo_pager_open_abort(p, w, MEO_ERR_CORRUPT, size);
+    }
+  }
+
+  // Mode conversion. The flag only ever changes through a journal commit, and
+  // the log is empty or gone by then, so a crash leaves one mode or the other.
+  var is_wal: bool = (p->meta.flags & MEO_META_F_WAL) != 0;
+  if (!read_only && is_wal && (flags & MEO_PAGER_NO_WAL) != 0) {
+    // Everything into the db file, then the log goes.
+    var left: int32 = meo_wal_checkpoint(w, MEO_CKPT_FULL);
+    if (left < 0) { return meo_pager_open_abort(p, w, 0 - left, 0); }
+    if (left > 0) { return meo_pager_open_abort(p, w, MEO_ERR_BUSY, (int64)left); }
+    p->wal = 0;
+    var crc: int32 = meo_wal_close(w, true);
+    w = 0;
+    if (crc != MEO_OK) { return meo_pager_open_abort(p, w, 0 - crc, 0); }
+    rc = meo_pager_flip_wal_flag(p, false);
+    if (rc != MEO_OK) { return meo_pager_open_abort(p, w, 0 - rc, 0); }
+    is_wal = false;
+  } else if (!read_only && !is_wal && (flags & MEO_PAGER_WAL) != 0) {
+    rc = meo_pager_flip_wal_flag(p, true);
+    if (rc != MEO_OK) { return meo_pager_open_abort(p, w, 0 - rc, 0); }
+    is_wal = true;
+  }
+
+  if (!is_wal) {
+    // A log left beside a rollback-mode file holds nothing committed; a writer
+    // removes it.
+    if (w != 0) { meo_wal_close(w, !read_only); }
+    p->wal = 0;
     return p;
   }
-  // Phase 1 never truncates the file, so a partial page is never ours.
-  if (size % (int64)MEO_PAGE_SIZE != 0) {
-    meo_pager_release_all(p);
-    free(p);
-    return meo_pager_open_failed(MEO_ERR_CORRUPT, size);
-  }
-  var rc: int32 = meo_pager_load_page_zero(p);
-  if (rc != MEO_OK) {
-    meo_pager_release_all(p);
-    free(p);
-    return meo_pager_open_failed(0 - rc, size);
-  }
-  // A page_count that disagrees with the file's length is a torn write or a
-  // foreign file. Trusting either number would be a repair, and repairing is
-  // not this layer's job.
-  if (size / (int64)MEO_PAGE_SIZE != (int64)p->meta.page_count) {
-    meo_pager_release_all(p);
-    free(p);
-    return meo_pager_open_failed(MEO_ERR_CORRUPT, size);
-  }
+
+  var pc_frames: int32 = 4 * n_frames;
+  if (pc_frames < MEO_PCACHE_MIN_FRAMES) { pc_frames = MEO_PCACHE_MIN_FRAMES; }
+  var pc: MeoPcache* = meo_pcache_new(pc_frames);
+  if (pc == 0) { return meo_pager_open_abort(p, w, MEO_ERR_NOMEM, 0); }
+  p->pcache = (rawptr)pc;
+  meo_wal_set_pcache(w, pc);
+  meo_wal_set_note(w, (rawptr)p, &meo_pager_wal_note);
+  var ck: int32 = 0;
+  if (!read_only) { ck = MEO_WAL_DEFAULT_CKPT; }
+  meo_wal_set_autockpt(w, ck);
+  p->wal = (rawptr)w;
   return p;
 }
 
@@ -803,11 +964,17 @@ export fn meo_pager_close(p: MeoPager*) -> int32 {
   // Second close is MEO_OK; the handle outlives it.
   if (!meo_pager_is_live(p)) { return MEO_OK; }
 
+  // Snapshots still reading the log pin it: nothing is touched.
+  var w: MeoWal* = (MeoWal*)p->wal;
+  if (w != 0 && meo_wal_readers(w) > 0) {
+    return meo_pager_fail(p, -MEO_ERR_BUSY, 0);
+  }
+
   var first: int32 = MEO_OK;
   // A close with an open transaction rolls it back: closing is not committing,
   // and leaving a hot journal behind would make the next open undo a
   // transaction the caller never committed.
-  if (p->journal != 0) {
+  if (pager_in_tx(p)) {
     var rrc: int32 = meo_pager_rollback(p);
     if (rrc != MEO_OK) { first = rrc; }
   }
@@ -820,6 +987,21 @@ export fn meo_pager_close(p: MeoPager*) -> int32 {
   if (rc != MEO_OK && first == MEO_OK) { first = rc; }
   rc = meo_pager_sync(p);
   if (rc != MEO_OK && first == MEO_OK) { first = rc; }
+  if (w != 0 && !p->read_only) {
+    if (meo_wal_failed(w)) {
+      // Nothing more is trusted to the log: keep it for recovery.
+      if (first == MEO_OK) { first = -MEO_ERR_IO; }
+    } else {
+      // A log with nothing left to copy is deleted; otherwise it stays.
+      var left: int32 = meo_wal_checkpoint(w, MEO_CKPT_FULL);
+      if (left < 0 && first == MEO_OK) { first = left; }
+      if (left == 0) {
+        p->wal = 0;
+        rc = meo_wal_close(w, true);
+        if (rc != MEO_OK && first == MEO_OK) { first = rc; }
+      }
+    }
+  }
   // Everything is freed on the error path too: a failed flush must not leak a
   // frame buffer or an array.
   rc = meo_pager_release_all(p);
@@ -837,7 +1019,7 @@ export fn meo_pager_free(p: MeoPager*) {
   if (!p->closed) {
     // Freeing without closing is a caller error, but it must not leave a hot
     // journal that would undo the next open. Roll back first, then release.
-    if (p->journal != 0) {
+    if (pager_in_tx(p)) {
       meo_pager_rollback(p);
     } else if (p->unflushed) {
       // Changes made outside a transaction are dropped here, but an eviction
@@ -1294,6 +1476,9 @@ fn meo_pager_flush_raw(p: MeoPager*) -> int32 {
   if (p->read_only && need > 0) {
     return meo_pager_fail(p, -MEO_ERR_READONLY, (int64)need);
   }
+  // WAL mode has no in-place write and no db-file sync here: a flush only turns
+  // dirty frames into log frames.
+  if (p->wal != 0) { return meo_pager_wal_write_pages(p, true); }
   if (need == 0) {
     // Nothing to write. A flush still means "make what is on the disk durable",
     // and a read-only pager can reach here (an fsync on a read-only file is
@@ -1336,6 +1521,119 @@ fn meo_pager_flush_raw(p: MeoPager*) -> int32 {
   return MEO_OK;
 }
 
+// Append every dirty page as a non-commit frame, ascending, page 0 last and only
+// when `with_zero`. No sync. Each page is clean as soon as its frame is written:
+// the frame is in the log, and a later rollback truncates it away.
+fn meo_pager_wal_write_pages(p: MeoPager*, with_zero: bool) -> int32 {
+  var need: int32 = meo_pager_plan_count(p);
+  if (need == 0) { return MEO_OK; }
+  var plan: uint32[] = new uint32[need];
+  var got: int32 = meo_pager_flush_plan(p, plan.data, need);
+  if (got < 0) {
+    free(plan.data);
+    return meo_pager_fail(p, got, (int64)need);
+  }
+  var i: int32 = 0;
+  while (i < got) {
+    if (plan[i] != 0 || with_zero) {
+      var rc: int32 = meo_pager_write_planned(p, plan[i]);
+      if (rc != MEO_OK) {
+        free(plan.data);
+        return meo_pager_fail(p, rc, (int64)plan[i]);
+      }
+      meo_pager_mark_written(p, plan[i]);
+    }
+    i += 1;
+  }
+  free(plan.data);
+  return MEO_OK;
+}
+
+// Append page 0 as the commit frame: the resident frame (re-encoded first when
+// p->meta is ahead of it) or, when it is not resident, a scratch page from
+// p->meta, as meo_pager_write_planned does.
+fn meo_pager_wal_commit_frame(p: MeoPager*, frame_out: uint32*) -> int32 {
+  var buf: uint8* = 0;
+  var scratch: uint8* = 0;
+  var fi: int32 = meo_pager_find(p, 0);
+  if (fi >= 0) {
+    buf = meo_pager_frame_at(p, fi)->data;
+    if (p->meta_dirty) { meo_meta_write(buf, p->meta); }
+  } else {
+    scratch = malloc((int64)MEO_PAGE_SIZE);
+    if (scratch == 0) { return -MEO_ERR_NOMEM; }
+    var rc: int32 = meo_page_init(scratch, MEO_PAGE_META);
+    if (rc == MEO_OK) { rc = meo_meta_write(scratch, p->meta); }
+    if (rc != MEO_OK) {
+      free(scratch);
+      return rc;
+    }
+    buf = scratch;
+  }
+  meo_page_seal(buf);
+  var wrc: int32 = meo_wal_commit_write((MeoWal*)p->wal, buf, p->page_count,
+    frame_out);
+  if (scratch != 0) { free(scratch); }
+  if (wrc == MEO_OK) { p->write_count += 1; }
+  return wrc;
+}
+
+// The append half of a WAL commit, shared by commit_async and the autocommit
+// flush: bump commit_seq (unless prepared), append the dirty pages, then the
+// commit frame, stage the feed and publish. Not durable yet; the ticket says
+// what to wait for. A failure before publish restores commit_seq and leaves
+// the transaction as it was.
+fn meo_pager_wal_commit_append(p: MeoPager*, ticket: uint64*) -> int32 {
+  var w: MeoWal* = (MeoWal*)p->wal;
+  var old_seq: uint64 = p->meta.commit_seq;
+  var bumped: bool = false;
+  if (!p->prepared) {
+    var brc: int32 = meo_pager_meta_set_commit_seq(p, old_seq + 1);
+    if (brc != MEO_OK) {
+      p->meta.commit_seq = old_seq;
+      return meo_pager_fail(p, brc, 0);
+    }
+    bumped = true;
+  }
+  var fr: uint32 = 0;
+  var rc: int32 = meo_pager_wal_write_pages(p, false);
+  if (rc == MEO_OK) { rc = meo_pager_wal_commit_frame(p, &fr); }
+  if (rc != MEO_OK) {
+    if (bumped) { meo_pager_meta_set_commit_seq(p, old_seq); }
+    return meo_pager_fail(p, rc, 0);
+  }
+  // Staged before it is published, so a leader can never deliver this commit
+  // before the feed holds its batch.
+  meo_pager_notify_event(p, MEO_HOOK_STAGE);
+  meo_wal_commit_publish(w, fr, p->meta.commit_seq, ticket);
+  meo_pager_mark_written(p, 0);
+  p->wal_tx = false;
+  p->prepared = false;
+  p->unflushed = false;
+  p->schema_bumped = false;
+  return MEO_OK;
+}
+
+// The WAL-mode public flush. In a transaction it only appends frames; outside
+// one, modifications made since the last flush are a whole commit (append, then
+// wait); otherwise it waits for what is already appended.
+fn meo_pager_wal_flush(p: MeoPager*) -> int32 {
+  if (p->wal_tx) { return meo_pager_flush_raw(p); }
+  if (p->unflushed) {
+    var ticket: uint64 = 0;
+    var rc: int32 = meo_pager_wal_commit_append(p, &ticket);
+    if (rc != MEO_OK) { return rc; }
+    rc = meo_wal_wait((MeoWal*)p->wal, ticket);
+    if (rc != MEO_OK) { return meo_pager_fail(p, rc, 0); }
+    return MEO_OK;
+  }
+  var frc: int32 = meo_pager_flush_raw(p);
+  if (frc != MEO_OK) { return frc; }
+  frc = meo_wal_wait_all((MeoWal*)p->wal);
+  if (frc != MEO_OK) { return meo_pager_fail(p, frc, 0); }
+  return MEO_OK;
+}
+
 // The public flush. Inside a transaction it is a plain write-out (a commit is
 // what counts). Outside one, with modifications made since the last flush
 // (`unflushed`), it is an autocommit: commit_seq is bumped into page 0 before
@@ -1345,7 +1643,8 @@ export fn meo_pager_flush(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
-  if (p->journal != 0 || p->read_only || !p->unflushed) {
+  if (p->wal != 0 && !p->read_only) { return meo_pager_wal_flush(p); }
+  if (pager_in_tx(p) || p->read_only || !p->unflushed) {
     return meo_pager_flush_raw(p);
   }
   var old_seq: uint64 = p->meta.commit_seq;
@@ -1369,6 +1668,11 @@ export fn meo_pager_sync(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->wal != 0) {
+    var wrc: int32 = meo_wal_wait_all((MeoWal*)p->wal);
+    if (wrc != MEO_OK) { return meo_pager_fail(p, wrc, 0); }
+    return MEO_OK;
+  }
   var rc: int32 = meo_file_sync(p->file);
   if (rc != MEO_OK) { return meo_pager_fail(p, rc, 0); }
   return MEO_OK;
@@ -1395,8 +1699,23 @@ export fn meo_pager_begin(p: MeoPager*) -> int32 {
   if (p->read_only) {
     return meo_pager_fail(p, -MEO_ERR_READONLY, 0);
   }
-  if (p->journal != 0) {
+  if (pager_in_tx(p)) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
+  }
+  p->schema_bumped = false;
+  if (p->wal != 0) {
+    var w: MeoWal* = (MeoWal*)p->wal;
+    if (meo_wal_failed(w)) { return meo_pager_fail(p, -MEO_ERR_IO, 0); }
+    // Changes made outside a transaction commit first, so the new transaction
+    // starts from a committed log.
+    if (p->unflushed) {
+      var frc: int32 = meo_pager_flush(p);
+      if (frc != MEO_OK) { return frc; }
+    }
+    // A fully copied, unread log starts over from frame 1 (best effort).
+    meo_wal_try_restart(w);
+    p->wal_tx = true;
+    return MEO_OK;
   }
   var j: MeoJournal* = meo_jrn_create(p->path, p->page_count,
     (uint32)p->meta.write_version, p->journal_cap);
@@ -1420,7 +1739,7 @@ export fn meo_pager_commit_prepare(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
-  if (p->journal == 0) {
+  if (!pager_in_tx(p)) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
   }
   var bumped: bool = false;
@@ -1433,7 +1752,13 @@ export fn meo_pager_commit_prepare(p: MeoPager*) -> int32 {
     }
     bumped = true;
   }
-  var rc: int32 = meo_pager_flush_raw(p);
+  var rc: int32 = MEO_OK;
+  if (p->wal != 0) {
+    // Page 0 is the commit's own frame; only the rest goes first.
+    rc = meo_pager_wal_write_pages(p, false);
+  } else {
+    rc = meo_pager_flush_raw(p);
+  }
   if (rc == MEO_OK) { rc = meo_pager_sync(p); }
   if (rc != MEO_OK) {
     if (bumped) { meo_pager_meta_set_commit_seq(p, old_seq); }
@@ -1447,8 +1772,16 @@ export fn meo_pager_commit(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
-  if (p->journal == 0) {
+  if (!pager_in_tx(p)) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
+  }
+  if (p->wal != 0) {
+    var ticket: uint64 = 0;
+    var arc: int32 = meo_pager_commit_async(p, &ticket);
+    if (arc != MEO_OK) { return arc; }
+    var wrc: int32 = meo_wal_wait((MeoWal*)p->wal, ticket);
+    if (wrc != MEO_OK) { return meo_pager_fail(p, wrc, 0); }
+    return MEO_OK;
   }
   // Write and fsync every dirty page first. Only after that is the journal
   // removed: a commit that deleted the journal first would lose the undo log
@@ -1459,6 +1792,7 @@ export fn meo_pager_commit(p: MeoPager*) -> int32 {
   p->journal = 0;
   p->prepared = false;
   p->unflushed = false;
+  p->schema_bumped = false;
   // Durable now: the journal is gone. Only now may anyone hear about it.
   meo_pager_notify_commit(p);
   return MEO_OK;
@@ -1468,7 +1802,7 @@ export fn meo_pager_rollback(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
-  if (p->journal == 0) {
+  if (!pager_in_tx(p)) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
   }
   // A pinned frame is a caller still reading a page this rollback is about to
@@ -1480,21 +1814,29 @@ export fn meo_pager_rollback(p: MeoPager*) -> int32 {
     }
     i += 1;
   }
-  var j: MeoJournal* = (MeoJournal*)p->journal;
-  var rc: int32 = meo_jrn_rollback(j, p->file);
-  if (rc != MEO_OK) {
-    // The file may be half restored and the transaction is still open: the
-    // feed must not trust anything it captured, so the outcome is uncertain.
-    meo_pager_notify_event(p, MEO_HOOK_UNCERTAIN);
-    return meo_pager_fail(p, rc, 0);
+  var rc: int32 = MEO_OK;
+  if (p->wal != 0) {
+    // Forgetting the frames past the last commit is all an undo takes.
+    meo_wal_tx_rollback((MeoWal*)p->wal);
+    p->wal_tx = false;
+  } else {
+    var j: MeoJournal* = (MeoJournal*)p->journal;
+    rc = meo_jrn_rollback(j, p->file);
+    if (rc != MEO_OK) {
+      // The file may be half restored and the transaction is still open: the
+      // feed must not trust anything it captured, so the outcome is uncertain.
+      meo_pager_notify_event(p, MEO_HOOK_UNCERTAIN);
+      return meo_pager_fail(p, rc, 0);
+    }
+    meo_jrn_destroy(j);
+    p->journal = 0;
   }
-  meo_jrn_destroy(j);
-  p->journal = 0;
   p->prepared = false;
   p->unflushed = false;
+  p->schema_bumped = false;
   meo_pager_notify_event(p, MEO_HOOK_ROLLBACK);
   // The cache still holds the new content. Drop every frame and reload page 0
-  // from the restored file, which also restores p->meta and p->page_count.
+  // from the restored file (or log), which also restores p->meta and p->page_count.
   i = 0;
   while (i < p->n_frames) {
     var f: MeoFrame* = meo_pager_frame_at(p, i);
@@ -1523,6 +1865,112 @@ export fn meo_pager_journal_attached(p: MeoPager*) -> bool {
   return p->journal != 0;
 }
 
+// --- WAL-mode API -----------------------------------------------------------
+
+// Append the transaction as a commit and return at once; `ticket` names what
+// meo_pager_commit_wait must wait for. In rollback mode this is a plain commit
+// and the ticket is 0.
+export fn meo_pager_commit_async(p: MeoPager*, ticket: uint64*) -> int32 {
+  if (p == 0 || ticket == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  *ticket = 0;
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->wal == 0) { return meo_pager_commit(p); }
+  if (!p->wal_tx) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  return meo_pager_wal_commit_append(p, ticket);
+}
+
+// Block until the commit named by `ticket` is durable. Any thread, no db lock:
+// it touches only the WAL and never records an error on the pager.
+export fn meo_pager_commit_wait(p: MeoPager*, ticket: uint64) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  if (ticket == 0 || p->wal == 0) { return MEO_OK; }
+  return meo_wal_wait((MeoWal*)p->wal, ticket);
+}
+
+export fn meo_pager_wal_mode(p: MeoPager*) -> bool {
+  if (p == 0) { return false; }
+  return p->wal != 0;
+}
+
+export fn meo_pager_in_tx(p: MeoPager*) -> bool {
+  if (p == 0) { return false; }
+  return pager_in_tx(p);
+}
+
+// Copy committed frames into the db file. Returns the frames left in the log, or
+// a negative code; rollback mode has no log.
+export fn meo_pager_checkpoint(p: MeoPager*, mode: int32) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->wal == 0) { return MEO_OK; }
+  var rc: int32 = meo_wal_checkpoint((MeoWal*)p->wal, mode);
+  if (rc < 0) { return meo_pager_fail(p, rc, 0); }
+  return rc;
+}
+
+export fn meo_pager_set_autocheckpoint(p: MeoPager*, frames: int32) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->wal == 0) { return MEO_OK; }
+  var rc: int32 = meo_wal_set_autockpt((MeoWal*)p->wal, frames);
+  if (rc != MEO_OK) { return meo_pager_fail(p, rc, (int64)frames); }
+  return MEO_OK;
+}
+
+// Frames in the log, committed or not.
+export fn meo_pager_wal_frames(p: MeoPager*) -> uint32 {
+  if (p == 0 || p->wal == 0) { return 0; }
+  return meo_wal_end((MeoWal*)p->wal);
+}
+
+// The last commit frame.
+export fn meo_pager_wal_committed(p: MeoPager*) -> uint32 {
+  if (p == 0 || p->wal == 0) { return 0; }
+  return meo_wal_last_commit((MeoWal*)p->wal);
+}
+
+// Frames already copied into the db file.
+export fn meo_pager_wal_backfilled(p: MeoPager*) -> uint32 {
+  if (p == 0 || p->wal == 0) { return 0; }
+  return meo_wal_backfilled((MeoWal*)p->wal);
+}
+
+// Note the transaction wrote the catalog tree, once per transaction: readers
+// key their catalog snapshots by schema_seq.
+export fn meo_pager_schema_bump(p: MeoPager*) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  meo_pager_clear_err(p);
+  if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (p->read_only) { return meo_pager_fail(p, -MEO_ERR_READONLY, 0); }
+  if (!p->schema_bumped) {
+    p->meta.schema_seq += 1;
+    meo_pager_meta_touch(p);
+    p->schema_bumped = true;
+  }
+  return MEO_OK;
+}
+
+export fn meo_pager_schema_seq(p: MeoPager*) -> uint64 {
+  if (p == 0) { return 0; }
+  return p->meta.schema_seq;
+}
+
+// The WAL's note callback. DURABLE comes from whichever thread led the fsync,
+// under the WAL's sync lock, once per commit in commit order.
+fn meo_pager_wal_note(ctx: rawptr, code: int32, seq: uint64) {
+  var p: MeoPager* = (MeoPager*)ctx;
+  if (code == MEO_WAL_NOTE_DURABLE) {
+    if (p->hook_commit != 0) {
+      p->hook_commit(p->hook_ctx, seq, meo_clock_realtime_us());
+    }
+    return;
+  }
+  meo_pager_notify_event(p, MEO_HOOK_UNCERTAIN);
+}
+
 // Lower the journal's record cap for this pager. It exists so a test can prove
 // NOSPC on a small database instead of allocating 65536 pages, and so an
 // embedder can bound the journal. The cap is read at begin; changing it while
@@ -1532,7 +1980,7 @@ export fn meo_pager_set_journal_cap(p: MeoPager*, records: int32) -> int32 {
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
   if (records < 1) { return meo_pager_fail(p, -MEO_ERR_USAGE, (int64)records); }
-  if (p->journal != 0) {
+  if (pager_in_tx(p)) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, (int64)records);
   }
   p->journal_cap = records;
@@ -1586,10 +2034,18 @@ export fn meo_pager_set_hook(p: MeoPager*, ctx: rawptr,
   if (ctx == 0 || meo_commit_cb == 0 || meo_event_cb == 0) {
     return meo_pager_fail(p, -MEO_ERR_USAGE, 0);
   }
-  if (p->journal != 0) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  if (pager_in_tx(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  // Every appended commit is durable (and delivered to the old hook) before the
+  // hook changes; a failure is reported through the note, not here.
+  var w: MeoWal* = (MeoWal*)p->wal;
+  if (w != 0) {
+    meo_wal_wait_all(w);
+    meo_wal_sync_lock(w);
+  }
   p->hook_ctx = ctx;
   p->hook_commit = meo_commit_cb;
   p->hook_event = meo_event_cb;
+  if (w != 0) { meo_wal_sync_unlock(w); }
   if (p->unflushed) { return 1; }
   return MEO_OK;
 }
@@ -1601,9 +2057,15 @@ export fn meo_pager_clear_hook(p: MeoPager*) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   meo_pager_clear_err(p);
   if (!meo_pager_is_live(p)) { return meo_pager_fail(p, -MEO_ERR_USAGE, 0); }
+  var w: MeoWal* = (MeoWal*)p->wal;
+  if (w != 0) {
+    meo_wal_wait_all(w);
+    meo_wal_sync_lock(w);
+  }
   p->hook_ctx = 0;
   p->hook_commit = 0;
   p->hook_event = 0;
+  if (w != 0) { meo_wal_sync_unlock(w); }
   return MEO_OK;
 }
 
@@ -1646,6 +2108,27 @@ fn peek_page0(f: MeoFile, buf: uint8*, seq: uint64*, got: int32*) -> int32 {
   return MEO_OK;
 }
 
+// The commit_seq of the newest valid commit frame in `<db>-wal`: MEO_OK with
+// seq[0] set, or 1 when there is no usable one (nothing found, or the frame's
+// page 0 fails the open's checks or lacks the WAL flag).
+fn peek_wal(path: string, seq: uint64*) -> int32 {
+  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (buf == 0) { return 1; }
+  var found: bool = false;
+  var rc: int32 = meo_wal_peek(path, buf, &found);
+  var out: int32 = 1;
+  if (rc == MEO_OK && found && meo_meta_check(buf) == MEO_OK
+      && meo_page_verify(buf) == MEO_OK) {
+    var m: MeoMeta = meo_meta_read(buf);
+    if (m.valid && (m.flags & MEO_META_F_WAL) != 0) {
+      seq[0] = m.commit_seq;
+      out = MEO_OK;
+    }
+  }
+  free(buf);
+  return out;
+}
+
 // Read commit_seq straight from page 0 on disk, with no pager: the cheap "did
 // anything commit?" probe for another handle or another process. Page 0 is
 // validated exactly as an open validates it (magic, version, page size, page
@@ -1685,6 +2168,25 @@ export fn meo_peek_commit_seq(path: string, out: uint64*) -> int32 {
   var got: int32 = 0;
   var got2: int32 = 0;
   var status: int32 = peek_page0(f, buf, &seq, &got);
+  // A WAL-mode file's newest commit is in the log, which can be ahead of (or,
+  // after a torn checkpoint, the only intact copy of) page 0 in the db file.
+  var try_wal: bool = status == -MEO_ERR_CORRUPT;
+  if (status == MEO_OK && (meo_meta_read(buf).flags & MEO_META_F_WAL) != 0) {
+    try_wal = true;
+  }
+  if (try_wal) {
+    var wseq: uint64 = 0;
+    var wrc: int32 = peek_wal(path, &wseq);
+    if (wrc == MEO_OK) {
+      meo_file_close(f);
+      free(buf);
+      var whot: int32 = meo_jrn_present(path);
+      if (whot < 0) { return whot; }
+      out[0] = wseq;
+      if (whot == 1) { return MEO_PEEK_HOT; }
+      return MEO_OK;
+    }
+  }
   var changed: bool = false;
   if (status == -MEO_ERR_CORRUPT) {
     var hot0: int32 = meo_jrn_present(path);
