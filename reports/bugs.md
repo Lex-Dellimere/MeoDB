@@ -22,9 +22,9 @@
 | B16 | btree | Delete has not run inside a killed-process crash test. | Recovery after a crash mid-delete is unproven. | `tests/phase3.mettle`, `tests/query_crash.mettle` | open |
 | B17 | db | Transaction poisoning after a real IO failure is only tested with a faked error code. `meo_db_close` returning BUSY with a live query is untested. | Error paths that rarely run. | `tests/catalog_self.mettle` | open |
 | B18 | server | `meo_srv_free` on its own after a missed stop deadline is untested (the analyser rejects using the server after a free call). | Only a second stop is covered. | `tests/srv_stop.mettle` | open |
-| B19 | feed | A ring-overrun GAP event has `time_us = 0`, and the last commit time can't be read. | mistplot can't timestamp a gap. | `src/feed/feed.mettle` | open |
-| B20 | feed | `meo_peek_commit_seq` can't tell a transient CORRUPT (an autocommit flush mid-write) from real damage. | mistplot retries up to 8 times. | `src/pager/pager.mettle` | open |
-| B21 | feed | Writes through the typed query API are not reported by the change feed; only `meo_feed_insert` writes are. | mistplot live charts can't follow app tables yet. | `src/feed/feed.mettle`, `src/table/table.mettle` | open |
+| B19 | feed | A ring-overrun GAP event has `time_us = 0`, and the last commit time can't be read. | mistplot can't timestamp a gap. | `src/feed/feed.mettle` | fixed, F8 |
+| B20 | feed | `meo_peek_commit_seq` can't tell a transient CORRUPT (an autocommit flush mid-write) from real damage. | mistplot retries up to 8 times. | `src/pager/pager.mettle` | fixed, F9 |
+| B21 | feed | Writes through the typed query API are not reported by the change feed; only `meo_feed_insert` writes are. | mistplot live charts can't follow app tables yet. | `src/feed/feed.mettle`, `src/table/table.mettle` | fixed, F10 |
 | B22 | tests | Some red-check failure messages print the real value as both sides (for example "2500 rows, want 2500"). | Cosmetic. | `tests/table_self.mettle`, `tests/draft.mettle` | open |
 
 ## Fixed
@@ -38,3 +38,6 @@
 | F5 | PING in an aborted transaction answered OK instead of `ERROR TX`. | `40e83b4` |
 | F6 | `meo_tbl_delete` dropped index root changes instead of saving them. | `268d81b` |
 | F7 | mistplot decoded integer keys by hand; `meo_key_int_decode` now exists. | `2938ddc` |
+| F8 | A ring-overrun GAP event had `time_us = 0`; it now carries the last commit time, also readable with `meo_feed_last_time`. | `611dc90` |
+| F9 | `meo_peek_commit_seq` reported a page 0 caught mid-write as damage; it now answers `MEO_PEEK_TRANSIENT` (2). | `802a1a1` |
+| F10 | Typed-API writes were not in the change feed; inserts, updates and deletes now are, with the row as a value. | `611dc90` |

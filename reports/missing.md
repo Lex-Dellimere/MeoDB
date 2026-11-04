@@ -7,7 +7,7 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 | M1 | CREATE INDEX / DROP INDEX: named, multi-column and non-unique indexes (today only single-column PK/UNIQUE declared in CREATE TABLE). The server answers UNSUPPORTED. | flux_orm migrations, example_sass (listing entries by user) | M3 | open |
 | M2 | Rows larger than 1280 encoded bytes (overflow pages). | example_sass entries, any long text | M3 | open |
 | M3 | Range scans on an ordered key for time windows. | mistplot | M3 | open |
-| M4 | Change feed for typed-API writes, with row payloads, GAP times and transient-error reporting. | mistplot live charts, raize notifications | M4 | open |
+| M4 | Change feed for typed-API writes, with row payloads, GAP times and transient-error reporting. | mistplot live charts, raize notifications | M4 | done (`611dc90`, `802a1a1`) |
 | M5 | Readers that don't wait for the writer (WAL + MVCC). | raize_web, any multi-user app | M5 | open |
 | M6 | Graph engine: node and edge tables with an adjacency index. | future apps | M6 | open |
 | M7 | Remote SUBSCRIBE over TCP. | browser dashboards via raize | M7 (after M4) | open |
@@ -26,3 +26,5 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 | M20 | IPv6 and host names. | non-local deployments | not scheduled | open |
 | M21 | A way to run every test in one command (the old check script was deleted). | developers | not scheduled | open |
 | M22 | Group commit: concurrent commits share one fsync. | write-heavy apps (example_sass F02.7) | M5 | open |
+| M23 | Catalog changes (create/drop table, add column) in the change feed. | mistplot, raize (schema-aware consumers) | M4 | open |
+| M24 | Feed callbacks on a feed thread outside the db lock, and a per-subscriber `meo_feed_subscribe`. | mistplot live push | M4 | open |

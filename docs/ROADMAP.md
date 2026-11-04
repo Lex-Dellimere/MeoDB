@@ -33,14 +33,14 @@ Layers 3, 4a, 5. Consumer: flux_orm.
 
 ## M4 — Change feed + in-process real-time
 Layer 6. Consumers: mistplot live push, raize notifications.
-Started early, below the table layer: the pager commit hook, persisted `commit_seq` and `src/feed/feed.mettle` (capture through `meo_feed_insert`) are built, and mistplot uses them. M4 moves capture up to `table/` so table writes are reported too, keeping the existing `meo_feed_*` and `MeoChange` names and meanings (new fields are appended).
-- [ ] Every committed insert/update/delete emits one event (table id, op, rowid, new row) with a 64-bit commit sequence, in commit order.
-- [ ] A rolled-back transaction emits nothing.
+The pager commit hook, persisted `commit_seq` and `src/feed/feed.mettle` came first, below the table layer, and mistplot uses them. Table writes are now captured too, with the row as a value; the `meo_feed_*` and `MeoChange` names and meanings are unchanged (new fields are appended). Catalog changes are not reported yet.
+- [x] Every committed insert/update/delete emits one event (table id, op, rowid, new row) with a 64-bit commit sequence, in commit order (`feed_table`).
+- [x] A rolled-back transaction emits nothing (`feed_table`).
 - [ ] `meo_feed_subscribe(db, table, ring)` delivers into a bounded ring per subscriber. A slow subscriber gets an "overrun, resync from seq N" marker and never blocks the writer.
 - [ ] Callbacks run on a feed thread, never under the db lock (asserted). A mistplot demo calls `mp_live_push` from the feed thread under its own app lock.
-- [ ] A ring-overrun GAP event carries the last commit time, not 0, and that time can be read directly.
-- [ ] `meo_key_int` has an inverse, so consumers don't decode keys by hand.
-- [ ] `meo_peek_commit_seq` tells a transient CORRUPT (autocommit flush mid-write) apart from real damage.
+- [x] A ring-overrun GAP event carries the last commit time, not 0, and that time can be read directly (`feed_table`).
+- [x] `meo_key_int` has an inverse, so consumers don't decode keys by hand (`key_self`).
+- [x] `meo_peek_commit_seq` tells a transient CORRUPT (autocommit flush mid-write) apart from real damage (`feed_self`).
 
 ## M5 — WAL + MVCC concurrent readers
 Layer 4b. Consumer: raize_web read-heavy load.
