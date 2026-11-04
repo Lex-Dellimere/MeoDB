@@ -1,6 +1,637 @@
+// wal_self: the WAL file format, index, append, recovery, peek and the test
+// hooks, on raw files (no pager).
+//
+// A program, not @test functions: every case needs real files in build/.
+//
+//   mettle --build tests/wal_self.mettle -o build/wal_self
+//   ./build/wal_self
+//
+// Prints "PASS wal_self" when every case passes, "FAIL <case>: <detail>" per
+// failing check. Cases, each with the bug it exists to catch:
+//   v1_basic        3 frames and a commit: find returns the newest frame per
+//                   page and respects mx; reopen rebuilds the same index.
+//                   Catches an index that keeps the first frame, or ignores mx.
+//   v2_segments     5000 frames over 600 pages cross a segment boundary: find
+//                   agrees with a brute-force oracle at several mx. Catches a
+//                   lookup that stops at the top segment.
+//   v3_corrupt      one flipped byte inside a commit: recovery stops at the
+//                   previous commit and the next append replaces the rest.
+//   v4_salt         a frame with a wrong salt but a correct CRC stops the scan.
+//   v5_stale        frames left behind by a rolled-back transaction never come
+//                   back after different frames are appended.
+//   v6_header       a bad header CRC or a short header means an empty WAL and
+//                   the next append starts a new generation.
+//   v7_peek         meo_wal_peek returns the newest commit page; no WAL means
+//                   not found; a torn tail means the previous commit.
+//   v8_io_points    the test hooks count header + frames + fsync exactly.
+//   v9_crash        a child dying at an I/O point (whole and torn) leaves a
+//                   WAL that recovers to the last durable-or-complete commit.
+
 import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/crc32.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/wal.mettle";
+import "tinytest.mettle";
+
+const WT_DB: string = "build/wal_self.dat";
+const WT_WAL: string = "build/wal_self.dat-wal";
+const WT_FRAME: int64 = 4120;
+
+var wt_notes: int32 = 0;
+var wt_note_failed: int32 = 0;
+var wt_note_seq: uint64 = 0;
+
+fn wt_note(ctx: rawptr, kind: int32, seq: uint64) {
+  if (kind == MEO_WAL_NOTE_DURABLE) {
+    wt_notes += 1;
+    wt_note_seq = seq;
+  } else {
+    wt_note_failed += 1;
+  }
+}
+
+fn eq(a: int64, b: int64, name: string) -> bool {
+  return meo_t_check_i64(a, b, name);
+}
+
+// --- builders ---------------------------------------------------------------
+
+// A sealed data page whose bytes depend on (page_no, tag).
+fn wt_page(buf: uint8*, page_no: uint32, tag: uint32) {
+  meo_page_init(buf, MEO_PAGE_BTREE_LEAF);
+  meo_put_u32le(buf, 200, page_no);
+  meo_put_u32le(buf, 204, tag);
+  meo_page_seal(buf);
+}
+
+// A sealed page 0 with the WAL flag.
+fn wt_page0(buf: uint8*, db_size: uint32, commit_seq: uint64) {
+  meo_page_init(buf, MEO_PAGE_META);
+  var m: MeoMeta;
+  m.valid = true;
+  m.magic = MEO_MAGIC;
+  m.version = MEO_FORMAT_VERSION;
+  m.page_size = MEO_PAGE_SIZE;
+  m.page_count = db_size;
+  m.flags = MEO_META_F_WAL;
+  m.commit_seq = commit_seq;
+  meo_meta_write(buf, m);
+}
+
+// Remove any WAL and make the db file empty. The handle is closed by the case.
+fn wt_fresh() -> MeoFile {
+  meo_file_unlink(WT_WAL);
+  var f: MeoFile = meo_file_open(WT_DB,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (f.is_open) { meo_file_truncate(f, 0); }
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  return f;
+}
+
+fn wt_open(db: MeoFile) -> MeoWal* {
+  var w: MeoWal* = 0;
+  var rc: int32 = meo_wal_open(WT_DB, db, false, &w);
+  if (rc != MEO_OK) {
+    println("FAIL open: rc {rc}");
+    return 0;
+  }
+  return w;
+}
+
+fn wt_append(w: MeoWal*, page_no: uint32, tag: uint32) -> int32 {
+  var b: uint8[4096];
+  wt_page(&b[0], page_no, tag);
+  return meo_wal_append(w, page_no, &b[0]);
+}
+
+// Write and publish a commit frame; returns its frame number, 0 on failure.
+fn wt_commit(w: MeoWal*, db_size: uint32, seq: uint64) -> uint32 {
+  var b: uint8[4096];
+  wt_page0(&b[0], db_size, seq);
+  var fr: uint32 = 0;
+  var rc: int32 = meo_wal_commit_write(w, &b[0], db_size, &fr);
+  if (rc != MEO_OK) {
+    println("FAIL commit_write: rc {rc}");
+    return 0;
+  }
+  var ticket: uint64 = 0;
+  meo_wal_commit_publish(w, fr, seq, &ticket);
+  return fr;
+}
+
+// --- raw file helpers -------------------------------------------------------
+
+fn wt_flip(off: int64) {
+  var f: MeoFile = meo_file_open(WT_WAL, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  var b: uint8[1];
+  meo_file_read_at(f, off, &b[0], 1);
+  b[0] = (uint8)(b[0] ^ 255);
+  meo_file_write_at(f, off, &b[0], 1);
+  meo_file_close(f);
+}
+
+fn wt_wal_size() -> int64 {
+  var f: MeoFile = meo_file_open(WT_WAL, MEO_OPEN_READ);
+  if (!f.is_open) { return -1; }
+  var n: int64 = meo_file_size(f);
+  meo_file_close(f);
+  return n;
+}
+
+fn wt_wal_truncate(size: int64) {
+  var f: MeoFile = meo_file_open(WT_WAL, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  meo_file_truncate(f, size);
+  meo_file_close(f);
+}
+
+fn wt_frame_off(fr: int64) -> int64 {
+  return 32 + (fr - 1) * WT_FRAME;
+}
+
+// The checksum chain value after frame `upto`, replayed from the file.
+fn wt_chain(upto: int32) -> uint32 {
+  var f: MeoFile = meo_file_open(WT_WAL, MEO_OPEN_READ);
+  var h: uint8[32];
+  meo_file_read_at(f, 0, &h[0], 32);
+  var c: uint32 = meo_get_u32le(&h[0], 24);
+  var buf: uint8* = malloc(WT_FRAME);
+  var i: int32 = 1;
+  while (i <= upto) {
+    meo_file_read_at(f, wt_frame_off((int64)i), buf, WT_FRAME);
+    c = meo_crc32_update(c, buf, 16);
+    c = meo_crc32_update(c, buf + 24, 4096);
+    i += 1;
+  }
+  free(buf);
+  meo_file_close(f);
+  return c;
+}
+
+// Page `fr` of the WAL read straight from the file.
+fn wt_read_frame_page(fr: uint32, out: uint8*) {
+  var f: MeoFile = meo_file_open(WT_WAL, MEO_OPEN_READ);
+  meo_file_read_at(f, wt_frame_off((int64)fr) + 24, out, 4096);
+  meo_file_close(f);
+}
+
+// --- cases ------------------------------------------------------------------
+
+fn v1_basic() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  w->note_cb = &wt_note;
+  wt_notes = 0;
+  if (!eq(meo_wal_last_commit(w), 0, "v1: empty last")) { return false; }
+  if (!eq(wt_append(w, 1, 10), 0, "v1: append 1")) { return false; }
+  if (!eq(wt_append(w, 2, 20), 0, "v1: append 2")) { return false; }
+  if (!eq(wt_append(w, 1, 11), 0, "v1: append 1 again")) { return false; }
+  if (!eq(wt_commit(w, 4, 7), 4, "v1: commit frame")) { return false; }
+  if (!eq(meo_wal_end(w), 4, "v1: end")) { return false; }
+  if (!eq(meo_wal_last_commit(w), 4, "v1: appended")) { return false; }
+  if (!eq(meo_wal_durable(w), 0, "v1: not durable before sync")) { return false; }
+  if (!eq(meo_wal_sync(w), 0, "v1: sync")) { return false; }
+  if (!eq(meo_wal_durable(w), 4, "v1: durable")) { return false; }
+  if (!eq(wt_notes, 1, "v1: one note")) { return false; }
+  if (!eq((int64)wt_note_seq, 7, "v1: note seq")) { return false; }
+
+  if (!eq(meo_wal_find(w, 1, 4), 3, "v1: find 1")) { return false; }
+  if (!eq(meo_wal_find(w, 1, 2), 1, "v1: find 1 at mx 2")) { return false; }
+  if (!eq(meo_wal_find(w, 1, 0), 0, "v1: find mx 0")) { return false; }
+  if (!eq(meo_wal_find(w, 2, 4), 2, "v1: find 2")) { return false; }
+  if (!eq(meo_wal_find(w, 2, 1), 0, "v1: find 2 at mx 1")) { return false; }
+  if (!eq(meo_wal_find(w, 0, 4), 4, "v1: find page 0")) { return false; }
+  if (!eq(meo_wal_find(w, 0, 3), 0, "v1: find page 0 at mx 3")) { return false; }
+  if (!eq(meo_wal_find(w, 5, 4), 0, "v1: find absent")) { return false; }
+
+  var want: uint8[4096];
+  var got: uint8[4096];
+  wt_page(&want[0], 1, 11);
+  if (!eq(meo_wal_read_page(w, 3, &got[0]), 0, "v1: read_page")) { return false; }
+  if (!meo_t_check_bytes(&got[0], &want[0], 4096, "v1: page bytes")) { return false; }
+  if (!eq(meo_wal_frame_db_size(w, 4), 4, "v1: db_size of commit")) { return false; }
+  if (!eq(meo_wal_frame_db_size(w, 3), 0, "v1: db_size of plain frame")) { return false; }
+  var gen: uint32 = meo_wal_gen(w);
+  if (!eq(gen, 1, "v1: first generation")) { return false; }
+  meo_wal_close(w, false);
+
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 4, "v1: reopen last")) { return false; }
+  if (!eq(meo_wal_durable(w2), 4, "v1: reopen durable")) { return false; }
+  if (!eq(meo_wal_end(w2), 4, "v1: reopen end")) { return false; }
+  if (!eq(meo_wal_gen(w2), gen, "v1: reopen gen")) { return false; }
+  if (!eq(meo_wal_find(w2, 1, 4), 3, "v1: reopen find 1")) { return false; }
+  if (!eq(meo_wal_find(w2, 2, 4), 2, "v1: reopen find 2")) { return false; }
+  if (!eq(meo_wal_find(w2, 0, 4), 4, "v1: reopen find 0")) { return false; }
+  // The chain continues: more frames on the reopened WAL survive another reopen.
+  if (!eq(wt_append(w2, 3, 30), 0, "v1: append after reopen")) { return false; }
+  if (!eq(wt_commit(w2, 5, 8), 6, "v1: commit after reopen")) { return false; }
+  meo_wal_sync(w2);
+  meo_wal_close(w2, false);
+  var w3: MeoWal* = wt_open(db);
+  if (w3 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w3), 6, "v1: second reopen last")) { return false; }
+  if (!eq(meo_wal_find(w3, 3, 6), 5, "v1: second reopen find 3")) { return false; }
+  meo_wal_close(w3, true);
+  meo_file_close(db);
+  if (!eq(wt_wal_size(), -1, "v1: close with unlink removes the file")) { return false; }
+  println("PASS v1_basic");
+  return true;
+}
+
+fn v2_segments() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  var n: int32 = 5000;
+  var npages: int32 = 600;
+  var pages: uint8* = malloc((int64)npages * 4096);
+  var pg: uint32* = (uint32*)malloc((int64)(n + 2) * 4);
+  var p: int32 = 0;
+  while (p < npages) {
+    wt_page(pages + (int64)p * 4096, (uint32)(p + 1), 0);
+    p += 1;
+  }
+  var i: int32 = 1;
+  while (i <= n) {
+    var page_no: int32 = (i * 7 + 3) % npages + 1;
+    pg[i] = (uint32)page_no;
+    var rc: int32 = meo_wal_append(w, (uint32)page_no,
+      pages + (int64)(page_no - 1) * 4096);
+    if (rc != MEO_OK) {
+      println("FAIL v2: append {i} rc {rc}");
+      return false;
+    }
+    i += 1;
+  }
+  pg[n + 1] = 0;
+  if (!eq(wt_commit(w, 700, 1), n + 1, "v2: commit frame")) { return false; }
+  meo_wal_sync(w);
+
+  var round: int32 = 0;
+  while (round < 2) {
+    var mxs: int32[8];
+    mxs[0] = 1;
+    mxs[1] = 100;
+    mxs[2] = 4095;
+    mxs[3] = 4096;
+    mxs[4] = 4097;
+    mxs[5] = 4999;
+    mxs[6] = 5000;
+    mxs[7] = 5001;
+    var k: int32 = 0;
+    while (k < 8) {
+      var mx: int32 = mxs[k];
+      var q: int32 = 0;
+      while (q < 24) {
+        var want_p: uint32 = (uint32)((q * 37) % npages + 1);
+        if (q == 23) { want_p = 0; }
+        var expect: int32 = 0;
+        var f: int32 = mx;
+        while (f >= 1 && expect == 0) {
+          if (pg[f] == want_p) { expect = f; }
+          f -= 1;
+        }
+        var got: uint32 = meo_wal_find(w, want_p, (uint32)mx);
+        if (!eq(got, expect, "v2: find vs oracle")) {
+          println("  page {want_p} mx {mx} round {round}");
+          return false;
+        }
+        q += 1;
+      }
+      k += 1;
+    }
+    if (round == 0) {
+      meo_wal_close(w, false);
+      w = wt_open(db);
+      if (w == 0) { return false; }
+      if (!eq(meo_wal_last_commit(w), n + 1, "v2: reopen last")) { return false; }
+    }
+    round += 1;
+  }
+  meo_wal_close(w, true);
+  meo_file_close(db);
+  free(pages);
+  free((rawptr)pg);
+  println("PASS v2_segments");
+  return true;
+}
+
+fn v3_corrupt() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  wt_append(w, 1, 1);
+  wt_append(w, 2, 2);
+  if (!eq(wt_commit(w, 3, 1), 3, "v3: commit A")) { return false; }
+  wt_append(w, 3, 3);
+  wt_append(w, 4, 4);
+  if (!eq(wt_commit(w, 5, 2), 6, "v3: commit B")) { return false; }
+  meo_wal_sync(w);
+  meo_wal_close(w, false);
+  // One byte in the middle of frame 5's page.
+  wt_flip(wt_frame_off(5) + 24 + 300);
+
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 3, "v3: recovers to commit A")) { return false; }
+  if (!eq(meo_wal_end(w2), 3, "v3: end")) { return false; }
+  if (!eq(meo_wal_find(w2, 3, 6), 0, "v3: page 3 gone")) { return false; }
+  if (!eq(meo_wal_find(w2, 2, 6), 2, "v3: page 2 kept")) { return false; }
+  // New frames replace the damaged tail, and the stale frame 6 stays dead.
+  wt_append(w2, 7, 7);
+  if (!eq(wt_commit(w2, 8, 3), 5, "v3: commit C")) { return false; }
+  meo_wal_sync(w2);
+  meo_wal_close(w2, false);
+  var w3: MeoWal* = wt_open(db);
+  if (w3 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w3), 5, "v3: reopen last")) { return false; }
+  if (!eq(meo_wal_find(w3, 7, 5), 4, "v3: page 7")) { return false; }
+  if (!eq(meo_wal_find(w3, 3, 5), 0, "v3: page 3 still gone")) { return false; }
+  meo_wal_close(w3, true);
+  meo_file_close(db);
+  println("PASS v3_corrupt");
+  return true;
+}
+
+fn v4_salt() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  wt_append(w, 1, 1);
+  wt_append(w, 2, 2);
+  if (!eq(wt_commit(w, 3, 1), 3, "v4: commit A")) { return false; }
+  wt_append(w, 3, 3);
+  if (!eq(wt_commit(w, 4, 2), 5, "v4: commit B")) { return false; }
+  meo_wal_sync(w);
+  meo_wal_close(w, false);
+
+  // Frame 5 gets a different salt1 and a CRC that matches it, so only the salt
+  // check can reject it.
+  var c4: uint32 = wt_chain(4);
+  var buf: uint8* = malloc(WT_FRAME);
+  var f: MeoFile = meo_file_open(WT_WAL, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  meo_file_read_at(f, wt_frame_off(5), buf, WT_FRAME);
+  meo_put_u32le(buf, 8, meo_get_u32le(buf, 8) + (uint32)1);
+  var c: uint32 = meo_crc32_update(c4, buf, 16);
+  c = meo_crc32_update(c, buf + 24, 4096);
+  meo_put_u32le(buf, 16, c);
+  meo_file_write_at(f, wt_frame_off(5), buf, WT_FRAME);
+  meo_file_close(f);
+  free(buf);
+
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 3, "v4: wrong salt stops the scan")) { return false; }
+  meo_wal_close(w2, true);
+  meo_file_close(db);
+  println("PASS v4_salt");
+  return true;
+}
+
+fn v5_stale() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  var i: uint32 = 1;
+  while (i <= 9) {
+    wt_append(w, i, 1);
+    i += 1;
+  }
+  if (!eq(wt_commit(w, 10, 1), 10, "v5: commit at 10")) { return false; }
+  meo_wal_sync(w);
+  // Frames 11..15: 13 holds page 12, 15 is a commit-style frame never published.
+  wt_append(w, 10, 2);
+  wt_append(w, 11, 2);
+  wt_append(w, 12, 2);
+  wt_append(w, 13, 2);
+  var b0: uint8[4096];
+  wt_page0(&b0[0], 14, 99);
+  var fr: uint32 = 0;
+  if (!eq(meo_wal_commit_write(w, &b0[0], 14, &fr), 0, "v5: unpublished commit")) { return false; }
+  if (!eq(fr, 15, "v5: frame 15")) { return false; }
+  if (!eq(meo_wal_find(w, 12, 15), 13, "v5: stale frame visible before rollback")) { return false; }
+  if (!eq(meo_wal_tx_rollback(w), 0, "v5: rollback")) { return false; }
+  if (!eq(meo_wal_end(w), 10, "v5: end after rollback")) { return false; }
+  if (!eq(meo_wal_find(w, 12, 15), 0, "v5: index truncated")) { return false; }
+  if (!eq(meo_wal_find(w, 5, 15), 5, "v5: older frames intact")) { return false; }
+  wt_append(w, 20, 3);
+  if (!eq(wt_commit(w, 12, 2), 12, "v5: new commit at 12")) { return false; }
+  meo_wal_sync(w);
+  meo_wal_close(w, false);
+
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 12, "v5: reopen last")) { return false; }
+  if (!meo_t_check(meo_wal_find(w2, 12, 12) <= 12, "v5: old page not found")) { return false; }
+  if (!eq(meo_wal_find(w2, 12, 15), 0, "v5: stale page absent")) { return false; }
+  if (!eq(meo_wal_find(w2, 20, 12), 11, "v5: new page")) { return false; }
+  meo_wal_close(w2, true);
+  meo_file_close(db);
+  println("PASS v5_stale");
+  return true;
+}
+
+fn v6_header() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  wt_append(w, 1, 1);
+  if (!eq(wt_commit(w, 2, 1), 2, "v6: commit")) { return false; }
+  meo_wal_sync(w);
+  var g1: uint32 = meo_wal_gen(w);
+  meo_wal_close(w, false);
+
+  // A bad hdr_crc: the WAL is empty and the next generation is newer.
+  wt_flip(24);
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 0, "v6: bad crc is empty")) { return false; }
+  if (!eq(meo_wal_end(w2), 0, "v6: end")) { return false; }
+  if (!eq(meo_wal_find(w2, 1, 2), 0, "v6: index empty")) { return false; }
+  if (!eq(meo_wal_gen(w2), g1 + 1, "v6: new generation")) { return false; }
+  wt_append(w2, 5, 5);
+  if (!eq(wt_commit(w2, 6, 2), 2, "v6: new commit")) { return false; }
+  meo_wal_sync(w2);
+  meo_wal_close(w2, false);
+  var w3: MeoWal* = wt_open(db);
+  if (w3 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w3), 2, "v6: reopen last")) { return false; }
+  if (!eq(meo_wal_find(w3, 5, 2), 1, "v6: new frame")) { return false; }
+  if (!eq(meo_wal_find(w3, 1, 2), 0, "v6: old frame gone")) { return false; }
+  if (!eq(meo_wal_gen(w3), g1 + 1, "v6: gen persisted")) { return false; }
+  meo_wal_close(w3, false);
+
+  // A header shorter than 32 bytes is empty too.
+  wt_wal_truncate(10);
+  var w4: MeoWal* = wt_open(db);
+  if (w4 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w4), 0, "v6: short header is empty")) { return false; }
+  wt_append(w4, 9, 9);
+  if (!eq(wt_commit(w4, 10, 3), 2, "v6: commit after short header")) { return false; }
+  meo_wal_sync(w4);
+  meo_wal_close(w4, false);
+  var w5: MeoWal* = wt_open(db);
+  if (w5 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w5), 2, "v6: reopen after short header")) { return false; }
+  meo_wal_close(w5, true);
+  meo_file_close(db);
+  println("PASS v6_header");
+  return true;
+}
+
+fn v7_peek() -> bool {
+  var db: MeoFile = wt_fresh();
+  var out: uint8[4096];
+  var found: bool = true;
+  if (!eq(meo_wal_peek(WT_DB, &out[0], &found), 0, "v7: peek of missing WAL")) { return false; }
+  if (!meo_t_check_false(found, "v7: missing WAL not found")) { return false; }
+
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  wt_append(w, 1, 1);
+  wt_commit(w, 2, 1);
+  wt_append(w, 2, 2);
+  if (!eq(wt_commit(w, 3, 2), 4, "v7: second commit")) { return false; }
+  meo_wal_sync(w);
+  meo_wal_close(w, false);
+
+  var want: uint8[4096];
+  wt_page0(&want[0], 3, 2);
+  if (!eq(meo_wal_peek(WT_DB, &out[0], &found), 0, "v7: peek")) { return false; }
+  if (!meo_t_check(found, "v7: found")) { return false; }
+  if (!meo_t_check_bytes(&out[0], &want[0], 4096, "v7: newest commit page")) { return false; }
+
+  // Cut the last frame in half: the previous commit is the newest.
+  wt_wal_truncate(wt_wal_size() - 100);
+  var want1: uint8[4096];
+  wt_page0(&want1[0], 2, 1);
+  if (!eq(meo_wal_peek(WT_DB, &out[0], &found), 0, "v7: peek torn")) { return false; }
+  if (!meo_t_check(found, "v7: torn found")) { return false; }
+  if (!meo_t_check_bytes(&out[0], &want1[0], 4096, "v7: previous commit page")) { return false; }
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 2, "v7: open of torn tail")) { return false; }
+  meo_wal_close(w2, false);
+
+  // Frames but no commit: not found.
+  meo_file_unlink(WT_WAL);
+  var w3: MeoWal* = wt_open(db);
+  if (w3 == 0) { return false; }
+  wt_append(w3, 1, 1);
+  meo_wal_close(w3, false);
+  if (!eq(meo_wal_peek(WT_DB, &out[0], &found), 0, "v7: peek without commit")) { return false; }
+  if (!meo_t_check_false(found, "v7: no commit not found")) { return false; }
+  meo_file_unlink(WT_WAL);
+  meo_file_close(db);
+  println("PASS v7_peek");
+  return true;
+}
+
+fn v8_io_points() -> bool {
+  var db: MeoFile = wt_fresh();
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0), 0, "v8: no I/O at open")) { return false; }
+  wt_append(w, 1, 1);
+  // header + frame 1
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0), 2, "v8: header and one frame")) { return false; }
+  wt_commit(w, 2, 1);
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0), 3, "v8: commit frame")) { return false; }
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_LAST_COMMIT_IO, 0), 3, "v8: commit io index")) { return false; }
+  meo_wal_sync(w);
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0), 4, "v8: fsync")) { return false; }
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0), 1, "v8: sync count")) { return false; }
+  if (!eq(w->n_syncs, 1, "v8: n_syncs")) { return false; }
+  // Nothing new to sync: no fsync.
+  meo_wal_sync(w);
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0), 1, "v8: idle sync is free")) { return false; }
+  // A spill frame (no commit) is synced by the next sync call.
+  wt_append(w, 3, 3);
+  meo_wal_sync(w);
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0), 2, "v8: spill sync")) { return false; }
+  // Closing with unlink is an I/O point.
+  var before: int64 = meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0);
+  meo_wal_close(w, true);
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0), before + 1, "v8: unlink is an I/O point")) { return false; }
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  if (!eq(meo_wal_test_ctl(MEO_WAL_T_IO_COUNT, 0), 0, "v8: reset")) { return false; }
+  meo_file_close(db);
+  println("PASS v8_io_points");
+  return true;
+}
+
+// Run a child that writes frame 1 and a commit, dying at I/O point `at`
+// (torn when `torn`). Returns the child's exit code.
+fn wt_child(at: int64, torn: bool) -> int32 {
+  var pid: int64 = syscall(57);
+  if (pid == 0) {
+    var db: MeoFile = meo_file_open(WT_DB, MEO_OPEN_READ | MEO_OPEN_WRITE);
+    var w: MeoWal* = wt_open(db);
+    if (w == 0) { syscall(60, 3); }
+    meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+    meo_wal_test_ctl(MEO_WAL_T_CRASH_AT, at);
+    if (torn) { meo_wal_test_ctl(MEO_WAL_T_TORN, 1); }
+    wt_append(w, 1, 1);
+    wt_commit(w, 2, 1);
+    meo_wal_sync(w);
+    syscall(60, 5);
+  }
+  var st: int32 = 0;
+  syscall(61, pid, (int64)&st, 0, 0);
+  return (st >> 8) & 255;
+}
+
+fn v9_crash() -> bool {
+  var db: MeoFile = wt_fresh();
+  // Point 3 is the commit frame: dead before it, nothing is committed.
+  if (!eq(wt_child(3, false), 77, "v9: child died")) { return false; }
+  var w: MeoWal* = wt_open(db);
+  if (w == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w), 0, "v9: crash before commit frame")) { return false; }
+  if (!eq(meo_wal_find(w, 1, 2), 0, "v9: uncommitted frame not indexed")) { return false; }
+  meo_wal_close(w, true);
+
+  // The same point torn: half the commit frame is on disk, still no commit.
+  if (!eq(wt_child(3, true), 77, "v9: torn child died")) { return false; }
+  if (!meo_t_check(wt_wal_size() > 32 + WT_FRAME, "v9: torn bytes landed")) { return false; }
+  var w2: MeoWal* = wt_open(db);
+  if (w2 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w2), 0, "v9: torn commit frame is invalid")) { return false; }
+  meo_wal_close(w2, true);
+
+  // Point 4 is the fsync: both frames are written, so they are recovered.
+  if (!eq(wt_child(4, false), 77, "v9: fsync child died")) { return false; }
+  var w3: MeoWal* = wt_open(db);
+  if (w3 == 0) { return false; }
+  if (!eq(meo_wal_last_commit(w3), 2, "v9: crash before fsync keeps the commit")) { return false; }
+  meo_wal_close(w3, true);
+
+  // Dying at point 5 never happens: the child finishes normally.
+  if (!eq(wt_child(5, false), 5, "v9: no crash past the last point")) { return false; }
+  meo_file_unlink(WT_WAL);
+  meo_file_close(db);
+  println("PASS v9_crash");
+  return true;
+}
 
 fn main() -> int32 {
-  println("PASS wal_self (stub)");
-  return 0;
+  if (!v1_basic()) { return meo_t_report() + 1; }
+  if (!v2_segments()) { return meo_t_report() + 1; }
+  if (!v3_corrupt()) { return meo_t_report() + 1; }
+  if (!v4_salt()) { return meo_t_report() + 1; }
+  if (!v5_stale()) { return meo_t_report() + 1; }
+  if (!v6_header()) { return meo_t_report() + 1; }
+  if (!v7_peek()) { return meo_t_report() + 1; }
+  if (!v8_io_points()) { return meo_t_report() + 1; }
+  if (!v9_crash()) { return meo_t_report() + 1; }
+  println("PASS wal_self");
+  return meo_t_report();
 }
