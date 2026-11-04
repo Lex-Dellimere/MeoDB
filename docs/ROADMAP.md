@@ -29,7 +29,7 @@ Layers 3, 4a, 5. Consumer: flux_orm.
 - [ ] Range predicates (`<`, `<=`, `>`, `>=`, BETWEEN) use an index.
 - [ ] `meo_tbl_scan_range(db, table, x_col, lo, hi, cb)` streams (x, y) float64 pairs. mistplot fills an `MpSeries` from 1M rows without a full-table materialization.
 - [ ] Opt-in streaming select: memory stays constant while reading all of a 1M-row table.
-- [ ] Opening a database takes an exclusive lock on the file; a second process (a second server, or an embedded open) gets BUSY instead of corrupting it.
+- [x] Opening a database takes an exclusive lock on the file; a second process (a second server, or an embedded open) gets BUSY instead of corrupting it (`flock_self`).
 
 ## M4 — Change feed + in-process real-time
 Layer 6. Consumers: mistplot live push, raize notifications.

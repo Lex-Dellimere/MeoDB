@@ -22,7 +22,7 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 | M16 | AUTOINCREMENT: rowids of deleted rows at the top end can be reused today. | apps that must never reuse ids | not scheduled | open |
 | M17 | Savepoints and nested transactions. | flux_orm nested units of work | not scheduled | open |
 | M18 | Streaming results or server-side cursors; results come back whole today. | large reads | M3 (embedded streaming select) | open |
-| M19 | An exclusive file lock at open, so a second process on the same file gets BUSY instead of corrupting it. | example_sass, any deployment | M3 | open |
+| M19 | An exclusive file lock at open, so a second process on the same file gets BUSY instead of corrupting it. | example_sass, any deployment | M3 | done (`16381e3`) |
 | M20 | IPv6 and host names. | non-local deployments | not scheduled | open |
 | M21 | A way to run every test in one command (the old check script was deleted). | developers | not scheduled | open |
 | M22 | Group commit: concurrent commits share one fsync. | write-heavy apps (example_sass F02.7) | M5 | open |
