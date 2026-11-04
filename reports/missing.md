@@ -6,7 +6,7 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 |---|---|---|---|---|
 | M1 | CREATE INDEX / DROP INDEX: named, multi-column and non-unique indexes (today only single-column PK/UNIQUE declared in CREATE TABLE). The server answers UNSUPPORTED. | flux_orm migrations, example_sass (listing entries by user) | M3 | open |
 | M2 | Rows larger than 1280 encoded bytes (overflow pages). | example_sass entries, any long text | M3 | open |
-| M3 | Range scans on an ordered key for time windows. | mistplot | M3 | open |
+| M3 | Range scans on an ordered key for time windows. | mistplot | M3 | done (`c3acf7f`) |
 | M4 | Change feed for typed-API writes, with row payloads, GAP times and transient-error reporting. | mistplot live charts, raize notifications | M4 | done (`611dc90`, `802a1a1`) |
 | M5 | Readers that don't wait for the writer (WAL + MVCC). | raize_web, any multi-user app | M5 | open |
 | M6 | Graph engine: node and edge tables with an adjacency index. | future apps | M6 | open |

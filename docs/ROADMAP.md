@@ -26,8 +26,8 @@ Layers 3, 4a, 5. Consumer: flux_orm.
 - [ ] Overflow pages: rows up to 16 MiB round-trip; `MEO_REC_MAX` is lifted.
 - [ ] B-tree merge/rebalance; emptied pages go back to the freelist (file size is stable under insert/delete churn).
 - [ ] Index creation on an existing table, composite and non-unique indexes; inner and left joins for flux_orm's join builder.
-- [ ] Range predicates (`<`, `<=`, `>`, `>=`, BETWEEN) use an index.
-- [ ] `meo_tbl_scan_range(db, table, x_col, lo, hi, cb)` streams (x, y) float64 pairs. mistplot fills an `MpSeries` from 1M rows without a full-table materialization.
+- [x] Range predicates (`<`, `<=`, `>`, `>=`, BETWEEN) use the rowid or a unique index (`range_self`).
+- [x] `meo_q_scan_xy` / `meo_q_scan_xyg` stream (x, y) float64 pairs over an x window without materializing the table (`range_self`). Filling an `MpSeries` from 1M rows is mistplot's to check.
 - [ ] Opt-in streaming select: memory stays constant while reading all of a 1M-row table.
 - [x] Opening a database takes an exclusive lock on the file; a second process (a second server, or an embedded open) gets BUSY instead of corrupting it (`flock_self`).
 
