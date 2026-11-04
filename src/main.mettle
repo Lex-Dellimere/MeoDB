@@ -1,4 +1,4 @@
-// main: the MeoSQL smoke entry. Phase 1 wires the modules together here so one
+// main: the MeoDB smoke entry. Phase 1 wires the modules together here so one
 // binary proves the whole stack: status codes, the file surface, the page
 // format, the arena. It grows a stage at a time; the phase-1 gate runs it in
 // both debug and release and requires identical output.

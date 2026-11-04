@@ -2,7 +2,7 @@
 //
 // They sit in their own module so that db/, query/ and every consumer can name
 // them without pulling in the engine. The open and transaction values equal
-// flux_orm's RC_MEOSQL_* and RC_TX_*, so an adapter passes them through
+// flux_orm's RC_MEODB_* and RC_TX_*, so an adapter passes them through
 // unchanged; never renumber them.
 //
 // meo_db_open flags: MEO_OPEN_READ 1, MEO_OPEN_WRITE 2, MEO_OPEN_CREATE 4 are

@@ -25,11 +25,11 @@ import "std/mem";
 import "../src/error/status.mettle";
 import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 import "tinytest.mettle";
 
-const RG_DB: string = "/dev/shm/meosql_range_self.dat";
-const RG_DB2: string = "/dev/shm/meosql_range_self_b.dat";
+const RG_DB: string = "/dev/shm/meodb_range_self.dat";
+const RG_DB2: string = "/dev/shm/meodb_range_self_b.dat";
 const RG_N: int32 = 1000;
 const RG_IDS: int32 = 1024;
 const RG_BIG: int32 = 100000;

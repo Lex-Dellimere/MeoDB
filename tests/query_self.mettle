@@ -13,7 +13,7 @@ import "../src/format/bytes.mettle";
 import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
 import "../src/mem/arena.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 
 // Red-check switch: 1 expects one row too many in the 10,000-row count.
 // Must be 0 when committed.

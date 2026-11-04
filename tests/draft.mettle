@@ -15,7 +15,7 @@ import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
 import "../src/pager/pager.mettle";
 import "../src/btree/node.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 
 const DR_ROWS: int32 = 3000;
 // Red-check switches: 1 expects one row too many / one "u" row too many.

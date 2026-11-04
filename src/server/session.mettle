@@ -245,7 +245,7 @@ fn srv_on_hello(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
   ok.max_frame = s->srv->cfg.max_frame;
   ok.session = (uint64)s->id;
   ok.caps = MEO_SRV_CAPS;
-  ok.name = "meosql 0.1.0";
+  ok.name = "meodb 0.1.0";
   meo_wbuf_begin(&s->w);
   meo_wire_hello_ok_put(&s->w, &ok);
   rc = srv_send(s, meo_wbuf_finish(&s->w, MEO_WIRE_K_HELLO_OK, h->rid));

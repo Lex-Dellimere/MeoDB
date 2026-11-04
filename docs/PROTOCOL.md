@@ -1,6 +1,6 @@
-# MeoSQL wire protocol v1
+# MeoDB wire protocol v1
 
-The byte-exact contract between the `meosql` server and any client. A client can be written from this page alone. The reference codec is `src/wire/`; where this page and that code disagree, the code wins and this page is the bug.
+The byte-exact contract between the `meodb` server and any client. A client can be written from this page alone. The reference codec is `src/wire/`; where this page and that code disagree, the code wins and this page is the bug.
 
 ## Basics
 
@@ -89,7 +89,7 @@ Every payload must be consumed exactly. Short or trailing bytes -> `ERROR PROTO`
 | 4 | 4 | max_frame | u32 | largest payload the server accepts |
 | 8 | 8 | session | u64 | session id, for logs |
 | 16 | 4 | caps | u32 | bit0 COUNT, bit1 ASSIGN_ADD; other bits 0 |
-| 20 | 2+n | name | str16 | e.g. "meosql 0.1.0" |
+| 20 | 2+n | name | str16 | e.g. "meodb 0.1.0" |
 
 A max_frame above 2^31-1 is read as 2^31-1.
 

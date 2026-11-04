@@ -5,11 +5,11 @@ fixed (with the commit) instead of deleting it.
 
 | File | What |
 |---|---|
-| [bugs.md](bugs.md) | Defects, risks and untested paths in MeoSQL |
-| [missing.md](missing.md) | Features MeoSQL does not have yet |
-| [mettle-release-miscompile.md](mettle-release-miscompile.md) | A Mettle compiler bug found while building MeoSQL |
+| [bugs.md](bugs.md) | Defects, risks and untested paths in MeoDB |
+| [missing.md](missing.md) | Features MeoDB does not have yet |
+| [mettle-release-miscompile.md](mettle-release-miscompile.md) | A Mettle compiler bug found while building MeoDB |
 
-Mettle changes MeoSQL needs are filed in `../Mettle/reports/` (that folder is
+Mettle changes MeoDB needs are filed in `../Mettle/reports/` (that folder is
 not in git): 038 release loop hang, 039 mutex timeout restarts, 040 no condition
 variable or rwlock, 041 std/net has no poll and hides errno, 042 no positional
 file IO / fsync / file lock, 043 analyser false positive on thread hand-off.

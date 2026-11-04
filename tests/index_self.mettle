@@ -33,10 +33,10 @@ import "../src/error/status.mettle";
 import "../src/format/bytes.mettle";
 import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 import "tinytest.mettle";
 
-const IX_DB: string = "/dev/shm/meosql_index_self.dat";
+const IX_DB: string = "/dev/shm/meodb_index_self.dat";
 const IX_N: int32 = 200;
 
 // The values every query is run with: prefix collisions, a miss, the ends.

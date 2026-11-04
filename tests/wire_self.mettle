@@ -378,7 +378,7 @@ fn t_round(w: MeoWBuf*, a: MeoArena*) {
   ho.max_frame = MEO_WIRE_MAX_FRAME;
   ho.session = 0xFEDCBA9876543210;
   ho.caps = MEO_WIRE_CAP_COUNT | MEO_WIRE_CAP_ASSIGN_ADD;
-  ho.name = t_str("meosql 0.1.0");
+  ho.name = t_str("meodb 0.1.0");
   meo_wbuf_begin(w);
   meo_wire_hello_ok_put(w, &ho);
   t_keep(w, MEO_WIRE_K_HELLO_OK, 1);

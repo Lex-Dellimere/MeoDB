@@ -18,4 +18,4 @@ With `--release`, each of these changes makes it pass:
 
 Replacing `break` with `return` still hangs, so the trigger is the inner loop on the pointer field plus an exit branch, not `break` itself.
 
-MeoSQL avoids the pattern; the lexer it was found in has since been removed.
+MeoDB avoids the pattern; the lexer it was found in has since been removed.

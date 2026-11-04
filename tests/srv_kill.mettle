@@ -20,7 +20,7 @@ import "../src/meo_client.mettle";
 // Red-check switch: 1 expects the dead child's rows to survive. Must be 0
 // when committed.
 const KILL_RED: int32 = 0;
-const KILL_DB: string = "/dev/shm/meosql_srv_kill.db";
+const KILL_DB: string = "/dev/shm/meodb_srv_kill.db";
 const KILL_IP: string = "127.0.0.1";
 const KILL_ROWS: int32 = 100;
 const KILL_HUNG_ROWS: int32 = 5;

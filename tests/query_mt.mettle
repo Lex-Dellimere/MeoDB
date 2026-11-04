@@ -13,7 +13,7 @@ import "../src/error/status.mettle";
 import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
 import "../src/platform/clock_linux.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 
 // Red-check switch: 1 expects one increment more than were made. Must be 0
 // when committed.
@@ -21,7 +21,7 @@ const MT_RED: int32 = 0;
 // On tmpfs: on disk every autocommit write pays its fsyncs (~5 ms each here),
 // which turns 22,400 serialized commits into minutes and tests the disk, not
 // the lock.
-const MT_DB: string = "/dev/shm/meosql_query_mt.db";
+const MT_DB: string = "/dev/shm/meodb_query_mt.db";
 const MT_THREADS: int32 = 64;
 const MT_OPS: int32 = 500;
 const MT_TX_THREADS: int32 = 8;

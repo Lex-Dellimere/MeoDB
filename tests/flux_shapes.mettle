@@ -7,7 +7,7 @@
 // shapes: versioned save and delete, created/updated INT timestamps,
 // update_all / delete_all with terms, count with terms, the migration ledger,
 // and the relation preload IN query. Joins are refused by the adapter itself
-// and never reach MeoSQL, so they have no case here.
+// and never reach MeoDB, so they have no case here.
 
 import "std/io";
 import "std/mem";
@@ -16,7 +16,7 @@ import "../src/error/status.mettle";
 import "../src/format/bytes.mettle";
 import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 
 // Red-check switch: 1 expects the stale versioned save to change a row.
 // Must be 0 when committed.

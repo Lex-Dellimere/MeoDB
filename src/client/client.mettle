@@ -72,7 +72,7 @@ export fn meo_cli_opts_init(o: MeoCliOpts*) {
   o->recv_ms = MEO_CLI_TIMEOUT_MS;
   o->send_ms = MEO_CLI_TIMEOUT_MS;
   o->max_frame = MEO_WIRE_MAX_FRAME;
-  o->name = "meosql-cli";
+  o->name = "meodb-cli";
 }
 
 fn meo_cli_str(p: uint8*, n: int32) -> string {

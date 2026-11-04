@@ -1,24 +1,24 @@
-// MeoSQL: a database written in Mettle, reached by flux_orm over TCP.
+// MeoDB: a database written in Mettle, reached by flux_orm over TCP.
 //
 //   mbuild build          debug, target linux -> build/linux/debug/
 //   mbuild build -r       release
 //   mbuild check          type-check every bin
 //   mbuild test           @test functions in the compile-time interpreter
-//   mbuild run meosql     the server (see --help)
+//   mbuild run meodb     the server (see --help)
 //   mbuild run smoke      the whole storage stack in one run
 //   mbuild run <test>     one test program; each prints PASS or FAIL
 //
-// Needs the head compiler, not the v0.17.0 release (MeoSQL uses syscall()):
+// Needs the head compiler, not the v0.17.0 release (MeoDB uses syscall()):
 //   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
 
 import "mbuild/api";
 
 fn project() {
-  mb_package("meosql", "0.1.0");
+  mb_package("meodb", "0.1.0");
   mb_targets("linux");
 
   // The server: owns one database file and serves the wire protocol.
-  mb_bin("meosql", "src/server/main.mettle");
+  mb_bin("meodb", "src/server/main.mettle");
 
   // The whole storage stack in one run.
   mb_bin("smoke", "src/main.mettle");

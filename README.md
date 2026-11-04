@@ -1,4 +1,4 @@
-# MeoSQL
+# MeoDB
 
 A relational database written in Mettle, and the storage backend for
 [flux_orm](../flux_orm).
@@ -15,7 +15,7 @@ A relational database written in Mettle, and the storage backend for
 
 ## Status
 
-MeoSQL has no SQL language. Programs call a typed query API (`meo_q_*`): a
+MeoDB has no SQL language. Programs call a typed query API (`meo_q_*`): a
 query is built with function calls and run with `meo_q_step`.
 
 Built: the single-node engine. Tables with INTEGER, REAL, TEXT and BLOB
@@ -26,7 +26,7 @@ up to 64 threads through a database-wide lock (one writer at a time). An
 in-process change feed reports committed writes (see
 [Change feed](#change-feed)).
 
-The `meosql` server serves one database over TCP for flux_orm and other
+The `meodb` server serves one database over TCP for flux_orm and other
 clients (see [Server](#server)). Not built yet: joins, CREATE INDEX,
 distribution, replication, and concurrent readers.
 
@@ -41,11 +41,11 @@ distribution, replication, and concurrent readers.
 | `src/feed/feed.mettle` | In-process committed-change feed |
 
 `src/meo_core.mettle` imports the engine without the query layer;
-`src/meosql.mettle` imports everything.
+`src/meodb.mettle` imports everything.
 
-## Using MeoSQL
+## Using MeoDB
 
-Import `src/meosql.mettle`. Every call returns `MEO_OK` (0), `MEO_ROW` /
+Import `src/meodb.mettle`. Every call returns `MEO_OK` (0), `MEO_ROW` /
 `MEO_DONE` from a step, or a negative `-MEO_ERR_*` code; checks are left out
 here.
 
@@ -92,9 +92,9 @@ transactions use `meo_db_begin`, `meo_db_commit` and `meo_db_rollback`.
 ## Server
 
 ```
-build/linux/release/meosql --db data.meo              # 127.0.0.1:5490
-build/linux/release/meosql --db data.meo --port 0     # any free port
-build/linux/release/meosql --db data.meo --listen 0.0.0.0:5490 --token-file token
+build/linux/release/meodb --db data.meo              # 127.0.0.1:5490
+build/linux/release/meodb --db data.meo --port 0     # any free port
+build/linux/release/meodb --db data.meo --listen 0.0.0.0:5490 --token-file token
 ```
 
 It prints the port it bound, serves until SIGINT or SIGTERM, and rolls back
@@ -107,7 +107,7 @@ client library for Mettle programs.
 
 `src/feed/feed.mettle` tells a consumer (MistPlot's live charts, for one)
 **what** changed and **when**, and only ever reports changes whose transaction
-committed. It does not carry values: MeoSQL maps a key to a `uint64` rowid and
+committed. It does not carry values: MeoDB maps a key to a `uint64` rowid and
 has no row payloads yet, so a consumer re-queries on change. `MeoChange` is laid
 out so a payload field can be appended later without breaking callers.
 
@@ -188,7 +188,7 @@ journals with `MEOJ`.
 
 ## Build
 
-MeoSQL needs the head Mettle compiler (the v0.17.0 release has no `syscall()`)
+MeoDB needs the head Mettle compiler (the v0.17.0 release has no `syscall()`)
 and mbuild 0.2 or later, which reads `mbuild.mettle`.
 
 ```
@@ -199,7 +199,7 @@ $MB run smoke         # the whole storage stack in one run
 $MB run phase2 -r     # one test program, release build
 ```
 
-Apart from `meosql` and `smoke`, every `mb_bin` in `mbuild.mettle` is a test
+Apart from `meodb` and `smoke`, every `mb_bin` in `mbuild.mettle` is a test
 program, and each should print `PASS` in both debug and release with zero
 compiler warnings.
 

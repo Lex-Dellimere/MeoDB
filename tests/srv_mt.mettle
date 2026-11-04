@@ -17,7 +17,7 @@ import "../src/meo_client.mettle";
 // committed.
 const MT_RED: int32 = 0;
 // On tmpfs: on disk every autocommit pays its fsyncs and the run tests the disk.
-const MT_DB: string = "/dev/shm/meosql_srv_mt.db";
+const MT_DB: string = "/dev/shm/meodb_srv_mt.db";
 const MT_IP: string = "127.0.0.1";
 const MT_THREADS: int32 = 64;
 const MT_OPS: int32 = 2000;

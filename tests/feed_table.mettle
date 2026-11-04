@@ -31,11 +31,11 @@ import "../src/types/key.mettle";
 import "../src/btree/btree.mettle";
 import "../src/feed/feed.mettle";
 import "../src/mem/arena.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 import "tinytest.mettle";
 
-const FT_DB: string = "/dev/shm/meosql_feed_table.dat";
-const FT_DB2: string = "/dev/shm/meosql_feed_table_pager.dat";
+const FT_DB: string = "/dev/shm/meodb_feed_table.dat";
+const FT_DB2: string = "/dev/shm/meodb_feed_table_pager.dat";
 const FT_OUT_CAP: int32 = 64;
 const FT_KEY_CAP: int32 = 65536;
 

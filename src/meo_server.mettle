@@ -1,7 +1,7 @@
 // meo_server: import root for programs that embed the network server: the
 // full engine plus the wire codec, sockets and server/server.
 
-import "meosql.mettle";
+import "meodb.mettle";
 import "wire/frame.mettle";
 import "wire/value.mettle";
 import "wire/stmt.mettle";

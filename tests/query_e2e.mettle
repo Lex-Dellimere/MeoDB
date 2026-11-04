@@ -12,7 +12,7 @@ import "../src/error/status.mettle";
 import "../src/format/bytes.mettle";
 import "../src/platform/file.mettle";
 import "../src/platform/file_linux.mettle";
-import "../src/meosql.mettle";
+import "../src/meodb.mettle";
 
 // Red-check switch: 1 expects one row too many after the rollback.
 // Must be 0 when committed.

@@ -1,4 +1,0 @@
-// meosql: import root of the full engine, meo_core + the typed query API.
-
-import "meo_core.mettle";
-import "query/query.mettle";

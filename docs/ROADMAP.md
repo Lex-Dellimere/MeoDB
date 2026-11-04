@@ -1,6 +1,6 @@
-# MeoSQL roadmap
+# MeoDB roadmap
 
-Milestones in build order, with one exception: the network server (M7, without remote subscribe) comes straight after M2, because flux_orm reaches MeoSQL over the network instead of compiling it in. Remote subscribe follows M4. A milestone is done when every exit criterion is checked by a `[bin.*]` test that passes in debug and release with zero warnings. Layer numbers refer to `docs/ARCHITECTURE.md`.
+Milestones in build order, with one exception: the network server (M7, without remote subscribe) comes straight after M2, because flux_orm reaches MeoDB over the network instead of compiling it in. Remote subscribe follows M4. A milestone is done when every exit criterion is checked by a `[bin.*]` test that passes in debug and release with zero warnings. Layer numbers refer to `docs/ARCHITECTURE.md`.
 
 ## M0 — Storage (done)
 Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback journal.
@@ -57,8 +57,8 @@ Layer 7.
 - [ ] Graph writes go through the same transactions and the change feed.
 
 ## M7 — Network server + remote real-time
-Layers 8 and 11. Consumer: flux_orm, which reaches MeoSQL over TCP instead of compiling it in. Remote subscribe comes after M4.
-- [x] A `meosql` binary serves one database file over TCP, bound to 127.0.0.1 by default, one thread per connection, up to 64 connections. Further connections get a BUSY frame and are closed.
+Layers 8 and 11. Consumer: flux_orm, which reaches MeoDB over TCP instead of compiling it in. Remote subscribe comes after M4.
+- [x] A `meodb` binary serves one database file over TCP, bound to 127.0.0.1 by default, one thread per connection, up to 64 connections. Further connections get a BUSY frame and are closed.
 - [x] Length-prefixed binary frames: HELLO (version check, optional token), PING, BEGIN, COMMIT, ROLLBACK, QUERY (a typed statement with typed values), BYE. A result comes back whole, with affected rows and the last rowid.
 - [x] The frame codec round-trips every frame kind and value exactly. Every truncated or corrupted frame is refused without a crash or an out-of-bounds read (`wire_self`).
 - [x] `meo_cli_` passes the M2 query suite and every flux_orm query shape remotely, with the same results as embedded (`srv_e2e`).
@@ -66,11 +66,11 @@ Layers 8 and 11. Consumer: flux_orm, which reaches MeoSQL over TCP instead of co
 - [x] A client killed mid-transaction: its writes are gone, and another connection gets the lock within 1 s. A client that hangs mid-transaction is cut off after the transaction idle timeout (`srv_kill`).
 - [x] An oversize frame gets TOOBIG, a wrong version gets VERSION, a wrong token gets AUTH, and a result over the frame limit gets TOOBIG with the connection still usable (`srv_limits`).
 - [x] Stopping the server rolls back open transactions. Reopening shows only committed data (`srv_stop`).
-- [x] flux_orm's network adapter passes its tests against a running server (flux_orm `tests/live_meosql.mettle`).
+- [x] flux_orm's network adapter passes its tests against a running server (flux_orm `tests/live_meodb.mettle`).
 - [ ] After M4: remote `SUBSCRIBE table` pushes events within 50 ms p99 on localhost, and raize can relay them to browsers.
 
 ## M7b — Authentication and access control
-Layer 8d. Consumers: every network client (flux_orm, raize_web apps). Hashing, key derivation and encryption come from a separate Mettle security library; MeoSQL calls it and implements no crypto of its own.
+Layer 8d. Consumers: every network client (flux_orm, raize_web apps). Hashing, key derivation and encryption come from a separate Mettle security library; MeoDB calls it and implements no crypto of its own.
 - [ ] Users live in a system table in the database file. Passwords are stored only as salted, slow hashes from the security library. Creating, changing and removing users is an admin operation.
 - [ ] HELLO carries a user name and a credential (a protocol minor version bump). The shared token stays as the bootstrap credential for the first admin. A wrong user or password returns AUTH after the same delay as today, with no hint which part was wrong.
 - [ ] Permissions per user: read and write per table, and admin for DDL and user management. A denied query returns AUTH, non-fatal, and leaves the transaction state unchanged.

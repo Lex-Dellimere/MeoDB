@@ -28,7 +28,7 @@ import "../src/pager/pager.mettle";
 import "../src/db/db.mettle";
 import "tinytest.mettle";
 
-const FL_DB: string = "/dev/shm/meosql_flock_self.dat";
+const FL_DB: string = "/dev/shm/meodb_flock_self.dat";
 
 fn fl_cleanup() {
   meo_file_unlink(FL_DB);
