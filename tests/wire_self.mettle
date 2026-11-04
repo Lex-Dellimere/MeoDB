@@ -2,6 +2,9 @@
 //
 //   t_round      every request and response kind round-trips, including all
 //                ten statement ops
+//   t_sub        SUBSCRIBE, SUB_OK, EVENTS, ACK, SCAN and SCAN_ROWS round-trip with
+//                every field edge; shape rules refuse on both sides; a frame that
+//                does not fit leaves the EVENTS frame as it was
 //   t_values     NULL, INT64 min/max, -0.0 and NaN bits, empty TEXT/BLOB
 //   t_max        a TEXT and a BLOB that exactly fill the max frame; one byte
 //                more is TOOBIG; a 65535-byte name fits, 65536 is USAGE
@@ -9,7 +12,7 @@
 //   t_prefix     every prefix of every frame, and of every payload, is PROTO
 //   t_trailing   one extra byte after any payload or frame is PROTO
 //   t_counts     a count claiming more items than bytes left is PROTO and
-//                allocates nothing
+//                allocates nothing, new frames included
 //   t_fuzz       10,000 seeded random byte flips: no crash, only known
 //                codes, and every decoded view lies inside its exact-size
 //                heap buffer
@@ -26,10 +29,11 @@ import "../src/wire/frame.mettle";
 import "../src/wire/value.mettle";
 import "../src/wire/stmt.mettle";
 import "../src/wire/msg.mettle";
+import "../src/wire/sub.mettle";
 
 const T_SEED: uint32 = 20261104;
 const T_FLIPS: int32 = 10000;
-const T_MAXF: int32 = 64;
+const T_MAXF: int32 = 128;
 
 var t_failures: int32 = 0;
 var t_rng: uint32 = 1;
@@ -150,6 +154,29 @@ fn t_stmt_inside(p: uint8*, pn: int32, st: MeoWStmt*) -> bool {
   return true;
 }
 
+fn t_cols_inside(p: uint8*, pn: int32, n: int32, cols: MeoWSchemaCol*) -> bool {
+  var i: int32 = 0;
+  while (i < n) {
+    if (!t_str_inside(p, pn, cols[i].name)) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+fn t_event_inside(p: uint8*, pn: int32, e: MeoWEvent*) -> bool {
+  var i: int32 = 0;
+  while (i < e->n_vals) {
+    if (!t_val_inside(p, pn, &e->vals[i])) { return false; }
+    i += 1;
+  }
+  i = 0;
+  while (i < e->n_old) {
+    if (!t_val_inside(p, pn, &e->old[i])) { return false; }
+    i += 1;
+  }
+  return t_str_inside(p, pn, e->name) && t_cols_inside(p, pn, e->n_cols, e->cols);
+}
+
 // Decode one payload by kind; on success, check every view stays in bounds.
 fn t_decode(kind: int32, p: uint8*, n: int32, a: MeoArena*) -> int32 {
   var r: MeoWRd;
@@ -166,6 +193,29 @@ fn t_decode(kind: int32, p: uint8*, n: int32, a: MeoArena*) -> int32 {
     case 3: {
       var mode: int32 = 0;
       rc = meo_wire_begin_get(&r, &mode);
+    }
+    case 8: {
+      var sb: MeoWSub;
+      rc = meo_wire_sub_get(&r, a, &sb);
+      if (rc == MEO_OK) {
+        var si: int32 = 0;
+        while (si < sb.n_tables && inside) {
+          inside = t_str_inside(p, n, sb.tables[si]);
+          si += 1;
+        }
+      }
+    }
+    case 9: {
+      var ak: uint64 = 0;
+      rc = meo_wire_ack_get(&r, &ak);
+    }
+    case 11: {
+      var sc: MeoWScan;
+      rc = meo_wire_scan_get(&r, &sc);
+      if (rc == MEO_OK) {
+        inside = t_str_inside(p, n, sc.table) && t_str_inside(p, n, sc.x)
+            && t_str_inside(p, n, sc.y) && t_str_inside(p, n, sc.group);
+      }
     }
     case 6: {
       var st: MeoWStmt;
@@ -194,9 +244,36 @@ fn t_decode(kind: int32, p: uint8*, n: int32, a: MeoArena*) -> int32 {
         }
       }
     }
+    case 68: {
+      var so: MeoWSubOk;
+      rc = meo_wire_sub_ok_get(&r, a, &so);
+      if (rc == MEO_OK) {
+        var ti: int32 = 0;
+        while (ti < so.n_tables && inside) {
+          inside = t_str_inside(p, n, so.tables[ti].name) && t_cols_inside(p, n, so.tables[ti].n_cols, so.tables[ti].cols);
+          ti += 1;
+        }
+      }
+    }
+    case 69: {
+      var sh: MeoWScanRows;
+      var sp: MeoWPoint* = 0;
+      rc = meo_wire_scan_rows_get(&r, a, &sh, &sp);
+    }
+    case 128: {
+      var evs: MeoWEvents;
+      rc = meo_wire_events_get(&r, a, &evs);
+      if (rc == MEO_OK) {
+        var ei: int32 = 0;
+        while (ei < evs.n && inside) {
+          inside = t_event_inside(p, n, &evs.ev[ei]);
+          ei += 1;
+        }
+      }
+    }
     default: {
       if (kind == MEO_WIRE_K_PING || kind == MEO_WIRE_K_COMMIT || kind == MEO_WIRE_K_ROLLBACK
-          || kind == MEO_WIRE_K_BYE || kind == MEO_WIRE_K_OK) {
+          || kind == MEO_WIRE_K_BYE || kind == MEO_WIRE_K_OK || kind == MEO_WIRE_K_UNSUBSCRIBE) {
         rc = meo_wire_empty_get(&r);
       }
     }
@@ -328,7 +405,7 @@ fn t_round(w: MeoWBuf*, a: MeoArena*) {
     var hg: MeoWHello;
     t_i32(meo_wire_hello_get(&r, &hg), MEO_OK, "hello get");
     t_i32(hg.major, 1, "hello major");
-    t_i32(hg.minor, 0, "hello minor");
+    t_i32(hg.minor, MEO_WIRE_MINOR, "hello minor");
     t_i32(hg.max_frame, MEO_WIRE_MAX_FRAME, "hello max_frame");
     t_ok(t_str_eq(hg.token, h.token), "hello token");
     t_ok(t_str_eq(hg.name, h.name), "hello name");
@@ -603,6 +680,556 @@ fn t_round(w: MeoWBuf*, a: MeoArena*) {
   t_case("t_round", f0);
 }
 
+fn t_cols_eq(an: int32, ac: MeoWSchemaCol*, bn: int32, bc: MeoWSchemaCol*, label: string) {
+  if (!t_i32(bn, an, "{label} n_cols")) { return; }
+  var i: int32 = 0;
+  while (i < an) {
+    t_ok(t_str_eq(ac[i].name, bc[i].name), "{label} col name {i}");
+    t_i32(bc[i].ty, ac[i].ty, "{label} col ty {i}");
+    i += 1;
+  }
+}
+
+fn t_event_eq(a: MeoWEvent*, b: MeoWEvent*, label: string) {
+  t_ok(a->seq == b->seq && a->commit_seq == b->commit_seq, "{label} seqs");
+  t_ok(a->time_us == b->time_us, "{label} time");
+  t_i32(b->kind, a->kind, "{label} kind");
+  t_ok(a->table_id == b->table_id, "{label} table_id");
+  t_ok(a->rowid == b->rowid && a->old_rowid == b->old_rowid, "{label} rowids");
+  if (!t_i32(b->n_vals, a->n_vals, "{label} n_vals")) { return; }
+  var i: int32 = 0;
+  while (i < a->n_vals) {
+    t_ok(t_val_eq(&a->vals[i], &b->vals[i]), "{label} val {i}");
+    i += 1;
+  }
+  if (!t_i32(b->n_old, a->n_old, "{label} n_old")) { return; }
+  i = 0;
+  while (i < a->n_old) {
+    t_ok(t_val_eq(&a->old[i], &b->old[i]), "{label} old {i}");
+    i += 1;
+  }
+  t_ok(t_str_eq(a->name, b->name), "{label} schema name");
+  t_cols_eq(a->n_cols, a->cols, b->n_cols, b->cols, label);
+}
+
+fn t_ev(e: MeoWEvent*, seq: uint64, kind: int32, table_id: uint32) {
+  e->seq = seq;
+  e->commit_seq = seq + 100;
+  e->time_us = 1700000000000000 + (int64)seq;
+  e->kind = kind;
+  e->table_id = table_id;
+  e->rowid = (int64)seq * 3;
+  e->old_rowid = 0;
+  e->n_vals = 0;
+  e->vals = 0;
+  e->n_old = 0;
+  e->old = 0;
+  e->name.chars = 0;
+  e->name.length = 0;
+  e->n_cols = 0;
+  e->cols = 0;
+}
+
+fn t_sub_round(w: MeoWBuf*, a: MeoArena*, sb: MeoWSub*, rid: uint32, label: string) {
+  meo_wbuf_begin(w);
+  meo_wire_sub_put(w, sb);
+  t_keep(w, MEO_WIRE_K_SUBSCRIBE, rid);
+  var r: MeoWRd;
+  if (!t_open(w, &r, MEO_WIRE_K_SUBSCRIBE, rid, label)) { return; }
+  meo_arena_reset(a);
+  var g: MeoWSub;
+  if (!t_i32(meo_wire_sub_get(&r, a, &g), MEO_OK, "{label} get")) { return; }
+  t_i32(g.n_tables, sb->n_tables, "{label} n_tables");
+  var i: int32 = 0;
+  while (i < sb->n_tables && i < g.n_tables) {
+    t_ok(t_str_eq(sb->tables[i], g.tables[i]), "{label} table {i}");
+    i += 1;
+  }
+  t_ok(g.from_seq == sb->from_seq && g.from_commit == sb->from_commit, "{label} from");
+  t_ok(g.window == sb->window, "{label} window");
+}
+
+fn t_sub_ok_round(w: MeoWBuf*, a: MeoArena*, so: MeoWSubOk*, rid: uint32, label: string) {
+  meo_wbuf_begin(w);
+  meo_wire_sub_ok_put(w, so);
+  t_keep(w, MEO_WIRE_K_SUB_OK, rid);
+  var r: MeoWRd;
+  if (!t_open(w, &r, MEO_WIRE_K_SUB_OK, rid, label)) { return; }
+  meo_arena_reset(a);
+  var g: MeoWSubOk;
+  if (!t_i32(meo_wire_sub_ok_get(&r, a, &g), MEO_OK, "{label} get")) { return; }
+  t_ok(g.start_seq == so->start_seq && g.commit_seq == so->commit_seq, "{label} seqs");
+  t_ok(g.heartbeat_ms == so->heartbeat_ms, "{label} heartbeat");
+  if (!t_i32(g.n_tables, so->n_tables, "{label} n_tables")) { return; }
+  var i: int32 = 0;
+  while (i < so->n_tables) {
+    t_ok(g.tables[i].id == so->tables[i].id, "{label} id {i}");
+    t_ok(t_str_eq(g.tables[i].name, so->tables[i].name), "{label} name {i}");
+    t_cols_eq(so->tables[i].n_cols, so->tables[i].cols, g.tables[i].n_cols, g.tables[i].cols, label);
+    i += 1;
+  }
+}
+
+fn t_events_round(w: MeoWBuf*, a: MeoArena*, n: int32, ev: MeoWEvent*, label: string) {
+  meo_wbuf_begin(w);
+  meo_wire_events_put(w, n, ev);
+  t_keep(w, MEO_WIRE_K_EVENTS, 0);
+  var r: MeoWRd;
+  if (!t_open(w, &r, MEO_WIRE_K_EVENTS, 0, label)) { return; }
+  meo_arena_reset(a);
+  var g: MeoWEvents;
+  if (!t_i32(meo_wire_events_get(&r, a, &g), MEO_OK, "{label} get")) { return; }
+  if (!t_i32(g.n, n, "{label} n")) { return; }
+  var i: int32 = 0;
+  while (i < n) {
+    t_event_eq(&ev[i], &g.ev[i], "{label} event {i}");
+    i += 1;
+  }
+}
+
+fn t_scan_rows_round(w: MeoWBuf*, a: MeoArena*, last: bool, grouped: bool, seq: uint64,
+                     n: int32, pts: MeoWPoint*, rid: uint32, label: string) {
+  meo_wbuf_begin(w);
+  meo_wire_scan_rows_put(w, last, grouped, seq, n, pts);
+  t_keep(w, MEO_WIRE_K_SCAN_ROWS, rid);
+  var r: MeoWRd;
+  if (!t_open(w, &r, MEO_WIRE_K_SCAN_ROWS, rid, label)) { return; }
+  t_i32(r.n, MEO_WIRE_SCAN_ROWS_HDR + n * meo_wire_scan_point_size(grouped), "{label} payload size");
+  meo_arena_reset(a);
+  var h: MeoWScanRows;
+  var g: MeoWPoint* = 0;
+  if (!t_i32(meo_wire_scan_rows_get(&r, a, &h, &g), MEO_OK, "{label} get")) { return; }
+  t_ok(h.last == last && h.grouped == grouped, "{label} flags");
+  t_ok(h.commit_seq == seq, "{label} commit_seq");
+  if (!t_i32(h.n, n, "{label} n")) { return; }
+  var i: int32 = 0;
+  while (i < n) {
+    t_ok(t_bits(g[i].x) == t_bits(pts[i].x) && t_bits(g[i].y) == t_bits(pts[i].y), "{label} point {i}");
+    if (grouped) { t_ok(g[i].g == pts[i].g, "{label} group {i}"); } else { t_ok(g[i].g == 0, "{label} no group {i}"); }
+    i += 1;
+  }
+}
+
+// A frame with one event, patched at `off` of its payload, must decode to PROTO.
+fn t_event_patch(w: MeoWBuf*, a: MeoArena*, e: MeoWEvent*, off: int32, v: int32, label: string) {
+  meo_wbuf_begin(w);
+  meo_wire_events_put(w, 1, e);
+  var n: int32 = w->n - MEO_WIRE_HDR;
+  var q: uint8* = t_copy(w->p + MEO_WIRE_HDR, n);
+  q[off] = (uint8)v;
+  t_i32(t_decode(MEO_WIRE_K_EVENTS, q, n, a), -MEO_ERR_PROTO, label);
+  free((rawptr)q);
+}
+
+fn t_sub(w: MeoWBuf*, a: MeoArena*) {
+  var f0: int32 = t_failures;
+  var blob: uint8* = (uint8*)malloc(8);
+  var k: int32 = 0;
+  while (k < 8) {
+    blob[k] = (uint8)(k * 11 + 1);
+    k += 1;
+  }
+  var vals: MeoValue* = (MeoValue*)malloc(14 * (int64)sizeof(MeoValue));
+  t_fill_values(vals, blob);
+
+  // Schema columns: one of each type.
+  var cols: MeoWSchemaCol* = (MeoWSchemaCol*)malloc(4 * (int64)sizeof(MeoWSchemaCol));
+  cols[0].name = t_str("id");
+  cols[0].ty = MEO_T_INT;
+  cols[1].name = t_str("score");
+  cols[1].ty = MEO_T_REAL;
+  cols[2].name = t_str("email");
+  cols[2].ty = MEO_T_TEXT;
+  cols[3].name = t_str("avatar");
+  cols[3].ty = MEO_T_BLOB;
+
+  // SUBSCRIBE: named tables, none (= all), and the field edges.
+  var names: string* = (string*)malloc(3 * (int64)sizeof(string));
+  names[0] = t_str("users");
+  names[1] = t_str("");
+  names[2] = t_str("a table with spaces");
+  var sb: MeoWSub;
+  sb.n_tables = 3;
+  sb.tables = names;
+  sb.from_seq = 0xFFFFFFFFFFFFFFFF;
+  sb.from_commit = 0x8000000000000001;
+  sb.window = 65536;
+  t_sub_round(w, a, &sb, 40, "subscribe named");
+  sb.n_tables = 0;
+  sb.tables = 0;
+  sb.from_seq = 0;
+  sb.from_commit = 0;
+  sb.window = 1;
+  t_sub_round(w, a, &sb, 41, "subscribe all");
+  // Ranges are the server's to check: window 0 and 2^32-1 still decode.
+  sb.window = 0;
+  t_sub_round(w, a, &sb, 42, "subscribe window 0");
+  sb.window = 0xFFFFFFFF;
+  sb.from_commit = 77;
+  t_sub_round(w, a, &sb, 43, "subscribe window max");
+  // 65535 tables is the most u16 can say; 65536 is a writer USAGE.
+  var many: string* = (string*)malloc(65536 * (int64)sizeof(string));
+  k = 0;
+  while (k < 65536) {
+    many[k].chars = 0;
+    many[k].length = 0;
+    k += 1;
+  }
+  sb.n_tables = 65535;
+  sb.tables = many;
+  meo_wbuf_begin(w);
+  meo_wire_sub_put(w, &sb);
+  t_i32(w->err, MEO_OK, "subscribe 65535 tables");
+  meo_arena_reset(a);
+  var r: MeoWRd;
+  meo_wrd_init(&r, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR);
+  var sg: MeoWSub;
+  t_i32(meo_wire_sub_get(&r, a, &sg), MEO_OK, "subscribe 65535 get");
+  t_i32(sg.n_tables, 65535, "subscribe 65535 count");
+  sb.n_tables = 65536;
+  meo_wbuf_begin(w);
+  meo_wire_sub_put(w, &sb);
+  t_i32(w->err, -MEO_ERR_USAGE, "subscribe 65536 tables");
+  sb.n_tables = 1;
+  many[0].chars = "a\0b".chars;
+  many[0].length = 3;
+  meo_wbuf_begin(w);
+  meo_wire_sub_put(w, &sb);
+  t_i32(w->err, -MEO_ERR_USAGE, "subscribe NUL in name");
+  sb.n_tables = 1;
+  sb.tables = 0;
+  meo_wbuf_begin(w);
+  meo_wire_sub_put(w, &sb);
+  t_i32(w->err, -MEO_ERR_USAGE, "subscribe tables missing");
+  free((rawptr)many);
+
+  // SUB_OK.
+  var tabs: MeoWSubTable* = (MeoWSubTable*)malloc(3 * (int64)sizeof(MeoWSubTable));
+  tabs[0].id = 1;
+  tabs[0].name = t_str("users");
+  tabs[0].n_cols = 4;
+  tabs[0].cols = cols;
+  tabs[1].id = 0xFFFFFFFF;
+  tabs[1].name = t_str("t");
+  tabs[1].n_cols = 0;
+  tabs[1].cols = 0;
+  tabs[2].id = 7;
+  tabs[2].name = t_str("");
+  tabs[2].n_cols = 1;
+  tabs[2].cols = &cols[3];
+  var so: MeoWSubOk;
+  so.start_seq = 0xFFFFFFFFFFFFFFFF;
+  so.commit_seq = 5;
+  so.heartbeat_ms = MEO_WIRE_HEARTBEAT_MS;
+  so.n_tables = 3;
+  so.tables = tabs;
+  t_sub_ok_round(w, a, &so, 44, "sub_ok");
+  so.start_seq = 1;
+  so.commit_seq = 0;
+  so.heartbeat_ms = 0;
+  so.n_tables = 0;
+  so.tables = 0;
+  t_sub_ok_round(w, a, &so, 45, "sub_ok no tables");
+  so.n_tables = 1;
+  so.tables = &tabs[0];
+  cols[1].ty = 0;
+  meo_wbuf_begin(w);
+  meo_wire_sub_ok_put(w, &so);
+  t_i32(w->err, -MEO_ERR_USAGE, "sub_ok column type 0");
+  cols[1].ty = 5;
+  meo_wbuf_begin(w);
+  meo_wire_sub_ok_put(w, &so);
+  t_i32(w->err, -MEO_ERR_USAGE, "sub_ok column type 5");
+  cols[1].ty = MEO_T_REAL;
+  // A column type of 5 on the wire is PROTO: first column's type byte.
+  meo_wbuf_begin(w);
+  meo_wire_sub_ok_put(w, &so);
+  var sn: int32 = w->n - MEO_WIRE_HDR;
+  var sq: uint8* = t_copy(w->p + MEO_WIRE_HDR, sn);
+  // 8+8+4+4 head, 4 id, 2+5 name, 2 n_cols, 2+2 col name "id", then the type.
+  sq[8 + 8 + 4 + 4 + 4 + 2 + 5 + 2 + 2 + 2] = 5;
+  t_i32(t_decode(MEO_WIRE_K_SUB_OK, sq, sn, a), -MEO_ERR_PROTO, "sub_ok wire column type 5");
+  sq[8 + 8 + 4 + 4 + 4 + 2 + 5 + 2 + 2 + 2] = 0;
+  t_i32(t_decode(MEO_WIRE_K_SUB_OK, sq, sn, a), -MEO_ERR_PROTO, "sub_ok wire column type 0");
+  sq[8 + 8 + 4 + 4 + 4 + 2 + 5 + 2 + 2 + 2] = 1;
+  t_i32(t_decode(MEO_WIRE_K_SUB_OK, sq, sn, a), MEO_OK, "sub_ok wire column type 1");
+  free((rawptr)sq);
+  free((rawptr)tabs);
+
+  // EVENTS: every kind, with the edges of each field.
+  var old: MeoValue* = &vals[10];
+  var ev: MeoWEvent* = (MeoWEvent*)malloc(8 * (int64)sizeof(MeoWEvent));
+  t_ev(&ev[0], 1, MEO_WIRE_EV_INSERT, 1);
+  ev[0].n_vals = 14;
+  ev[0].vals = vals;
+  t_ev(&ev[1], 2, MEO_WIRE_EV_UPDATE, 1);
+  ev[1].old_rowid = -4;
+  ev[1].n_vals = 14;
+  ev[1].vals = vals;
+  ev[1].n_old = 3;
+  ev[1].old = old;
+  t_ev(&ev[2], 3, MEO_WIRE_EV_DELETE, 2);
+  ev[2].n_vals = 3;
+  ev[2].vals = old;
+  t_ev(&ev[3], 4, MEO_WIRE_EV_GAP, 0);
+  t_ev(&ev[4], 5, MEO_WIRE_EV_SCHEMA, 1);
+  ev[4].name = t_str("users");
+  ev[4].n_cols = 4;
+  ev[4].cols = cols;
+  t_ev(&ev[5], 0xFFFFFFFFFFFFFFFF, MEO_WIRE_EV_INSERT, 0xFFFFFFFF);
+  ev[5].commit_seq = 0xFFFFFFFFFFFFFFFF;
+  ev[5].time_us = -9223372036854775807 - 1;
+  ev[5].rowid = -9223372036854775807 - 1;
+  ev[5].old_rowid = 9223372036854775807;
+  t_ev(&ev[6], 0, MEO_WIRE_EV_UPDATE, 3);
+  t_ev(&ev[7], 9, MEO_WIRE_EV_SCHEMA, 4);
+  ev[7].name = t_str("empty");
+  t_events_round(w, a, 8, ev, "events");
+  t_events_round(w, a, 1, &ev[1], "events update");
+  t_events_round(w, a, 0, ev, "events heartbeat");
+  // The count sits at the front of the payload.
+  meo_wbuf_begin(w);
+  meo_wire_events_put(w, 3, ev);
+  t_ok(meo_get_u32le(w->p, (int64)MEO_WIRE_HDR) == 3, "events count bytes");
+
+  // Shape rules, writer side: nothing is written and the frame stays usable.
+  var bad: MeoWEvent;
+  meo_wbuf_begin(w);
+  meo_wire_events_begin(w);
+  var before: int32 = w->n;
+  t_ev(&bad, 1, 3, 1);
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "event kind 3");
+  t_ev(&bad, 1, 0, 1);
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "event kind 0");
+  t_ev(&bad, 1, 7, 1);
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "event kind 7");
+  t_ev(&bad, 1, MEO_WIRE_EV_GAP, 1);
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "gap with a table");
+  t_ev(&bad, 1, MEO_WIRE_EV_GAP, 0);
+  bad.n_vals = 1;
+  bad.vals = vals;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "gap with values");
+  t_ev(&bad, 1, MEO_WIRE_EV_SCHEMA, 1);
+  bad.n_vals = 1;
+  bad.vals = vals;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "schema with values");
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  bad.n_old = 1;
+  bad.old = vals;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "insert with old");
+  t_ev(&bad, 1, MEO_WIRE_EV_DELETE, 1);
+  bad.n_old = 1;
+  bad.old = vals;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "delete with old");
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  bad.name = t_str("x");
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "insert with schema name");
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  bad.n_vals = 2;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "values missing");
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  bad.n_vals = -1;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "negative n_vals");
+  t_ev(&bad, 1, MEO_WIRE_EV_SCHEMA, 1);
+  bad.n_cols = 1;
+  bad.cols = cols;
+  cols[0].ty = 9;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "schema column type 9");
+  cols[0].ty = MEO_T_INT;
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  bad.n_vals = 1;
+  var bv: MeoValue;
+  meo_value_set_text(&bv, blob, -1);
+  bad.vals = &bv;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "bad value in event");
+  t_i32(w->n, before, "refused events leave the frame");
+  t_i32(w->err, MEO_OK, "refused events leave no error");
+  t_ok(meo_get_u32le(w->p, (int64)MEO_WIRE_HDR) == 0, "refused events are not counted");
+  // 65535 values fit u16; one more does not.
+  var big: MeoValue* = (MeoValue*)malloc(65536 * (int64)sizeof(MeoValue));
+  k = 0;
+  while (k < 65536) {
+    meo_value_set_null(&big[k]);
+    k += 1;
+  }
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  bad.n_vals = 65535;
+  bad.vals = big;
+  t_i32(meo_wire_events_add(w, &bad), MEO_OK, "65535 values");
+  bad.n_vals = 65536;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "65536 values");
+  t_ev(&bad, 1, MEO_WIRE_EV_UPDATE, 1);
+  bad.n_old = 65535;
+  bad.old = big;
+  t_i32(meo_wire_events_add(w, &bad), MEO_OK, "65535 old values");
+  bad.n_old = 65536;
+  t_i32(meo_wire_events_add(w, &bad), -MEO_ERR_USAGE, "65536 old values");
+  free((rawptr)big);
+
+  // Shape rules, wire side: change a valid event's kind so only the shape is wrong.
+  // Payload offsets: n 0, seq 4, commit 12, time 20, kind 28, table 29.
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 1);
+  t_event_patch(w, a, &bad, 28, 0, "wire kind 0");
+  t_event_patch(w, a, &bad, 28, 3, "wire kind 3");
+  t_event_patch(w, a, &bad, 28, 7, "wire kind 7");
+  t_event_patch(w, a, &bad, 28, 255, "wire kind 255");
+  t_event_patch(w, a, &bad, 28, MEO_WIRE_EV_GAP, "wire gap with a table");
+  t_ev(&bad, 1, MEO_WIRE_EV_INSERT, 0);
+  bad.n_vals = 1;
+  bad.vals = vals;
+  t_event_patch(w, a, &bad, 28, MEO_WIRE_EV_GAP, "wire gap with values");
+  t_ev(&bad, 1, MEO_WIRE_EV_UPDATE, 1);
+  bad.n_old = 1;
+  bad.old = vals;
+  t_event_patch(w, a, &bad, 28, MEO_WIRE_EV_INSERT, "wire insert with old values");
+  t_event_patch(w, a, &bad, 28, MEO_WIRE_EV_DELETE, "wire delete with old values");
+
+  // A frame that does not fit: the add that overflows leaves the rest intact.
+  var ws: MeoWBuf;
+  meo_wbuf_init(&ws, 200);
+  meo_wbuf_begin(&ws);
+  meo_wire_events_begin(&ws);
+  var added: int32 = 0;
+  var refused: int32 = 0;
+  k = 0;
+  while (k < 10) {
+    t_ev(&bad, (uint64)(k + 1), MEO_WIRE_EV_INSERT, 1);
+    bad.n_vals = 3;
+    bad.vals = &vals[1];
+    var rc: int32 = meo_wire_events_add(&ws, &bad);
+    if (rc == MEO_OK) {
+      added += 1;
+    } else {
+      t_i32(rc, -MEO_ERR_TOOBIG, "overflowing event");
+      refused += 1;
+      t_i32(ws.err, MEO_OK, "overflow leaves no error");
+    }
+    k += 1;
+  }
+  t_ok(added > 0 && refused > 0, "some events fit, some do not");
+  var wn: int32 = meo_wbuf_finish(&ws, MEO_WIRE_K_EVENTS, 0);
+  t_ok(wn > 0 && wn - MEO_WIRE_HDR <= 200, "frame within its max");
+  meo_wrd_init(&r, ws.p + MEO_WIRE_HDR, wn - MEO_WIRE_HDR);
+  var eg: MeoWEvents;
+  meo_arena_reset(a);
+  t_i32(meo_wire_events_get(&r, a, &eg), MEO_OK, "partial frame decodes");
+  t_i32(eg.n, added, "partial frame count");
+  if (eg.n > 0) { t_ok(eg.ev[eg.n - 1].seq == (uint64)eg.n, "partial frame keeps order"); }
+  meo_wbuf_free(&ws);
+
+  // ACK.
+  meo_wbuf_begin(w);
+  meo_wire_ack_put(w, 0xFFFFFFFFFFFFFFFF);
+  t_keep(w, MEO_WIRE_K_ACK, 46);
+  if (t_open(w, &r, MEO_WIRE_K_ACK, 46, "ack")) {
+    var seq: uint64 = 0;
+    t_i32(meo_wire_ack_get(&r, &seq), MEO_OK, "ack get");
+    t_ok(seq == 0xFFFFFFFFFFFFFFFF, "ack seq");
+  }
+  meo_wbuf_begin(w);
+  meo_wire_ack_put(w, 0);
+  t_keep(w, MEO_WIRE_K_ACK, 47);
+  t_empty_round(w, MEO_WIRE_K_UNSUBSCRIBE, 48);
+
+  // SCAN: edges of the f64 window and the u32 chunk.
+  var sc: MeoWScan;
+  sc.table = t_str("readings");
+  sc.x = t_str("t");
+  sc.y = t_str("v");
+  sc.group = t_str("sensor");
+  sc.lo = -1.5;
+  sc.hi = 1e300;
+  sc.chunk = 1048576;
+  meo_wbuf_begin(w);
+  meo_wire_scan_put(w, &sc);
+  t_keep(w, MEO_WIRE_K_SCAN, 49);
+  if (t_open(w, &r, MEO_WIRE_K_SCAN, 49, "scan")) {
+    var sg2: MeoWScan;
+    t_i32(meo_wire_scan_get(&r, &sg2), MEO_OK, "scan get");
+    t_ok(t_str_eq(sg2.table, sc.table) && t_str_eq(sg2.x, sc.x) && t_str_eq(sg2.y, sc.y), "scan names");
+    t_ok(t_str_eq(sg2.group, sc.group), "scan group");
+    t_ok(t_bits(sg2.lo) == t_bits(sc.lo) && t_bits(sg2.hi) == t_bits(sc.hi), "scan window");
+    t_ok(sg2.chunk == 1048576, "scan chunk");
+  }
+  sc.group = t_str("");
+  sc.lo = t_from_bits(0x8000000000000000);
+  sc.hi = t_from_bits(0x7FF8000000000321);
+  sc.chunk = 0xFFFFFFFF;
+  meo_wbuf_begin(w);
+  meo_wire_scan_put(w, &sc);
+  t_keep(w, MEO_WIRE_K_SCAN, 50);
+  if (t_open(w, &r, MEO_WIRE_K_SCAN, 50, "scan edges")) {
+    var sg3: MeoWScan;
+    t_i32(meo_wire_scan_get(&r, &sg3), MEO_OK, "scan edges get");
+    t_i32((int32)sg3.group.length, 0, "scan empty group");
+    t_ok(t_bits(sg3.lo) == 0x8000000000000000 && t_bits(sg3.hi) == 0x7FF8000000000321, "scan -0.0 and NaN bits");
+    t_ok(sg3.chunk == 0xFFFFFFFF, "scan chunk 2^32-1");
+  }
+  sc.chunk = 0;
+  meo_wbuf_begin(w);
+  meo_wire_scan_put(w, &sc);
+  t_keep(w, MEO_WIRE_K_SCAN, 51);
+  sc.table = t_str("a\0b");
+  meo_wbuf_begin(w);
+  meo_wire_scan_put(w, &sc);
+  t_i32(w->err, -MEO_ERR_USAGE, "scan NUL in name");
+
+  // SCAN_ROWS.
+  var pts: MeoWPoint* = (MeoWPoint*)malloc(4 * (int64)sizeof(MeoWPoint));
+  pts[0].g = -9223372036854775807 - 1;
+  pts[0].x = -0.0;
+  pts[0].y = t_from_bits(0x7FF8000000000123);
+  pts[1].g = 9223372036854775807;
+  pts[1].x = 1.0e308;
+  pts[1].y = -2.5;
+  pts[2].g = 0;
+  pts[2].x = t_from_bits(0xFFF0000000000000);
+  pts[2].y = 0.0;
+  pts[3].g = 7;
+  pts[3].x = 3.0;
+  pts[3].y = 4.0;
+  t_scan_rows_round(w, a, false, false, 12, 4, pts, 52, "scan_rows");
+  t_scan_rows_round(w, a, true, true, 0xFFFFFFFFFFFFFFFF, 4, pts, 53, "scan_rows grouped last");
+  t_scan_rows_round(w, a, true, false, 0, 0, pts, 54, "scan_rows empty last");
+  t_scan_rows_round(w, a, false, true, 1, 0, pts, 55, "scan_rows empty grouped");
+  // The iterator reads the same points with no allocation.
+  meo_wbuf_begin(w);
+  meo_wire_scan_rows_put(w, false, true, 9, 4, pts);
+  meo_wrd_init(&r, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR);
+  var hd: MeoWScanRows;
+  t_i32(meo_wire_scan_rows_head_get(&r, &hd), MEO_OK, "scan_rows head");
+  k = 0;
+  while (k < hd.n) {
+    var pt: MeoWPoint;
+    meo_wire_scan_point_get(&r, hd.grouped, &pt);
+    t_ok(pt.g == pts[k].g && t_bits(pt.x) == t_bits(pts[k].x), "scan_rows iterator point {k}");
+    k += 1;
+  }
+  t_i32(meo_wrd_end(&r), MEO_OK, "scan_rows iterator consumed");
+  // Flag bytes other than 0/1 are PROTO.
+  var fq: uint8* = t_copy(w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR);
+  fq[0] = 2;
+  t_i32(t_decode(MEO_WIRE_K_SCAN_ROWS, fq, w->n - MEO_WIRE_HDR, a), -MEO_ERR_PROTO, "scan_rows last 2");
+  fq[0] = 0;
+  fq[1] = 2;
+  t_i32(t_decode(MEO_WIRE_K_SCAN_ROWS, fq, w->n - MEO_WIRE_HDR, a), -MEO_ERR_PROTO, "scan_rows grouped 2");
+  free((rawptr)fq);
+  meo_wbuf_begin(w);
+  meo_wire_scan_rows_put(w, false, false, 1, 1, 0);
+  t_i32(w->err, -MEO_ERR_USAGE, "scan_rows points missing");
+  meo_wbuf_begin(w);
+  meo_wire_scan_rows_put(w, false, false, 1, -1, pts);
+  t_i32(w->err, -MEO_ERR_USAGE, "scan_rows negative n");
+  free((rawptr)pts);
+
+  free((rawptr)ev);
+  free((rawptr)cols);
+  free((rawptr)names);
+  free((rawptr)vals);
+  free((rawptr)blob);
+  t_case("t_sub", f0);
+}
+
 fn t_values(w: MeoWBuf*) {
   var f0: int32 = t_failures;
   var blob: uint8* = (uint8*)malloc(8);
@@ -738,6 +1365,12 @@ fn t_header() {
   t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), -MEO_ERR_PROTO, "hdr rsv");
   t_ok(meo_wire_kind_is_request(1) && meo_wire_kind_is_request(7), "request kinds");
   t_ok(!meo_wire_kind_is_request(8) && !meo_wire_kind_is_request(64) && !meo_wire_kind_is_request(128), "non-request kinds");
+  t_ok(!meo_wire_kind_is_sub_request(7) && meo_wire_kind_is_sub_request(8)
+       && meo_wire_kind_is_sub_request(11) && !meo_wire_kind_is_sub_request(12), "sub request kinds");
+  t_ok(!meo_wire_kind_is_push(127) && meo_wire_kind_is_push(128) && meo_wire_kind_is_push(255), "push kinds");
+  t_ok(MEO_WIRE_K_SUB_OK == 0x44 && MEO_WIRE_K_SCAN_ROWS == 0x45 && MEO_WIRE_K_EVENTS == 0x80
+       && MEO_WIRE_K_SCAN == 0x0B, "sub kind numbers");
+  t_ok(MEO_WIRE_CAP_SUBSCRIBE == 4 && MEO_WIRE_CAP_SCAN == 8 && MEO_WIRE_MINOR == 1, "sub caps and minor");
   free((rawptr)p);
   t_case("t_header", f0);
 }
@@ -823,6 +1456,15 @@ fn t_stmt_head(w: MeoWBuf*) {
   meo_wbuf_str16(w, "");
 }
 
+// The same for the minor-1 payloads, by kind.
+fn t_count_kind(w: MeoWBuf*, a: MeoArena*, kind: int32, label: string) {
+  meo_arena_reset(a);
+  var cur: uint8* = a->cur;
+  var owns: int64 = a->owns;
+  t_i32(t_decode(kind, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR, a), -MEO_ERR_PROTO, label);
+  t_ok(a->cur == cur && a->owns == owns, "{label}: allocated before refusing");
+}
+
 fn t_counts(w: MeoWBuf*, a: MeoArena*) {
   var f0: int32 = t_failures;
   t_stmt_head(w);
@@ -899,6 +1541,104 @@ fn t_counts(w: MeoWBuf*, a: MeoArena*) {
   var st: MeoWStmt;
   meo_arena_reset(a);
   t_i32(meo_wire_stmt_get(&r, a, &st), -MEO_ERR_PROTO, "text length past end");
+
+  // The minor-1 frames.
+  meo_wbuf_begin(w);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 1);
+  t_count_kind(w, a, MEO_WIRE_K_SUBSCRIBE, "subscribe n_tables 65535");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 15000);
+  meo_wbuf_u32(w, 0x7FFFFFFF);
+  meo_wbuf_u8(w, 0);
+  t_count_kind(w, a, MEO_WIRE_K_SUB_OK, "sub_ok n_tables 2^31-1");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 15000);
+  meo_wbuf_u32(w, 0xFFFFFFFF);
+  t_count_kind(w, a, MEO_WIRE_K_SUB_OK, "sub_ok n_tables 2^32-1");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 15000);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_str16(w, "t");
+  meo_wbuf_u16(w, 65535);
+  t_i32(t_decode(MEO_WIRE_K_SUB_OK, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR, a), -MEO_ERR_PROTO, "sub_ok n_cols 65535");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u32(w, 0x7FFFFFFF);
+  meo_wbuf_u8(w, 0);
+  t_count_kind(w, a, MEO_WIRE_K_EVENTS, "events n 2^31-1");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u32(w, 0xFFFFFFFF);
+  t_count_kind(w, a, MEO_WIRE_K_EVENTS, "events n 2^32-1");
+
+  // The table array of the sub_ok above is allocated before its columns are
+  // refused, so that case checks the code only. One event whose value count passes the bytes left; it may allocate the
+  // event array first, so only the code is checked.
+  meo_wbuf_begin(w);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_u64(w, 1);
+  meo_wbuf_u64(w, 1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u8(w, MEO_WIRE_EV_INSERT);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_i64(w, 1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u8(w, 0);
+  t_i32(t_decode(MEO_WIRE_K_EVENTS, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR, a), -MEO_ERR_PROTO, "event n_vals 65535");
+  meo_wbuf_begin(w);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_u64(w, 1);
+  meo_wbuf_u64(w, 1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u8(w, MEO_WIRE_EV_UPDATE);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_i64(w, 1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u8(w, 0);
+  t_i32(t_decode(MEO_WIRE_K_EVENTS, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR, a), -MEO_ERR_PROTO, "event n_old 65535");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u8(w, 0);
+  meo_wbuf_u8(w, 0);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 0x7FFFFFFF);
+  meo_wbuf_u64(w, 0);
+  t_count_kind(w, a, MEO_WIRE_K_SCAN_ROWS, "scan_rows n 2^31-1");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_u8(w, 1);
+  meo_wbuf_u8(w, 1);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 0xFFFFFFFF);
+  t_count_kind(w, a, MEO_WIRE_K_SCAN_ROWS, "scan_rows n 2^32-1");
+
+  // Exactly one grouped point (24 bytes) fits n = 1 but not n = 2.
+  meo_wbuf_begin(w);
+  meo_wbuf_u8(w, 1);
+  meo_wbuf_u8(w, 1);
+  meo_wbuf_u64(w, 0);
+  meo_wbuf_u32(w, 2);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_f64(w, 0.0);
+  meo_wbuf_f64(w, 0.0);
+  t_count_kind(w, a, MEO_WIRE_K_SCAN_ROWS, "scan_rows n 2 with one grouped point");
   t_case("t_counts", f0);
 }
 
@@ -949,6 +1689,7 @@ fn main() -> int32 {
   var w: MeoWBuf;
   meo_wbuf_init(&w, MEO_WIRE_MAX_FRAME);
   t_round(&w, a);
+  t_sub(&w, a);
   t_values(&w);
   t_max(&w, a);
   t_header();

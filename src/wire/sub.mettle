@@ -1,0 +1,607 @@
+// wire/sub: the minor-1 messages, SUBSCRIBE with its push stream and the
+// streaming SCAN.
+//
+//   subscribe   u16 n_tables x str16 name; u64 from_seq; u64 from_commit; u32 window
+//   sub_ok      u64 start_seq; u64 commit_seq; u32 heartbeat_ms;
+//               u32 n_tables x { u32 table_id; str16 name; cols }
+//   cols        u16 n x { str16 name; u8 type (1..4) }
+//   events      u32 n x event
+//   event       u64 seq; u64 commit_seq; i64 time_us; u8 kind; u32 table_id;
+//               i64 rowid; i64 old_rowid; u16 n_vals x val; u16 n_old x val;
+//               SCHEMA only: str16 table; cols
+//   ack         u64 seq
+//   unsubscribe no payload (meo_wire_empty_get)
+//   scan        str16 table; str16 x; str16 y; str16 group; u64 lo; u64 hi (f64 bits);
+//               u32 chunk
+//   scan_rows   u8 last; u8 grouped; u64 commit_seq; u32 n;
+//               n x { grouped: i64 group; f64 x; f64 y }
+//
+// Like msg: every *_get decodes a whole payload, short or trailing bytes are
+// PROTO, and strings and TEXT/BLOB cells are views into the payload. Ranges
+// the server owns (window, chunk) pass through, as op does in QUERY.
+
+import "../error/status.mettle";
+import "../mem/arena.mettle";
+import "../record/value.mettle";
+import "frame.mettle";
+import "value.mettle";
+
+export const MEO_WIRE_EV_INSERT: int32 = 1;
+export const MEO_WIRE_EV_UPDATE: int32 = 2;
+export const MEO_WIRE_EV_GAP: int32 = 4;
+export const MEO_WIRE_EV_DELETE: int32 = 5;
+export const MEO_WIRE_EV_SCHEMA: int32 = 6;
+
+export const MEO_WIRE_WINDOW_MAX: uint32 = 65536;
+export const MEO_WIRE_CHUNK_MAX: uint32 = 1048576;
+export const MEO_WIRE_HEARTBEAT_MS: uint32 = 15000;
+
+export const MEO_WIRE_EVENTS_HDR: int32 = 4;          // u32 n
+export const MEO_WIRE_EVENT_MIN: int32 = 49;          // an event with no values
+export const MEO_WIRE_SCAN_ROWS_HDR: int32 = 14;      // before the points
+
+export struct MeoWSchemaCol {
+  name: string;
+  ty: int32;
+}
+
+export struct MeoWSubTable {
+  id: uint32;
+  name: string;
+  n_cols: int32;
+  cols: MeoWSchemaCol*;
+}
+
+export struct MeoWSub {
+  n_tables: int32;
+  tables: string*;
+  from_seq: uint64;
+  from_commit: uint64;
+  window: uint32;
+}
+
+export struct MeoWSubOk {
+  start_seq: uint64;
+  commit_seq: uint64;
+  heartbeat_ms: uint32;
+  n_tables: int32;
+  tables: MeoWSubTable*;
+}
+
+// name, n_cols and cols are the SCHEMA event's table; they stay empty for
+// every other kind.
+export struct MeoWEvent {
+  seq: uint64;
+  commit_seq: uint64;
+  time_us: int64;
+  kind: int32;
+  table_id: uint32;
+  rowid: int64;
+  old_rowid: int64;
+  n_vals: int32;
+  vals: MeoValue*;
+  n_old: int32;
+  old: MeoValue*;
+  name: string;
+  n_cols: int32;
+  cols: MeoWSchemaCol*;
+}
+
+export struct MeoWEvents {
+  n: int32;
+  ev: MeoWEvent*;
+}
+
+export struct MeoWScan {
+  table: string;
+  x: string;
+  y: string;
+  group: string;
+  lo: float64;
+  hi: float64;
+  chunk: uint32;
+}
+
+export struct MeoWPoint {
+  g: int64;
+  x: float64;
+  y: float64;
+}
+
+export struct MeoWScanRows {
+  last: bool;
+  grouped: bool;
+  commit_seq: uint64;
+  n: int32;
+}
+
+fn meo_wire_str_empty(s: string*) {
+  s->chars = 0;
+  s->length = 0;
+}
+
+// ---- schema columns ----
+
+fn meo_wire_cols_put(w: MeoWBuf*, n: int32, cols: MeoWSchemaCol*) {
+  if (n < 0 || n > 65535 || (n > 0 && cols == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_u16(w, n);
+  var i: int32 = 0;
+  while (i < n) {
+    if (cols[i].ty < MEO_T_INT || cols[i].ty > MEO_T_BLOB) { meo_wbuf_usage(w); }
+    meo_wbuf_str16(w, cols[i].name);
+    meo_wbuf_u8(w, cols[i].ty);
+    i += 1;
+  }
+}
+
+// The count is checked against the bytes left (a column is at least 3) before
+// the array is allocated from `a`.
+fn meo_wire_cols_get(r: MeoWRd*, a: MeoArena*, n_out: int32*, out: MeoWSchemaCol**) -> int32 {
+  *n_out = 0;
+  *out = 0;
+  var n: int32 = meo_wrd_u16(r);
+  if (r->err != MEO_OK) { return r->err; }
+  if ((int64)n * 3 > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  var cols: MeoWSchemaCol* = 0;
+  if (n > 0) {
+    cols = (MeoWSchemaCol*)meo_arena_alloc(a, (int64)n * (int64)sizeof(MeoWSchemaCol));
+    if (cols == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    meo_wrd_str16(r, &cols[i].name);
+    cols[i].ty = meo_wrd_u8(r);
+    if (r->err == MEO_OK && (cols[i].ty < MEO_T_INT || cols[i].ty > MEO_T_BLOB)) {
+      meo_wrd_fail(r, -MEO_ERR_PROTO);
+    }
+    i += 1;
+  }
+  if (r->err != MEO_OK) { return r->err; }
+  *n_out = n;
+  *out = cols;
+  return MEO_OK;
+}
+
+// ---- subscribe ----
+
+export fn meo_wire_sub_put(w: MeoWBuf*, s: MeoWSub*) {
+  if (s->n_tables < 0 || s->n_tables > 65535 || (s->n_tables > 0 && s->tables == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_u16(w, s->n_tables);
+  var i: int32 = 0;
+  while (i < s->n_tables) {
+    meo_wbuf_str16(w, s->tables[i]);
+    i += 1;
+  }
+  meo_wbuf_u64(w, s->from_seq);
+  meo_wbuf_u64(w, s->from_commit);
+  meo_wbuf_u32(w, s->window);
+}
+
+export fn meo_wire_sub_get(r: MeoWRd*, a: MeoArena*, s: MeoWSub*) -> int32 {
+  s->n_tables = 0;
+  s->tables = 0;
+  s->from_seq = 0;
+  s->from_commit = 0;
+  s->window = 0;
+  if (a == 0) {
+    meo_wrd_fail(r, -MEO_ERR_USAGE);
+    return r->err;
+  }
+  var n: int32 = meo_wrd_u16(r);
+  if (r->err != MEO_OK) { return r->err; }
+  if ((int64)n * 2 > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  var names: string* = 0;
+  if (n > 0) {
+    names = (string*)meo_arena_alloc(a, (int64)n * (int64)sizeof(string));
+    if (names == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    meo_wrd_str16(r, &names[i]);
+    i += 1;
+  }
+  s->from_seq = meo_wrd_u64(r);
+  s->from_commit = meo_wrd_u64(r);
+  s->window = meo_wrd_u32(r);
+  if (r->err != MEO_OK) { return r->err; }
+  s->n_tables = n;
+  s->tables = names;
+  return meo_wrd_end(r);
+}
+
+export fn meo_wire_sub_ok_put(w: MeoWBuf*, s: MeoWSubOk*) {
+  if (s->n_tables < 0 || (s->n_tables > 0 && s->tables == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_u64(w, s->start_seq);
+  meo_wbuf_u64(w, s->commit_seq);
+  meo_wbuf_u32(w, s->heartbeat_ms);
+  meo_wbuf_u32(w, (uint32)s->n_tables);
+  var i: int32 = 0;
+  while (i < s->n_tables && w->err == MEO_OK) {
+    meo_wbuf_u32(w, s->tables[i].id);
+    meo_wbuf_str16(w, s->tables[i].name);
+    meo_wire_cols_put(w, s->tables[i].n_cols, s->tables[i].cols);
+    i += 1;
+  }
+}
+
+export fn meo_wire_sub_ok_get(r: MeoWRd*, a: MeoArena*, s: MeoWSubOk*) -> int32 {
+  s->start_seq = 0;
+  s->commit_seq = 0;
+  s->heartbeat_ms = 0;
+  s->n_tables = 0;
+  s->tables = 0;
+  if (a == 0) {
+    meo_wrd_fail(r, -MEO_ERR_USAGE);
+    return r->err;
+  }
+  s->start_seq = meo_wrd_u64(r);
+  s->commit_seq = meo_wrd_u64(r);
+  s->heartbeat_ms = meo_wrd_u32(r);
+  var n: int32 = meo_wrd_count(r);
+  if (r->err != MEO_OK) { return r->err; }
+  // A table is at least id + empty name + n_cols.
+  if ((int64)n * 8 > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  var t: MeoWSubTable* = 0;
+  if (n > 0) {
+    t = (MeoWSubTable*)meo_arena_alloc(a, (int64)n * (int64)sizeof(MeoWSubTable));
+    if (t == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    t[i].id = meo_wrd_u32(r);
+    meo_wrd_str16(r, &t[i].name);
+    meo_wire_cols_get(r, a, &t[i].n_cols, &t[i].cols);
+    if (r->err != MEO_OK) { return r->err; }
+    i += 1;
+  }
+  s->n_tables = n;
+  s->tables = t;
+  return meo_wrd_end(r);
+}
+
+// ---- events ----
+
+fn meo_wire_event_shape(kind: int32, table_id: uint32, n_vals: int32, n_old: int32) -> bool {
+  if (kind != MEO_WIRE_EV_INSERT && kind != MEO_WIRE_EV_UPDATE && kind != MEO_WIRE_EV_GAP
+      && kind != MEO_WIRE_EV_DELETE && kind != MEO_WIRE_EV_SCHEMA) {
+    return false;
+  }
+  if (kind == MEO_WIRE_EV_GAP && table_id != 0) { return false; }
+  if ((kind == MEO_WIRE_EV_GAP || kind == MEO_WIRE_EV_SCHEMA) && n_vals != 0) { return false; }
+  if (kind != MEO_WIRE_EV_UPDATE && n_old != 0) { return false; }
+  return true;
+}
+
+// Start an EVENTS frame: the u32 count, 0 until events are added.
+export fn meo_wire_events_begin(w: MeoWBuf*) {
+  meo_wbuf_u32(w, 0);
+}
+
+// Append one event and count it. On any error the frame is left as it was and
+// the code is returned, so the caller can send what fits (TOOBIG) and put this
+// event in the next frame, or send a GAP in its place.
+export fn meo_wire_events_add(w: MeoWBuf*, e: MeoWEvent*) -> int32 {
+  if (w->err != MEO_OK) { return w->err; }
+  if (w->n < MEO_WIRE_HDR + MEO_WIRE_EVENTS_HDR) { return -MEO_ERR_USAGE; }
+  var mark: int32 = w->n;
+  var ok: bool = meo_wire_event_shape(e->kind, e->table_id, e->n_vals, e->n_old)
+      && e->n_vals >= 0 && e->n_vals <= 65535 && (e->n_vals == 0 || e->vals != 0)
+      && e->n_old >= 0 && e->n_old <= 65535 && (e->n_old == 0 || e->old != 0);
+  if (!ok) { return -MEO_ERR_USAGE; }
+  meo_wbuf_u64(w, e->seq);
+  meo_wbuf_u64(w, e->commit_seq);
+  meo_wbuf_i64(w, e->time_us);
+  meo_wbuf_u8(w, e->kind);
+  meo_wbuf_u32(w, e->table_id);
+  meo_wbuf_i64(w, e->rowid);
+  meo_wbuf_i64(w, e->old_rowid);
+  meo_wbuf_u16(w, e->n_vals);
+  var i: int32 = 0;
+  while (i < e->n_vals && w->err == MEO_OK) {
+    meo_wire_val_put(w, &e->vals[i]);
+    i += 1;
+  }
+  meo_wbuf_u16(w, e->n_old);
+  i = 0;
+  while (i < e->n_old && w->err == MEO_OK) {
+    meo_wire_val_put(w, &e->old[i]);
+    i += 1;
+  }
+  if (e->kind == MEO_WIRE_EV_SCHEMA) {
+    meo_wbuf_str16(w, e->name);
+    meo_wire_cols_put(w, e->n_cols, e->cols);
+  } else if (e->name.length != 0 || e->n_cols != 0) {
+    meo_wbuf_usage(w);
+  }
+  if (w->err != MEO_OK) {
+    var rc: int32 = w->err;
+    w->n = mark;
+    w->err = MEO_OK;
+    return rc;
+  }
+  var cnt: uint32 = meo_get_u32le(w->p, (int64)MEO_WIRE_HDR);
+  meo_put_u32le(w->p, (int64)MEO_WIRE_HDR, cnt + 1);
+  return MEO_OK;
+}
+
+// A whole frame at once; the heartbeat is n = 0.
+export fn meo_wire_events_put(w: MeoWBuf*, n: int32, ev: MeoWEvent*) {
+  if (n < 0 || (n > 0 && ev == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wire_events_begin(w);
+  var i: int32 = 0;
+  while (i < n && w->err == MEO_OK) {
+    var rc: int32 = meo_wire_events_add(w, &ev[i]);
+    if (rc < 0) { w->err = rc; }
+    i += 1;
+  }
+}
+
+// The event count, checked against the bytes left at the smallest event.
+export fn meo_wire_events_head_get(r: MeoWRd*, n_out: int32*) -> int32 {
+  *n_out = 0;
+  var n: int32 = meo_wrd_count(r);
+  if (r->err != MEO_OK) { return r->err; }
+  if ((int64)n * (int64)MEO_WIRE_EVENT_MIN > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  *n_out = n;
+  return MEO_OK;
+}
+
+fn meo_wire_vals_get(r: MeoWRd*, a: MeoArena*, n_out: int32*, out: MeoValue**) -> int32 {
+  *n_out = 0;
+  *out = 0;
+  var n: int32 = meo_wrd_u16(r);
+  if (r->err != MEO_OK) { return r->err; }
+  if ((int64)n > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  var v: MeoValue* = 0;
+  if (n > 0) {
+    v = (MeoValue*)meo_arena_alloc(a, (int64)n * (int64)sizeof(MeoValue));
+    if (v == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    meo_wire_val_get(r, &v[i]);
+    i += 1;
+  }
+  if (r->err != MEO_OK) { return r->err; }
+  *n_out = n;
+  *out = v;
+  return MEO_OK;
+}
+
+// One event; its arrays come from `a`. Does not check that the payload ends.
+export fn meo_wire_event_get(r: MeoWRd*, a: MeoArena*, e: MeoWEvent*) -> int32 {
+  e->seq = 0;
+  e->commit_seq = 0;
+  e->time_us = 0;
+  e->kind = 0;
+  e->table_id = 0;
+  e->rowid = 0;
+  e->old_rowid = 0;
+  e->n_vals = 0;
+  e->vals = 0;
+  e->n_old = 0;
+  e->old = 0;
+  meo_wire_str_empty(&e->name);
+  e->n_cols = 0;
+  e->cols = 0;
+  if (a == 0) {
+    meo_wrd_fail(r, -MEO_ERR_USAGE);
+    return r->err;
+  }
+  e->seq = meo_wrd_u64(r);
+  e->commit_seq = meo_wrd_u64(r);
+  e->time_us = meo_wrd_i64(r);
+  e->kind = meo_wrd_u8(r);
+  e->table_id = meo_wrd_u32(r);
+  e->rowid = meo_wrd_i64(r);
+  e->old_rowid = meo_wrd_i64(r);
+  if (r->err != MEO_OK) { return r->err; }
+  meo_wire_vals_get(r, a, &e->n_vals, &e->vals);
+  if (r->err != MEO_OK) { return r->err; }
+  meo_wire_vals_get(r, a, &e->n_old, &e->old);
+  if (r->err != MEO_OK) { return r->err; }
+  if (!meo_wire_event_shape(e->kind, e->table_id, e->n_vals, e->n_old)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  if (e->kind == MEO_WIRE_EV_SCHEMA) {
+    meo_wrd_str16(r, &e->name);
+    meo_wire_cols_get(r, a, &e->n_cols, &e->cols);
+  }
+  return r->err;
+}
+
+// Every event of a frame, allocated from `a`.
+export fn meo_wire_events_get(r: MeoWRd*, a: MeoArena*, out: MeoWEvents*) -> int32 {
+  out->n = 0;
+  out->ev = 0;
+  if (a == 0) {
+    meo_wrd_fail(r, -MEO_ERR_USAGE);
+    return r->err;
+  }
+  var n: int32 = 0;
+  if (meo_wire_events_head_get(r, &n) < 0) { return r->err; }
+  var ev: MeoWEvent* = 0;
+  if (n > 0) {
+    ev = (MeoWEvent*)meo_arena_alloc(a, (int64)n * (int64)sizeof(MeoWEvent));
+    if (ev == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    if (meo_wire_event_get(r, a, &ev[i]) < 0) { return r->err; }
+    i += 1;
+  }
+  out->n = n;
+  out->ev = ev;
+  return meo_wrd_end(r);
+}
+
+// ---- ack ----
+
+export fn meo_wire_ack_put(w: MeoWBuf*, seq: uint64) {
+  meo_wbuf_u64(w, seq);
+}
+
+export fn meo_wire_ack_get(r: MeoWRd*, seq: uint64*) -> int32 {
+  *seq = meo_wrd_u64(r);
+  return meo_wrd_end(r);
+}
+
+// ---- scan ----
+
+export fn meo_wire_scan_put(w: MeoWBuf*, s: MeoWScan*) {
+  meo_wbuf_str16(w, s->table);
+  meo_wbuf_str16(w, s->x);
+  meo_wbuf_str16(w, s->y);
+  meo_wbuf_str16(w, s->group);
+  meo_wbuf_f64(w, s->lo);
+  meo_wbuf_f64(w, s->hi);
+  meo_wbuf_u32(w, s->chunk);
+}
+
+export fn meo_wire_scan_get(r: MeoWRd*, s: MeoWScan*) -> int32 {
+  meo_wire_str_empty(&s->table);
+  meo_wire_str_empty(&s->x);
+  meo_wire_str_empty(&s->y);
+  meo_wire_str_empty(&s->group);
+  s->lo = 0.0;
+  s->hi = 0.0;
+  s->chunk = 0;
+  meo_wrd_str16(r, &s->table);
+  meo_wrd_str16(r, &s->x);
+  meo_wrd_str16(r, &s->y);
+  meo_wrd_str16(r, &s->group);
+  s->lo = meo_wrd_f64(r);
+  s->hi = meo_wrd_f64(r);
+  s->chunk = meo_wrd_u32(r);
+  return meo_wrd_end(r);
+}
+
+// ---- scan rows ----
+
+// Bytes per point, for a server that fills frames up to max_frame.
+export fn meo_wire_scan_point_size(grouped: bool) -> int32 {
+  if (grouped) { return 24; }
+  return 16;
+}
+
+export fn meo_wire_scan_rows_put(w: MeoWBuf*, last: bool, grouped: bool, commit_seq: uint64,
+                                 n: int32, pts: MeoWPoint*) {
+  if (n < 0 || (n > 0 && pts == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  if (last) { meo_wbuf_u8(w, 1); } else { meo_wbuf_u8(w, 0); }
+  if (grouped) { meo_wbuf_u8(w, 1); } else { meo_wbuf_u8(w, 0); }
+  meo_wbuf_u64(w, commit_seq);
+  meo_wbuf_u32(w, (uint32)n);
+  var i: int32 = 0;
+  while (i < n && w->err == MEO_OK) {
+    if (grouped) { meo_wbuf_i64(w, pts[i].g); }
+    meo_wbuf_f64(w, pts[i].x);
+    meo_wbuf_f64(w, pts[i].y);
+    i += 1;
+  }
+}
+
+// The header; the point count is checked against the bytes left, so the
+// caller can read n points with meo_wire_scan_point_get and no allocation.
+export fn meo_wire_scan_rows_head_get(r: MeoWRd*, h: MeoWScanRows*) -> int32 {
+  h->last = false;
+  h->grouped = false;
+  h->commit_seq = 0;
+  h->n = 0;
+  var last: int32 = meo_wrd_u8(r);
+  var grouped: int32 = meo_wrd_u8(r);
+  h->commit_seq = meo_wrd_u64(r);
+  var n: int32 = meo_wrd_count(r);
+  if (r->err != MEO_OK) { return r->err; }
+  if (last > 1 || grouped > 1) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  h->last = last == 1;
+  h->grouped = grouped == 1;
+  if ((int64)n * (int64)meo_wire_scan_point_size(h->grouped) > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  h->n = n;
+  return MEO_OK;
+}
+
+export fn meo_wire_scan_point_get(r: MeoWRd*, grouped: bool, p: MeoWPoint*) -> int32 {
+  p->g = 0;
+  if (grouped) { p->g = meo_wrd_i64(r); }
+  p->x = meo_wrd_f64(r);
+  p->y = meo_wrd_f64(r);
+  return r->err;
+}
+
+// A whole SCAN_ROWS frame; the points come from `a`.
+export fn meo_wire_scan_rows_get(r: MeoWRd*, a: MeoArena*, h: MeoWScanRows*, pts: MeoWPoint**) -> int32 {
+  *pts = 0;
+  if (a == 0) {
+    meo_wrd_fail(r, -MEO_ERR_USAGE);
+    return r->err;
+  }
+  if (meo_wire_scan_rows_head_get(r, h) < 0) { return r->err; }
+  var p: MeoWPoint* = 0;
+  if (h->n > 0) {
+    p = (MeoWPoint*)meo_arena_alloc(a, (int64)h->n * (int64)sizeof(MeoWPoint));
+    if (p == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int32 = 0;
+  while (i < h->n) {
+    meo_wire_scan_point_get(r, h->grouped, &p[i]);
+    i += 1;
+  }
+  if (r->err != MEO_OK) { return r->err; }
+  *pts = p;
+  return meo_wrd_end(r);
+}

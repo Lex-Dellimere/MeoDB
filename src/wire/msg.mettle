@@ -19,6 +19,8 @@ import "value.mettle";
 
 export const MEO_WIRE_CAP_COUNT: uint32 = 1;
 export const MEO_WIRE_CAP_ASSIGN_ADD: uint32 = 2;
+export const MEO_WIRE_CAP_SUBSCRIBE: uint32 = 4;
+export const MEO_WIRE_CAP_SCAN: uint32 = 8;
 
 export const MEO_WIRE_TX_NONE: int32 = 0;
 export const MEO_WIRE_TX_OPEN: int32 = 1;

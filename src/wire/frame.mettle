@@ -23,7 +23,7 @@ export const MEO_WIRE_MIN_FRAME: int32 = 65536;         // smallest max a peer m
 export const MEO_WIRE_MAX_FRAME_LIMIT: int32 = 268435456;
 
 export const MEO_WIRE_MAJOR: int32 = 1;
-export const MEO_WIRE_MINOR: int32 = 0;
+export const MEO_WIRE_MINOR: int32 = 1;
 
 // Requests.
 export const MEO_WIRE_K_HELLO: int32 = 1;
@@ -33,13 +33,21 @@ export const MEO_WIRE_K_COMMIT: int32 = 4;
 export const MEO_WIRE_K_ROLLBACK: int32 = 5;
 export const MEO_WIRE_K_QUERY: int32 = 6;
 export const MEO_WIRE_K_BYE: int32 = 7;
+// Requests added in minor 1; valid only when HELLO_OK caps allow them.
+export const MEO_WIRE_K_SUBSCRIBE: int32 = 8;
+export const MEO_WIRE_K_ACK: int32 = 9;
+export const MEO_WIRE_K_UNSUBSCRIBE: int32 = 10;
+export const MEO_WIRE_K_SCAN: int32 = 11;
 // Responses.
 export const MEO_WIRE_K_OK: int32 = 64;
 export const MEO_WIRE_K_HELLO_OK: int32 = 65;
 export const MEO_WIRE_K_ERROR: int32 = 66;
 export const MEO_WIRE_K_RESULT: int32 = 67;
-// 0x80..0xFF: server push (rid 0), reserved for remote subscribe.
+export const MEO_WIRE_K_SUB_OK: int32 = 68;
+export const MEO_WIRE_K_SCAN_ROWS: int32 = 69;
+// 0x80..0xFF: server push (rid 0), only to a subscribed session.
 export const MEO_WIRE_K_PUSH: int32 = 128;
+export const MEO_WIRE_K_EVENTS: int32 = 128;
 
 export struct MeoWHdr {
   len: int32;
@@ -68,6 +76,16 @@ export struct MeoWRd {
 
 export fn meo_wire_kind_is_request(kind: int32) -> bool {
   return kind >= MEO_WIRE_K_HELLO && kind <= MEO_WIRE_K_BYE;
+}
+
+// The minor-1 requests. meo_wire_kind_is_request stays the v1 set, so a server
+// that does not serve these still refuses them as reserved kinds.
+export fn meo_wire_kind_is_sub_request(kind: int32) -> bool {
+  return kind >= MEO_WIRE_K_SUBSCRIBE && kind <= MEO_WIRE_K_SCAN;
+}
+
+export fn meo_wire_kind_is_push(kind: int32) -> bool {
+  return kind >= MEO_WIRE_K_PUSH && kind <= 255;
 }
 
 export fn meo_wire_hdr_put(p: uint8*, len: int32, kind: int32, rid: uint32) {
