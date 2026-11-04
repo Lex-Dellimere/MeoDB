@@ -10,10 +10,12 @@
 // Shape of a node (btree/node.mettle has the byte-level detail):
 //   leaf   cells sorted ascending by key, rowid in the tail of each cell
 //   inner  cells 0..n-2 are (key, left_child), cell n-1 is the right child
-// and key_i is the smallest key of the subtree under child_{i+1}. Descent takes
+// and key_i is a fence: every key under child_i is below it, every key under
+// child_{i+1} is at or above it, and it need not be a present key. Descent takes
 // the first separator strictly greater than the target; the range scan moves to
 // the next child of the nearest ancestor that has one, so no leaf needs a
-// sibling pointer.
+// sibling pointer. Leaves may be empty after deletes, so every reader steps
+// over empty leaves instead of assuming the next leaf has a row.
 //
 // PINNING. The pager's frame table is the only record of who owns a buffer, so
 // every frame this module holds is pinned, and a cursor pins exactly ONE leaf
@@ -24,9 +26,8 @@
 // write-back -- which is exactly what PHASE2.md 2E's E6 measures.
 //
 // KNOWN GAP, deliberately not hidden: there is no merge and no rebalance. A
-// node that a split left underfull stays underfull, and deleting from the tree
-// is out of scope for phase 2 (PHASE2.md 2F). Space that a future rebalance
-// would recover stays allocated.
+// node that a split left underfull stays underfull, and delete only removes the
+// leaf cell: an emptied leaf stays linked and its page is not reclaimed.
 //
 // KNOWN GAP, also deliberate: a failed root split is not atomic. Once a split
 // has rewritten the old root into its lower half and released it dirty, a
@@ -244,21 +245,56 @@ fn bt_move_to(p: MeoPager*, c: MeoBtCursor*, level: int32,
   return bt_descend_left(p, c, level, page);
 }
 
-// Advance to the next leaf. 0 = a leaf is pinned with slot_in_leaf == 0,
-// 1 = the cursor is past the last leaf and pins nothing, negative on failure.
+// Advance to the next leaf that has a row. 0 = a leaf is pinned with
+// slot_in_leaf == 0, 1 = the cursor is past the last leaf and pins nothing,
+// negative on failure. Empty leaves are stepped over, any number in a row.
 fn bt_advance(p: MeoPager*, c: MeoBtCursor*) -> int32 {
-  var level: int32 = 0;
-  var page: uint32 = 0;
-  var rc: int32 = bt_successor(p, c, &level, &page);
-  if (rc != MEO_OK) {
-    if (c->leaf != 0) {
-      meo_pager_release(p, c->leaf, false);
-      c->leaf = 0;
+  while (true) {
+    var level: int32 = 0;
+    var page: uint32 = 0;
+    var rc: int32 = bt_successor(p, c, &level, &page);
+    if (rc != MEO_OK) {
+      if (c->leaf != 0) {
+        meo_pager_release(p, c->leaf, false);
+        c->leaf = 0;
+      }
+      c->depth = 0;
+      return rc;
     }
-    c->depth = 0;
-    return rc;
+    rc = bt_move_to(p, c, level, page);
+    if (rc != MEO_OK) { return rc; }
+    if (meo_page_n_cells(c->leaf->data) > 0) { return MEO_OK; }
   }
-  return bt_move_to(p, c, level, page);
+  return -MEO_ERR_CORRUPT;
+}
+
+// Pin the rightmost leaf of the subtree rooted at `page` (level `level`) and
+// record the path, like bt_descend_left in the other direction.
+fn bt_descend_right(p: MeoPager*, c: MeoBtCursor*, level: int32,
+    page: uint32) -> int32 {
+  var lv: int32 = level;
+  var cur: uint32 = page;
+  while (true) {
+    if (lv >= MEO_BT_MAX_DEPTH) { return -MEO_ERR_CORRUPT; }
+    var rc: int32 = MEO_OK;
+    var f: MeoFrame* = bt_pin(p, cur, false, &rc);
+    if (f == 0) { return rc; }
+    c->path[lv] = cur;
+    var n: int32 = meo_page_n_cells(f->data);
+    if (meo_btn_is_leaf(f->data)) {
+      c->slot[lv] = -1;
+      c->depth = lv + 1;
+      c->leaf = f;
+      c->slot_in_leaf = n - 1;
+      return MEO_OK;
+    }
+    c->slot[lv] = n - 1;
+    var child: uint32 = meo_btn_inner_child(f->data, n - 1);
+    meo_pager_release(p, f, false);
+    cur = child;
+    lv += 1;
+  }
+  return -MEO_ERR_CORRUPT;
 }
 
 // --- public API (PHASE2.md 2D) ---------------------------------------------
@@ -303,9 +339,9 @@ export fn meo_bt_seek(p: MeoPager*, c: MeoBtCursor*, root: uint32,
   c->slot_in_leaf = meo_btn_leaf_search(c->leaf->data, key.data, key.len,
     cmp_cb);
   if (c->slot_in_leaf < n) { return MEO_OK; }
-  // The lower bound is past this leaf. Because a separator is the smallest key
-  // of the subtree to its right, the row may be the next leaf's first cell --
-  // or there may be no such row at all.
+  // The lower bound is past this leaf (or the leaf is empty). Every key to the
+  // right is at or above the next fence, which is above `key`, so the row is
+  // the first cell of the next non-empty leaf -- or there is no such row.
   rc = bt_advance(p, c);
   if (rc < 0) { c->err = 0 - rc; }
   return rc;
@@ -403,33 +439,82 @@ export fn meo_bt_insert_sep(p: MeoPager*, root: uint32*,
   return bt_insert_impl(p, root, cmp_cb, key, rowid, sep_max);
 }
 
-// Rowid of the largest key: MEO_OK, 1 empty tree, negative on failure.
-// WS2: step back past an empty rightmost leaf once delete exists.
+// Rowid of the largest key: MEO_OK, 1 empty tree, negative on failure. Empty
+// rightmost leaves are stepped over, walking left through the ancestors.
 export fn meo_bt_last(p: MeoPager*, root: uint32, rowid: uint64*) -> int32 {
   if (p == 0 || rowid == 0) { return -MEO_ERR_USAGE; }
   if (root == 0) { return 1; }
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
   var page: uint32 = root;
   var level: int32 = 0;
-  while (level < MEO_BT_MAX_DEPTH) {
-    var rc: int32 = MEO_OK;
-    var f: MeoFrame* = bt_pin(p, page, false, &rc);
-    if (f == 0) { return rc; }
-    var n: int32 = meo_page_n_cells(f->data);
-    if (meo_btn_is_leaf(f->data)) {
-      if (n == 0) {
-        meo_pager_release(p, f, false);
-        return 1;
-      }
-      rowid[0] = meo_btn_leaf_rowid(f->data, n - 1);
-      meo_pager_release(p, f, false);
+  while (true) {
+    var rc: int32 = bt_descend_right(p, &c, level, page);
+    if (rc != MEO_OK) { return rc; }
+    var n: int32 = meo_page_n_cells(c.leaf->data);
+    if (n > 0) {
+      rowid[0] = meo_btn_leaf_rowid(c.leaf->data, n - 1);
+      meo_bt_close(p, &c);
       return MEO_OK;
     }
-    var child: uint32 = meo_btn_inner_child(f->data, n - 1);
-    meo_pager_release(p, f, false);
-    page = child;
-    level += 1;
+    // Close resets depth, so read it first. Then find the nearest ancestor
+    // with a child left of the one taken.
+    var lv: int32 = c.depth - 1;
+    meo_bt_close(p, &c);
+    var found: bool = false;
+    while (lv > 0 && !found) {
+      lv -= 1;
+      var s: int32 = c.slot[lv];
+      if (s > 0) {
+        var f: MeoFrame* = bt_pin(p, c.path[lv], false, &rc);
+        if (f == 0) { return rc; }
+        page = meo_btn_inner_child(f->data, s - 1);
+        meo_pager_release(p, f, false);
+        // The path above lv is kept, so the next empty leaf resumes from here.
+        c.slot[lv] = s - 1;
+        level = lv + 1;
+        found = true;
+      }
+    }
+    if (!found) { return 1; }
   }
   return -MEO_ERR_CORRUPT;
+}
+
+// Remove `key`. MEO_OK removed, 1 absent, negative on failure. Only the leaf
+// changes: no merge, no parent update, so root* is never rewritten and an
+// emptied leaf (even an empty root leaf) stays in the tree.
+export fn meo_bt_delete(p: MeoPager*, root: uint32*,
+    cmp_cb: fn(uint8*, int32, uint8*, int32) -> int32, key: MeoBtKey) -> int32 {
+  if (p == 0 || root == 0 || cmp_cb == 0 || key.data == 0 || key.len < 0) {
+    return -MEO_ERR_USAGE;
+  }
+  if (root[0] == 0) { return 1; }
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = bt_seek_leaf(p, &c, root[0], cmp_cb, key.data, key.len);
+  if (rc != MEO_OK) { return rc; }
+  var n: int32 = meo_page_n_cells(c.leaf->data);
+  var at: int32 = meo_btn_leaf_search(c.leaf->data, key.data, key.len, cmp_cb);
+  if (at >= n || cmp_cb(meo_btn_leaf_key_ptr(c.leaf->data, at),
+      meo_btn_leaf_key_len(c.leaf->data, at), key.data, key.len) != 0) {
+    meo_bt_close(p, &c);
+    return 1;
+  }
+  var copy: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (copy == 0) {
+    meo_bt_close(p, &c);
+    return -MEO_ERR_NOMEM;
+  }
+  defer free(copy);
+  meo_bytes_copy(copy, c.leaf->data, (int64)MEO_PAGE_SIZE);
+  rc = meo_btn_leaf_remove(c.leaf->data, copy, at);
+  if (rc != MEO_OK) {
+    meo_bytes_copy(c.leaf->data, copy, (int64)MEO_PAGE_SIZE);
+  }
+  meo_pager_release(p, c.leaf, rc == MEO_OK);
+  c.leaf = 0;
+  return rc;
 }
 
 fn bt_insert_impl(p: MeoPager*, root: uint32*,
@@ -483,14 +568,11 @@ fn bt_insert_impl(p: MeoPager*, root: uint32*,
   if (rc != MEO_OK) { return rc; }
   var n: int32 = meo_page_n_cells(c.leaf->data);
   var at: int32 = meo_btn_leaf_search(c.leaf->data, key.data, key.len, cmp_cb);
-  // at == n means the key is past this leaf's last cell -- and it belongs at
-  // the END of this leaf, not at the front of the next one. The descent already
-  // chose the leaf whose fence range contains the key (first separator strictly
-  // greater, else the right child), so the key is still below this leaf's upper
-  // fence. Inserting it at the front of the next leaf would silently change
-  // that leaf's smallest key while the parent's separator kept the old one: the
-  // separator would then name a key that is no longer the subtree's minimum and
-  // the key would become unreachable from the root.
+  // at == n (including an empty leaf) means the key goes at the END of this
+  // leaf, never the front of the next one. The descent chose the only leaf
+  // whose fences hold the key (lower fence <= key < upper fence); the next
+  // leaf's lower fence is above the key, so putting it there would break the
+  // fence order and a later descent would not find it.
   c.slot_in_leaf = at;
 
   // Keys are unique (PHASE2.md 2D): an existing key replaces its rowid. The
@@ -527,9 +609,10 @@ fn bt_insert_impl(p: MeoPager*, root: uint32*,
     return -MEO_ERR_CORRUPT;
   }
 
-  // The leaf is full: split it, then carry its first upper key up. Both halves
-  // are smaller than the sequence that did not fit, so the split cannot run out
-  // of room on either page.
+  // The leaf is full: split it, then carry its first upper key up. The split
+  // balances bytes and a cell is under half a page, so both halves fit. hi's
+  // first key (or its first sep_max bytes) is a valid fence: above every key
+  // in lo, at or below every key in hi, and inside the old leaf's fences.
   var src_rc: int32 = MEO_OK;
   var sib: MeoFrame* = bt_alloc(p, &src_rc);
   if (sib == 0) {

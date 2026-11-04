@@ -9,6 +9,7 @@
 // One encoded field is:
 //
 //   [tag:u8][payload]   meo_key_int (9 bytes), meo_key_text (1 + len), meo_key_null (1)
+//                       meo_key_real (9 bytes), meo_key_blob (1 + len)
 //   [payload]           meo_key_rowid (8 bytes), the only field with no tag
 //
 // A composite key is the fields concatenated in index order, with no
@@ -30,6 +31,8 @@ export const MEO_KEY_INT: int32 = 1;
 export const MEO_KEY_TEXT: int32 = 2;
 export const MEO_KEY_NULL: int32 = 3;
 export const MEO_KEY_ROWID: int32 = 4;
+export const MEO_KEY_REAL: int32 = 5;
+export const MEO_KEY_BLOB: int32 = 6;
 
 // Byte-reverse a uint64: the big-endian writer, since meo_put_u64le is
 // little-endian and bytes.mettle is the only place allowed to say so.
@@ -106,4 +109,50 @@ export fn meo_key_compare(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
   if (an < bn) { return -1; }
   if (an > bn) { return 1; }
   return 0;
+}
+
+// Encode a tagged float64 key: [MEO_KEY_REAL][8 bytes], ordered like the
+// numbers. A set sign bit flips every bit (more negative sorts lower), a clear
+// one flips only the sign bit (positives above negatives). -0.0 is stored as
+// 0.0 so the two compare equal, and every NaN is stored as one quiet NaN that
+// sorts above +inf. Returns 9, or -MEO_ERR_FULL when cap < 9.
+export fn meo_key_real(buf: uint8*, cap: int32, v: float64) -> int32 {
+  if (buf == 0 || cap < 0) { return -MEO_ERR_USAGE; }
+  if (cap < 9) { return -MEO_ERR_FULL; }
+  var x: float64 = v;
+  if (x == 0.0) { x = 0.0; }
+  meo_put_f64le(buf, 1, x);
+  var bits: uint64 = meo_get_u64le(buf, 1);
+  if (v != v) { bits = (uint64)0x7FF8 << 48; }
+  var sign: uint64 = (uint64)1 << 63;
+  if ((bits & sign) != (uint64)0) {
+    bits = ~bits;
+  } else {
+    bits = bits ^ sign;
+  }
+  buf[0] = (uint8)MEO_KEY_REAL;
+  meo_put_u64le(buf, 1, key_bswap64(bits));
+  return 9;
+}
+
+// Encode a tagged blob key: [MEO_KEY_BLOB][the raw bytes]. Returns 1 + n, or
+// -MEO_ERR_FULL when the buffer cannot hold that (nothing is written).
+export fn meo_key_blob(buf: uint8*, cap: int32, p: uint8*, n: int32) -> int32 {
+  if (buf == 0 || cap < 0 || n < 0) { return -MEO_ERR_USAGE; }
+  if (p == 0 && n > 0) { return -MEO_ERR_USAGE; }
+  if ((int64)n > (int64)cap - 1) { return -MEO_ERR_FULL; }
+  buf[0] = (uint8)MEO_KEY_BLOB;
+  if (n > 0) { meo_bytes_copy(buf + 1, p, (int64)n); }
+  return n + 1;
+}
+
+// Decode the meo_key_int field at the front of buf into out[0]. Returns 9 (the
+// bytes read; a composite key may continue after them), or -MEO_ERR_CORRUPT
+// when buf does not start with one.
+export fn meo_key_int_decode(buf: uint8*, n: int32, out: int64*) -> int32 {
+  if (buf == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  if (n < 9 || (int32)buf[0] != MEO_KEY_INT) { return -MEO_ERR_CORRUPT; }
+  var x: uint64 = key_bswap64(meo_get_u64le(buf, 1));
+  out[0] = (int64)(x ^ ((uint64)1 << 63));
+  return 9;
 }

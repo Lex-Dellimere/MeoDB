@@ -12,15 +12,17 @@
 // pointer: a four-byte body with no key. Cells 0..n_cells-2 each carry
 // (key, left_child), and the one order invariant everything here depends on is
 //
-//   key_i is the smallest key in the subtree under child_{i+1}
+//   every key under child_i < key_i <= every key under child_{i+1}
 //
-// i.e. cell i's child holds the keys strictly below cell i's key, and the cell
-// after it holds the keys at or above that key. That is why descent takes the
-// first key strictly greater than the target, and why a split copies a leaf's
-// first upper key up (B+ style: the key stays in the leaf) while an inner split
-// moves its middle key up (the key leaves both halves, because it is the fence
-// between them). The same invariant is what meo_bt_next's range scan relies on
-// to find the next leaf.
+// key_i is a fence, not necessarily a key that is still present: a delete
+// removes the leaf cell and leaves the parent alone, so a fence may name a gone
+// key and a leaf may be empty. That is why descent takes the first key strictly
+// greater than the target, and why a split copies a leaf's first upper key up
+// (B+ style: the key stays in the leaf) while an inner split moves its middle
+// key up (the key leaves both halves, because it is the fence between them).
+//
+// Splits balance bytes, not cell counts: with cells of very different sizes a
+// count split can leave one half larger than a page.
 //
 // Keys are opaque bytes here: ordering is the caller's comparator
 // (fn(uint8*, int32, uint8*, int32) -> int32) and this module must not import
@@ -286,17 +288,65 @@ export fn meo_btn_leaf_insert(dst: uint8*, src: uint8*, key: uint8*,
   return MEO_OK;
 }
 
+// Rebuild `dst` as the leaf `src` without cell `at`. Nothing else moves, so
+// the parent's fences stay valid; the result may have no cells at all.
+export fn meo_btn_leaf_remove(dst: uint8*, src: uint8*, at: int32) -> int32 {
+  var n: int32 = meo_page_n_cells(src);
+  if (at < 0 || at >= n) { return -MEO_ERR_RANGE; }
+  var rc: int32 = meo_page_init(dst, MEO_PAGE_BTREE_LEAF);
+  if (rc != MEO_OK) { return rc; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (i != at) {
+      rc = meo_btn_leaf_append(dst, meo_btn_leaf_key_ptr(src, i),
+        meo_btn_leaf_key_len(src, i), meo_btn_leaf_rowid(src, i));
+      if (rc != MEO_OK) { return rc; }
+    }
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// First index of the upper half when the n + 1 cell leaf sequence splits: the
+// one in 1..n that minimises the larger half's bytes.
+fn leaf_split_point(src: uint8*, at: int32, klen: int32) -> int32 {
+  var n: int32 = meo_page_n_cells(src);
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i <= n) {
+    total += leaf_seq_key_len(src, at, klen, i) + MEO_BTN_LEAF_ROWID
+      + MEO_BTN_CELL_OVERHEAD;
+    i += 1;
+  }
+  var best: int32 = 1;
+  var best_max: int32 = total + 1;
+  var lo_bytes: int32 = 0;
+  var mid: int32 = 1;
+  while (mid <= n) {
+    lo_bytes += leaf_seq_key_len(src, at, klen, mid - 1) + MEO_BTN_LEAF_ROWID
+      + MEO_BTN_CELL_OVERHEAD;
+    var m: int32 = lo_bytes;
+    if (total - lo_bytes > m) { m = total - lo_bytes; }
+    if (m < best_max) {
+      best_max = m;
+      best = mid;
+    }
+    mid += 1;
+  }
+  return best;
+}
+
 // Split a full leaf into `lo` and `hi` while inserting (key, rowid) at `at`.
-// `src` is the old leaf's bytes. The two halves are the sequence's lower and
-// upper half by cell count, so the separator the caller copies up is exactly
-// hi's first key, and that key STAYS in hi: it is the smallest key of the new
-// subtree, which is what the parent's cell must name (PHASE2.md 2D).
+// `src` is the old leaf's bytes. The split point balances bytes, so neither
+// half can overflow while every cell is at most half a page. The separator the
+// caller copies up is hi's first key, which STAYS in hi: it is a valid fence
+// between the halves.
 export fn meo_btn_leaf_split(lo: uint8*, hi: uint8*, src: uint8*, key: uint8*,
     klen: int32, rowid: uint64, at: int32) -> int32 {
   var n: int32 = meo_page_n_cells(src);
   if (at < 0 || at > n) { return -MEO_ERR_RANGE; }
   if (n < 1) { return -MEO_ERR_CORRUPT; }
-  var mid: int32 = (n + 1) / 2;
+  var mid: int32 = leaf_split_point(src, at, klen);
   var rc: int32 = meo_page_init(lo, MEO_PAGE_BTREE_LEAF);
   if (rc != MEO_OK) { return rc; }
   rc = meo_page_init(hi, MEO_PAGE_BTREE_LEAF);
@@ -373,13 +423,47 @@ export fn meo_btn_inner_insert(dst: uint8*, src: uint8*, at: int32,
     inner_seq_child(src, at, child, sibling, n));
 }
 
+// The key index that moves up when the combined inner node (n keys) splits:
+// the m in 1..n-1 that minimises the larger half's bytes. Each half also
+// carries its bare right-child cell.
+fn inner_split_point(src: uint8*, at: int32, klen: int32) -> int32 {
+  var n: int32 = meo_page_n_cells(src);
+  var right: int32 = MEO_BTN_INNER_CHILD + MEO_BTN_CELL_OVERHEAD;
+  var total: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    total += inner_seq_key_len(src, at, klen, i) + MEO_BTN_INNER_CHILD
+      + MEO_BTN_CELL_OVERHEAD;
+    i += 1;
+  }
+  var best: int32 = 1;
+  var best_max: int32 = total + 2 * right + 1;
+  var lo_bytes: int32 = 0;
+  var m: int32 = 1;
+  while (m < n) {
+    var cm: int32 = inner_seq_key_len(src, at, klen, m) + MEO_BTN_INNER_CHILD
+      + MEO_BTN_CELL_OVERHEAD;
+    lo_bytes += inner_seq_key_len(src, at, klen, m - 1) + MEO_BTN_INNER_CHILD
+      + MEO_BTN_CELL_OVERHEAD;
+    var hi_bytes: int32 = total - lo_bytes - cm + right;
+    var worst: int32 = lo_bytes + right;
+    if (hi_bytes > worst) { worst = hi_bytes; }
+    if (worst < best_max) {
+      best_max = worst;
+      best = m;
+    }
+    m += 1;
+  }
+  return best;
+}
+
 // Split the combined inner node (src plus the new cell at `at`) into `lo` and
 // `hi`, and write the key that no longer belongs to either half into
 // `sep_out` (capacity is the caller's; a separator is a key that was already in
 // a page, so a MEO_PAGE_SIZE buffer always holds it).
 //
-// The separator is q[m]: it is the smallest key of hi's subtree, so it moves
-// UP to the parent and is absent from both halves - the opposite of the leaf
+// The separator is q[m], chosen to balance bytes: it is the fence between the
+// halves, so it moves UP to the parent and is absent from both halves - the opposite of the leaf
 // split, where the separator stays in the upper leaf. `sep_out` may alias `key`
 // (the caller reuses one buffer down the tree): the copy is the last thing this
 // function does, after every read of `key`.
@@ -392,7 +476,7 @@ export fn meo_btn_inner_split_insert(lo: uint8*, hi: uint8*, src: uint8*,
   // this function has to invent a split for.
   if (n < 2) { return -MEO_ERR_CORRUPT; }
   if (at < 0 || at > n - 1) { return -MEO_ERR_RANGE; }
-  var m: int32 = n / 2;
+  var m: int32 = inner_split_point(src, at, klen);
   var rc: int32 = meo_page_init(lo, MEO_PAGE_BTREE_INNER);
   if (rc != MEO_OK) { return rc; }
   rc = meo_page_init(hi, MEO_PAGE_BTREE_INNER);

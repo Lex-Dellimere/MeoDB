@@ -1,0 +1,857 @@
+// btdel_self: b-tree delete, empty-leaf skipping, byte-balanced splits, and
+// the key_real / key_blob / key_int_decode encodings.
+//
+// Prints "PASS <case>" per case and "FAIL <case>: <detail>" per failing check,
+// and returns non-zero on failure (tests/tinytest.mettle).
+//
+// Cases:
+//   d1_random   seeded random insert/delete/seek/next/lookup/last against a
+//               sorted-array oracle at n_frames = 8, keys 1..1280 bytes; the
+//               second half is delete-heavy so the tree drains. A full
+//               scan and a structure walk (fence order, uniform depth, row
+//               count) run every D_CHECK_EVERY ops and at the end.
+//   d2_leaves   delete every key of a middle leaf, of the last leaf and of the
+//               first leaf, then scan, seek into the gaps, last, and refill.
+//   d3_all      delete everything, read the empty tree, insert it all again.
+//   d4_real     meo_key_real order, -0.0 == 0.0, NaN above +inf; meo_key_blob.
+//   d5_decode   meo_key_int_decode round trip and refusals.
+
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/node.mettle";
+import "../src/btree/btree.mettle";
+import "tinytest.mettle";
+import "std/io";
+import "std/mem";
+
+const D_RAND_PATH: string = "build/btdel_self_rand.dat";
+const D_LEAF_PATH: string = "build/btdel_self_leaf.dat";
+
+const D_SEED: uint32 = 20261104;
+const D_OPS: int32 = 20000;
+const D_CHECK_EVERY: int32 = 1000;
+const D_FRAMES: int32 = 8;
+// Largest live set the oracle holds; past it an insert turns into a delete.
+const D_CAP: int32 = 4000;
+const D_KMAX: int32 = 1280;
+
+// d2/d3: keys are meo_key_int(i) padded to D_WIDE bytes, so a leaf holds about
+// 36 and the tree is three levels deep.
+const D_WIDE: int32 = 100;
+const D_N: int32 = 3000;
+const D_ROWID_BASE: uint64 = 1000000;
+
+// --- helpers ----------------------------------------------------------------
+
+fn d_reset(path: string) -> int32 {
+  var f: MeoFile = meo_file_open(path,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  return rc;
+}
+
+fn d_pins(p: MeoPager*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < meo_pager_frames(p)) {
+    if (p->frames[i].pin > 0) { n += 1; }
+    i += 1;
+  }
+  return n;
+}
+
+// xorshift32: fixed seed, same sequence in both profiles.
+fn d_rand(state: uint32*) -> uint32 {
+  var x: uint32 = state[0];
+  x = x ^ (x << 13);
+  x = x ^ (x >> 17);
+  x = x ^ (x << 5);
+  state[0] = x;
+  return x;
+}
+
+fn d_rand64(state: uint32*) -> uint64 {
+  var hi: uint64 = (uint64)d_rand(state);
+  return (hi << 32) | (uint64)d_rand(state);
+}
+
+fn d_key(data: uint8*, len: int32) -> MeoBtKey {
+  var k: MeoBtKey;
+  k.data = data;
+  k.len = len;
+  return k;
+}
+
+// --- structure walk ---------------------------------------------------------
+
+// Walk the subtree at `page`: every node passes meo_btn_check, every key lies
+// in [lo, hi) (a length of -1 means unbounded), leaf keys strictly ascend,
+// fences strictly ascend, and every leaf is at the same depth. Each node is
+// copied out and released before its children are visited, so the walk pins
+// one frame at a time. Rows found are added to count[0].
+fn d_walk(p: MeoPager*, page: uint32, depth: int32, lo: uint8*, lo_len: int32,
+    hi: uint8*, hi_len: int32, leaf_depth: int32*, count: int64*) -> bool {
+  if (depth > MEO_BT_MAX_DEPTH) { return false; }
+  var f: MeoFrame* = meo_pager_get(p, page, false);
+  if (f == 0) { return false; }
+  var pg: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (pg == 0) {
+    meo_pager_release(p, f, false);
+    return false;
+  }
+  defer free(pg);
+  meo_bytes_copy(pg, f->data, (int64)MEO_PAGE_SIZE);
+  meo_pager_release(p, f, false);
+  if (meo_btn_check(pg) != MEO_OK) { return false; }
+  var n: int32 = meo_page_n_cells(pg);
+  if (meo_btn_is_leaf(pg)) {
+    if (leaf_depth[0] < 0) { leaf_depth[0] = depth; }
+    if (leaf_depth[0] != depth) { return false; }
+    var i: int32 = 0;
+    while (i < n) {
+      var k: uint8* = meo_btn_leaf_key_ptr(pg, i);
+      var kl: int32 = meo_btn_leaf_key_len(pg, i);
+      if (lo_len >= 0 && meo_key_compare(k, kl, lo, lo_len) < 0) { return false; }
+      if (hi_len >= 0 && meo_key_compare(k, kl, hi, hi_len) >= 0) { return false; }
+      if (i > 0 && meo_key_compare(meo_btn_leaf_key_ptr(pg, i - 1),
+          meo_btn_leaf_key_len(pg, i - 1), k, kl) >= 0) {
+        return false;
+      }
+      i += 1;
+    }
+    count[0] += (int64)n;
+    return true;
+  }
+  var j: int32 = 0;
+  while (j < n - 1) {
+    var fk: uint8* = meo_btn_inner_key_ptr(pg, j);
+    var fl: int32 = meo_btn_inner_key_len(pg, j);
+    if (lo_len >= 0 && meo_key_compare(fk, fl, lo, lo_len) < 0) { return false; }
+    if (hi_len >= 0 && meo_key_compare(fk, fl, hi, hi_len) >= 0) { return false; }
+    if (j > 0 && meo_key_compare(meo_btn_inner_key_ptr(pg, j - 1),
+        meo_btn_inner_key_len(pg, j - 1), fk, fl) >= 0) {
+      return false;
+    }
+    j += 1;
+  }
+  var c: int32 = 0;
+  while (c < n) {
+    var clo: uint8* = lo;
+    var clo_len: int32 = lo_len;
+    if (c > 0) {
+      clo = meo_btn_inner_key_ptr(pg, c - 1);
+      clo_len = meo_btn_inner_key_len(pg, c - 1);
+    }
+    var chi: uint8* = hi;
+    var chi_len: int32 = hi_len;
+    if (c < n - 1) {
+      chi = meo_btn_inner_key_ptr(pg, c);
+      chi_len = meo_btn_inner_key_len(pg, c);
+    }
+    if (!d_walk(p, meo_btn_inner_child(pg, c), depth + 1, clo, clo_len, chi,
+        chi_len, leaf_depth, count)) {
+      return false;
+    }
+    c += 1;
+  }
+  return true;
+}
+
+// The whole tree is well formed and holds exactly `want` rows.
+fn d_check_tree(p: MeoPager*, root: uint32, want: int64, name: string) -> bool {
+  if (root == 0) { return meo_t_check_i64(want, 0, name); }
+  var leaf_depth: int32 = -1;
+  var count: int64 = 0;
+  var dummy: uint8 = 0;
+  if (!meo_t_check(d_walk(p, root, 1, &dummy, -1, &dummy, -1, &leaf_depth,
+      &count), name)) {
+    return false;
+  }
+  return meo_t_check_i64(count, want, name);
+}
+
+// --- the oracle -------------------------------------------------------------
+
+// Sorted keys, by slot. Slot s's bytes live at pool + s * D_KMAX.
+struct DOracle {
+  n: int32;
+  ord: int32*;
+  len: int32*;
+  rowid: uint64*;
+  pool: uint8*;
+  free_slots: int32*;
+  n_free: int32;
+}
+
+fn o_key(o: DOracle*, i: int32) -> uint8* {
+  return o->pool + (int64)o->ord[i] * (int64)D_KMAX;
+}
+
+fn o_len(o: DOracle*, i: int32) -> int32 {
+  return o->len[o->ord[i]];
+}
+
+// Lower bound of key in the oracle; found[0] says whether it is equal.
+fn o_find(o: DOracle*, key: uint8*, klen: int32, found: bool*) -> int32 {
+  var lo: int32 = 0;
+  var hi: int32 = o->n;
+  while (lo < hi) {
+    var mid: int32 = lo + (hi - lo) / 2;
+    if (meo_key_compare(o_key(o, mid), o_len(o, mid), key, klen) < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  found[0] = lo < o->n && meo_key_compare(o_key(o, lo), o_len(o, lo), key,
+    klen) == 0;
+  return lo;
+}
+
+fn o_insert(o: DOracle*, key: uint8*, klen: int32, rowid: uint64) {
+  var found: bool = false;
+  var at: int32 = o_find(o, key, klen, &found);
+  if (found) {
+    o->rowid[o->ord[at]] = rowid;
+    return;
+  }
+  o->n_free -= 1;
+  var s: int32 = o->free_slots[o->n_free];
+  meo_bytes_copy(o->pool + (int64)s * (int64)D_KMAX, key, (int64)klen);
+  o->len[s] = klen;
+  o->rowid[s] = rowid;
+  var i: int32 = o->n;
+  while (i > at) {
+    o->ord[i] = o->ord[i - 1];
+    i -= 1;
+  }
+  o->ord[at] = s;
+  o->n += 1;
+}
+
+fn o_remove(o: DOracle*, at: int32) {
+  o->free_slots[o->n_free] = o->ord[at];
+  o->n_free += 1;
+  var i: int32 = at;
+  while (i < o->n - 1) {
+    o->ord[i] = o->ord[i + 1];
+    i += 1;
+  }
+  o->n -= 1;
+}
+
+// A random key: tiny, medium or huge, with a small alphabet in the first bytes
+// so prefixes and repeats are common.
+fn d_gen_key(st: uint32*, buf: uint8*) -> int32 {
+  var r: uint32 = d_rand(st) % (uint32)10;
+  var len: int32 = 0;
+  if (r < (uint32)3) {
+    len = 1 + (int32)(d_rand(st) % (uint32)6);
+  } else if (r < (uint32)7) {
+    len = 7 + (int32)(d_rand(st) % (uint32)200);
+  } else {
+    len = 200 + (int32)(d_rand(st) % (uint32)(D_KMAX - 199));
+  }
+  var i: int32 = 0;
+  while (i < len) {
+    if (i < 3) {
+      buf[i] = (uint8)(d_rand(st) % (uint32)4);
+    } else {
+      buf[i] = (uint8)(d_rand(st) % (uint32)256);
+    }
+    i += 1;
+  }
+  return len;
+}
+
+// The tree in full, row by row, equals the oracle.
+fn d_scan_equal(p: MeoPager*, root: uint32, o: DOracle*, name: string) -> bool {
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var empty: uint8 = 0;
+  var rc: int32 = meo_bt_seek(p, &c, root, meo_key_compare, d_key(&empty, 0));
+  var i: int32 = 0;
+  while (rc == 0) {
+    if (i >= o->n) {
+      meo_bt_close(p, &c);
+      return meo_t_check(false, name);
+    }
+    var kl: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+    var ok: bool = kl == o_len(o, i) && meo_key_compare(
+      meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf), kl, o_key(o, i),
+      o_len(o, i)) == 0;
+    var rid: uint64 = 0;
+    meo_bt_rowid(p, &c, &rid);
+    if (!ok || rid != o->rowid[o->ord[i]]) {
+      meo_bt_close(p, &c);
+      println("FAIL {name}: row {i} differs");
+      return meo_t_check(false, name);
+    }
+    i += 1;
+    rc = meo_bt_next(p, &c);
+  }
+  meo_bt_close(p, &c);
+  if (!meo_t_check_i64(rc, 1, name)) { return false; }
+  return meo_t_check_i64(i, o->n, name);
+}
+
+// --- d1: random ops against the oracle --------------------------------------
+
+fn d1_random() -> int32 {
+  if (!meo_t_check_i64(d_reset(D_RAND_PATH), MEO_OK, "d1: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(D_RAND_PATH, D_FRAMES, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "d1: open")) { return 1; }
+  defer meo_pager_free(p);
+
+  var o: DOracle;
+  o.n = 0;
+  o.ord = malloc((int64)D_CAP * 4);
+  o.len = malloc((int64)D_CAP * 4);
+  o.rowid = malloc((int64)D_CAP * 8);
+  o.pool = malloc((int64)D_CAP * (int64)D_KMAX);
+  o.free_slots = malloc((int64)D_CAP * 4);
+  var kb: uint8* = malloc((int64)D_KMAX);
+  if (o.ord == 0 || o.len == 0 || o.rowid == 0 || o.pool == 0
+      || o.free_slots == 0 || kb == 0) {
+    meo_t_check(false, "d1: malloc");
+    return 1;
+  }
+  defer free(o.ord);
+  defer free(o.len);
+  defer free(o.rowid);
+  defer free(o.pool);
+  defer free(o.free_slots);
+  defer free(kb);
+  var s: int32 = 0;
+  while (s < D_CAP) {
+    o.free_slots[s] = D_CAP - 1 - s;
+    s += 1;
+  }
+  o.n_free = D_CAP;
+
+  var st: uint32 = D_SEED;
+  var root: uint32 = 0;
+  var n_ins: int32 = 0;
+  var n_del: int32 = 0;
+  var n_hit: int32 = 0;
+  var max_live: int32 = 0;
+  var op: int32 = 0;
+  while (op < D_OPS) {
+    // First half grows the tree, second half drains it through empty leaves.
+    var t_ins: uint32 = (uint32)45;
+    if (op >= D_OPS / 2) { t_ins = (uint32)15; }
+    var r: uint32 = d_rand(&st) % (uint32)100;
+    if (r < t_ins && o.n >= D_CAP) { r = (uint32)50; }
+    if (r < t_ins) {
+      var kl: int32 = d_gen_key(&st, kb);
+      var rid: uint64 = d_rand64(&st);
+      var rc: int32 = meo_bt_insert(p, &root, meo_key_compare, d_key(kb, kl),
+        rid);
+      if (!meo_t_check_i64(rc, MEO_OK, "d1: insert")) {
+        println("FAIL d1: op {op} insert len {kl}");
+        return 1;
+      }
+      o_insert(&o, kb, kl, rid);
+      n_ins += 1;
+    } else if (r < (uint32)75) {
+      var kl: int32 = 0;
+      if (o.n > 0 && d_rand(&st) % (uint32)10 < (uint32)7) {
+        var pick: int32 = (int32)(d_rand(&st) % (uint32)o.n);
+        kl = o_len(&o, pick);
+        meo_bytes_copy(kb, o_key(&o, pick), (int64)kl);
+      } else {
+        kl = d_gen_key(&st, kb);
+      }
+      var found: bool = false;
+      var at: int32 = o_find(&o, kb, kl, &found);
+      var want: int32 = 1;
+      if (found) { want = MEO_OK; }
+      var rc: int32 = meo_bt_delete(p, &root, meo_key_compare, d_key(kb, kl));
+      if (!meo_t_check_i64(rc, want, "d1: delete")) {
+        println("FAIL d1: op {op} delete");
+        return 1;
+      }
+      if (found) {
+        o_remove(&o, at);
+        n_del += 1;
+      }
+    } else if (r < (uint32)94) {
+      var kl: int32 = 0;
+      if (o.n > 0 && d_rand(&st) % (uint32)2 == (uint32)0) {
+        var pick: int32 = (int32)(d_rand(&st) % (uint32)o.n);
+        kl = o_len(&o, pick);
+        meo_bytes_copy(kb, o_key(&o, pick), (int64)kl);
+      } else {
+        kl = d_gen_key(&st, kb);
+      }
+      var found: bool = false;
+      var at: int32 = o_find(&o, kb, kl, &found);
+      if (r < (uint32)86) {
+        // seek, then up to 5 nexts
+        var c: MeoBtCursor;
+        meo_bt_cursor_init(&c);
+        var rc: int32 = meo_bt_seek(p, &c, root, meo_key_compare,
+          d_key(kb, kl));
+        var steps: int32 = 0;
+        while (steps < 6) {
+          var want: int32 = 0;
+          if (at + steps >= o.n) { want = 1; }
+          if (!meo_t_check_i64(rc, want, "d1: seek/next")) {
+            println("FAIL d1: op {op} step {steps}");
+            meo_bt_close(p, &c);
+            return 1;
+          }
+          if (rc != 0) { break; }
+          var ix: int32 = at + steps;
+          var ckl: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
+          var rid: uint64 = 0;
+          meo_bt_rowid(p, &c, &rid);
+          if (!meo_t_check(meo_key_compare(meo_btn_leaf_key_ptr(c.leaf->data,
+              c.slot_in_leaf), ckl, o_key(&o, ix), o_len(&o, ix)) == 0
+              && rid == o.rowid[o.ord[ix]], "d1: seek/next row")) {
+            println("FAIL d1: op {op} step {steps}");
+            meo_bt_close(p, &c);
+            return 1;
+          }
+          if (steps == 0) { n_hit += 1; }
+          steps += 1;
+          rc = meo_bt_next(p, &c);
+        }
+        meo_bt_close(p, &c);
+      } else {
+        var rid: uint64 = 0;
+        var rc: int32 = meo_bt_lookup(p, root, meo_key_compare, d_key(kb, kl),
+          &rid);
+        var want: int32 = 1;
+        if (found) { want = MEO_OK; }
+        if (!meo_t_check_i64(rc, want, "d1: lookup")) { return 1; }
+        if (found && !meo_t_check(rid == o.rowid[o.ord[at]], "d1: lookup rowid")) {
+          return 1;
+        }
+      }
+    } else {
+      var rid: uint64 = 0;
+      var rc: int32 = meo_bt_last(p, root, &rid);
+      var want: int32 = 1;
+      if (o.n > 0) { want = MEO_OK; }
+      if (!meo_t_check_i64(rc, want, "d1: last")) {
+        println("FAIL d1: op {op} last");
+        return 1;
+      }
+      if (o.n > 0 && !meo_t_check(rid == o.rowid[o.ord[o.n - 1]],
+          "d1: last rowid")) {
+        return 1;
+      }
+    }
+    if (!meo_t_check_i64(d_pins(p), 0, "d1: pins after op")) { return 1; }
+    if (o.n > max_live) { max_live = o.n; }
+    op += 1;
+    if (op % D_CHECK_EVERY == 0 || op == D_OPS) {
+      if (!d_scan_equal(p, root, &o, "d1: scan")) {
+        println("FAIL d1: scan at op {op}");
+        return 1;
+      }
+      if (!d_check_tree(p, root, (int64)o.n, "d1: structure")) {
+        println("FAIL d1: structure at op {op}");
+        return 1;
+      }
+    }
+  }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "d1: close")) { return 1; }
+  var live: int32 = o.n;
+  println("INFO d1: seed {D_SEED} ops {D_OPS} inserts {n_ins} deletes {n_del} seek hits {n_hit} live {live} max live {max_live}");
+  println("PASS d1_random");
+  return 0;
+}
+
+// --- d2 / d3: whole leaves ---------------------------------------------------
+
+fn d_wide_key(buf: uint8*, v: int64) {
+  meo_key_int(buf, D_WIDE, v);
+  var i: int32 = 9;
+  while (i < D_WIDE) {
+    buf[i] = (uint8)0x5A;
+    i += 1;
+  }
+}
+
+fn d_ins(p: MeoPager*, root: uint32*, buf: uint8*, v: int64) -> bool {
+  d_wide_key(buf, v);
+  return meo_bt_insert(p, root, meo_key_compare, d_key(buf, D_WIDE),
+    D_ROWID_BASE + (uint64)v) == MEO_OK;
+}
+
+fn d_del(p: MeoPager*, root: uint32*, buf: uint8*, v: int64) -> int32 {
+  d_wide_key(buf, v);
+  return meo_bt_delete(p, root, meo_key_compare, d_key(buf, D_WIDE));
+}
+
+// The first and last key value of the leaf a seek for v lands on.
+fn d_leaf_range(p: MeoPager*, root: uint32, buf: uint8*, v: int64,
+    first: int64*, last: int64*) -> bool {
+  d_wide_key(buf, v);
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  if (meo_bt_seek(p, &c, root, meo_key_compare, d_key(buf, D_WIDE)) != 0) {
+    meo_bt_close(p, &c);
+    return false;
+  }
+  var n: int32 = meo_page_n_cells(c.leaf->data);
+  var ok: bool = meo_key_int_decode(meo_btn_leaf_key_ptr(c.leaf->data, 0),
+    meo_btn_leaf_key_len(c.leaf->data, 0), first) == 9
+    && meo_key_int_decode(meo_btn_leaf_key_ptr(c.leaf->data, n - 1),
+    meo_btn_leaf_key_len(c.leaf->data, n - 1), last) == 9;
+  meo_bt_close(p, &c);
+  return ok;
+}
+
+// Scan from the start: rows ascend, each rowid matches its key, and present[]
+// says exactly which values are in the tree.
+fn d_scan_present(p: MeoPager*, root: uint32, present: bool*, buf: uint8*,
+    name: string) -> bool {
+  var want: int64 = 0;
+  var v: int32 = 1;
+  while (v <= D_N) {
+    if (present[v]) { want += 1; }
+    v += 1;
+  }
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var empty: uint8 = 0;
+  var rc: int32 = meo_bt_seek(p, &c, root, meo_key_compare, d_key(&empty, 0));
+  var prev: int64 = 0;
+  var got: int64 = 0;
+  while (rc == 0) {
+    var k: int64 = 0;
+    meo_key_int_decode(meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf),
+      meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf), &k);
+    var rid: uint64 = 0;
+    meo_bt_rowid(p, &c, &rid);
+    if (k <= prev || k > (int64)D_N || !present[(int32)k]
+        || rid != D_ROWID_BASE + (uint64)k) {
+      meo_bt_close(p, &c);
+      println("FAIL {name}: bad row {k} after {prev}");
+      return meo_t_check(false, name);
+    }
+    prev = k;
+    got += 1;
+    rc = meo_bt_next(p, &c);
+  }
+  meo_bt_close(p, &c);
+  if (!meo_t_check_i64(rc, 1, name)) { return false; }
+  if (!meo_t_check_i64(got, want, name)) { return false; }
+  return d_check_tree(p, root, want, name);
+}
+
+// Delete values first..last, marking them absent.
+fn d_del_range(p: MeoPager*, root: uint32*, buf: uint8*, present: bool*,
+    first: int64, last: int64, name: string) -> bool {
+  var v: int64 = first;
+  while (v <= last) {
+    if (!meo_t_check_i64(d_del(p, root, buf, v), MEO_OK, name)) { return false; }
+    present[(int32)v] = false;
+    v += 1;
+  }
+  return true;
+}
+
+fn d_expect_last(p: MeoPager*, root: uint32, want: int64, name: string) -> bool {
+  var rid: uint64 = 0;
+  var rc: int32 = meo_bt_last(p, root, &rid);
+  if (want == 0) { return meo_t_check_i64(rc, 1, name); }
+  if (!meo_t_check_i64(rc, MEO_OK, name)) { return false; }
+  return meo_t_check_i64((int64)(rid - D_ROWID_BASE), want, name);
+}
+
+// A seek for v answers the first present value >= v, or 1 when there is none.
+fn d_expect_seek(p: MeoPager*, root: uint32, buf: uint8*, v: int64,
+    want: int64, name: string) -> bool {
+  d_wide_key(buf, v);
+  var c: MeoBtCursor;
+  meo_bt_cursor_init(&c);
+  var rc: int32 = meo_bt_seek(p, &c, root, meo_key_compare, d_key(buf, D_WIDE));
+  if (want == 0) {
+    meo_bt_close(p, &c);
+    return meo_t_check_i64(rc, 1, name);
+  }
+  if (!meo_t_check_i64(rc, 0, name)) {
+    meo_bt_close(p, &c);
+    return false;
+  }
+  var k: int64 = 0;
+  meo_key_int_decode(meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf),
+    meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf), &k);
+  meo_bt_close(p, &c);
+  return meo_t_check_i64(k, want, name);
+}
+
+fn d2_d3_leaves() -> int32 {
+  if (!meo_t_check_i64(d_reset(D_LEAF_PATH), MEO_OK, "d2: reset")) { return 1; }
+  var p: MeoPager* = meo_pager_open(D_LEAF_PATH, D_FRAMES, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "d2: open")) { return 1; }
+  defer meo_pager_free(p);
+  var buf: uint8* = malloc((int64)D_WIDE);
+  var present: bool* = malloc((int64)D_N + 1);
+  if (buf == 0 || present == 0) { return 1; }
+  defer free(buf);
+  defer free(present);
+
+  var root: uint32 = 0;
+  present[0] = false;
+  var v: int32 = 1;
+  while (v <= D_N) {
+    if (!meo_t_check(d_ins(p, &root, buf, (int64)v), "d2: fill")) { return 1; }
+    present[v] = true;
+    v += 1;
+  }
+  if (!d_scan_present(p, root, present, buf, "d2: initial")) { return 1; }
+
+  // A middle leaf, then two neighbours of it, so the scan has to step over a
+  // run of empty leaves.
+  var first: int64 = 0;
+  var last: int64 = 0;
+  if (!meo_t_check(d_leaf_range(p, root, buf, (int64)(D_N / 2), &first, &last),
+      "d2: middle leaf")) {
+    return 1;
+  }
+  var mid_first: int64 = first;
+  if (!d_del_range(p, &root, buf, present, first, last, "d2: del middle")) {
+    return 1;
+  }
+  var run_last: int64 = last;
+  var k: int32 = 0;
+  while (k < 2) {
+    if (!d_leaf_range(p, root, buf, run_last + 1, &first, &last)) { return 1; }
+    if (!d_del_range(p, &root, buf, present, first, last, "d2: del next")) {
+      return 1;
+    }
+    run_last = last;
+    k += 1;
+  }
+  if (!d_scan_present(p, root, present, buf, "d2: after middle")) { return 1; }
+  if (!d_expect_seek(p, root, buf, mid_first, run_last + 1, "d2: seek gap")) {
+    return 1;
+  }
+  var rid: uint64 = 0;
+  d_wide_key(buf, mid_first);
+  if (!meo_t_check_i64(meo_bt_lookup(p, root, meo_key_compare,
+      d_key(buf, D_WIDE), &rid), 1, "d2: lookup gone")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(d_del(p, &root, buf, mid_first), 1, "d2: del twice")) {
+    return 1;
+  }
+
+  // The last leaf: last must step back to the leaf before it.
+  if (!d_leaf_range(p, root, buf, (int64)D_N, &first, &last)) { return 1; }
+  if (!d_del_range(p, &root, buf, present, first, last, "d2: del last leaf")) {
+    return 1;
+  }
+  if (!d_expect_last(p, root, first - 1, "d2: last after tail")) { return 1; }
+  if (!d_expect_seek(p, root, buf, first, 0, "d2: seek past end")) { return 1; }
+
+  // The first leaf: a scan from the start skips it.
+  if (!d_leaf_range(p, root, buf, 1, &first, &last)) { return 1; }
+  if (!d_del_range(p, &root, buf, present, first, last, "d2: del first leaf")) {
+    return 1;
+  }
+  if (!d_scan_present(p, root, present, buf, "d2: after ends")) { return 1; }
+
+  // Refill the middle run: the keys go back into their emptied leaves.
+  var w: int64 = mid_first;
+  while (w <= run_last) {
+    if (!meo_t_check(d_ins(p, &root, buf, w), "d2: refill")) { return 1; }
+    present[(int32)w] = true;
+    w += 1;
+  }
+  if (!d_scan_present(p, root, present, buf, "d2: refilled")) { return 1; }
+  println("PASS d2_leaves");
+
+  // d3: everything goes, in a scattered order.
+  var root_before: uint32 = root;
+  var step: int32 = 7;
+  var start: int32 = 0;
+  while (start < step) {
+    var x: int32 = 1 + start;
+    while (x <= D_N) {
+      if (present[x]) {
+        if (!meo_t_check_i64(d_del(p, &root, buf, (int64)x), MEO_OK,
+            "d3: del all")) {
+          return 1;
+        }
+        present[x] = false;
+      }
+      x += step;
+    }
+    start += 1;
+  }
+  if (!meo_t_check(root == root_before, "d3: root unchanged")) { return 1; }
+  if (!d_scan_present(p, root, present, buf, "d3: empty")) { return 1; }
+  if (!d_expect_last(p, root, 0, "d3: last empty")) { return 1; }
+  if (!d_expect_seek(p, root, buf, 1, 0, "d3: seek empty")) { return 1; }
+  d_wide_key(buf, 5);
+  if (!meo_t_check_i64(meo_bt_lookup(p, root, meo_key_compare,
+      d_key(buf, D_WIDE), &rid), 1, "d3: lookup empty")) {
+    return 1;
+  }
+  v = D_N;
+  while (v >= 1) {
+    if (!meo_t_check(d_ins(p, &root, buf, (int64)v), "d3: refill")) { return 1; }
+    present[v] = true;
+    v -= 1;
+  }
+  if (!d_scan_present(p, root, present, buf, "d3: refilled")) { return 1; }
+  if (!d_expect_last(p, root, (int64)D_N, "d3: last refilled")) { return 1; }
+
+  // An empty root leaf keeps the tree alive.
+  var r2: uint32 = 0;
+  if (!meo_t_check(d_ins(p, &r2, buf, 42), "d3: tiny insert")) { return 1; }
+  if (!meo_t_check_i64(d_del(p, &r2, buf, 42), MEO_OK, "d3: tiny del")) {
+    return 1;
+  }
+  if (!meo_t_check(r2 != 0, "d3: root leaf kept")) { return 1; }
+  if (!d_expect_last(p, r2, 0, "d3: empty root last")) { return 1; }
+  if (!meo_t_check(d_ins(p, &r2, buf, 43), "d3: reuse root")) { return 1; }
+  if (!d_expect_last(p, r2, 43, "d3: reuse root last")) { return 1; }
+  if (!meo_t_check_i64(d_pins(p), 0, "d3: pins")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_close(p), MEO_OK, "d3: close")) { return 1; }
+  println("PASS d3_all");
+  return 0;
+}
+
+// --- d4: real and blob keys ---------------------------------------------------
+
+fn d4_real() -> int32 {
+  var zero: float64 = 0.0;
+  var inf: float64 = 1.0 / zero;
+  var nan: float64 = zero / zero;
+  var nzero: float64 = -zero;
+  var tiny: float64 = 5e-324;
+  // Ascending; -0.0 and 0.0 are checked for equality separately.
+  var vals: float64[11];
+  vals[0] = -inf;
+  vals[1] = -1e300;
+  vals[2] = -1.5;
+  vals[3] = -tiny;
+  vals[4] = nzero;
+  vals[5] = tiny;
+  vals[6] = 1.0;
+  vals[7] = 1.5;
+  vals[8] = 1e300;
+  vals[9] = inf;
+  vals[10] = nan;
+  var a: uint8[9];
+  var b: uint8[9];
+  var i: int32 = 0;
+  while (i < 10) {
+    if (!meo_t_check_i64(meo_key_real(&a[0], 9, vals[i]), 9, "d4: encode")) {
+      return 1;
+    }
+    meo_key_real(&b[0], 9, vals[i + 1]);
+    if (!meo_t_check_i64(meo_key_compare(&a[0], 9, &b[0], 9), -1, "d4: order")) {
+      println("FAIL d4: order at {i}");
+      return 1;
+    }
+    i += 1;
+  }
+  meo_key_real(&a[0], 9, nzero);
+  meo_key_real(&b[0], 9, zero);
+  if (!meo_t_check_i64(meo_key_compare(&a[0], 9, &b[0], 9), 0, "d4: -0 == 0")) {
+    return 1;
+  }
+  meo_key_real(&a[0], 9, nan);
+  meo_key_real(&b[0], 9, -nan);
+  if (!meo_t_check_i64(meo_key_compare(&a[0], 9, &b[0], 9), 0, "d4: one NaN")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)a[0], (int64)MEO_KEY_REAL, "d4: tag")) { return 1; }
+  if (!meo_t_check_i64(meo_key_real(&a[0], 8, 1.0), -MEO_ERR_FULL, "d4: cap")) {
+    return 1;
+  }
+
+  // Blobs: tag 6, raw bytes, a prefix sorts first, and above every real.
+  var x: uint8[4];
+  x[0] = (uint8)0;
+  x[1] = (uint8)255;
+  x[2] = (uint8)7;
+  x[3] = (uint8)7;
+  var ba: uint8[8];
+  var bb: uint8[8];
+  if (!meo_t_check_i64(meo_key_blob(&ba[0], 8, &x[0], 3), 4, "d4: blob")) {
+    return 1;
+  }
+  meo_key_blob(&bb[0], 8, &x[0], 4);
+  if (!meo_t_check_i64((int64)ba[0], (int64)MEO_KEY_BLOB, "d4: blob tag")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_key_compare(&ba[0], 4, &bb[0], 5), -1,
+      "d4: blob prefix")) {
+    return 1;
+  }
+  meo_key_real(&a[0], 9, nan);
+  if (!meo_t_check_i64(meo_key_compare(&a[0], 9, &ba[0], 4), -1,
+      "d4: real below blob")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_key_blob(&ba[0], 8, &x[0], 0), 1, "d4: empty blob")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_key_blob(&ba[0], 4, &x[0], 4), -MEO_ERR_FULL,
+      "d4: blob cap")) {
+    return 1;
+  }
+  println("PASS d4_real");
+  return 0;
+}
+
+// --- d5: int decode -----------------------------------------------------------
+
+fn d5_decode() -> int32 {
+  var vals: int64[6];
+  vals[0] = (int64)((uint64)1 << 63);
+  vals[1] = (int64)(((uint64)1 << 63) - (uint64)1);
+  vals[2] = 0;
+  vals[3] = -1;
+  vals[4] = 1;
+  vals[5] = -123456789012;
+  var buf: uint8[12];
+  var i: int32 = 0;
+  while (i < 6) {
+    meo_key_int(&buf[0], 12, vals[i]);
+    buf[9] = (uint8)0xEE;
+    var out: int64 = 7;
+    if (!meo_t_check_i64(meo_key_int_decode(&buf[0], 10, &out), 9,
+        "d5: decode rc")) {
+      return 1;
+    }
+    if (!meo_t_check_i64(out, vals[i], "d5: round trip")) { return 1; }
+    i += 1;
+  }
+  var out2: int64 = 0;
+  if (!meo_t_check_i64(meo_key_int_decode(&buf[0], 8, &out2), -MEO_ERR_CORRUPT,
+      "d5: short")) {
+    return 1;
+  }
+  meo_key_null(&buf[0], 12);
+  if (!meo_t_check_i64(meo_key_int_decode(&buf[0], 9, &out2), -MEO_ERR_CORRUPT,
+      "d5: wrong tag")) {
+    return 1;
+  }
+  println("PASS d5_decode");
+  return 0;
+}
+
+fn main() -> int32 {
+  if (d4_real() != 0) { return 1; }
+  if (d5_decode() != 0) { return 1; }
+  if (d2_d3_leaves() != 0) { return 1; }
+  if (d1_random() != 0) { return 1; }
+  return meo_t_report();
+}

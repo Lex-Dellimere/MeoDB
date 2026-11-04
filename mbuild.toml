@@ -94,3 +94,8 @@ main = "tests/lock_self.mettle"
 # Lexer and parser for the whole SQL subset, including error offsets.
 [bin.parse_self]
 main = "tests/parse_self.mettle"
+
+# B-tree delete, byte-balanced splits and float/blob keys, checked against a
+# sorted-array oracle.
+[bin.btdel_self]
+main = "tests/btdel_self.mettle"
