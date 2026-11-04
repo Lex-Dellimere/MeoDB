@@ -186,12 +186,16 @@ fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int3
   return MEO_OK;
 }
 
-// Same id, name and columns: the decoded row describes this object.
+// Same id and name, and one column list is a prefix of the other: the decoded
+// row describes this object (a longer or shorter list is an ADD COLUMN that
+// was committed or rolled back).
 fn cat_same(old: MeoTable*, t: MeoTable*) -> bool {
-  if (old->id != t->id || old->n_cols != t->n_cols) { return false; }
+  if (old->id != t->id) { return false; }
   if (!meo_cat_name_eq(old->name, old->name_len, t->name, t->name_len)) { return false; }
+  var n: int32 = old->n_cols;
+  if (t->n_cols < n) { n = t->n_cols; }
   var k: int32 = 0;
-  while (k < old->n_cols) {
+  while (k < n) {
     var a: MeoColumn* = &old->columns[k];
     var b: MeoColumn* = &t->columns[k];
     if (!meo_cat_name_eq(a->name, a->name_len, b->name, b->name_len)) { return false; }
@@ -213,6 +217,15 @@ fn cat_merge(cat: MeoCatalog*, t: MeoTable*) -> int32 {
       old->root = t->root;
       old->tflags = t->tflags;
       old->live = true;
+      if (old->n_cols != t->n_cols) {
+        // Take the decoded column list; the old one goes with t.
+        var oc: MeoColumn* = old->columns;
+        var on: int32 = old->n_cols;
+        old->columns = t->columns;
+        old->n_cols = t->n_cols;
+        t->columns = oc;
+        t->n_cols = on;
+      }
       var k: int32 = 0;
       while (k < old->n_cols) {
         old->columns[k].index_root = t->columns[k].index_root;
@@ -513,5 +526,147 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
     return rc;
   }
   out[0] = t;
+  return MEO_OK;
+}
+
+// --- drop / add column -----------------------------------------------------
+
+// The negative code for a failed pager call; a page the file does not have
+// means a corrupt tree.
+fn cat_pager_fail(p: MeoPager*) -> int32 {
+  var e: int32 = meo_pager_err(p);
+  if (e == MEO_OK || e == MEO_ERR_RANGE) { e = MEO_ERR_CORRUPT; }
+  return 0 - e;
+}
+
+fn cat_free_level(p: MeoPager*, page: uint32, depth: int32) -> int32 {
+  if (depth >= MEO_BT_MAX_DEPTH) { return -MEO_ERR_CORRUPT; }
+  var f: MeoFrame* = meo_pager_get(p, page, false);
+  if (f == 0) { return cat_pager_fail(p); }
+  var rc: int32 = meo_btn_check(f->data);
+  if (rc != MEO_OK) {
+    meo_pager_release(p, f, false);
+    return rc;
+  }
+  if (meo_btn_is_leaf(f->data)) {
+    meo_pager_release(p, f, false);
+    return meo_pager_free_page(p, page);
+  }
+  // Copy the children out: a page cannot be freed while pinned.
+  var n: int32 = meo_page_n_cells(f->data);
+  var kids: uint32* = (uint32*)malloc((int64)n * 4 + 4);
+  if (kids == 0) {
+    meo_pager_release(p, f, false);
+    return -MEO_ERR_NOMEM;
+  }
+  defer free(kids);
+  var i: int32 = 0;
+  while (i < n) {
+    kids[i] = meo_btn_inner_child(f->data, i);
+    i += 1;
+  }
+  meo_pager_release(p, f, false);
+  i = 0;
+  while (i < n) {
+    if (kids[i] == 0) { return -MEO_ERR_CORRUPT; }
+    rc = cat_free_level(p, kids[i], depth + 1);
+    if (rc != MEO_OK) { return rc; }
+    i += 1;
+  }
+  return meo_pager_free_page(p, page);
+}
+
+// Put every page of the tree at `root` on the freelist, in the caller's pager
+// transaction. Root 0 (no tree yet) is MEO_OK.
+export fn meo_cat_free_tree(p: MeoPager*, root: uint32) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  if (root == 0) { return MEO_OK; }
+  return cat_free_level(p, root, 0);
+}
+
+// Drop t: free its table tree and every index tree, delete its catalog row,
+// mark it dead. The caller holds the db lock and a pager transaction and rolls
+// it back on failure (the reload brings t back). -MEO_ERR_SCHEMA for a dead
+// table, -MEO_ERR_CORRUPT once a reload has failed.
+export fn meo_cat_drop_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
+  if (cat == 0 || t == 0) { return -MEO_ERR_USAGE; }
+  if (cat->broken) { return -MEO_ERR_CORRUPT; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  var p: MeoPager* = cat->pager;
+  // Dead from the first freed page on, so nothing reads a half-freed tree.
+  t->live = false;
+  var rc: int32 = meo_cat_free_tree(p, t->root);
+  var i: int32 = 0;
+  while (i < t->n_cols && rc == MEO_OK) {
+    rc = meo_cat_free_tree(p, t->columns[i].index_root);
+    i += 1;
+  }
+  if (rc != MEO_OK) { return rc; }
+  var start: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
+  var root: uint32 = start;
+  var k: uint8[8];
+  meo_key_rowid(&k[0], 8, t->id);
+  var key: MeoBtKey = { data: &k[0], len: 8 };
+  rc = meo_bt_delete(p, &root, meo_cat_cmp, key);
+  if (rc == 1) { return -MEO_ERR_CORRUPT; }   // a live table always has its row
+  if (rc != MEO_OK) { return rc; }
+  if (root != start) { return meo_pager_set_root(p, MEO_ROOT_CATALOG, root); }
+  return MEO_OK;
+}
+
+// Append one column to t and save its row. Existing rows are not rewritten:
+// they read the new column as NULL. -MEO_ERR_UNSUPPORTED unless the column is
+// nullable and not PK or UNIQUE; -MEO_ERR_SCHEMA for a dead table or a name
+// t already has; -MEO_ERR_USAGE for a bad affinity or name or a full table;
+// -MEO_ERR_TOOBIG when the catalog row would exceed MEO_REC_MAX. Nothing
+// changes on any of these. The caller holds the db lock and a pager
+// transaction.
+export fn meo_cat_add_column(cat: MeoCatalog*, t: MeoTable*, col: MeoColumn*) -> int32 {
+  if (cat == 0 || t == 0 || col == 0 || col->name == 0) { return -MEO_ERR_USAGE; }
+  if (cat->broken) { return -MEO_ERR_CORRUPT; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  if (col->cflags != 0) { return -MEO_ERR_UNSUPPORTED; }
+  if (!meo_schema_affinity_ok(col->affinity) || col->name_len <= 0) { return -MEO_ERR_USAGE; }
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    if (meo_cat_name_eq(t->columns[i].name, t->columns[i].name_len, col->name, col->name_len)) {
+      return -MEO_ERR_SCHEMA;
+    }
+    i += 1;
+  }
+  if (t->n_cols >= MEO_MAX_COLS) { return -MEO_ERR_USAGE; }
+  var n: int32 = t->n_cols + 1;
+  var nc: MeoColumn* = (MeoColumn*)malloc((int64)n * (int64)sizeof(MeoColumn));
+  var nm: uint8* = cat_dup(col->name, col->name_len);
+  if (nc == 0 || nm == 0) {
+    if (nc != 0) { free(nc); }
+    if (nm != 0) { free(nm); }
+    return -MEO_ERR_NOMEM;
+  }
+  i = 0;
+  while (i < t->n_cols) {
+    nc[i] = t->columns[i];
+    i += 1;
+  }
+  nc[i].name = nm;
+  nc[i].name_len = col->name_len;
+  nc[i].affinity = col->affinity;
+  nc[i].cflags = 0;
+  nc[i].index_root = 0;
+  var oc: MeoColumn* = t->columns;
+  t->columns = nc;
+  t->n_cols = n;
+  var rc: int32 = cat_row_size(t);
+  if (rc >= 0 && rc > MEO_REC_MAX) { rc = -MEO_ERR_TOOBIG; }
+  if (rc >= 0) { rc = meo_cat_save_table(cat, t); }
+  if (rc < 0) {
+    // The names are shared with oc; only the new one and the array go.
+    t->columns = oc;
+    t->n_cols = n - 1;
+    free(nm);
+    free(nc);
+    return rc;
+  }
+  free(oc);
   return MEO_OK;
 }

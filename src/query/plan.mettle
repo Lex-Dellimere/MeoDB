@@ -20,8 +20,8 @@ export struct MeoPlan {
   kind: int32;            // MEO_Q_K_*
   t: MeoTable*;           // resolved table; 0 for CREATE
 
-  // CREATE: the columns for meo_cat_create_table (arena; names point into
-  // the spec).
+  // CREATE: the columns for meo_cat_create_table; ADD COLUMN: the one new
+  // column (arena; names point into the spec).
   new_cols: MeoColumn*;
   n_new_cols: int32;
 
@@ -129,6 +129,23 @@ fn plan_create(s: MeoQSpec*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
   }
   if (n_pk > 1) { return -MEO_ERR_SCHEMA; }   // no composite keys in v1
   pl->n_new_cols = s->n_cols;
+  return MEO_OK;
+}
+
+fn plan_add_column(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
+  if (s->n_cols != 1) { return -MEO_ERR_USAGE; }
+  var cd: MeoQColDef* = &s->cols[0];
+  if (cd->cflags != 0) { return -MEO_ERR_UNSUPPORTED; }   // nullable, no index
+  if (meo_plan_col(t, &cd->name) >= 0) { return -MEO_ERR_SCHEMA; }
+  if (t->n_cols >= MEO_MAX_COLS) { return -MEO_ERR_USAGE; }
+  pl->new_cols = (MeoColumn*)meo_arena_alloc_zeroed(arena, (int64)sizeof(MeoColumn));
+  if (pl->new_cols == 0) { return -MEO_ERR_NOMEM; }
+  pl->new_cols[0].name = cd->name.p;
+  pl->new_cols[0].name_len = cd->name.n;
+  pl->new_cols[0].affinity = cd->affinity;
+  pl->new_cols[0].cflags = 0;
+  pl->new_cols[0].index_root = 0;
+  pl->n_new_cols = 1;
   return MEO_OK;
 }
 
@@ -259,7 +276,8 @@ fn plan_update(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> in
   return plan_terms(s, t, arena, pl);
 }
 
-// Build the plan for `s` against table `t` (0 only for CREATE). MEO_OK,
+// Build the plan for `s` against table `t` (0 only for CREATE, or DROP of a
+// missing table, which exec answers). MEO_OK,
 // -MEO_ERR_SCHEMA (unknown table or column, bad definition), -MEO_ERR_USAGE
 // (shape), -MEO_ERR_NOMEM.
 export fn meo_plan_build(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
@@ -268,8 +286,13 @@ export fn meo_plan_build(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPl
   pl->kind = s->kind;
   if (s->kind == MEO_Q_K_CREATE) { return plan_create(s, arena, pl); }
   if (s->kind == MEO_Q_K_UPDATE && s->n_sets == 0) { return -MEO_ERR_USAGE; }
+  if (s->kind == MEO_Q_K_DROP) {
+    pl->t = t;
+    return MEO_OK;
+  }
   if (t == 0) { return -MEO_ERR_SCHEMA; }   // no such table
   pl->t = t;
+  if (s->kind == MEO_Q_K_ADD_COLUMN) { return plan_add_column(s, t, arena, pl); }
   if (s->kind == MEO_Q_K_INSERT) { return plan_insert(s, t, arena, pl); }
   if (s->kind == MEO_Q_K_SELECT) { return plan_select(s, t, arena, pl); }
   if (s->kind == MEO_Q_K_UPDATE) { return plan_update(s, t, arena, pl); }

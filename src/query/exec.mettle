@@ -176,6 +176,29 @@ fn exec_create(q: MeoQuery*) -> int32 {
   return meo_db_stmt_end(db, started, true, rc);
 }
 
+// A missing table is fine with "if exists": MEO_OK, nothing written.
+fn exec_drop(q: MeoQuery*, t: MeoTable*) -> int32 {
+  var db: MeoDb* = q->db;
+  if (t == 0) {
+    if (q->spec.if_not_exists) { return MEO_OK; }
+    return -MEO_ERR_SCHEMA;
+  }
+  var started: bool = false;
+  var rc: int32 = meo_db_stmt_begin(db, &started);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_cat_drop_table(db->cat, t);
+  return meo_db_stmt_end(db, started, true, rc);
+}
+
+fn exec_add_column(q: MeoQuery*, t: MeoTable*) -> int32 {
+  var db: MeoDb* = q->db;
+  var started: bool = false;
+  var rc: int32 = meo_db_stmt_begin(db, &started);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_cat_add_column(db->cat, t, &q->plan.new_cols[0]);
+  return meo_db_stmt_end(db, started, true, rc);
+}
+
 // Phase A over every row, then Phase B: a check failure writes nothing.
 fn exec_insert(q: MeoQuery*, t: MeoTable*) -> int32 {
   var db: MeoDb* = q->db;
@@ -778,6 +801,10 @@ fn exec_run(q: MeoQuery*) -> int32 {
       rc = exec_select(q, t);
     } else if (q->spec.kind == MEO_Q_K_COUNT) {
       rc = exec_count(q, t);
+    } else if (q->spec.kind == MEO_Q_K_DROP) {
+      rc = exec_drop(q, t);
+    } else if (q->spec.kind == MEO_Q_K_ADD_COLUMN) {
+      rc = exec_add_column(q, t);
     } else {
       rc = exec_write(q, t);
     }

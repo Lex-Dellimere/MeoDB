@@ -18,6 +18,8 @@ export const MEO_Q_K_SELECT: int32 = 3;
 export const MEO_Q_K_UPDATE: int32 = 4;
 export const MEO_Q_K_DELETE: int32 = 5;
 export const MEO_Q_K_COUNT: int32 = 6;
+export const MEO_Q_K_DROP: int32 = 7;
+export const MEO_Q_K_ADD_COLUMN: int32 = 8;
 
 // Filter kinds (MeoQTerm.kind).
 export const MEO_Q_EQ: int32 = 1;
@@ -63,8 +65,8 @@ export struct MeoQAssign {
 export struct MeoQSpec {
   kind: int32;           // MEO_Q_K_*
   table: MeoQName;
-  if_not_exists: bool;
-  cols: MeoQColDef*;     // CREATE
+  if_not_exists: bool;   // DROP: if exists
+  cols: MeoQColDef*;     // CREATE, ADD COLUMN
   n_cols: int32;
   cap_cols: int32;
   names: MeoQName*;      // INSERT column list / SELECT pick; 0 = every column

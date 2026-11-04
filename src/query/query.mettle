@@ -110,6 +110,18 @@ export fn meo_q_count(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
   return q_new(db, MEO_Q_K_COUNT, table, out);
 }
 
+// Drop a table, its rows and its indexes. Missing -> -MEO_ERR_SCHEMA, or
+// MEO_DONE with changes 0 after meo_q_if_not_exists (here: "if exists").
+export fn meo_q_drop(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_DROP, table, out);
+}
+
+// Add one column, given by exactly one meo_q_column_def: nullable, not PK,
+// not UNIQUE (else -MEO_ERR_UNSUPPORTED). Existing rows read it as NULL.
+export fn meo_q_add_column(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_ADD_COLUMN, table, out);
+}
+
 // --- builders ---------------------------------------------------------------
 
 // Record a builder failure so the next step reports it.
@@ -137,7 +149,12 @@ fn q_check_value(q: MeoQuery*, v: MeoValue*) -> int32 {
 
 export fn meo_q_column_def(q: MeoQuery*, name: string, affinity: int32, cflags: int32) -> int32 {
   if (q == 0) { return -MEO_ERR_USAGE; }
-  var rc: int32 = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
+  var rc: int32 = MEO_OK;
+  if (q->spec.kind == MEO_Q_K_ADD_COLUMN) {
+    rc = q_check(q, MEO_Q_K_ADD_COLUMN, MEO_Q_K_ADD_COLUMN);
+  } else {
+    rc = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
+  }
   if (rc != MEO_OK) { return rc; }
   var known: int32 = MEO_COL_PK | MEO_COL_NOT_NULL | MEO_COL_UNIQUE;
   if (!meo_schema_affinity_ok(affinity) || (cflags & ~known) != 0) {
@@ -156,9 +173,15 @@ export fn meo_q_column_def(q: MeoQuery*, name: string, affinity: int32, cflags: 
   return MEO_OK;
 }
 
+// CREATE: if not exists. DROP: if exists.
 export fn meo_q_if_not_exists(q: MeoQuery*) -> int32 {
   if (q == 0) { return -MEO_ERR_USAGE; }
-  var rc: int32 = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
+  var rc: int32 = MEO_OK;
+  if (q->spec.kind == MEO_Q_K_DROP) {
+    rc = q_check(q, MEO_Q_K_DROP, MEO_Q_K_DROP);
+  } else {
+    rc = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
+  }
   if (rc != MEO_OK) { return rc; }
   q->spec.if_not_exists = true;
   return MEO_OK;

@@ -1,0 +1,464 @@
+// schema_self: DROP and ADD COLUMN. Dropping a 2000-row table with a unique
+// index frees its pages and the next inserts into another table reuse them;
+// drop of a missing table with and without "if exists"; drop inside a
+// transaction then rollback brings the table, its rows and its index back;
+// ADD COLUMN: old rows read NULL, new rows store values, filters work, reopen
+// keeps it; ADD COLUMN rollback restores the old column count; refused kinds.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meosql.mettle";
+
+// Red-check switch: 1 expects the dropped table's pages not to be reused.
+// Must be 0 when committed.
+const SS_RED: int32 = 0;
+const SS_BIG: int32 = 2000;
+
+fn ss_fail(msg: string) -> int32 {
+  println("FAIL schema_self: {msg}");
+  return 1;
+}
+
+fn ss_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn vi(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn vt(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn vn() -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_null(&v);
+  return v;
+}
+
+fn ss_same(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  return meo_bytes_equal(a.chars, b.chars, (int64)a.length);
+}
+
+// Step once, free, answer the step's code.
+fn ss_run(q: MeoQuery*) -> int32 {
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+fn ss_drop(db: MeoDb*, tbl: string, if_exists: bool) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_drop(db, tbl, &q);
+  if (if_exists) { meo_q_if_not_exists(q); }
+  return ss_run(q);
+}
+
+fn ss_add(db: MeoDb*, tbl: string, col: string, aff: int32, cflags: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_add_column(db, tbl, &q);
+  meo_q_column_def(q, col, aff, cflags);
+  return ss_run(q);
+}
+
+fn ss_ins(db: MeoDb*, tbl: string, vals: MeoValue*, n: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, tbl, &q);
+  var i: int32 = 0;
+  while (i < n) {
+    meo_q_value(q, &vals[i]);
+    i += 1;
+  }
+  return ss_run(q);
+}
+
+fn ss_count(db: MeoDb*, tbl: string) -> int64 {
+  var q: MeoQuery* = 0;
+  meo_q_count(db, tbl, &q);
+  var rc: int32 = meo_q_step(q);
+  var n: int64 = (int64)rc;
+  if (rc == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+// Column 0 of every row of q joined by ",": ints, text as written, "N" for
+// NULL, or "ERR<rc>".
+fn ss_out(q: MeoQuery*) -> string {
+  var acc: string = "";
+  var first: bool = true;
+  while (true) {
+    var rc: int32 = meo_q_step(q);
+    if (rc == MEO_DONE) { break; }
+    if (rc != MEO_ROW) {
+      meo_q_free(q);
+      return "ERR{rc}";
+    }
+    var part: string = "N";
+    var ty: int32 = meo_q_column_type(q, 0);
+    if (ty == MEO_T_INT) { part = "{meo_q_column_int64(q, 0)}"; }
+    if (ty == MEO_T_TEXT) {
+      var v: MeoValue;
+      meo_q_column(q, 0, &v);
+      part = "t";
+      if (v.n == 1) { part = "t{v.p[0]}"; }
+    }
+    if (!first) { acc = acc + ","; }
+    acc = acc + part;
+    first = false;
+  }
+  meo_q_free(q);
+  return acc;
+}
+
+fn ss_expect(name: string, got: string, want: string) -> int32 {
+  if (!ss_same(got, want)) { return ss_fail("{name}: got [{got}] want [{want}]"); }
+  return 0;
+}
+
+fn ss_find(db: MeoDb*, name: string) -> MeoTable* {
+  return meo_cat_find(db->cat, name.chars, (int32)name.length);
+}
+
+fn ss_key(i: int32) -> string {
+  return "key-{i}-padding-padding";
+}
+
+// big(id INT PK, u TEXT UNIQUE, v INT) with SS_BIG rows in one insert.
+fn ss_make_big(db: MeoDb*, tbl: string, rows: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, tbl, &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "u", MEO_T_TEXT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "v", MEO_T_INT, 0);
+  var rc: int32 = ss_run(q);
+  if (rc != MEO_DONE) { return ss_fail("create {tbl} rc={rc}"); }
+  var qi: MeoQuery* = 0;
+  meo_q_insert(db, tbl, &qi);
+  var i: int32 = 1;
+  while (i <= rows) {
+    var a: MeoValue = vi((int64)i);
+    var k: string = ss_key(i);
+    var b: MeoValue = vt(k);
+    var c: MeoValue = vi((int64)i * 3);
+    meo_q_value(qi, &a);
+    meo_q_value(qi, &b);
+    meo_q_value(qi, &c);
+    free(k.chars);
+    i += 1;
+  }
+  rc = ss_run(qi);
+  if (rc != MEO_DONE) { return ss_fail("fill {tbl} rc={rc}"); }
+  return 0;
+}
+
+fn ss_drop_reuse(db: MeoDb*) -> int32 {
+  if (ss_make_big(db, "big", SS_BIG) != 0) { return 1; }
+  var p: MeoPager* = db->pager;
+  var pc0: uint32 = meo_pager_page_count(p);
+  var fc0: int64 = meo_free_count(p);
+  var rc: int32 = ss_drop(db, "big", false);
+  if (rc != MEO_DONE) { return ss_fail("drop big rc={rc}"); }
+  var pc1: uint32 = meo_pager_page_count(p);
+  var fc1: int64 = meo_free_count(p);
+  // The freelist may take one new trunk page.
+  if (pc1 > pc0 + (uint32)1) { return ss_fail("drop grew the file {pc0} -> {pc1}"); }
+  if (fc1 < fc0 + 20) { return ss_fail("drop freed too few pages: {fc0} -> {fc1}"); }
+  if (ss_count(db, "big") != (int64)(-MEO_ERR_SCHEMA)) { return ss_fail("dropped table still readable"); }
+  // A table half the size fits in the freed pages: the file does not grow.
+  if (ss_make_big(db, "other", SS_BIG / 2) != 0) { return 1; }
+  var pc2: uint32 = meo_pager_page_count(p);
+  var fc2: int64 = meo_free_count(p);
+  if (SS_RED != 0) { pc2 = pc2 + (uint32)1; }
+  if (pc2 != pc1) { return ss_fail("inserts grew the file {pc1} -> {pc2} with {fc1} free pages"); }
+  if (fc2 >= fc1) { return ss_fail("free pages not reused: {fc1} -> {fc2}"); }
+  if (ss_count(db, "other") != (int64)(SS_BIG / 2)) { return ss_fail("other count"); }
+  // Same name again starts empty.
+  if (ss_make_big(db, "big", 3) != 0) { return 1; }
+  if (ss_count(db, "big") != 3) { return ss_fail("recreated big count"); }
+  println("  drop: {fc1 - fc0} pages freed, {fc1 - fc2} reused, file {pc2} pages");
+  return 0;
+}
+
+fn ss_drop_missing(db: MeoDb*) -> int32 {
+  var rc: int32 = ss_drop(db, "nope", false);
+  if (rc != -MEO_ERR_SCHEMA) { return ss_fail("drop missing rc={rc}"); }
+  var q: MeoQuery* = 0;
+  meo_q_drop(db, "nope", &q);
+  meo_q_if_not_exists(q);
+  rc = meo_q_step(q);
+  var ch: int32 = meo_q_changes(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE || ch != 0) { return ss_fail("drop if exists rc={rc} changes={ch}"); }
+  // Builders that do not belong to DROP.
+  var q2: MeoQuery* = 0;
+  meo_q_drop(db, "big", &q2);
+  if (meo_q_column_def(q2, "x", MEO_T_INT, 0) != -MEO_ERR_USAGE) { return ss_fail("column_def on drop"); }
+  rc = ss_run(q2);
+  if (rc != -MEO_ERR_USAGE) { return ss_fail("sticky on drop rc={rc}"); }
+  if (ss_count(db, "big") != 3) { return ss_fail("refused drop touched big"); }
+  return 0;
+}
+
+fn ss_unique_hit(db: MeoDb*, tbl: string, i: int32) -> string {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, tbl, &q);
+  meo_q_pick(q, "id");
+  var k: string = ss_key(i);
+  var v: MeoValue = vt(k);
+  meo_q_where(q, "u", MEO_Q_EQ, &v);
+  free(k.chars);
+  return ss_out(q);
+}
+
+fn ss_drop_rollback(db: MeoDb*) -> int32 {
+  if (ss_make_big(db, "keep", 300) != 0) { return 1; }
+  var p: MeoPager* = db->pager;
+  var fc0: int64 = meo_free_count(p);
+  var t0: MeoTable* = ss_find(db, "keep");
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return ss_fail("begin rc={rc}"); }
+  rc = ss_drop(db, "keep", false);
+  if (rc != MEO_DONE) { return ss_fail("drop in txn rc={rc}"); }
+  if (ss_count(db, "keep") != (int64)(-MEO_ERR_SCHEMA)) { return ss_fail("dropped in txn still readable"); }
+  // Reuse some freed pages inside the same txn.
+  if (ss_make_big(db, "tmp", 100) != 0) { return 1; }
+  rc = meo_db_rollback(db);
+  if (rc != MEO_OK) { return ss_fail("rollback rc={rc}"); }
+  if (ss_find(db, "keep") != t0) { return ss_fail("rollback: not the same table object"); }
+  var n: int64 = ss_count(db, "keep");
+  if (n != 300) { return ss_fail("rollback: keep count {n}"); }
+  if (ss_count(db, "tmp") != (int64)(-MEO_ERR_SCHEMA)) { return ss_fail("rollback: tmp survived"); }
+  var fc1: int64 = meo_free_count(p);
+  if (fc1 != fc0) { return ss_fail("rollback: freelist {fc0} -> {fc1}"); }
+  var f: int32 = ss_expect("rollback index", ss_unique_hit(db, "keep", 177), "177");
+  if (f != 0) { return f; }
+  var row: MeoValue[3];
+  var k: string = ss_key(5);
+  row[0] = vi(9999); row[1] = vt(k); row[2] = vn();
+  rc = ss_ins(db, "keep", &row[0], 3);
+  free(k.chars);
+  if (rc != -MEO_ERR_CONFLICT) { return ss_fail("rollback: unique not enforced rc={rc}"); }
+  return 0;
+}
+
+// SELECT pick FROM keep [WHERE where = v] ORDER BY id.
+fn ss_pick(db: MeoDb*, pick: string, wcol: string, op: int32, v: MeoValue*) -> string {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "keep", &q);
+  meo_q_pick(q, pick);
+  if (op == MEO_Q_IS_NULL) { meo_q_where_null(q, wcol); }
+  if (op == MEO_Q_NOT_NULL) { meo_q_where_not_null(q, wcol); }
+  if (op == MEO_Q_EQ) { meo_q_where(q, wcol, op, v); }
+  meo_q_order(q, "id", false);
+  return ss_out(q);
+}
+
+fn ss_add_column(db: MeoDb*) -> int32 {
+  var rc: int32 = ss_add(db, "keep", "extra", MEO_T_TEXT, 0);
+  if (rc != MEO_DONE) { return ss_fail("add column rc={rc}"); }
+  var nul: MeoValue = vn();
+  var one: MeoValue = vi(1);
+  var f: int32 = ss_expect("old row reads NULL", ss_pick(db, "extra", "id", MEO_Q_EQ, &one), "N");
+  if (f != 0) { return f; }
+  var row: MeoValue[4];
+  var k: string = "new-row";
+  row[0] = vi(1000); row[1] = vt(k); row[2] = vi(7); row[3] = vt("x");
+  rc = ss_ins(db, "keep", &row[0], 4);
+  if (rc != MEO_DONE) { return ss_fail("insert 4 cols rc={rc}"); }
+  // The old width is now short a cell.
+  rc = ss_ins(db, "keep", &row[0], 3);
+  if (rc != -MEO_ERR_USAGE) { return ss_fail("insert 3 cols rc={rc}"); }
+  var x: MeoValue = vt("x");
+  f = ss_expect("filter new col", ss_pick(db, "id", "extra", MEO_Q_EQ, &x), "1000");
+  if (f == 0) { f = ss_expect("not null new col", ss_pick(db, "id", "extra", MEO_Q_NOT_NULL, &nul), "1000"); }
+  if (f != 0) { return f; }
+  // Update an old row: it is rewritten with every column.
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "keep", &q);
+  var y: MeoValue = vt("y");
+  meo_q_assign(q, "extra", &y);
+  var two: MeoValue = vi(2);
+  meo_q_where(q, "id", MEO_Q_EQ, &two);
+  rc = ss_run(q);
+  if (rc != MEO_DONE) { return ss_fail("update new col rc={rc}"); }
+  f = ss_expect("updated old row", ss_pick(db, "extra", "id", MEO_Q_EQ, &two), "t121");
+  if (f == 0) { f = ss_expect("by new col", ss_pick(db, "id", "extra", MEO_Q_EQ, &y), "2"); }
+  if (f != 0) { return f; }
+  var qc: MeoQuery* = 0;
+  meo_q_count(db, "keep", &qc);
+  meo_q_where_null(qc, "extra");
+  rc = meo_q_step(qc);
+  var n: int64 = meo_q_column_int64(qc, 0);
+  meo_q_free(qc);
+  if (rc != MEO_ROW || n != 299) { return ss_fail("null count rc={rc} n={n}"); }
+  return 0;
+}
+
+fn ss_ncols(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "keep", &q);
+  meo_q_limit(q, 1);
+  var rc: int32 = meo_q_step(q);
+  var n: int32 = meo_q_column_count(q);
+  meo_q_free(q);
+  if (rc < 0) { return rc; }
+  return n;
+}
+
+fn ss_add_rollback(db: MeoDb*) -> int32 {
+  var t0: MeoTable* = ss_find(db, "keep");
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return ss_fail("begin rc={rc}"); }
+  rc = ss_add(db, "keep", "tmpcol", MEO_T_INT, 0);
+  if (rc != MEO_DONE) { return ss_fail("add in txn rc={rc}"); }
+  var row: MeoValue[5];
+  row[0] = vi(2000); row[1] = vt("txn-row"); row[2] = vn(); row[3] = vn(); row[4] = vi(5);
+  rc = ss_ins(db, "keep", &row[0], 5);
+  if (rc != MEO_DONE) { return ss_fail("insert 5 cols rc={rc}"); }
+  if (ss_ncols(db) != 5) { return ss_fail("5 cols in txn"); }
+  rc = meo_db_rollback(db);
+  if (rc != MEO_OK) { return ss_fail("rollback rc={rc}"); }
+  var t1: MeoTable* = ss_find(db, "keep");
+  if (t1 != t0) { return ss_fail("add rollback: not the same table object"); }
+  if (t1->n_cols != 4 || ss_ncols(db) != 4) { return ss_fail("add rollback: n_cols {t1->n_cols}"); }
+  var nul: MeoValue = vn();
+  var f: int32 = ss_expect("tmpcol gone", ss_pick(db, "tmpcol", "id", MEO_Q_NOT_NULL, &nul), "ERR-16");
+  if (f != 0) { return f; }
+  if (ss_count(db, "keep") != 301) { return ss_fail("add rollback: count"); }
+  row[0] = vi(2001); row[1] = vt("after-rb"); row[2] = vn(); row[3] = vt("z");
+  rc = ss_ins(db, "keep", &row[0], 4);
+  if (rc != MEO_DONE) { return ss_fail("insert after add rollback rc={rc}"); }
+  // The same name can be added again for real.
+  rc = ss_add(db, "keep", "tmpcol", MEO_T_INT, 0);
+  if (rc != MEO_DONE) { return ss_fail("re-add rc={rc}"); }
+  if (ss_ncols(db) != 5) { return ss_fail("re-add cols"); }
+  return 0;
+}
+
+fn ss_refused(db: MeoDb*) -> int32 {
+  var rc: int32 = ss_add(db, "keep", "a", MEO_T_INT, MEO_COL_PK);
+  if (rc != -MEO_ERR_UNSUPPORTED) { return ss_fail("add PK rc={rc}"); }
+  rc = ss_add(db, "keep", "a", MEO_T_TEXT, MEO_COL_UNIQUE);
+  if (rc != -MEO_ERR_UNSUPPORTED) { return ss_fail("add UNIQUE rc={rc}"); }
+  rc = ss_add(db, "keep", "a", MEO_T_TEXT, MEO_COL_NOT_NULL);
+  if (rc != -MEO_ERR_UNSUPPORTED) { return ss_fail("add NOT NULL rc={rc}"); }
+  rc = ss_add(db, "keep", "EXTRA", MEO_T_TEXT, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return ss_fail("add duplicate rc={rc}"); }
+  rc = ss_add(db, "nope", "a", MEO_T_TEXT, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return ss_fail("add to missing rc={rc}"); }
+  var q: MeoQuery* = 0;
+  meo_q_add_column(db, "keep", &q);
+  rc = ss_run(q);
+  if (rc != -MEO_ERR_USAGE) { return ss_fail("add no column rc={rc}"); }
+  var q2: MeoQuery* = 0;
+  meo_q_add_column(db, "keep", &q2);
+  meo_q_column_def(q2, "a", MEO_T_TEXT, 0);
+  meo_q_column_def(q2, "b", MEO_T_TEXT, 0);
+  rc = ss_run(q2);
+  if (rc != -MEO_ERR_USAGE) { return ss_fail("add two columns rc={rc}"); }
+  var q3: MeoQuery* = 0;
+  meo_q_add_column(db, "keep", &q3);
+  if (meo_q_if_not_exists(q3) != -MEO_ERR_USAGE) { return ss_fail("if_not_exists on add"); }
+  meo_q_free(q3);
+  if (ss_ncols(db) != 5) { return ss_fail("refused adds changed keep"); }
+  // Column limit: a 64-column table takes no more.
+  var qw: MeoQuery* = 0;
+  meo_q_create(db, "wide", &qw);
+  var i: int32 = 0;
+  while (i < MEO_MAX_COLS) {
+    meo_q_column_def(qw, "c{i}", MEO_T_INT, 0);
+    i += 1;
+  }
+  rc = ss_run(qw);
+  if (rc != MEO_DONE) { return ss_fail("create wide rc={rc}"); }
+  rc = ss_add(db, "wide", "more", MEO_T_INT, 0);
+  if (rc != -MEO_ERR_USAGE) { return ss_fail("add past MEO_MAX_COLS rc={rc}"); }
+  // Catalog row size: long names until the row would pass MEO_REC_MAX.
+  var qn: MeoQuery* = 0;
+  meo_q_create(db, "named", &qn);
+  meo_q_column_def(qn, "c", MEO_T_INT, 0);
+  rc = ss_run(qn);
+  if (rc != MEO_DONE) { return ss_fail("create named rc={rc}"); }
+  var pad: string = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
+  var added: int32 = 0;
+  rc = MEO_DONE;
+  while (rc == MEO_DONE && added < 40) {
+    rc = ss_add(db, "named", "{pad}{added}", MEO_T_TEXT, 0);
+    if (rc == MEO_DONE) { added += 1; }
+  }
+  if (rc != -MEO_ERR_TOOBIG) { return ss_fail("long names rc={rc} after {added}"); }
+  var t: MeoTable* = ss_find(db, "named");
+  if (t == 0 || t->n_cols != added + 1) { return ss_fail("TOOBIG add changed named"); }
+  var r: MeoValue[1];
+  r[0] = vi(1);
+  var qi: MeoQuery* = 0;
+  meo_q_insert(db, "named", &qi);
+  meo_q_into(qi, "c");
+  meo_q_value(qi, &r[0]);
+  rc = ss_run(qi);
+  if (rc != MEO_DONE) { return ss_fail("insert into named rc={rc}"); }
+  return 0;
+}
+
+fn ss_reopen(path: string, db: MeoDb**) -> int32 {
+  var rc: int32 = meo_db_close(db[0]);
+  if (rc != MEO_OK) { return ss_fail("close rc={rc}"); }
+  db[0] = 0;
+  rc = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, db);
+  if (rc != MEO_OK) { return ss_fail("reopen rc={rc}"); }
+  var d: MeoDb* = db[0];
+  var nc: int32 = ss_ncols(d);
+  if (nc != 5) { return ss_fail("reopen: keep cols {nc}"); }
+  var y: MeoValue = vt("y");
+  var f: int32 = ss_expect("reopen: by new col", ss_pick(d, "id", "extra", MEO_Q_EQ, &y), "2");
+  var x: MeoValue = vt("x");
+  if (f == 0) { f = ss_expect("reopen: by new col x", ss_pick(d, "id", "extra", MEO_Q_EQ, &x), "1000"); }
+  if (f != 0) { return f; }
+  if (ss_count(d, "other") != (int64)(SS_BIG / 2)) { return ss_fail("reopen: other count"); }
+  if (ss_count(d, "big") != 3) { return ss_fail("reopen: big count"); }
+  if (ss_count(d, "tmp") != (int64)(-MEO_ERR_SCHEMA)) { return ss_fail("reopen: tmp exists"); }
+  var rc2: int32 = ss_drop(d, "keep", false);
+  if (rc2 != MEO_DONE) { return ss_fail("reopen: drop keep rc={rc2}"); }
+  return 0;
+}
+
+fn main() -> int32 {
+  var path: string = "build/schema_self.dat";
+  if (ss_reset(path) != MEO_OK) { return ss_fail("reset"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return ss_fail("open rc={rc}"); }
+  var f: int32 = ss_drop_reuse(db);
+  if (f == 0) { f += ss_drop_missing(db); }
+  if (f == 0) { f += ss_drop_rollback(db); }
+  if (f == 0) { f += ss_add_column(db); }
+  if (f == 0) { f += ss_add_rollback(db); }
+  if (f == 0) { f += ss_refused(db); }
+  if (f == 0) { f += ss_reopen(path, &db); }
+  if (f != 0) {
+    println("FAIL schema_self ({f})");
+    return 1;
+  }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return ss_fail("close rc={rc}"); }
+  println("PASS schema_self");
+  return 0;
+}
