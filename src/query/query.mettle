@@ -71,6 +71,7 @@ fn q_new(db: MeoDb*, kind: int32, table: string, out: MeoQuery**) -> int32 {
   q->cur = 0;
   q->changes = 0;
   q->last_rowid = 0;
+  q->ticket = 0;
   var rc: int32 = meo_qspec_name(&q->spec.table, table);
   if (rc == MEO_OK) {
     q->plan_arena = meo_arena_new(4096);
@@ -672,8 +673,8 @@ fn q_scan_full(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
   return q_scan_end(rc, st);
 }
 
-// The scan under the db lock. Columns resolve here, so an unknown table or
-// column is -MEO_ERR_SCHEMA.
+// The scan on `db`: the base handle under its lock, or a snapshot view with no
+// lock. Columns resolve here, so an unknown table or column is -MEO_ERR_SCHEMA.
 fn q_scan_locked(db: MeoDb*, table: string, x: string, y: string, group: string,
     sc: QScan*) -> int32 {
   var t: MeoTable* = meo_cat_find(db->cat, table.chars, (int32)table.length);
@@ -693,6 +694,17 @@ fn q_scan_locked(db: MeoDb*, table: string, x: string, y: string, group: string,
 }
 
 fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QScan*) -> int32 {
+  // WAL mode, no lock held by this thread: scan a snapshot, never block on a
+  // writer. A thread inside its own transaction scans its own writes.
+  if (db->wal && !meo_lock_held(&db->lock)) {
+    var v: MeoDb* = 0;
+    var src: int32 = meo_db_snap_begin(db, &v);
+    if (src != MEO_OK) { return src; }
+    src = q_scan_locked(v, table, x, y, group, sc);
+    var e: int32 = meo_db_snap_end(v);
+    if (src >= 0 && e < 0) { src = e; }
+    return src;
+  }
   var rc: int32 = meo_db_enter(db);
   if (rc != MEO_OK) { return rc; }
   rc = q_scan_locked(db, table, x, y, group, sc);
@@ -710,8 +722,9 @@ fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QS
 // meo_scan_cb answer stops the scan and is returned. Else MEO_OK, or
 // -MEO_ERR_SCHEMA (unknown table or column) or a storage code.
 //
-// The callback runs under the db lock with a page pinned: keep it quick and
-// do not call back into this db.
+// The callback runs with a page pinned: keep it quick and do not call back
+// into this db. In rollback mode it runs under the db lock; in WAL mode it
+// runs on a snapshot, holding it (not the lock) for the whole scan.
 export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: float64,
     hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32, ctx: rawptr) -> int32 {
   if (db == 0 || meo_scan_cb == 0) { return -MEO_ERR_USAGE; }

@@ -1,6 +1,562 @@
+// wal_db_self: the db layer in WAL mode: snapshot reads that never wait for a
+// writer, catalog snapshots, group-commit autocommit, conversions.
+//
+// A program, not @test functions: every case needs real files in build/ and
+// most run threads. Run it with
+//
+//   mbuild run wal_db_self
+//
+// It prints "PASS wal_db_self" when every case passes and "FAIL D<n>: ..." per
+// failing check. Cases, each with the bug it exists to catch:
+//   D1  WAL mode persists across opens; MEO_OPEN_NO_WAL converts back.
+//   D2  a count on another thread does not wait for an open transaction and
+//       sees only committed rows; after the commit it sees the new row.
+//   D3  a select inside the writing thread's own transaction sees its rows.
+//   D4  DDL on one thread is seen by a reader on another; a dropped table is
+//       a SCHEMA error, not a stale table.
+//   D5  200 selects with no DDL load the snapshot catalog at most once.
+//   D6  meo_q_scan_xy does not wait for an open transaction.
+//   D7  8 threads of autocommit inserts all land; a FULL checkpoint empties
+//       the log.
+//   D8  rollback mode: no snapshots, selects unchanged.
+//   D9  close is BUSY while a statement or a snapshot is live; a WAL-mode
+//       close removes the log.
+//   D10 schema_seq moves with DDL and with the first insert, not with plain
+//       inserts.
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/platform/futex_linux.mettle";
+import "../src/meodb.mettle";
+import "tinytest.mettle";
+
+const WD_WAIT_MS: int64 = 10000;
+
+fn eq(a: int64, b: int64, name: string) -> bool {
+  return meo_t_check_i64(a, b, name);
+}
+
+// --- file helpers -----------------------------------------------------------
+
+// The same pointer by another name. The checker reads a close as a free, but a
+// refused (BUSY) close frees nothing and the caller keeps using the handle.
+var wd_slot: MeoDb* = 0;
+
+fn wd_alias(db: MeoDb*) -> MeoDb* {
+  wd_slot = db;
+  return wd_slot;
+}
+
+fn wd_exists(path: string) -> bool {
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return false; }
+  meo_file_close(f);
+  return true;
+}
+
+// A fresh, empty database: no file contents, no journal, no log.
+fn wd_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  var wpath: string = db + "-wal";
+  meo_file_unlink(jpath);
+  meo_file_unlink(wpath);
+  free(jpath.chars);
+  free(wpath.chars);
+  return rc;
+}
+
+fn wd_wal_exists(db: string) -> bool {
+  var wpath: string = db + "-wal";
+  var e: bool = wd_exists(wpath);
+  free(wpath.chars);
+  return e;
+}
+
+// --- query helpers ----------------------------------------------------------
+
+// CREATE TABLE <name> (id INTEGER PRIMARY KEY, v INTEGER).
+fn wd_create(db: MeoDb*, name: string) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "v", MEO_T_INT, 0);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn wd_drop(db: MeoDb*, name: string) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_drop(db, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn wd_ins_in(db: MeoDb*, name: string, k: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_into(q, "id");
+  meo_q_into(q, "v");
+  var v: MeoValue;
+  meo_value_set_int(&v, k);
+  meo_q_value(q, &v);
+  meo_value_set_int(&v, k * 10);
+  meo_q_value(q, &v);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn wd_ins(db: MeoDb*, k: int64) -> int32 {
+  return wd_ins_in(db, "t", k);
+}
+
+// Rows 0..n-1 in one explicit transaction.
+fn wd_fill(db: MeoDb*, n: int64) -> int32 {
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  var k: int64 = 0;
+  while (rc == MEO_OK && k < n) {
+    rc = wd_ins(db, k);
+    k += 1;
+  }
+  if (rc != MEO_OK) {
+    meo_db_rollback(db);
+    return rc;
+  }
+  return meo_db_commit(db);
+}
+
+// COUNT(*) of the table: the count, or the negative code.
+fn wd_count_in(db: MeoDb*, name: string) -> int64 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_count(db, name, &q);
+  if (rc != MEO_OK) { return (int64)rc; }
+  rc = meo_q_step(q);
+  var n: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW) { return (int64)rc; }
+  return n;
+}
+
+fn wd_count(db: MeoDb*) -> int64 {
+  return wd_count_in(db, "t");
+}
+
+// --- threads ----------------------------------------------------------------
+
+var g_db: MeoDb* = 0;
+var g_state: int32 = 0;       // holder progress: 1 holding, 2 release, 3 done
+var g_hold_rc: int32 = 0;     // holder: begin + insert result
+var g_commit_rc: int32 = 0;   // holder: commit result
+var g_which: int32 = 0;       // remote count: 0 = t, 1 = t2
+var g_result: int64 = 0;      // remote count result
+var g_wr_err: int32 = 0;      // first writer failure
+var g_scan_n: int64 = 0;
+
+fn wd_wait_state(want: int32) -> bool {
+  var t0: int64 = meo_clock_monotonic_us();
+  while (meo_atomic_load_i32(&g_state) != want) {
+    if ((meo_clock_monotonic_us() - t0) / 1000 > WD_WAIT_MS) { return false; }
+    meo_sleep_us(500);
+  }
+  return true;
+}
+
+// Begin, insert row 1000000 and hold the db lock until told to commit.
+fn wd_holder(arg: cstring) -> uint32 {
+  g_hold_rc = meo_db_begin(g_db, MEO_TX_DEFAULT);
+  if (g_hold_rc == MEO_OK) {
+    g_hold_rc = wd_ins(g_db, 1000000);
+    if (g_hold_rc != MEO_OK) { meo_db_rollback(g_db); }
+  }
+  meo_atomic_store_i32(&g_state, 1);
+  if (g_hold_rc == MEO_OK) {
+    wd_wait_state(2);
+    g_commit_rc = meo_db_commit(g_db);
+  }
+  meo_atomic_store_i32(&g_state, 3);
+  return 0;
+}
+
+fn wd_remote_count(arg: cstring) -> uint32 {
+  if (g_which == 0) {
+    g_result = wd_count_in(g_db, "t");
+  } else {
+    g_result = wd_count_in(g_db, "t2");
+  }
+  return 0;
+}
+
+// Count table `which` on a thread that holds nothing.
+fn wd_count_remote(which: int32) -> int64 {
+  g_which = which;
+  g_result = -1;
+  var h: int64 = CreateThread(0, 0, &wd_remote_count, 0, 0, 0);
+  if (h == 0) { return -9999; }
+  if (thread_join(h, (uint32)WD_WAIT_MS) != WAIT_OBJECT_0()) {
+    println("FAIL remote count: thread still running (deadlock?)");
+    syscall(231, (int64)1);
+  }
+  thread_close(h);
+  return g_result;
+}
+
+fn wd_start_holder() -> int64 {
+  meo_atomic_store_i32(&g_state, 0);
+  g_hold_rc = 0;
+  g_commit_rc = 0;
+  return CreateThread(0, 0, &wd_holder, 0, 0, 0);
+}
+
+fn wd_end_holder(h: int64) {
+  meo_atomic_store_i32(&g_state, 2);
+  thread_join(h, (uint32)WD_WAIT_MS);
+  thread_close(h);
+}
+
+fn wd_scan_cb(ctx: rawptr, x: float64, y: float64) -> int32 {
+  g_scan_n += 1;
+  return 0;
+}
+
+fn wd_writer(arg: cstring) -> uint32 {
+  var tid: int64 = (int64)arg;
+  var i: int64 = 0;
+  while (i < 50) {
+    var rc: int32 = wd_ins(g_db, 100 + tid * 1000 + i);
+    if (rc != MEO_OK && g_wr_err == 0) { g_wr_err = rc; }
+    i += 1;
+  }
+  return 0;
+}
+
+// --- cases ------------------------------------------------------------------
+
+// D1: the mode persists; NO_WAL converts back with the data intact.
+fn d1() -> int32 {
+  var path: string = "build/wal_db_d1.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &db);
+  if (!eq(rc, 0, "D1: open wal")) { return 1; }
+  if (!meo_t_check(meo_db_wal_mode(db), "D1: wal mode")) { return 1; }
+  if (!eq(wd_create(db, "t"), 0, "D1: create")) { return 1; }
+  if (!eq(wd_fill(db, 3), 0, "D1: fill")) { return 1; }
+  if (!eq(wd_ins(db, 3), 0, "D1: autocommit insert")) { return 1; }
+  if (!eq(wd_count(db), 4, "D1: count")) { return 1; }
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "t", &q);
+  meo_q_pick(q, "v");
+  var v: MeoValue;
+  meo_value_set_int(&v, 2);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var got: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (!eq(rc, MEO_ROW, "D1: point select")) { return 1; }
+  if (!eq(got, 20, "D1: point value")) { return 1; }
+  if (!eq(meo_db_close(db), 0, "D1: close")) { return 1; }
+
+  var db2: MeoDb* = 0;
+  rc = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db2);
+  if (!eq(rc, 0, "D1: reopen")) { return 1; }
+  if (!meo_t_check(meo_db_wal_mode(db2), "D1: still wal")) { return 1; }
+  if (!eq(wd_count(db2), 4, "D1: count after reopen")) { return 1; }
+  if (!eq(meo_db_close(db2), 0, "D1: close 2")) { return 1; }
+
+  var db3: MeoDb* = 0;
+  rc = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_NO_WAL, 0, &db3);
+  if (!eq(rc, 0, "D1: open no_wal")) { return 1; }
+  if (!meo_t_check_false(meo_db_wal_mode(db3), "D1: rollback mode")) { return 1; }
+  if (!eq(wd_count(db3), 4, "D1: count in rollback")) { return 1; }
+  if (!eq(wd_ins(db3, 4), 0, "D1: rollback insert")) { return 1; }
+  if (!eq(meo_db_close(db3), 0, "D1: close 3")) { return 1; }
+  if (!meo_t_check_false(wd_wal_exists(path), "D1: no log")) { return 1; }
+  var db4: MeoDb* = 0;
+  rc = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db4);
+  if (!eq(rc, 0, "D1: reopen 3")) { return 1; }
+  if (!meo_t_check_false(meo_db_wal_mode(db4), "D1: stays rollback")) { return 1; }
+  if (!eq(wd_count(db4), 5, "D1: count 5")) { return 1; }
+  meo_db_close(db4);
+  println("PASS D1: the mode persists and converts back");
+  return 0;
+}
+
+// D2: a reader does not wait for the writer's transaction.
+fn d2() -> int32 {
+  var path: string = "build/wal_db_d2.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &g_db);
+  if (!eq(rc, 0, "D2: open")) { return 1; }
+  if (!eq(wd_create(g_db, "t"), 0, "D2: create")) { return 1; }
+  if (!eq(wd_fill(g_db, 20), 0, "D2: fill")) { return 1; }
+  meo_db_busy_timeout(g_db, 2000);
+  var h: int64 = wd_start_holder();
+  if (h == 0) { return 1; }
+  if (!meo_t_check(wd_wait_state(1), "D2: holder started")) { return 1; }
+  if (!eq(g_hold_rc, 0, "D2: holder insert")) { return 1; }
+  var t0: int64 = meo_clock_monotonic_us();
+  var n: int64 = wd_count(g_db);
+  var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+  if (!eq(n, 20, "D2: count during the transaction")) { return 1; }
+  if (!meo_t_check(ms < 100, "D2: count returned at once ({ms} ms)")) { return 1; }
+  wd_end_holder(h);
+  if (!eq(g_commit_rc, 0, "D2: commit")) { return 1; }
+  if (!eq(wd_count(g_db), 21, "D2: count after commit")) { return 1; }
+  if (!eq(meo_db_close(g_db), 0, "D2: close")) { return 1; }
+  println("PASS D2: reads do not wait for an open transaction");
+  return 0;
+}
+
+// D3: the writer's own transaction is visible to its own selects.
+fn d3() -> int32 {
+  var path: string = "build/wal_db_d3.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &db);
+  if (!eq(rc, 0, "D3: open")) { return 1; }
+  if (!eq(wd_create(db, "t"), 0, "D3: create")) { return 1; }
+  if (!eq(wd_fill(db, 5), 0, "D3: fill")) { return 1; }
+  if (!eq(meo_db_begin(db, MEO_TX_DEFAULT), 0, "D3: begin")) { return 1; }
+  if (!eq(wd_ins(db, 50), 0, "D3: insert")) { return 1; }
+  if (!eq(wd_count(db), 6, "D3: own row visible")) { return 1; }
+  if (!eq(meo_db_rollback(db), 0, "D3: rollback")) { return 1; }
+  if (!eq(wd_count(db), 5, "D3: rolled back")) { return 1; }
+  if (!eq(meo_db_close(db), 0, "D3: close")) { return 1; }
+  println("PASS D3: a transaction sees its own rows");
+  return 0;
+}
+
+// D4: DDL on one thread reaches readers on another.
+fn d4() -> int32 {
+  var path: string = "build/wal_db_d4.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &g_db);
+  if (!eq(rc, 0, "D4: open")) { return 1; }
+  if (!eq(wd_create(g_db, "t"), 0, "D4: create t")) { return 1; }
+  if (!eq(wd_count_remote(0), 0, "D4: t empty")) { return 1; }
+  if (!eq(wd_count_remote(1), -MEO_ERR_SCHEMA, "D4: t2 not there yet")) { return 1; }
+  if (!eq(wd_create(g_db, "t2"), 0, "D4: create t2")) { return 1; }
+  if (!eq(wd_ins_in(g_db, "t2", 7), 0, "D4: insert t2")) { return 1; }
+  if (!eq(wd_count_remote(1), 1, "D4: t2 seen")) { return 1; }
+  if (!eq(wd_drop(g_db, "t2"), 0, "D4: drop t2")) { return 1; }
+  if (!eq(wd_count_remote(1), -MEO_ERR_SCHEMA, "D4: t2 gone")) { return 1; }
+  if (!eq(wd_count_remote(0), 0, "D4: t still there")) { return 1; }
+  if (!eq(meo_db_close(g_db), 0, "D4: close")) { return 1; }
+  println("PASS D4: DDL is seen across threads");
+  return 0;
+}
+
+// D5: the snapshot catalog is shared until the schema changes.
+fn d5() -> int32 {
+  var path: string = "build/wal_db_d5.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &db);
+  if (!eq(rc, 0, "D5: open")) { return 1; }
+  if (!eq(wd_create(db, "t"), 0, "D5: create")) { return 1; }
+  if (!eq(wd_fill(db, 10), 0, "D5: fill")) { return 1; }
+  var before: int64 = meo_db_snap_cat_loads(db);
+  var i: int32 = 0;
+  while (i < 200) {
+    if (!eq(wd_count(db), 10, "D5: count")) { return 1; }
+    i += 1;
+  }
+  var loads: int64 = meo_db_snap_cat_loads(db) - before;
+  if (!meo_t_check(loads <= 1, "D5: {loads} catalog loads for 200 selects")) { return 1; }
+  // A schema change makes the next reader load a new one, once.
+  before = meo_db_snap_cat_loads(db);
+  if (!eq(wd_create(db, "t2"), 0, "D5: create t2")) { return 1; }
+  i = 0;
+  while (i < 50) {
+    if (!eq(wd_count_in(db, "t2"), 0, "D5: count t2")) { return 1; }
+    i += 1;
+  }
+  loads = meo_db_snap_cat_loads(db) - before;
+  if (!eq(loads, 1, "D5: one load after DDL")) { return 1; }
+  if (!eq(meo_db_close(db), 0, "D5: close")) { return 1; }
+  println("PASS D5: the snapshot catalog is shared");
+  return 0;
+}
+
+// D6: a chart scan does not wait for a writer.
+fn d6() -> int32 {
+  var path: string = "build/wal_db_d6.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &g_db);
+  if (!eq(rc, 0, "D6: open")) { return 1; }
+  if (!eq(wd_create(g_db, "t"), 0, "D6: create")) { return 1; }
+  if (!eq(wd_fill(g_db, 30), 0, "D6: fill")) { return 1; }
+  meo_db_busy_timeout(g_db, 2000);
+  var h: int64 = wd_start_holder();
+  if (h == 0) { return 1; }
+  if (!meo_t_check(wd_wait_state(1), "D6: holder started")) { return 1; }
+  if (!eq(g_hold_rc, 0, "D6: holder insert")) { return 1; }
+  g_scan_n = 0;
+  var t0: int64 = meo_clock_monotonic_us();
+  rc = meo_q_scan_xy(g_db, "t", "id", "v", 0.0, 1.0e9, &wd_scan_cb, 0);
+  var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+  if (!eq(rc, 0, "D6: scan")) { return 1; }
+  if (!eq(g_scan_n, 30, "D6: committed rows only")) { return 1; }
+  if (!meo_t_check(ms < 100, "D6: scan returned at once ({ms} ms)")) { return 1; }
+  wd_end_holder(h);
+  if (!eq(g_commit_rc, 0, "D6: commit")) { return 1; }
+  g_scan_n = 0;
+  rc = meo_q_scan_xy(g_db, "t", "id", "v", 0.0, 1.0e9, &wd_scan_cb, 0);
+  if (!eq(rc, 0, "D6: scan after")) { return 1; }
+  if (!eq(g_scan_n, 31, "D6: sees the commit")) { return 1; }
+  if (!eq(meo_db_close(g_db), 0, "D6: close")) { return 1; }
+  println("PASS D6: scans do not wait for an open transaction");
+  return 0;
+}
+
+// D7: concurrent autocommit inserts share fsyncs and all land.
+fn d7() -> int32 {
+  var path: string = "build/wal_db_d7.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &g_db);
+  if (!eq(rc, 0, "D7: open")) { return 1; }
+  if (!eq(wd_create(g_db, "t"), 0, "D7: create")) { return 1; }
+  meo_db_busy_timeout(g_db, 30000);
+  g_wr_err = 0;
+  var hs: int64[] = new int64[8];
+  defer free(hs.data);
+  var i: int32 = 0;
+  while (i < 8) {
+    hs[i] = CreateThread(0, 0, &wd_writer, (cstring)(int64)i, 0, 0);
+    if (hs[i] == 0) { return 1; }
+    i += 1;
+  }
+  i = 0;
+  while (i < 8) {
+    if (thread_join(hs[i], 120000) != WAIT_OBJECT_0()) {
+      println("FAIL D7: writer {i} still running (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  if (!eq(g_wr_err, 0, "D7: writer error")) { return 1; }
+  if (!eq(wd_count(g_db), 400, "D7: all rows")) { return 1; }
+  if (!eq(meo_db_checkpoint(g_db, true), 0, "D7: full checkpoint")) { return 1; }
+  if (!eq(meo_db_close(g_db), 0, "D7: close")) { return 1; }
+  println("PASS D7: concurrent autocommit inserts");
+  return 0;
+}
+
+// D8: rollback mode has no snapshots and reads as before.
+fn d8() -> int32 {
+  var path: string = "build/wal_db_d8.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE, 0, &db);
+  if (!eq(rc, 0, "D8: open")) { return 1; }
+  if (!meo_t_check_false(meo_db_wal_mode(db), "D8: rollback mode")) { return 1; }
+  if (!eq(wd_create(db, "t"), 0, "D8: create")) { return 1; }
+  if (!eq(wd_fill(db, 12), 0, "D8: fill")) { return 1; }
+  var v: MeoDb* = db;
+  if (!eq(meo_db_snap_begin(db, &v), -MEO_ERR_UNSUPPORTED, "D8: snap_begin")) { return 1; }
+  if (!meo_t_check(v == 0, "D8: out cleared")) { return 1; }
+  if (!eq(wd_count(db), 12, "D8: count")) { return 1; }
+  if (!eq(meo_db_checkpoint(db, true), 0, "D8: checkpoint is a no-op")) { return 1; }
+  if (!eq(meo_db_close(db), 0, "D8: close")) { return 1; }
+  println("PASS D8: rollback mode is unchanged");
+  return 0;
+}
+
+// D9: close refuses live statements and snapshots; a WAL close drops the log.
+fn d9() -> int32 {
+  var path: string = "build/wal_db_d9.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &db);
+  if (!eq(rc, 0, "D9: open")) { return 1; }
+  if (!eq(wd_create(db, "t"), 0, "D9: create")) { return 1; }
+  if (!eq(wd_fill(db, 5), 0, "D9: fill")) { return 1; }
+  if (!meo_t_check(wd_wal_exists(path), "D9: log while open")) { return 1; }
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "t", &q);
+  if (!eq(meo_db_close(wd_alias(db)), -MEO_ERR_BUSY, "D9: close with a statement")) { return 1; }
+  meo_q_free(q);
+  var v: MeoDb* = 0;
+  if (!eq(meo_db_snap_begin(db, &v), 0, "D9: snap_begin")) { return 1; }
+  if (!meo_t_check(v != 0, "D9: a view")) { return 1; }
+  if (!eq(meo_db_enter(v), -MEO_ERR_USAGE, "D9: a view has no lock")) { return 1; }
+  if (!eq(meo_db_begin(v, MEO_TX_DEFAULT), -MEO_ERR_USAGE, "D9: a view cannot begin")) { return 1; }
+  if (!eq(meo_db_close(wd_alias(db)), -MEO_ERR_BUSY, "D9: close with a snapshot")) { return 1; }
+  if (!eq(wd_count(db), 5, "D9: db still usable")) { return 1; }
+  if (!eq(meo_db_snap_end(v), 0, "D9: snap_end")) { return 1; }
+  if (!eq(meo_db_close(db), 0, "D9: close")) { return 1; }
+  if (!meo_t_check_false(wd_wal_exists(path), "D9: log removed")) { return 1; }
+  println("PASS D9: close is BUSY while readers are live");
+  return 0;
+}
+
+// D10: schema_seq follows catalog writes only.
+fn d10() -> int32 {
+  var path: string = "build/wal_db_d10.dat";
+  if (wd_reset(path) != MEO_OK) { return 1; }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL,
+    0, &db);
+  if (!eq(rc, 0, "D10: open")) { return 1; }
+  var s0: uint64 = meo_pager_schema_seq(db->pager);
+  if (!eq(wd_create(db, "t"), 0, "D10: create")) { return 1; }
+  var s1: uint64 = meo_pager_schema_seq(db->pager);
+  if (!meo_t_check(s1 > s0, "D10: create bumps")) { return 1; }
+  // The first insert gives the table its root, which is a catalog write.
+  if (!eq(wd_ins(db, 1), 0, "D10: first insert")) { return 1; }
+  var s2: uint64 = meo_pager_schema_seq(db->pager);
+  if (!meo_t_check(s2 > s1, "D10: first insert bumps")) { return 1; }
+  if (!eq(wd_ins(db, 2), 0, "D10: second insert")) { return 1; }
+  if (!eq(wd_ins(db, 3), 0, "D10: third insert")) { return 1; }
+  if (!eq((int64)meo_pager_schema_seq(db->pager), (int64)s2, "D10: plain inserts leave it")) {
+    return 1;
+  }
+  if (!eq(wd_drop(db, "t"), 0, "D10: drop")) { return 1; }
+  if (!meo_t_check(meo_pager_schema_seq(db->pager) > s2, "D10: drop bumps")) { return 1; }
+  if (!eq(meo_db_close(db), 0, "D10: close")) { return 1; }
+  println("PASS D10: schema_seq follows catalog writes");
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_db_self (stub)");
-  return 0;
+  if (d1() != 0) { meo_t_report(); return 1; }
+  if (d2() != 0) { meo_t_report(); return 1; }
+  if (d3() != 0) { meo_t_report(); return 1; }
+  if (d4() != 0) { meo_t_report(); return 1; }
+  if (d5() != 0) { meo_t_report(); return 1; }
+  if (d6() != 0) { meo_t_report(); return 1; }
+  if (d7() != 0) { meo_t_report(); return 1; }
+  if (d8() != 0) { meo_t_report(); return 1; }
+  if (d9() != 0) { meo_t_report(); return 1; }
+  if (d10() != 0) { meo_t_report(); return 1; }
+  var rc: int32 = meo_t_report();
+  if (rc == 0) { println("PASS wal_db_self"); }
+  return rc;
 }

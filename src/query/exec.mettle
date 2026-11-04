@@ -1,4 +1,5 @@
-// query/exec: MeoQuery and its run on the first step, under the db lock.
+// query/exec: MeoQuery and its run on the first step, under the db lock (WAL
+// reads run on a snapshot instead).
 // Names resolve and the plan is rebuilt on every run, so a table dropped by a
 // rollback reload shows up as -MEO_ERR_SCHEMA rather than a stale pointer.
 // SELECT is materialized; later steps walk the buffer without the lock.
@@ -53,6 +54,7 @@ export struct MeoQuery {
 
   changes: int32;         // rows written by the last run
   last_rowid: int64;      // last rowid inserted by the last run
+  ticket: uint64;         // WAL commit the run waits for after the lock; 0 = none
 }
 
 // Store a copy of *v in slot k (bytes into the slot's own buffer).
@@ -173,7 +175,7 @@ fn exec_create(q: MeoQuery*) -> int32 {
   var t: MeoTable* = 0;
   rc = meo_cat_create_table(db->cat, s->table.p, s->table.n, q->plan.new_cols,
     q->plan.n_new_cols, &t);
-  return meo_db_stmt_end(db, started, true, rc);
+  return meo_db_stmt_end_t(db, started, true, rc, &q->ticket);
 }
 
 // A missing table is fine with "if exists": MEO_OK, nothing written.
@@ -187,7 +189,7 @@ fn exec_drop(q: MeoQuery*, t: MeoTable*) -> int32 {
   var rc: int32 = meo_db_stmt_begin(db, &started);
   if (rc != MEO_OK) { return rc; }
   rc = meo_cat_drop_table(db->cat, t);
-  return meo_db_stmt_end(db, started, true, rc);
+  return meo_db_stmt_end_t(db, started, true, rc, &q->ticket);
 }
 
 fn exec_add_column(q: MeoQuery*, t: MeoTable*) -> int32 {
@@ -196,7 +198,7 @@ fn exec_add_column(q: MeoQuery*, t: MeoTable*) -> int32 {
   var rc: int32 = meo_db_stmt_begin(db, &started);
   if (rc != MEO_OK) { return rc; }
   rc = meo_cat_add_column(db->cat, t, &q->plan.new_cols[0]);
-  return meo_db_stmt_end(db, started, true, rc);
+  return meo_db_stmt_end_t(db, started, true, rc, &q->ticket);
 }
 
 // A taken name is fine with "if not exists", whatever column it indexes.
@@ -215,7 +217,7 @@ fn exec_create_index(q: MeoQuery*, t: MeoTable*) -> int32 {
   var wrote: bool = false;
   rc = meo_tbl_create_index(db, t, q->plan.index_col, s->index.p, s->index.n, s->unique,
     &wrote);
-  return meo_db_stmt_end(db, started, wrote, rc);
+  return meo_db_stmt_end_t(db, started, wrote, rc, &q->ticket);
 }
 
 // An index that is missing, or belongs to another table, is fine with "if
@@ -233,7 +235,7 @@ fn exec_drop_index(q: MeoQuery*, t: MeoTable*) -> int32 {
   var rc: int32 = meo_db_stmt_begin(db, &started);
   if (rc != MEO_OK) { return rc; }
   rc = meo_cat_drop_index(db->cat, t, col);
-  return meo_db_stmt_end(db, started, true, rc);
+  return meo_db_stmt_end_t(db, started, true, rc, &q->ticket);
 }
 
 // Phase A over every row, then Phase B: a check failure writes nothing.
@@ -284,7 +286,7 @@ fn exec_insert(q: MeoQuery*, t: MeoTable*) -> int32 {
     }
     r += 1;
   }
-  return meo_db_stmt_end(db, started, wrote, rc);
+  return meo_db_stmt_end_t(db, started, wrote, rc, &q->ticket);
 }
 
 // --- filters ----------------------------------------------------------------
@@ -885,14 +887,13 @@ fn exec_write(q: MeoQuery*, t: MeoTable*) -> int32 {
     }
   }
   if (vs.ids != 0) { free(vs.ids); }
-  return meo_db_stmt_end(db, started, wrote, rc);
+  return meo_db_stmt_end_t(db, started, wrote, rc, &q->ticket);
 }
 
-// Run the query once (first step). Lock held for the whole run.
-fn exec_run(q: MeoQuery*) -> int32 {
+// Plan and run the query on q->db: the base handle under its lock, or a
+// snapshot view (WAL reads) with no lock.
+fn exec_body(q: MeoQuery*) -> int32 {
   var db: MeoDb* = q->db;
-  var rc: int32 = meo_db_enter(db);
-  if (rc != MEO_OK) { return rc; }
   q->changes = 0;
   q->last_rowid = 0;
   q->n_rows = 0;
@@ -905,7 +906,7 @@ fn exec_run(q: MeoQuery*) -> int32 {
   if (q->spec.kind != MEO_Q_K_CREATE) {
     t = meo_cat_find(db->cat, q->spec.table.p, q->spec.table.n);
   }
-  rc = meo_plan_build(&q->spec, t, q->vals, q->plan_arena, &q->plan);
+  var rc: int32 = meo_plan_build(&q->spec, t, q->vals, q->plan_arena, &q->plan);
   if (rc == MEO_OK) {
     q->n_cols = q->plan.n_out;
     if (q->spec.kind == MEO_Q_K_CREATE) {
@@ -928,7 +929,37 @@ fn exec_run(q: MeoQuery*) -> int32 {
       rc = exec_write(q, t);
     }
   }
+  return rc;
+}
+
+// Run the query once (first step). In WAL mode a read on a thread that holds
+// no lock runs on a snapshot and never waits for a writer. Otherwise the lock
+// is held for the whole run, and a WAL commit is waited for after releasing it
+// so concurrent commits share one fsync.
+fn exec_run(q: MeoQuery*) -> int32 {
+  var db: MeoDb* = q->db;
+  q->ticket = 0;
+  var read: bool = q->spec.kind == MEO_Q_K_SELECT || q->spec.kind == MEO_Q_K_COUNT;
+  var rc: int32 = MEO_OK;
+  if (read && db->wal && !meo_lock_held(&db->lock)) {
+    var v: MeoDb* = 0;
+    rc = meo_db_snap_begin(db, &v);
+    if (rc != MEO_OK) { return rc; }
+    q->db = v;
+    rc = exec_body(q);
+    q->db = db;
+    var e: int32 = meo_db_snap_end(v);
+    if (rc >= 0 && e < 0) { rc = e; }
+    return rc;
+  }
+  rc = meo_db_enter(db);
+  if (rc != MEO_OK) { return rc; }
+  rc = exec_body(q);
   meo_db_leave(db);
+  if (q->ticket != 0) {
+    var w: int32 = meo_db_commit_wait(db, q->ticket);
+    if (w < 0) { return w; }
+  }
   return rc;
 }
 

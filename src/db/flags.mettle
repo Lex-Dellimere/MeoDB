@@ -24,3 +24,9 @@ export const MEO_TX_IMMEDIATE: int32 = 2;
 // negative-on-failure convention, and far above any status code.
 export const MEO_ROW: int32 = 100;
 export const MEO_DONE: int32 = 101;
+
+// meo_db_open WAL flags: with neither, an existing file keeps its mode and a
+// new one is rollback-journal. MEO_OPEN_WAL converts to WAL, MEO_OPEN_NO_WAL
+// back to rollback. They map to MEO_PAGER_WAL and MEO_PAGER_NO_WAL.
+export const MEO_OPEN_WAL: int32 = 16;
+export const MEO_OPEN_NO_WAL: int32 = 32;

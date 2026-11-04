@@ -463,9 +463,10 @@ export fn meo_cat_save_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
   if (cat->broken) { return -MEO_ERR_CORRUPT; }
   if (!t->live) { return -MEO_ERR_SCHEMA; }
   var p: MeoPager* = cat->pager;
+  var rc: int32 = meo_pager_schema_bump(p);
+  if (rc != MEO_OK) { return rc; }
   var start: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
   var root: uint32 = start;
-  var rc: int32 = MEO_OK;
   if (root == 0) {
     var hv: MeoValue[2];
     var magic: string = "meocat";
@@ -550,7 +551,8 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
     if (sz < 0) { return sz; }
     return -MEO_ERR_TOOBIG;
   }
-  var rc: int32 = cat_push(cat, t);
+  var rc: int32 = meo_pager_schema_bump(cat->pager);
+  if (rc == MEO_OK) { rc = cat_push(cat, t); }
   if (rc != MEO_OK) {
     cat_free_table(t);
     return rc;
@@ -663,9 +665,10 @@ export fn meo_cat_drop_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
   if (cat->broken) { return -MEO_ERR_CORRUPT; }
   if (!t->live) { return -MEO_ERR_SCHEMA; }
   var p: MeoPager* = cat->pager;
+  var rc: int32 = meo_pager_schema_bump(p);
+  if (rc != MEO_OK) { return rc; }
   // Dead from the first freed page on, so nothing reads a half-freed tree.
   t->live = false;
-  var rc: int32 = MEO_OK;
   if (t->root != 0) { rc = cat_free_level(p, t->root, 0, true); }
   var i: int32 = 0;
   while (i < t->n_cols && rc == MEO_OK) {
@@ -706,6 +709,8 @@ export fn meo_cat_add_column(cat: MeoCatalog*, t: MeoTable*, col: MeoColumn*) ->
     i += 1;
   }
   if (t->n_cols >= MEO_MAX_COLS) { return -MEO_ERR_USAGE; }
+  var bump: int32 = meo_pager_schema_bump(cat->pager);
+  if (bump != MEO_OK) { return bump; }
   var n: int32 = t->n_cols + 1;
   var nc: MeoColumn* = (MeoColumn*)malloc((int64)n * (int64)sizeof(MeoColumn));
   var nm: uint8* = cat_dup(col->name, col->name_len);
@@ -802,6 +807,7 @@ export fn meo_cat_index_check(cat: MeoCatalog*, t: MeoTable*, col: int32, name: 
 export fn meo_cat_create_index(cat: MeoCatalog*, t: MeoTable*, col: int32, name: uint8*,
     name_len: int32, unique: bool, root: uint32) -> int32 {
   var rc: int32 = meo_cat_index_check(cat, t, col, name, name_len);
+  if (rc == MEO_OK) { rc = meo_pager_schema_bump(cat->pager); }
   if (rc != MEO_OK) { return rc; }
   var nm: uint8* = cat_dup(name, name_len);
   if (nm == 0) { return -MEO_ERR_NOMEM; }
@@ -829,6 +835,8 @@ export fn meo_cat_drop_index(cat: MeoCatalog*, t: MeoTable*, col: int32) -> int3
   if (col < 0 || col >= t->n_cols) { return -MEO_ERR_USAGE; }
   var c: MeoColumn* = &t->columns[col];
   if (c->idx_name == 0) { return -MEO_ERR_SCHEMA; }
+  var rc: int32 = meo_pager_schema_bump(cat->pager);
+  if (rc != MEO_OK) { return rc; }
   var root: uint32 = c->index_root;
   // Unindexed from the first freed page on, so nothing reads a half-freed tree.
   c->index_root = 0;
@@ -836,7 +844,7 @@ export fn meo_cat_drop_index(cat: MeoCatalog*, t: MeoTable*, col: int32) -> int3
   free(c->idx_name);
   c->idx_name = 0;
   c->idx_name_len = 0;
-  var rc: int32 = meo_cat_free_tree(cat->pager, root);
+  rc = meo_cat_free_tree(cat->pager, root);
   if (rc != MEO_OK) { return rc; }
   return meo_cat_save_table(cat, t);
 }

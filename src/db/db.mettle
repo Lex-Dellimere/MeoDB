@@ -6,8 +6,14 @@
 // returning, except meo_db_begin, which keeps it until the same thread's
 // commit or rollback. After a failed catalog reload the handle refuses
 // writes with -MEO_ERR_CORRUPT; close it and reopen.
+//
+// In WAL mode readers do not take that lock: meo_db_snap_begin hands out a
+// read-only view handle (own pager view, own catalog snapshot) that sees the
+// last durable commit, and commits wait for durability after the lock is
+// released so concurrent commits share one fsync.
 
 import "std/mem";
+import "std/thread";
 import "../error/status.mettle";
 import "../format/meta.mettle";
 import "../pager/pager.mettle";
@@ -17,6 +23,8 @@ import "flags.mettle";
 
 export const MEO_DB_DEFAULT_FRAMES: int32 = 256;
 export const MEO_DB_DEFAULT_BUSY_MS: int32 = 5000;
+
+const MEO_DB_VIEW_POOL_MAX: int32 = 64;
 
 export struct MeoDb {
   pager: MeoPager*;
@@ -29,11 +37,31 @@ export struct MeoDb {
   last_rowid: int64;     // db-wide last insert rowid (racy by design)
   n_stmts: int32;        // live statements; changed atomically, never under the lock
   read_only: bool;
+  // WAL mode. A view handle (view_of != 0) has its own pager view and a shared
+  // catalog snapshot, and never takes `lock`.
+  wal: bool;
+  view_of: MeoDb*;
+  snap_cat: rawptr;      // a view's MeoCatSnap
+  rcat_lock: int32;      // guards rcat, cat_loads and every MeoCatSnap.refs
+  rcat: rawptr;          // newest shared MeoCatSnap, one ref held here
+  cat_loads: int64;      // catalogs loaded for views
+  pool_lock: int32;
+  pool: MeoDb*;          // idle view handles, linked through pool_next
+  pool_n: int32;
+  pool_next: MeoDb*;
+}
+
+// The catalog a view reads: loaded once per schema_seq and shared by reference.
+struct MeoCatSnap {
+  cat: MeoCatalog*;      // pager = 0: never written or reloaded
+  schema_seq: uint64;
+  refs: int32;
 }
 
 // Open (or create) a database. flags: MEO_OPEN_READ | MEO_OPEN_WRITE |
 // MEO_OPEN_CREATE. n_frames 0 = MEO_DB_DEFAULT_FRAMES. MEO_OK and *out, or
-// the pager's / catalog's code with *out = 0.
+// the pager's / catalog's code with *out = 0. MEO_OPEN_WAL / MEO_OPEN_NO_WAL
+// convert the file's mode (both is an error); without them it keeps its mode.
 export fn meo_db_open(path: string, flags: int32, n_frames: int32, out: MeoDb**) -> int32 {
   if (out == 0) { return -MEO_ERR_USAGE; }
   out[0] = 0;
@@ -44,6 +72,8 @@ export fn meo_db_open(path: string, flags: int32, n_frames: int32, out: MeoDb**)
   var ro: bool = (flags & MEO_OPEN_WRITE) == 0;
   if (ro) { pflags = pflags | MEO_PAGER_READONLY; }
   if ((flags & MEO_OPEN_CREATE) != 0 && !ro) { pflags = pflags | MEO_PAGER_CREATE; }
+  if ((flags & MEO_OPEN_WAL) != 0) { pflags = pflags | MEO_PAGER_WAL; }
+  if ((flags & MEO_OPEN_NO_WAL) != 0) { pflags = pflags | MEO_PAGER_NO_WAL; }
   var p: MeoPager* = meo_pager_open(path, frames, pflags);
   if (p == 0) {
     var e: int32 = meo_pager_err(0);
@@ -75,14 +105,24 @@ export fn meo_db_open(path: string, flags: int32, n_frames: int32, out: MeoDb**)
   db->last_rowid = 0;
   db->n_stmts = 0;
   db->read_only = ro;
+  db->wal = meo_pager_wal_mode(p);
+  db->view_of = 0;
+  db->snap_cat = 0;
+  db->rcat_lock = 0;
+  db->rcat = 0;
+  db->cat_loads = 0;
+  db->pool_lock = 0;
+  db->pool = 0;
+  db->pool_n = 0;
+  db->pool_next = 0;
   out[0] = db;
   return MEO_OK;
 }
 
 // Close and free. -MEO_ERR_TX while a transaction is open, -MEO_ERR_BUSY
-// while statements are live (nothing is closed then).
+// while statements or snapshot views are live (nothing is closed then).
 export fn meo_db_close(db: MeoDb*) -> int32 {
-  if (db == 0) { return -MEO_ERR_USAGE; }
+  if (db == 0 || db->view_of != 0) { return -MEO_ERR_USAGE; }
   // Checked before waiting: another thread's transaction would only time out.
   if (db->in_tx) { return -MEO_ERR_TX; }
   var rc: int32 = meo_lock_enter(&db->lock, db->busy_ms);
@@ -95,11 +135,23 @@ export fn meo_db_close(db: MeoDb*) -> int32 {
     meo_lock_leave(&db->lock);
     return -MEO_ERR_BUSY;
   }
+  rc = meo_pager_close(db->pager);
+  // Live snapshot views pin the log: the pager closed nothing, neither do we.
+  if (db->wal && rc == -MEO_ERR_BUSY) {
+    meo_lock_leave(&db->lock);
+    return rc;
+  }
   meo_cat_close(db->cat);
   db->cat = 0;
-  rc = meo_pager_close(db->pager);
   meo_pager_free(db->pager);
   db->pager = 0;
+  db_cs_release(db, (MeoCatSnap*)db->rcat);
+  db->rcat = 0;
+  while (db->pool != 0) {
+    var v: MeoDb* = db->pool;
+    db->pool = v->pool_next;
+    free(v);
+  }
   meo_lock_leave(&db->lock);
   meo_lock_destroy(&db->lock);
   free(db);
@@ -168,6 +220,17 @@ export fn meo_db_commit(db: MeoDb*) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
   if (!db_tx_mine(db)) { return -MEO_ERR_TX; }
   if (db->poisoned) { return -MEO_ERR_TX; }
+  if (db->wal) {
+    // Append under the lock, wait for the fsync after leaving it so other
+    // writers can append and share the sync.
+    var ticket: uint64 = 0;
+    var arc: int32 = meo_pager_commit_async(db->pager, &ticket);
+    if (arc != MEO_OK) { return arc; }   // still open, as below
+    db->in_tx = false;
+    db->tx_owner = 0;
+    meo_lock_leave(&db->lock);
+    return meo_pager_commit_wait(db->pager, ticket);
+  }
   var rc: int32 = meo_pager_commit(db->pager);
   if (rc != MEO_OK) { return rc; }   // still open: the caller may roll back
   db->in_tx = false;
@@ -238,10 +301,27 @@ export fn meo_db_stmt_begin(db: MeoDb*, started: bool*) -> int32 {
 // clean. Answers rc, or the commit's failure.
 export fn meo_db_stmt_end(db: MeoDb*, started: bool, wrote: bool, rc: int32) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
+  var ticket: uint64 = 0;
+  var r: int32 = meo_db_stmt_end_t(db, started, wrote, rc, &ticket);
+  if (ticket == 0) { return r; }
+  // This caller keeps the lock, so it waits for durability here.
+  var w: int32 = meo_pager_commit_wait(db->pager, ticket);
+  if (r >= 0 && w < 0) { return w; }
+  return r;
+}
+
+// meo_db_stmt_end for a caller that waits itself: in WAL mode an autocommit
+// statement is appended, not yet durable, and *ticket names what
+// meo_db_commit_wait must wait for after the lock is released. 0 otherwise.
+export fn meo_db_stmt_end_t(db: MeoDb*, started: bool, wrote: bool, rc: int32,
+    ticket: uint64*) -> int32 {
+  if (db == 0 || ticket == 0) { return -MEO_ERR_USAGE; }
+  ticket[0] = 0;
   if (started) {
     if (rc >= 0) {
-      var c: int32 = meo_pager_commit(db->pager);
+      var c: int32 = meo_pager_commit_async(db->pager, ticket);
       if (c == MEO_OK) { return rc; }
+      ticket[0] = 0;
       db_rollback_locked(db);
       return c;
     }
@@ -250,4 +330,167 @@ export fn meo_db_stmt_end(db: MeoDb*, started: bool, wrote: bool, rc: int32) -> 
   }
   if (rc < 0 && wrote && db->in_tx) { db->poisoned = true; }
   return rc;
+}
+
+// Block until the commit named by `ticket` is durable. Any thread, no lock.
+export fn meo_db_commit_wait(db: MeoDb*, ticket: uint64) -> int32 {
+  if (db == 0) { return -MEO_ERR_USAGE; }
+  return meo_pager_commit_wait(db->pager, ticket);
+}
+
+// --- WAL mode ---------------------------------------------------------------
+
+export fn meo_db_wal_mode(db: MeoDb*) -> bool {
+  if (db == 0) { return false; }
+  return db->wal;
+}
+
+// Copy committed frames into the db file, without the db lock. Frames left in
+// the log, or a negative code; FULL leaves frames behind while a snapshot
+// still reads them. Rollback mode: 0.
+export fn meo_db_checkpoint(db: MeoDb*, full: bool) -> int32 {
+  if (db == 0 || db->view_of != 0) { return -MEO_ERR_USAGE; }
+  var mode: int32 = MEO_CKPT_PASSIVE;
+  if (full) { mode = MEO_CKPT_FULL; }
+  return meo_pager_checkpoint(db->pager, mode);
+}
+
+// Checkpoint on its own once this many frames are unbackfilled; 0 disables.
+export fn meo_db_wal_autocheckpoint(db: MeoDb*, frames: int32) -> int32 {
+  if (db == 0 || db->view_of != 0) { return -MEO_ERR_USAGE; }
+  return meo_pager_set_autocheckpoint(db->pager, frames);
+}
+
+// Catalogs loaded for snapshot views so far.
+export fn meo_db_snap_cat_loads(db: MeoDb*) -> int64 {
+  if (db == 0) { return 0; }
+  var base: MeoDb* = db;
+  if (db->view_of != 0) { base = db->view_of; }
+  spin_lock(&base->rcat_lock);
+  var n: int64 = base->cat_loads;
+  spin_unlock(&base->rcat_lock);
+  return n;
+}
+
+// Drop one reference; the last one frees the catalog.
+fn db_cs_release(db: MeoDb*, cs: MeoCatSnap*) {
+  if (cs == 0) { return; }
+  spin_lock(&db->rcat_lock);
+  cs->refs -= 1;
+  var dead: bool = cs->refs == 0;
+  spin_unlock(&db->rcat_lock);
+  if (dead) {
+    meo_cat_close(cs->cat);
+    free(cs);
+  }
+}
+
+// The catalog for schema_seq `seq`, as one reference. The newest shared one
+// when it matches; else a private load through the view's pager, installed as
+// the shared one when it is newer.
+fn db_cs_acquire(db: MeoDb*, vp: MeoPager*, seq: uint64, out: MeoCatSnap**) -> int32 {
+  spin_lock(&db->rcat_lock);
+  var cur: MeoCatSnap* = (MeoCatSnap*)db->rcat;
+  if (cur != 0 && cur->schema_seq == seq) {
+    cur->refs += 1;
+    spin_unlock(&db->rcat_lock);
+    out[0] = cur;
+    return MEO_OK;
+  }
+  spin_unlock(&db->rcat_lock);
+  var cat: MeoCatalog* = 0;
+  var rc: int32 = meo_cat_open(vp, &cat);
+  if (rc != MEO_OK) { return rc; }
+  cat->pager = 0;   // the view ends before this catalog does
+  var cs: MeoCatSnap* = new MeoCatSnap;
+  if (cs == 0) {
+    meo_cat_close(cat);
+    return -MEO_ERR_NOMEM;
+  }
+  cs->cat = cat;
+  cs->schema_seq = seq;
+  cs->refs = 1;
+  spin_lock(&db->rcat_lock);
+  db->cat_loads += 1;
+  var old: MeoCatSnap* = 0;
+  cur = (MeoCatSnap*)db->rcat;
+  if (cur == 0 || cur->schema_seq < seq) {
+    cs->refs += 1;
+    db->rcat = (rawptr)cs;
+    old = cur;
+  }
+  spin_unlock(&db->rcat_lock);
+  db_cs_release(db, old);
+  out[0] = cs;
+  return MEO_OK;
+}
+
+// Back to the base's pool (or free), with every field cleared; the zeroed
+// lock makes meo_db_enter on a view answer -MEO_ERR_USAGE.
+fn db_view_recycle(db: MeoDb*, v: MeoDb*) {
+  memset(v, 0, (int64)sizeof(MeoDb));
+  spin_lock(&db->pool_lock);
+  if (db->pool_n < MEO_DB_VIEW_POOL_MAX) {
+    v->pool_next = db->pool;
+    db->pool = v;
+    db->pool_n += 1;
+    spin_unlock(&db->pool_lock);
+    return;
+  }
+  spin_unlock(&db->pool_lock);
+  free(v);
+}
+
+// Open a read-only view of the last durable commit. Any thread, no db lock;
+// end it with meo_db_snap_end. -MEO_ERR_UNSUPPORTED in rollback mode,
+// -MEO_ERR_USAGE for a view.
+export fn meo_db_snap_begin(db: MeoDb*, out: MeoDb**) -> int32 {
+  if (db == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  out[0] = 0;
+  if (db->view_of != 0) { return -MEO_ERR_USAGE; }
+  if (!db->wal) { return -MEO_ERR_UNSUPPORTED; }
+  var v: MeoDb* = 0;
+  spin_lock(&db->pool_lock);
+  if (db->pool != 0) {
+    v = db->pool;
+    db->pool = v->pool_next;
+    db->pool_n -= 1;
+  }
+  spin_unlock(&db->pool_lock);
+  if (v == 0) {
+    v = (MeoDb*)calloc(1, (int64)sizeof(MeoDb));
+    if (v == 0) { return -MEO_ERR_NOMEM; }
+  }
+  var vp: MeoPager* = 0;
+  var rc: int32 = meo_pager_snap_begin(db->pager, &vp);
+  var cs: MeoCatSnap* = 0;
+  if (rc == MEO_OK) {
+    rc = db_cs_acquire(db, vp, meo_pager_schema_seq(vp), &cs);
+    if (rc != MEO_OK) { meo_pager_snap_end(vp); }
+  }
+  if (rc != MEO_OK) {
+    db_view_recycle(db, v);
+    return rc;
+  }
+  v->pager = vp;
+  v->cat = cs->cat;
+  v->snap_cat = (rawptr)cs;
+  v->busy_ms = db->busy_ms;
+  v->read_only = true;
+  v->wal = true;
+  v->view_of = db;
+  v->pool_next = 0;
+  out[0] = v;
+  return MEO_OK;
+}
+
+// End a view. -MEO_ERR_BUSY, with nothing ended, while a page is pinned.
+export fn meo_db_snap_end(v: MeoDb*) -> int32 {
+  if (v == 0 || v->view_of == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = meo_pager_snap_end(v->pager);
+  if (rc != MEO_OK) { return rc; }
+  var db: MeoDb* = v->view_of;
+  db_cs_release(db, (MeoCatSnap*)v->snap_cat);
+  db_view_recycle(db, v);
+  return MEO_OK;
 }
