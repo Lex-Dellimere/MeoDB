@@ -16,6 +16,7 @@ import "../btree/btree.mettle";
 import "../types/key.mettle";
 import "../record/value.mettle";
 import "../record/codec.mettle";
+import "../table/overflow.mettle";
 import "schema.mettle";
 
 export const MEO_CAT_VERSION: int32 = 1;
@@ -578,7 +579,30 @@ fn cat_pager_fail(p: MeoPager*) -> int32 {
   return 0 - e;
 }
 
-fn cat_free_level(p: MeoPager*, page: uint32, depth: int32) -> int32 {
+// Free the overflow chain behind every stub in a table leaf.
+fn cat_free_chains(p: MeoPager*, d: uint8*) -> int32 {
+  var n: int32 = meo_page_n_cells(d);
+  var i: int32 = 0;
+  while (i < n) {
+    var kl: int32 = meo_btn_leaf_key_len(d, i);
+    if (kl >= 9) {
+      var len: int32 = 0;
+      var first: uint32 = 0;
+      var rc: int32 = meo_ovf_stub_get(meo_btn_leaf_key_ptr(d, i) + 8, kl - 8, &len, &first);
+      if (rc < 0) { return rc; }
+      if (rc == MEO_OK) {
+        rc = meo_ovf_free(p, first, len);
+        if (rc != MEO_OK) { return rc; }
+      }
+    }
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// Free the tree under `page`; `rows` marks a table tree, whose leaves may hold
+// overflow stubs to follow.
+fn cat_free_level(p: MeoPager*, page: uint32, depth: int32, rows: bool) -> int32 {
   if (depth >= MEO_BT_MAX_DEPTH) { return -MEO_ERR_CORRUPT; }
   var f: MeoFrame* = meo_pager_get(p, page, false);
   if (f == 0) { return cat_pager_fail(p); }
@@ -588,6 +612,13 @@ fn cat_free_level(p: MeoPager*, page: uint32, depth: int32) -> int32 {
     return rc;
   }
   if (meo_btn_is_leaf(f->data)) {
+    if (rows) {
+      rc = cat_free_chains(p, f->data);
+      if (rc != MEO_OK) {
+        meo_pager_release(p, f, false);
+        return rc;
+      }
+    }
     meo_pager_release(p, f, false);
     return meo_pager_free_page(p, page);
   }
@@ -608,7 +639,7 @@ fn cat_free_level(p: MeoPager*, page: uint32, depth: int32) -> int32 {
   i = 0;
   while (i < n) {
     if (kids[i] == 0) { return -MEO_ERR_CORRUPT; }
-    rc = cat_free_level(p, kids[i], depth + 1);
+    rc = cat_free_level(p, kids[i], depth + 1, rows);
     if (rc != MEO_OK) { return rc; }
     i += 1;
   }
@@ -620,7 +651,7 @@ fn cat_free_level(p: MeoPager*, page: uint32, depth: int32) -> int32 {
 export fn meo_cat_free_tree(p: MeoPager*, root: uint32) -> int32 {
   if (p == 0) { return -MEO_ERR_USAGE; }
   if (root == 0) { return MEO_OK; }
-  return cat_free_level(p, root, 0);
+  return cat_free_level(p, root, 0, false);
 }
 
 // Drop t: free its table tree and every index tree, delete its catalog row,
@@ -634,7 +665,8 @@ export fn meo_cat_drop_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
   var p: MeoPager* = cat->pager;
   // Dead from the first freed page on, so nothing reads a half-freed tree.
   t->live = false;
-  var rc: int32 = meo_cat_free_tree(p, t->root);
+  var rc: int32 = MEO_OK;
+  if (t->root != 0) { rc = cat_free_level(p, t->root, 0, true); }
   var i: int32 = 0;
   while (i < t->n_cols && rc == MEO_OK) {
     rc = meo_cat_free_tree(p, t->columns[i].index_root);

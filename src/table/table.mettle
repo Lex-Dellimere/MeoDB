@@ -3,7 +3,10 @@
 // PRIMARY KEYs, non-unique for CREATE INDEX (MEO_COL_INDEXED).
 //
 // Table key = 8-byte rowid ++ record, separators truncated to 8; the rowid
-// alias is stored NULL and filled from the key. Unique index key = types/key
+// alias is stored NULL and filled from the key. A record over MEO_REC_MAX (up
+// to MEO_ROW_MAX) lives in an overflow chain (table/overflow) and the key
+// holds rowid ++ a 9-byte stub in its place; every read path gives the full
+// record, in-leaf ones as a view of the leaf, chained ones in a MeoTblBuf. Unique index key = types/key
 // encoding of the value (meo_key_compare); non-unique index key = that
 // encoding ++ meo_key_rowid(rowid) (meo_idx_cmp). Both store u64 = rowid, use
 // whole-key separators, and leave NULLs out. Writes are two-phase:
@@ -26,6 +29,14 @@ import "../catalog/schema.mettle";
 import "../catalog/catalog.mettle";
 import "../db/db.mettle";
 import "../feed/feed.mettle";
+import "overflow.mettle";
+
+// A growable record buffer: zero it with meo_tbl_buf_init, free it with
+// meo_tbl_buf_free. It keeps the largest record it has held.
+export struct MeoTblBuf {
+  data: uint8*;
+  cap: int32;
+}
 
 // One row: its rowid and a view of its record bytes (see the header).
 export struct MeoTblRow {
@@ -43,6 +54,7 @@ export struct MeoTblScan {
   started: bool;
   done: bool;
   start: int64;           // the first rowid the scan seeks to
+  buf: MeoTblBuf;         // holds the record of an overflow row
 }
 
 // A range cursor over one index, in key order. Holds one pinned leaf and a
@@ -63,6 +75,31 @@ export struct MeoTblIdxScan {
 
 // Room for one index key: a value key (at most MEO_REC_MAX) plus the rowid.
 const TBL_KBUF: int32 = MEO_REC_MAX + 8;
+
+export fn meo_tbl_buf_init(b: MeoTblBuf*) {
+  b->data = 0;
+  b->cap = 0;
+}
+
+export fn meo_tbl_buf_free(b: MeoTblBuf*) {
+  if (b == 0) { return; }
+  if (b->data != 0) { free(b->data); }
+  b->data = 0;
+  b->cap = 0;
+}
+
+// Room for n bytes, at least MEO_REC_MAX. The old contents are dropped.
+fn tbl_buf_reserve(b: MeoTblBuf*, n: int32) -> int32 {
+  if (b->data != 0 && b->cap >= n) { return MEO_OK; }
+  var cap: int32 = n;
+  if (cap < MEO_REC_MAX) { cap = MEO_REC_MAX; }
+  var d: uint8* = malloc((int64)cap);
+  if (d == 0) { return -MEO_ERR_NOMEM; }
+  if (b->data != 0) { free(b->data); }
+  b->data = d;
+  b->cap = cap;
+  return MEO_OK;
+}
 
 // The table-tree comparator: the 8-byte rowid prefix decides.
 export fn meo_tbl_cmp(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
@@ -384,7 +421,7 @@ export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: 
     if (rowid > hi) { hi = rowid; }
     var sz: int32 = tbl_row_size(t, vals, n_cols);
     if (sz < 0) { return sz; }
-    if (sz > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+    if (sz > MEO_ROW_MAX) { return -MEO_ERR_TOOBIG; }
     rowids_out[r] = rowid;
     r += 1;
   }
@@ -433,7 +470,7 @@ export fn meo_tbl_check_update(db: MeoDb*, t: MeoTable*, rowids: int64*, n: int3
     }
     var sz: int32 = tbl_row_size(t, vals, n_cols);
     if (sz < 0) { return sz; }
-    if (sz > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+    if (sz > MEO_ROW_MAX) { return -MEO_ERR_TOOBIG; }
     r += 1;
   }
   var err: int32 = MEO_OK;
@@ -453,7 +490,7 @@ fn tbl_encode_row(t: MeoTable*, vals: MeoValue*, n: int32, rowid: int64, out: ui
     meo_value_set_null(&vals[alias]);
   }
   var sz: int32 = meo_rec_size(vals, n);
-  if (sz < 0 || sz > MEO_REC_MAX) {
+  if (sz < 0 || sz > MEO_ROW_MAX) {
     if (alias >= 0) { vals[alias] = saved; }
     return -MEO_ERR_USAGE;   // Phase A was skipped
   }
@@ -474,16 +511,29 @@ fn tbl_encode_row(t: MeoTable*, vals: MeoValue*, n: int32, rowid: int64, out: ui
   return MEO_OK;
 }
 
-// Insert an encoded row (rowid ++ record) into the table tree.
+// Insert an encoded row (rowid ++ record) into the table tree; a record over
+// MEO_REC_MAX goes to an overflow chain and the key gets the stub.
 fn tbl_put_row(db: MeoDb*, t: MeoTable*, buf: uint8*, len: int32, rowid: int64,
     dirty: bool*) -> int32 {
   var key: MeoBtKey = { data: buf, len: len };
+  var stub: uint8[17];
+  var first: uint32 = 0;
+  var big: bool = len - 8 > MEO_REC_MAX;
+  if (big) {
+    var wrc: int32 = meo_ovf_write(db->pager, buf + 8, len - 8, &first);
+    if (wrc != MEO_OK) { return wrc; }
+    meo_key_rowid(&stub[0], 8, rowid);
+    meo_ovf_stub_put(&stub[8], len - 8, first);
+    key.data = &stub[0];
+    key.len = 8 + MEO_OVF_STUB_LEN;
+  }
   var root: uint32 = t->root;
   var rc: int32 = meo_bt_insert_sep(db->pager, &root, meo_tbl_cmp, key, (uint64)rowid, 8);
   if (root != t->root) {
     t->root = root;
     dirty[0] = true;
   }
+  if (big && rc != MEO_OK) { meo_ovf_free(db->pager, first, len - 8); }
   return rc;
 }
 
@@ -582,17 +632,22 @@ export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
 // Delete the row with this rowid and its index entries. MEO_OK, 1 absent.
 export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   if (db == 0 || t == 0) { return -MEO_ERR_USAGE; }
-  var old: uint8* = malloc((int64)MEO_REC_MAX + (int64)TBL_KBUF);
-  if (old == 0) { return -MEO_ERR_NOMEM; }
-  defer free(old);
+  var kbuf: uint8* = malloc((int64)TBL_KBUF);
+  if (kbuf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(kbuf);
+  var old: MeoTblBuf;
+  meo_tbl_buf_init(&old);
+  defer meo_tbl_buf_free(&old);
   var row: MeoTblRow;
-  var rc: int32 = meo_tbl_lookup_rowid(db, t, rowid, old, MEO_REC_MAX, &row);
+  var first: uint32 = 0;
+  var rc: int32 = tbl_lookup(db, t, rowid, &old, &row, &first);
   if (rc != MEO_OK) { return rc; }
   var dirty: bool = false;
-  rc = tbl_index_rec(db, t, row.rec, row.rec_len, rowid, false, old + MEO_REC_MAX, &dirty);
+  rc = tbl_index_rec(db, t, row.rec, row.rec_len, rowid, false, kbuf, &dirty);
   if (rc != MEO_OK) { return rc; }
   rc = tbl_del_row(db, t, rowid);
   if (rc == 1) { return -MEO_ERR_CORRUPT; }
+  if (rc == MEO_OK && first != 0) { rc = meo_ovf_free(db->pager, first, row.rec_len); }
   rc = tbl_finish(db, t, rc, dirty);
   if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_DELETE, rowid, 0, row.rec, row.rec_len); }
   return rc;
@@ -605,12 +660,15 @@ export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
 export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*,
     n: int32) -> int32 {
   if (db == 0 || t == 0 || vals == 0 || n != t->n_cols) { return -MEO_ERR_USAGE; }
-  var old: uint8* = malloc((int64)MEO_REC_MAX + (int64)TBL_KBUF);
-  if (old == 0) { return -MEO_ERR_NOMEM; }
-  defer free(old);
-  var kbuf: uint8* = old + MEO_REC_MAX;
+  var kbuf: uint8* = malloc((int64)TBL_KBUF);
+  if (kbuf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(kbuf);
+  var old: MeoTblBuf;
+  meo_tbl_buf_init(&old);
+  defer meo_tbl_buf_free(&old);
   var row: MeoTblRow;
-  var rc: int32 = meo_tbl_lookup_rowid(db, t, rowid, old, MEO_REC_MAX, &row);
+  var first: uint32 = 0;
+  var rc: int32 = tbl_lookup(db, t, rowid, &old, &row, &first);
   if (rc != MEO_OK) { return rc; }
   var nid: int64 = rowid;
   var alias: int32 = meo_tbl_alias_col(t);
@@ -628,6 +686,8 @@ export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*
     if (rc == 1) { rc = -MEO_ERR_CORRUPT; }
   }
   if (rc == MEO_OK) { rc = tbl_put_row(db, t, buf, len, nid, &dirty); }
+  // The old chain goes once the new row stands.
+  if (rc == MEO_OK && first != 0) { rc = meo_ovf_free(db->pager, first, row.rec_len); }
   if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, nid, true, kbuf, &dirty); }
   rc = tbl_finish(db, t, rc, dirty);
   if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_REPLACE, nid, rowid, buf + 8, len - 8); }
@@ -656,12 +716,36 @@ export fn meo_tbl_index_lookup(db: MeoDb*, t: MeoTable*, col: int32, v: MeoValue
   return tbl_index_get(db, t, col, kbuf, kn, rowid_out);
 }
 
-// Point lookup: copy the record of `rowid` into buf[0..cap) (cap >=
-// MEO_REC_MAX always suffices) and point row at it. MEO_OK, 1 absent,
-// -MEO_ERR_FULL when cap is too small, negative on failure.
-export fn meo_tbl_lookup_rowid(db: MeoDb*, t: MeoTable*, rowid: int64, buf: uint8*,
-    cap: int32, row: MeoTblRow*) -> int32 {
-  if (db == 0 || t == 0 || buf == 0 || row == 0) { return -MEO_ERR_USAGE; }
+// The record a leaf holds, given the bytes after the rowid: an ordinary record
+// stays where it is (*first = 0), a stub is read into b (*first = its first
+// page). The leaf may stay pinned; MEO_OK or a negative code.
+fn tbl_fetch(p: MeoPager*, rec: uint8*, rec_len: int32, b: MeoTblBuf*, rec_out: uint8**,
+    len_out: int32*, first: uint32*) -> int32 {
+  var n: int32 = 0;
+  var pg: uint32 = 0;
+  var rc: int32 = meo_ovf_stub_get(rec, rec_len, &n, &pg);
+  if (rc < 0) { return rc; }
+  first[0] = 0;
+  if (rc == 1) {
+    rec_out[0] = rec;
+    len_out[0] = rec_len;
+    return MEO_OK;
+  }
+  rc = tbl_buf_reserve(b, n);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_ovf_read(p, pg, n, b->data);
+  if (rc != MEO_OK) { return rc; }
+  rec_out[0] = b->data;
+  len_out[0] = n;
+  first[0] = pg;
+  return MEO_OK;
+}
+
+// meo_tbl_lookup_rowid, also giving the first overflow page (0 when the
+// record sits in the leaf).
+fn tbl_lookup(db: MeoDb*, t: MeoTable*, rowid: int64, b: MeoTblBuf*, row: MeoTblRow*,
+    first: uint32*) -> int32 {
+  if (db == 0 || t == 0 || b == 0 || row == 0) { return -MEO_ERR_USAGE; }
   if (t->root == 0) { return 1; }
   var k: uint8[8];
   meo_key_rowid(&k[0], 8, rowid);
@@ -683,16 +767,38 @@ export fn meo_tbl_lookup_rowid(db: MeoDb*, t: MeoTable*, rowid: int64, buf: uint
     meo_bt_close(db->pager, &c);
     return -MEO_ERR_CORRUPT;
   }
-  if (kl - 8 > cap) {
-    meo_bt_close(db->pager, &c);
-    return -MEO_ERR_FULL;
+  // Copy or read into b: the leaf is released before the caller looks.
+  var rec: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf) + 8;
+  var n: int32 = 0;
+  var pg: uint32 = 0;
+  rc = meo_ovf_stub_get(rec, kl - 8, &n, &pg);
+  if (rc == 1) {
+    rc = tbl_buf_reserve(b, kl - 8);
+    if (rc == MEO_OK) { meo_bytes_copy(b->data, rec, (int64)(kl - 8)); }
+    n = kl - 8;
+    pg = 0;
   }
-  meo_bytes_copy(buf, meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf) + 8, (int64)(kl - 8));
   meo_bt_close(db->pager, &c);
+  if (rc < 0) { return rc; }
+  if (pg != 0) {
+    rc = tbl_buf_reserve(b, n);
+    if (rc == MEO_OK) { rc = meo_ovf_read(db->pager, pg, n, b->data); }
+    if (rc != MEO_OK) { return rc; }
+  }
   row->rowid = rowid;
-  row->rec = buf;
-  row->rec_len = kl - 8;
+  row->rec = b->data;
+  row->rec_len = n;
+  first[0] = pg;
   return MEO_OK;
+}
+
+// Point lookup: the full record of `rowid`, read into b (grown as needed, so
+// it stays valid until b's next use), row pointing at it. MEO_OK, 1 absent,
+// negative on failure (-MEO_ERR_CORRUPT for a damaged overflow chain).
+export fn meo_tbl_lookup_rowid(db: MeoDb*, t: MeoTable*, rowid: int64, b: MeoTblBuf*,
+    row: MeoTblRow*) -> int32 {
+  var first: uint32 = 0;
+  return tbl_lookup(db, t, rowid, b, row, &first);
 }
 
 // Open a full scan in rowid order. MEO_OK; nothing is pinned until the first
@@ -706,6 +812,7 @@ export fn meo_tbl_scan_open(db: MeoDb*, t: MeoTable*, sc: MeoTblScan*) -> int32 
   sc->done = false;
   sc->start = (int64)((uint64)1 << 63);   // INT64_MIN
   meo_bt_cursor_init(&sc->cur);
+  meo_tbl_buf_init(&sc->buf);
   return MEO_OK;
 }
 
@@ -718,7 +825,8 @@ export fn meo_tbl_scan_from(db: MeoDb*, t: MeoTable*, lo: int64, sc: MeoTblScan*
   return MEO_OK;
 }
 
-// The next row: 0 = *row filled (borrowing the pinned leaf), 1 = done,
+// The next row: 0 = *row filled (borrowing the pinned leaf, or the scan's
+// buffer for an overflow row; either lasts until the next call), 1 = done,
 // negative on failure.
 export fn meo_tbl_scan_next(sc: MeoTblScan*, row: MeoTblRow*) -> int32 {
   if (sc == 0 || row == 0) { return -MEO_ERR_USAGE; }
@@ -751,16 +859,23 @@ export fn meo_tbl_scan_next(sc: MeoTblScan*, row: MeoTblRow*) -> int32 {
     meo_bt_close(p, &sc->cur);
     return -MEO_ERR_CORRUPT;
   }
+  var first: uint32 = 0;
+  rc = tbl_fetch(p, meo_btn_leaf_key_ptr(lf, at) + 8, kl - 8, &sc->buf, &row->rec,
+    &row->rec_len, &first);
+  if (rc != MEO_OK) {
+    sc->done = true;
+    meo_bt_close(p, &sc->cur);
+    return rc;
+  }
   row->rowid = (int64)meo_btn_leaf_rowid(lf, at);
-  row->rec = meo_btn_leaf_key_ptr(lf, at) + 8;
-  row->rec_len = kl - 8;
   return 0;
 }
 
-// Release the scan's leaf. Always safe.
+// Release the scan's leaf and buffer. Always safe.
 export fn meo_tbl_scan_close(sc: MeoTblScan*) {
   if (sc == 0 || sc->db == 0) { return; }
   meo_bt_close(sc->db->pager, &sc->cur);
+  meo_tbl_buf_free(&sc->buf);
   sc->done = true;
 }
 

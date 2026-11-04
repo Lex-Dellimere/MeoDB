@@ -76,6 +76,7 @@ fn project() {
 
   // Range access paths and the streaming x/y scan.
   mb_bin("range_self", "tests/range_self.mettle");
+  mb_bin("rowbig_self", "tests/rowbig_self.mettle");
 
   // Named and non-unique indexes on existing tables.
   mb_bin("index_self", "tests/index_self.mettle");

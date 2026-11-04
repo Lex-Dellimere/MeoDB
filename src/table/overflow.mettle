@@ -130,6 +130,32 @@ export fn meo_ovf_write(p: MeoPager*, data: uint8*, len: int32,
   return MEO_OK;
 }
 
+// A record over MEO_REC_MAX sits in its table leaf as a stub: 0xFF, the total
+// record length(u32) and the first page(u32). No real record starts with 0xFF
+// (it opens with a varint column count below 0x80), so the first byte tells
+// the two apart.
+export const MEO_OVF_STUB_LEN: int32 = 9;
+
+// Write the stub for a chain of `len` bytes at `first` into out[0..9).
+export fn meo_ovf_stub_put(out: uint8*, len: int32, first: uint32) {
+  out[0] = (uint8)255;
+  meo_put_u32le(out, 1, (uint32)len);
+  meo_put_u32le(out, 5, first);
+}
+
+// Read the leaf bytes after the rowid: MEO_OK with *len and *first set for a
+// stub, 1 for an ordinary record, -MEO_ERR_CORRUPT for a malformed stub.
+export fn meo_ovf_stub_get(rec: uint8*, rec_len: int32, len: int32*,
+    first: uint32*) -> int32 {
+  if (rec_len < 1 || rec[0] != (uint8)255) { return 1; }
+  if (rec_len != MEO_OVF_STUB_LEN) { return -MEO_ERR_CORRUPT; }
+  var n: uint32 = meo_get_u32le(rec, 1);
+  if (n <= (uint32)MEO_REC_MAX || n > (uint32)MEO_ROW_MAX) { return -MEO_ERR_CORRUPT; }
+  len[0] = (int32)n;
+  first[0] = meo_get_u32le(rec, 5);
+  return MEO_OK;
+}
+
 // Copy exactly `len` bytes of the chain starting at `first` into `out`.
 export fn meo_ovf_read(p: MeoPager*, first: uint32, len: int32,
     out: uint8*) -> int32 {

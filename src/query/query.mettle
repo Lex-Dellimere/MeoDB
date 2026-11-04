@@ -627,9 +627,9 @@ fn q_scan_rowids(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
 
 // Indexed x: rows arrive in x order.
 fn q_scan_index(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
-  var buf: uint8* = malloc((int64)MEO_REC_MAX);
-  if (buf == 0) { return -MEO_ERR_NOMEM; }
-  defer free(buf);
+  var buf: MeoTblBuf;
+  meo_tbl_buf_init(&buf);
+  defer meo_tbl_buf_free(&buf);
   var lo: MeoValue;
   var hi: MeoValue;
   meo_value_set_real(&lo, sc->lo);
@@ -643,7 +643,7 @@ fn q_scan_index(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
     var id: int64 = 0;
     rc = meo_tbl_idx_scan_next(&cur, &id);
     if (rc != 0) { break; }
-    rc = meo_tbl_lookup_rowid(db, t, id, buf, MEO_REC_MAX, &row);
+    rc = meo_tbl_lookup_rowid(db, t, id, &buf, &row);
     if (rc == MEO_OK) {
       st = q_scan_row(sc, t, &row);
     } else if (rc == 1) {

@@ -145,11 +145,12 @@ fn tb_users(db: MeoDb*) -> int32 {
   if (rc != MEO_OK || ids[0] != 1) { return tb_fail("insert a@x rc={rc} id={ids[0]}"); }
   if (t->columns[1].index_root == 0) { return tb_fail("no index root after the first insert"); }
   if (tb_find(db, t, 1, "a@x") != 1) { return tb_fail("a@x not indexed"); }
-  var buf: uint8* = malloc((int64)MEO_REC_MAX);
-  defer free(buf);
+  var buf: MeoTblBuf;
+  meo_tbl_buf_init(&buf);
+  defer meo_tbl_buf_free(&buf);
   var row: MeoTblRow;
   var v: MeoValue;
-  rc = meo_tbl_lookup_rowid(db, t, 1, buf, MEO_REC_MAX, &row);
+  rc = meo_tbl_lookup_rowid(db, t, 1, &buf, &row);
   if (rc != MEO_OK) { return tb_fail("lookup 1 rc={rc}"); }
   meo_tbl_row_get(t, &row, 2, &v);
   if (v.type != MEO_T_REAL || v.f != 5.0) { return tb_fail("score not converted to REAL"); }
@@ -240,7 +241,7 @@ fn tb_users(db: MeoDb*) -> int32 {
   if (rc != MEO_OK) { return tb_fail("update 7 rc={rc}"); }
   if (tb_find(db, t, 1, "z@x") != 7) { return tb_fail("z@x not mapped to 7"); }
   if (tb_find(db, t, 1, "a@x") != 0) { return tb_fail("a@x still indexed after update"); }
-  rc = meo_tbl_lookup_rowid(db, t, 7, buf, MEO_REC_MAX, &row);
+  rc = meo_tbl_lookup_rowid(db, t, 7, &buf, &row);
   meo_tbl_row_get(t, &row, 2, &v);
   if (rc != MEO_OK || v.type != MEO_T_REAL || v.f != 2.0) { return tb_fail("row 7 not rewritten"); }
   meo_value_set_null(&rows[0]);

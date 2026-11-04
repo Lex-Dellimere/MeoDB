@@ -171,7 +171,8 @@ fn ix_entries(db: MeoDb*, tbl: string, col: string) -> int64 {
   var n: int64 = -1;
   var sc: MeoTblIdxScan;
   if (c >= 0 && meo_tbl_idx_scan_open(db, t, c, 0, 0, &sc) == MEO_OK) {
-    var buf: uint8* = malloc((int64)MEO_REC_MAX);
+    var buf: MeoTblBuf;
+    meo_tbl_buf_init(&buf);
     var prev: MeoValue = vn();
     var pbuf: uint8* = malloc((int64)MEO_REC_MAX);
     n = 0;
@@ -184,7 +185,7 @@ fn ix_entries(db: MeoDb*, tbl: string, col: string) -> int64 {
       }
       var row: MeoTblRow;
       var v: MeoValue;
-      rc = meo_tbl_lookup_rowid(db, t, id, buf, MEO_REC_MAX, &row);
+      rc = meo_tbl_lookup_rowid(db, t, id, &buf, &row);
       if (rc == MEO_OK) { rc = meo_tbl_row_get(t, &row, c, &v); }
       if (rc != MEO_OK || v.type == MEO_T_NULL) {
         n = -1;
@@ -206,7 +207,7 @@ fn ix_entries(db: MeoDb*, tbl: string, col: string) -> int64 {
       }
     }
     meo_tbl_idx_scan_close(&sc);
-    free(buf);
+    meo_tbl_buf_free(&buf);
     free(pbuf);
   }
   meo_db_leave(db);

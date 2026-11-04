@@ -603,9 +603,9 @@ fn exec_visit_index(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
   var hi: MeoValue* = 0;
   if (q->plan.lo_term >= 0) { lo = &q->vals[q->spec.terms[q->plan.lo_term].v0]; }
   if (q->plan.hi_term >= 0) { hi = &q->vals[q->spec.terms[q->plan.hi_term].v0]; }
-  var buf: uint8* = malloc((int64)MEO_REC_MAX);
-  if (buf == 0) { return -MEO_ERR_NOMEM; }
-  defer free(buf);
+  var buf: MeoTblBuf;
+  meo_tbl_buf_init(&buf);
+  defer meo_tbl_buf_free(&buf);
   var sc: MeoTblIdxScan;
   var rc: int32 = meo_tbl_idx_scan_open(db, t, q->plan.range_col, lo, hi, &sc);
   if (rc != MEO_OK) { return rc; }
@@ -614,7 +614,7 @@ fn exec_visit_index(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
     var id: int64 = 0;
     rc = meo_tbl_idx_scan_next(&sc, &id);
     if (rc != 0) { break; }
-    rc = meo_tbl_lookup_rowid(db, t, id, buf, MEO_REC_MAX, &row);
+    rc = meo_tbl_lookup_rowid(db, t, id, &buf, &row);
     if (rc == MEO_OK) {
       if (exec_match(q, t, &row, &rc)) { rc = exec_take(q, t, &row, vs); }
     } else if (rc == 1) {
@@ -652,12 +652,12 @@ fn exec_visit(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
   var ids: int64* = 0;
   var n: int32 = exec_candidates(q, t, &ids);
   if (n < 0) { return n; }
-  var buf: uint8* = malloc((int64)MEO_REC_MAX);
-  if (buf == 0) { return -MEO_ERR_NOMEM; }
-  defer free(buf);
+  var buf: MeoTblBuf;
+  meo_tbl_buf_init(&buf);
+  defer meo_tbl_buf_free(&buf);
   var j: int32 = 0;
   while (j < n) {
-    rc = meo_tbl_lookup_rowid(db, t, ids[j], buf, MEO_REC_MAX, &row);
+    rc = meo_tbl_lookup_rowid(db, t, ids[j], &buf, &row);
     if (rc < 0) { return rc; }
     if (rc == MEO_OK) {
       if (exec_match(q, t, &row, &rc)) { rc = exec_take(q, t, &row, vs); }
@@ -795,16 +795,16 @@ fn exec_update_rows(q: MeoQuery*, t: MeoTable*, ids: int64*, n: int32, wrote: bo
   var db: MeoDb* = q->db;
   var nc: int32 = t->n_cols;
   var rows: MeoValue* = (MeoValue*)malloc((int64)n * (int64)nc * (int64)sizeof(MeoValue));
-  var buf: uint8* = malloc((int64)MEO_REC_MAX);
   var tmp: MeoArena* = meo_arena_new(65536);
-  if (rows == 0 || buf == 0 || tmp == 0) {
+  if (rows == 0 || tmp == 0) {
     if (rows != 0) { free(rows); }
-    if (buf != 0) { free(buf); }
     if (tmp != 0) { meo_arena_free(tmp); }
     return -MEO_ERR_NOMEM;
   }
   defer free(rows);
-  defer free(buf);
+  var buf: MeoTblBuf;
+  meo_tbl_buf_init(&buf);
+  defer meo_tbl_buf_free(&buf);
   defer meo_arena_free(tmp);
   var int64_min: int64 = (int64)((uint64)1 << 63);
   var int64_max: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
@@ -812,7 +812,7 @@ fn exec_update_rows(q: MeoQuery*, t: MeoTable*, ids: int64*, n: int32, wrote: bo
   var rc: int32 = MEO_OK;
   var r: int32 = 0;
   while (r < n) {
-    rc = meo_tbl_lookup_rowid(db, t, ids[r], buf, MEO_REC_MAX, &row);
+    rc = meo_tbl_lookup_rowid(db, t, ids[r], &buf, &row);
     if (rc == 1) { return -MEO_ERR_CORRUPT; }   // collected under the same lock
     if (rc != MEO_OK) { return rc; }
     var vals: MeoValue* = rows + (int64)r * (int64)nc;

@@ -1,0 +1,676 @@
+// rowbig_self: rows past MEO_REC_MAX, stored in overflow chains, driven
+// through the typed query API.
+//
+// A program, not @test functions: every case needs a real db file. Prints
+// "PASS <case>" per case and "FAIL <case>: <detail>" per failing check.
+//
+//   r1_round_trip   2 KB, 100 KB and 16 MiB TEXT and BLOB rows insert and
+//                   select back byte for byte; one byte past MEO_ROW_MAX is
+//                   TOOBIG and writes nothing.
+//   r2_threshold    a record of MEO_REC_MAX bytes stays in the leaf, one more
+//                   overflows; both read back.
+//   r3_update       big -> small, small -> big, big -> big, and an update that
+//                   leaves the big value alone.
+//   r4_delete       a deleted big row frees its chain; a re-insert reuses it.
+//   r5_cycles       50 insert/delete cycles of a 1 MiB row keep the page count.
+//   r6_rollback     a rolled-back transaction of big writes leaves rows and
+//                   page count as before, also after reopen.
+//   r7_reopen       big rows survive a close and reopen.
+//   r8_scans        full scan, rowid range, index point and range, equality on
+//                   a big value, and meo_q_scan_xy over every x path, with
+//                   small and big rows mixed.
+//   r9_unique       a UNIQUE value past MEO_REC_MAX is TOOBIG; one at the limit
+//                   in a big row indexes and is found.
+//   r10_drop        DROP TABLE frees the chains of its big rows.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meodb.mettle";
+import "tinytest.mettle";
+
+const RB_DB: string = "/dev/shm/meodb_rowbig_self.dat";
+const RB_KIB: int32 = 1024;
+const RB_MIB: int32 = 1048576;
+const RB_ROWS: int32 = 40;
+
+// --- helpers ---------------------------------------------------------------
+
+fn rb_remove() {
+  meo_file_unlink(RB_DB);
+  var jpath: string = RB_DB + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+}
+
+fn rb_i(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn rb_r(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+// Byte i of a body seeded `salt`: a letter, so it is fine as TEXT too.
+fn rb_byte(i: int32, salt: int32) -> uint8 {
+  return (uint8)(97 + ((i * 7 + (i >> 8) * 13 + (i >> 16) * 31 + salt) % 26));
+}
+
+fn rb_fill(buf: uint8*, n: int32, salt: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = rb_byte(i, salt);
+    i += 1;
+  }
+}
+
+fn rb_same(p: uint8*, n: int32, salt: int32) -> bool {
+  var i: int32 = 0;
+  while (i < n) {
+    if (p[i] != rb_byte(i, salt)) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+fn rb_pages(db: MeoDb*) -> int64 {
+  return (int64)db->pager->page_count;
+}
+
+fn rb_open(db: MeoDb**) -> bool {
+  var rc: int32 = meo_db_open(RB_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, db);
+  return meo_t_check_i64(rc, MEO_OK, "open");
+}
+
+// One statement run to the end. MEO_DONE or the failing code.
+fn rb_run(q: MeoQuery*) -> int32 {
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+// bb(id INTEGER PRIMARY KEY, body BLOB): its record is body + 5 bytes up to a
+// 16383-byte body.
+fn rb_create_bb(db: MeoDb*) -> bool {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "bb", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "body", MEO_T_BLOB, 0);
+  return meo_t_check_i64(rb_run(q), MEO_DONE, "create bb");
+}
+
+// Insert (id, body of n bytes seeded salt) into bb. MEO_DONE or a failing code.
+fn rb_put(db: MeoDb*, id: int64, n: int32, salt: int32) -> int32 {
+  var body: uint8* = malloc((int64)n + 1);
+  if (body == 0) { return -MEO_ERR_NOMEM; }
+  rb_fill(body, n, salt);
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "bb", &q);
+  if (rc != MEO_OK) {
+    free(body);
+    return rc;
+  }
+  var a: MeoValue = rb_i(id);
+  var b: MeoValue;
+  meo_value_set_blob(&b, body, n);
+  meo_q_value(q, &a);
+  meo_q_value(q, &b);
+  rc = rb_run(q);
+  free(body);
+  return rc;
+}
+
+// bb row `id` has a body of n bytes seeded salt (n < 0: no such row).
+fn rb_has(db: MeoDb*, id: int64, n: int32, salt: int32, label: string) -> bool {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "bb", &q);
+  meo_q_pick(q, "body");
+  var a: MeoValue = rb_i(id);
+  meo_q_where(q, "id", MEO_Q_EQ, &a);
+  var rc: int32 = meo_q_step(q);
+  var ok: bool = true;
+  if (n < 0) {
+    ok = meo_t_check_i64(rc, MEO_DONE, label + ": absent");
+  } else if (meo_t_check_i64(rc, MEO_ROW, label + ": row")) {
+    ok = meo_t_check_i64(meo_q_column_bytes(q, 0), n, label + ": length");
+    if (ok) { ok = meo_t_check(rb_same(meo_q_column_blob(q, 0), n, salt), label + ": bytes"); }
+  } else {
+    ok = false;
+  }
+  meo_q_free(q);
+  return ok;
+}
+
+fn rb_count(db: MeoDb*, tbl: string) -> int64 {
+  var q: MeoQuery* = 0;
+  if (meo_q_count(db, tbl, &q) != MEO_OK) { return -1; }
+  var n: int64 = -1;
+  if (meo_q_step(q) == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+fn rb_delete(db: MeoDb*, id: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_delete(db, "bb", &q);
+  if (rc != MEO_OK) { return rc; }
+  var a: MeoValue = rb_i(id);
+  meo_q_where(q, "id", MEO_Q_EQ, &a);
+  return rb_run(q);
+}
+
+// UPDATE bb SET body = (n bytes seeded salt) WHERE id = `id`.
+fn rb_set(db: MeoDb*, id: int64, n: int32, salt: int32) -> int32 {
+  var body: uint8* = malloc((int64)n + 1);
+  if (body == 0) { return -MEO_ERR_NOMEM; }
+  rb_fill(body, n, salt);
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_update(db, "bb", &q);
+  if (rc != MEO_OK) {
+    free(body);
+    return rc;
+  }
+  var b: MeoValue;
+  meo_value_set_blob(&b, body, n);
+  meo_q_assign(q, "body", &b);
+  var a: MeoValue = rb_i(id);
+  meo_q_where(q, "id", MEO_Q_EQ, &a);
+  rc = rb_run(q);
+  free(body);
+  return rc;
+}
+
+// True when row `id` of table `name` reads from an overflow chain.
+fn rb_is_overflow(db: MeoDb*, name: string, id: int64) -> bool {
+  meo_db_enter(db);
+  var t: MeoTable* = meo_cat_find(db->cat, name.chars, (int32)name.length);
+  var sc: MeoTblScan;
+  var row: MeoTblRow;
+  var big: bool = false;
+  if (t != 0 && meo_tbl_scan_from(db, t, id, &sc) == MEO_OK) {
+    if (meo_tbl_scan_next(&sc, &row) == 0 && row.rowid == id) {
+      big = sc.buf.data != 0 && row.rec == sc.buf.data;
+    }
+    meo_tbl_scan_close(&sc);
+  }
+  meo_db_leave(db);
+  return big;
+}
+
+// --- r1 ----------------------------------------------------------------------
+
+// bg(id INTEGER PRIMARY KEY, x INTEGER UNIQUE, y REAL, n INTEGER, u TEXT UNIQUE,
+//    body TEXT)
+fn rb_create_bg(db: MeoDb*) -> bool {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "bg", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "x", MEO_T_INT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "y", MEO_T_REAL, 0);
+  meo_q_column_def(q, "n", MEO_T_INT, 0);
+  meo_q_column_def(q, "u", MEO_T_TEXT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "body", MEO_T_TEXT, 0);
+  return meo_t_check_i64(rb_run(q), MEO_DONE, "create bg");
+}
+
+// Insert bg row `id`: x = 10 id, y = id / 2, n = 2 id, u = "u<id>", body of
+// `len` bytes seeded id (len 0: NULL). MEO_DONE or a failing code.
+fn rb_put_bg(db: MeoDb*, id: int64, len: int32, u_len: int32) -> int32 {
+  var body: uint8* = malloc((int64)len + (int64)u_len + 1);
+  if (body == 0) { return -MEO_ERR_NOMEM; }
+  rb_fill(body, len, (int32)id);
+  var ub: uint8* = body + len;
+  rb_fill(ub, u_len, 3);
+  // The unique text carries the id in its first bytes.
+  if (u_len >= 8) {
+    var k: int32 = 0;
+    var d: int64 = id;
+    while (k < 4) {
+      ub[k] = (uint8)(48 + d % 10);
+      d = d / 10;
+      k += 1;
+    }
+  }
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "bg", &q);
+  if (rc != MEO_OK) {
+    free(body);
+    return rc;
+  }
+  var a: MeoValue = rb_i(id);
+  var x: MeoValue = rb_i(id * 10);
+  var y: MeoValue = rb_r((float64)id * 0.5);
+  var n: MeoValue = rb_i(id * 2);
+  var u: MeoValue;
+  meo_value_set_text(&u, ub, u_len);
+  var b: MeoValue;
+  if (len > 0) { meo_value_set_text(&b, body, len); } else { meo_value_set_null(&b); }
+  meo_q_value(q, &a);
+  meo_q_value(q, &x);
+  meo_q_value(q, &y);
+  meo_q_value(q, &n);
+  meo_q_value(q, &u);
+  meo_q_value(q, &b);
+  rc = rb_run(q);
+  free(body);
+  return rc;
+}
+
+fn r1_round_trip(db: MeoDb*) -> int32 {
+  if (!rb_create_bb(db)) { return 1; }
+  var sizes: int32[3];
+  sizes[0] = 2 * RB_KIB;
+  sizes[1] = 100 * RB_KIB;
+  sizes[2] = MEO_ROW_MAX - 7;   // exactly MEO_ROW_MAX with the record framing
+  var i: int32 = 0;
+  while (i < 3) {
+    var id: int64 = (int64)i + 1;
+    if (!meo_t_check_i64(rb_put(db, id, sizes[i], i + 1), MEO_DONE, "r1 insert blob")) { return 1; }
+    if (!rb_has(db, id, sizes[i], i + 1, "r1 blob")) { return 1; }
+    i += 1;
+  }
+  if (!meo_t_check(rb_is_overflow(db, "bb", 3), "r1 16 MiB row is chained")) { return 1; }
+  // One byte more is TOOBIG and leaves nothing behind.
+  var pages: int64 = rb_pages(db);
+  if (!meo_t_check_i64(rb_put(db, 4, MEO_ROW_MAX - 6, 9), -MEO_ERR_TOOBIG, "r1 past the max")) { return 1; }
+  if (!meo_t_check_i64(rb_count(db, "bb"), 3, "r1 count after TOOBIG")) { return 1; }
+  if (!meo_t_check_i64(rb_pages(db), pages, "r1 pages after TOOBIG")) { return 1; }
+  // TEXT rows: the same sizes through bg's body.
+  if (!rb_create_bg(db)) { return 1; }
+  if (!meo_t_check_i64(rb_put_bg(db, 1, 2 * RB_KIB, 8), MEO_DONE, "r1 insert 2 KB text")) { return 1; }
+  if (!meo_t_check_i64(rb_put_bg(db, 2, 100 * RB_KIB, 8), MEO_DONE, "r1 insert 100 KB text")) { return 1; }
+  if (!meo_t_check_i64(rb_put_bg(db, 3, MEO_ROW_MAX - 100, 8), MEO_DONE, "r1 insert 16 MiB text")) { return 1; }
+  var j: int32 = 1;
+  while (j <= 3) {
+    var q: MeoQuery* = 0;
+    meo_q_select(db, "bg", &q);
+    meo_q_pick(q, "body");
+    var a: MeoValue = rb_i(j);
+    meo_q_where(q, "id", MEO_Q_EQ, &a);
+    var want: int32 = 2 * RB_KIB;
+    if (j == 2) { want = 100 * RB_KIB; }
+    if (j == 3) { want = MEO_ROW_MAX - 100; }
+    var ok: bool = meo_t_check_i64(meo_q_step(q), MEO_ROW, "r1 text row");
+    if (ok) { ok = meo_t_check_i64(meo_q_column_bytes(q, 0), want, "r1 text length"); }
+    if (ok) { ok = meo_t_check(rb_same(meo_q_column_text(q, 0), want, j), "r1 text bytes"); }
+    meo_q_free(q);
+    if (!ok) { return 1; }
+    j += 1;
+  }
+  println("PASS r1_round_trip");
+  return 0;
+}
+
+// --- r2 ----------------------------------------------------------------------
+
+fn r2_threshold(db: MeoDb*) -> int32 {
+  // record = 1 (columns) + 2 (tags) + 2 (length) + body = body + 5.
+  var edge: int32 = MEO_REC_MAX - 5;
+  if (!meo_t_check_i64(rb_put(db, 10, edge, 5), MEO_DONE, "r2 insert at the limit")) { return 1; }
+  if (!meo_t_check_i64(rb_put(db, 11, edge + 1, 6), MEO_DONE, "r2 insert past the limit")) { return 1; }
+  if (!meo_t_check_false(rb_is_overflow(db, "bb", 10), "r2 limit row stays in the leaf")) { return 1; }
+  if (!meo_t_check(rb_is_overflow(db, "bb", 11), "r2 limit+1 row overflows")) { return 1; }
+  if (!rb_has(db, 10, edge, 5, "r2 limit row")) { return 1; }
+  if (!rb_has(db, 11, edge + 1, 6, "r2 limit+1 row")) { return 1; }
+  println("PASS r2_threshold");
+  return 0;
+}
+
+// --- r3 ----------------------------------------------------------------------
+
+fn r3_update(db: MeoDb*) -> int32 {
+  // big -> small
+  if (!meo_t_check_i64(rb_set(db, 2, 300, 21), MEO_DONE, "r3 big to small")) { return 1; }
+  if (!rb_has(db, 2, 300, 21, "r3 big to small")) { return 1; }
+  if (!meo_t_check_false(rb_is_overflow(db, "bb", 2), "r3 shrunk row is in the leaf")) { return 1; }
+  // small -> big
+  if (!meo_t_check_i64(rb_set(db, 2, 200 * RB_KIB, 22), MEO_DONE, "r3 small to big")) { return 1; }
+  if (!rb_has(db, 2, 200 * RB_KIB, 22, "r3 small to big")) { return 1; }
+  // big -> big, shorter and longer
+  if (!meo_t_check_i64(rb_set(db, 2, 20 * RB_KIB, 23), MEO_DONE, "r3 big to big shorter")) { return 1; }
+  if (!rb_has(db, 2, 20 * RB_KIB, 23, "r3 big to big shorter")) { return 1; }
+  if (!meo_t_check_i64(rb_set(db, 2, 300 * RB_KIB, 24), MEO_DONE, "r3 big to big longer")) { return 1; }
+  if (!rb_has(db, 2, 300 * RB_KIB, 24, "r3 big to big longer")) { return 1; }
+  // The other rows did not move.
+  if (!rb_has(db, 1, 2 * RB_KIB, 1, "r3 row 1 intact")) { return 1; }
+  if (!rb_has(db, 3, MEO_ROW_MAX - 7, 3, "r3 row 3 intact")) { return 1; }
+  // Moving the rowid alias of a big row moves its chain along.
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "bb", &q);
+  var nid: MeoValue = rb_i(20);
+  meo_q_assign(q, "id", &nid);
+  var a: MeoValue = rb_i(2);
+  meo_q_where(q, "id", MEO_Q_EQ, &a);
+  if (!meo_t_check_i64(rb_run(q), MEO_DONE, "r3 move rowid")) { return 1; }
+  if (!rb_has(db, 2, -1, 0, "r3 old rowid")) { return 1; }
+  if (!rb_has(db, 20, 300 * RB_KIB, 24, "r3 new rowid")) { return 1; }
+  println("PASS r3_update");
+  return 0;
+}
+
+// --- r4 ----------------------------------------------------------------------
+
+fn r4_delete(db: MeoDb*) -> int32 {
+  var base: int64 = rb_pages(db);
+  if (!meo_t_check_i64(rb_put(db, 30, RB_MIB, 31), MEO_DONE, "r4 insert")) { return 1; }
+  var grown: int64 = rb_pages(db);
+  if (!meo_t_check(grown > base + 100, "r4 chain took pages")) { return 1; }
+  if (!meo_t_check_i64(rb_delete(db, 30), MEO_DONE, "r4 delete")) { return 1; }
+  if (!rb_has(db, 30, -1, 0, "r4 deleted")) { return 1; }
+  if (!meo_t_check_i64(rb_put(db, 30, RB_MIB, 32), MEO_DONE, "r4 re-insert")) { return 1; }
+  // The first cycle may add a bookkeeping page; after it the count is fixed.
+  grown = rb_pages(db);
+  if (!meo_t_check_i64(rb_delete(db, 30), MEO_DONE, "r4 delete again")) { return 1; }
+  if (!meo_t_check_i64(rb_put(db, 30, RB_MIB, 33), MEO_DONE, "r4 insert again")) { return 1; }
+  if (!meo_t_check_i64(rb_pages(db), grown, "r4 freed pages reused")) { return 1; }
+  if (!rb_has(db, 30, RB_MIB, 33, "r4 re-inserted")) { return 1; }
+  if (!meo_t_check_i64(rb_delete(db, 30), MEO_DONE, "r4 delete last")) { return 1; }
+  println("PASS r4_delete");
+  return 0;
+}
+
+// --- r5 ----------------------------------------------------------------------
+
+fn r5_cycles(db: MeoDb*) -> int32 {
+  if (!meo_t_check_i64(rb_put(db, 40, RB_MIB, 41), MEO_DONE, "r5 first insert")) { return 1; }
+  if (!meo_t_check_i64(rb_delete(db, 40), MEO_DONE, "r5 first delete")) { return 1; }
+  var steady: int64 = rb_pages(db);
+  var i: int32 = 0;
+  while (i < 50) {
+    if (!meo_t_check_i64(rb_put(db, 40, RB_MIB, 42 + i), MEO_DONE, "r5 insert")) { return 1; }
+    if (!meo_t_check_i64(rb_delete(db, 40), MEO_DONE, "r5 delete")) { return 1; }
+    i += 1;
+  }
+  if (!meo_t_check_i64(rb_pages(db), steady, "r5 page count after 50 cycles")) { return 1; }
+  println("PASS r5_cycles");
+  return 0;
+}
+
+// --- r6 ----------------------------------------------------------------------
+
+fn r6_rollback(db: MeoDb**) -> int32 {
+  var cnt: int64 = rb_count(db[0], "bb");
+  var pages: int64 = rb_pages(db[0]);
+  if (!meo_t_check_i64(meo_db_begin(db[0], MEO_TX_DEFAULT), MEO_OK, "r6 begin")) { return 1; }
+  if (!meo_t_check_i64(rb_put(db[0], 50, RB_MIB, 51), MEO_DONE, "r6 insert")) { return 1; }
+  if (!meo_t_check_i64(rb_put(db[0], 51, 3 * RB_KIB, 52), MEO_DONE, "r6 insert 2")) { return 1; }
+  if (!meo_t_check_i64(rb_set(db[0], 20, 700 * RB_KIB, 53), MEO_DONE, "r6 update")) { return 1; }
+  if (!meo_t_check_i64(rb_delete(db[0], 1), MEO_DONE, "r6 delete small-chain row")) { return 1; }
+  if (!meo_t_check_i64(rb_delete(db[0], 11), MEO_DONE, "r6 delete chained row")) { return 1; }
+  if (!meo_t_check_i64(meo_db_rollback(db[0]), MEO_OK, "r6 rollback")) { return 1; }
+  if (!meo_t_check_i64(rb_count(db[0], "bb"), cnt, "r6 rows after rollback")) { return 1; }
+  if (!meo_t_check_i64(rb_pages(db[0]), pages, "r6 pages after rollback")) { return 1; }
+  if (!rb_has(db[0], 20, 300 * RB_KIB, 24, "r6 updated row restored")) { return 1; }
+  if (!rb_has(db[0], 11, MEO_REC_MAX - 4, 6, "r6 deleted row restored")) { return 1; }
+  if (!rb_has(db[0], 50, -1, 0, "r6 rolled-back insert")) { return 1; }
+  meo_db_close(db[0]);
+  if (!rb_open(db)) { return 1; }
+  if (!meo_t_check_i64(rb_count(db[0], "bb"), cnt, "r6 rows after reopen")) { return 1; }
+  if (!meo_t_check_i64(rb_pages(db[0]), pages, "r6 pages after reopen")) { return 1; }
+  if (!rb_has(db[0], 20, 300 * RB_KIB, 24, "r6 row after reopen")) { return 1; }
+  println("PASS r6_rollback");
+  return 0;
+}
+
+// --- r7 ----------------------------------------------------------------------
+
+fn r7_reopen(db: MeoDb**) -> int32 {
+  if (!meo_t_check_i64(meo_db_close(db[0]), MEO_OK, "r7 close")) { return 1; }
+  if (!rb_open(db)) { return 1; }
+  if (!rb_has(db[0], 1, 2 * RB_KIB, 1, "r7 row 1")) { return 1; }
+  if (!rb_has(db[0], 3, MEO_ROW_MAX - 7, 3, "r7 16 MiB row")) { return 1; }
+  if (!rb_has(db[0], 11, MEO_REC_MAX - 4, 6, "r7 limit+1 row")) { return 1; }
+  if (!rb_has(db[0], 20, 300 * RB_KIB, 24, "r7 moved row")) { return 1; }
+  println("PASS r7_reopen");
+  return 0;
+}
+
+// --- r8 ----------------------------------------------------------------------
+
+// Rows 1..RB_ROWS of bg (rows 1-3 are r1's): every 5th is big, the rest small.
+fn rb_len(id: int32) -> int32 {
+  if (id % 5 == 0) { return 3000 + id * 50; }
+  return 40 + id;
+}
+
+var g_n: int32 = 0;
+var g_sum: float64 = 0.0;
+var g_bad: int32 = 0;
+var g_seen: int64 = 0;
+
+fn rb_cb(ctx: rawptr, x: float64, y: float64) -> int32 {
+  g_n += 1;
+  g_sum += y;
+  // x is 10 id (x path) or the rowid / n: y is id / 2 either way.
+  if (x < 0.0) { g_bad += 1; }
+  return 0;
+}
+
+fn rb_cbg(ctx: rawptr, g: int64, x: float64, y: float64) -> int32 {
+  g_n += 1;
+  g_sum += y;
+  g_seen += g;
+  return 0;
+}
+
+// SELECT id FROM bg WHERE c1 op1 v1 [AND c2 op2 v2]: the row count into g_n
+// and the sum of ids into g_seen.
+fn rb_ids(db: MeoDb*, c1: string, op1: int32, v1: MeoValue, c2: string, op2: int32,
+    v2: MeoValue) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(db, "bg", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_pick(q, "id");
+  meo_q_where(q, c1, op1, &v1);
+  if (c2.length > 0) { meo_q_where(q, c2, op2, &v2); }
+  g_n = 0;
+  g_seen = 0;
+  rc = meo_q_step(q);
+  while (rc == MEO_ROW) {
+    g_n += 1;
+    g_seen += meo_q_column_int64(q, 0);
+    rc = meo_q_step(q);
+  }
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn r8_scans(db: MeoDb*) -> int32 {
+  var id: int32 = 4;
+  while (id <= RB_ROWS) {
+    if (!meo_t_check_i64(rb_put_bg(db, id, rb_len(id), 8), MEO_DONE, "r8 insert")) { return 1; }
+    id += 1;
+  }
+  // Full scan with every body checked.
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "bg", &q);
+  meo_q_pick(q, "id");
+  meo_q_pick(q, "body");
+  var rc: int32 = meo_q_step(q);
+  var seen: int32 = 0;
+  var ok: bool = true;
+  while (rc == MEO_ROW && ok) {
+    var rid: int32 = (int32)meo_q_column_int64(q, 0);
+    var want: int32 = rb_len(rid);
+    if (rid == 1) { want = 2 * RB_KIB; }
+    if (rid == 2) { want = 100 * RB_KIB; }
+    if (rid == 3) { want = MEO_ROW_MAX - 100; }
+    ok = meo_t_check_i64(meo_q_column_bytes(q, 1), want, "r8 scan length");
+    if (ok) { ok = meo_t_check(rb_same(meo_q_column_text(q, 1), want, rid), "r8 scan bytes"); }
+    seen += 1;
+    rc = meo_q_step(q);
+  }
+  meo_q_free(q);
+  if (!ok) { return 1; }
+  if (!meo_t_check_i64(rc, MEO_DONE, "r8 scan end")) { return 1; }
+  if (!meo_t_check_i64(seen, RB_ROWS, "r8 scan rows")) { return 1; }
+  // Rowid range over a stretch holding big rows 10, 15, 20.
+  var none: MeoValue;
+  meo_value_set_null(&none);
+  if (!meo_t_check_i64(rb_ids(db, "id", MEO_Q_GE, rb_i(9), "id", MEO_Q_LE, rb_i(21)), MEO_OK, "r8 rowid range")) { return 1; }
+  if (!meo_t_check_i64(g_n, 13, "r8 rowid range rows")) { return 1; }
+  if (!meo_t_check_i64(g_seen, 195, "r8 rowid range ids")) { return 1; }
+  // Index range on x (= 10 id): ids 10..19, with big row 10 and 15.
+  if (!meo_t_check_i64(rb_ids(db, "x", MEO_Q_GE, rb_i(100), "x", MEO_Q_LT, rb_i(200)), MEO_OK, "r8 index range")) { return 1; }
+  if (!meo_t_check_i64(g_n, 10, "r8 index range rows")) { return 1; }
+  if (!meo_t_check_i64(g_seen, 145, "r8 index range ids")) { return 1; }
+  // Index point on a big row.
+  if (!meo_t_check_i64(rb_ids(db, "x", MEO_Q_EQ, rb_i(250), "", 0, none), MEO_OK, "r8 index point")) { return 1; }
+  if (!meo_t_check_i64(g_seen, 25, "r8 index point id")) { return 1; }
+  // Equality on a big value finds exactly its row (a full scan filter).
+  var want_len: int32 = rb_len(25);
+  var body: uint8* = malloc((int64)want_len + 1);
+  rb_fill(body, want_len, 25);
+  var bv: MeoValue;
+  meo_value_set_text(&bv, body, want_len);
+  var rc2: int32 = rb_ids(db, "body", MEO_Q_EQ, bv, "", 0, none);
+  free(body);
+  if (!meo_t_check_i64(rc2, MEO_OK, "r8 body equality")) { return 1; }
+  if (!meo_t_check_i64(g_n, 1, "r8 body equality rows")) { return 1; }
+  if (!meo_t_check_i64(g_seen, 25, "r8 body equality id")) { return 1; }
+  // meo_q_scan_xy over the rowid alias, the index, and an unindexed column.
+  var want_sum: float64 = 0.0;
+  id = 1;
+  while (id <= RB_ROWS) {
+    want_sum += (float64)id * 0.5;
+    id += 1;
+  }
+  var xs: string[] = new string[3];
+  xs[0] = "id";
+  xs[1] = "x";
+  xs[2] = "n";
+  var k: int32 = 0;
+  while (k < 3) {
+    g_n = 0;
+    g_sum = 0.0;
+    g_bad = 0;
+    rc = meo_q_scan_xy(db, "bg", xs[k], "y", 0.0, 1.0e9, rb_cb, 0);
+    if (!meo_t_check_i64(rc, MEO_OK, "r8 scan_xy")) { return 1; }
+    if (!meo_t_check_i64(g_n, RB_ROWS, "r8 scan_xy rows")) { return 1; }
+    if (!meo_t_check(g_sum == want_sum, "r8 scan_xy sum")) { return 1; }
+    k += 1;
+  }
+  free(xs.data);
+  // Grouped: group by n, which is 2 id, so the group sum is the id sum times 2.
+  g_n = 0;
+  g_sum = 0.0;
+  g_seen = 0;
+  rc = meo_q_scan_xyg(db, "bg", "x", "y", "n", 0.0, 1.0e9, rb_cbg, 0);
+  if (!meo_t_check_i64(rc, MEO_OK, "r8 scan_xyg")) { return 1; }
+  if (!meo_t_check_i64(g_n, RB_ROWS, "r8 scan_xyg rows")) { return 1; }
+  if (!meo_t_check_i64(g_seen, (int64)RB_ROWS * (RB_ROWS + 1), "r8 scan_xyg groups")) { return 1; }
+  // A window of x skips the rows outside it, big ones included.
+  g_n = 0;
+  g_sum = 0.0;
+  rc = meo_q_scan_xy(db, "bg", "x", "y", 95.0, 205.0, rb_cb, 0);
+  if (!meo_t_check_i64(rc, MEO_OK, "r8 scan_xy window")) { return 1; }
+  if (!meo_t_check_i64(g_n, 11, "r8 scan_xy window rows")) { return 1; }
+  println("PASS r8_scans");
+  return 0;
+}
+
+// --- r9 ----------------------------------------------------------------------
+
+fn r9_unique(db: MeoDb*) -> int32 {
+  // A key of MEO_REC_MAX bytes (the tag and 1279 text bytes) fits, in a row
+  // that is itself chained.
+  if (!meo_t_check_i64(rb_put_bg(db, 60, 5000, MEO_REC_MAX - 1), MEO_DONE, "r9 key at the limit")) { return 1; }
+  var u: uint8* = malloc((int64)MEO_REC_MAX);
+  rb_fill(u, MEO_REC_MAX - 1, 3);
+  var k: int32 = 0;
+  var d: int64 = 60;
+  while (k < 4) {
+    u[k] = (uint8)(48 + d % 10);
+    d = d / 10;
+    k += 1;
+  }
+  var uv: MeoValue;
+  meo_value_set_text(&uv, u, MEO_REC_MAX - 1);
+  var none: MeoValue;
+  meo_value_set_null(&none);
+  var rc: int32 = rb_ids(db, "u", MEO_Q_EQ, uv, "", 0, none);
+  free(u);
+  if (!meo_t_check_i64(rc, MEO_OK, "r9 find by key")) { return 1; }
+  if (!meo_t_check_i64(g_seen, 60, "r9 key finds its row")) { return 1; }
+  // One byte more is TOOBIG, and nothing is written.
+  var rows: int64 = rb_count(db, "bg");
+  var pages: int64 = rb_pages(db);
+  if (!meo_t_check_i64(rb_put_bg(db, 61, 5000, MEO_REC_MAX), -MEO_ERR_TOOBIG, "r9 key past the limit")) { return 1; }
+  if (!meo_t_check_i64(rb_count(db, "bg"), rows, "r9 rows after TOOBIG")) { return 1; }
+  if (!meo_t_check_i64(rb_pages(db), pages, "r9 pages after TOOBIG")) { return 1; }
+  println("PASS r9_unique");
+  return 0;
+}
+
+// --- r10 ---------------------------------------------------------------------
+
+fn r10_drop(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "dd", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "body", MEO_T_BLOB, 0);
+  if (!meo_t_check_i64(rb_run(q), MEO_DONE, "r10 create")) { return 1; }
+  var body: uint8* = malloc((int64)(400 * RB_KIB));
+  rb_fill(body, 400 * RB_KIB, 7);
+  var round: int32 = 0;
+  var steady: int64 = 0;
+  while (round < 3) {
+    var ins: MeoQuery* = 0;
+    meo_q_insert(db, "dd", &ins);
+    var v: MeoValue;
+    meo_value_set_blob(&v, body, 400 * RB_KIB);
+    var a: MeoValue = rb_i(1);
+    meo_q_value(ins, &a);
+    meo_q_value(ins, &v);
+    if (!meo_t_check_i64(rb_run(ins), MEO_DONE, "r10 insert")) { return 1; }
+    var ins2: MeoQuery* = 0;
+    meo_q_insert(db, "dd", &ins2);
+    a = rb_i(2);
+    meo_q_value(ins2, &a);
+    meo_q_value(ins2, &v);
+    if (!meo_t_check_i64(rb_run(ins2), MEO_DONE, "r10 insert 2")) { return 1; }
+    var dr: MeoQuery* = 0;
+    meo_q_drop(db, "dd", &dr);
+    if (!meo_t_check_i64(rb_run(dr), MEO_DONE, "r10 drop")) { return 1; }
+    if (round == 0) { steady = rb_pages(db); }
+    if (!meo_t_check_i64(rb_pages(db), steady, "r10 pages after drop")) { return 1; }
+    var cq: MeoQuery* = 0;
+    meo_q_create(db, "dd", &cq);
+    meo_q_column_def(cq, "id", MEO_T_INT, MEO_COL_PK);
+    meo_q_column_def(cq, "body", MEO_T_BLOB, 0);
+    if (!meo_t_check_i64(rb_run(cq), MEO_DONE, "r10 recreate")) { return 1; }
+    round += 1;
+  }
+  free(body);
+  println("PASS r10_drop");
+  return 0;
+}
+
+fn main() -> int32 {
+  rb_remove();
+  var db: MeoDb* = 0;
+  var rc: int32 = 1;
+  if (rb_open(&db)) {
+    rc = r1_round_trip(db);
+    if (rc == 0) { rc = r2_threshold(db); }
+    if (rc == 0) { rc = r3_update(db); }
+    if (rc == 0) { rc = r4_delete(db); }
+    if (rc == 0) { rc = r5_cycles(db); }
+    if (rc == 0) { rc = r6_rollback(&db); }
+    if (rc == 0) { rc = r7_reopen(&db); }
+    if (rc == 0) { rc = r8_scans(db); }
+    if (rc == 0) { rc = r9_unique(db); }
+    if (rc == 0) { rc = r10_drop(db); }
+    meo_db_close(db);
+  }
+  rb_remove();
+  if (rc == 0) { println("PASS rowbig_self"); }
+  return meo_t_report();
+}
