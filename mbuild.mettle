@@ -185,4 +185,16 @@ fn project() {
 
   // Server in WAL mode.
   mb_bin("srv_wal", "tests/srv_wal.mettle");
+
+  // Feed wait, scans on a snapshot view, row decode.
+  mb_bin("scan_view", "tests/scan_view.mettle");
+
+  // Wire SUBSCRIBE.
+  mb_bin("srv_sub", "tests/srv_sub.mettle");
+
+  // Wire streaming SCAN.
+  mb_bin("srv_scan", "tests/srv_scan.mettle");
+
+  // Client subscribe and scan.
+  mb_bin("cli_sub", "tests/cli_sub.mettle");
 }
