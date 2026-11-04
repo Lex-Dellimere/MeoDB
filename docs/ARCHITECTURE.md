@@ -13,9 +13,9 @@ Build order: [ROADMAP.md](ROADMAP.md).
 | 2 | B-tree + key encoding | `src/btree/`, `src/types/key.mettle` | `meo_bt_`, `meo_btn_`, `meo_key_` | 1 | tables, indexes, graph | built; delete in M2 |
 | 3 | Records, catalog, tables, db handle | `src/record/`, `src/catalog/`, `src/table/`, `src/db/` | `meo_rec_`, `meo_cat_`, `meo_tbl_`, `meo_db_` | 2, 4a | mistplot (data mapping), flux_orm via 5 | M2 |
 | 4a | Concurrency v1: db-wide lock | `src/conc/` | `meo_lock_` | std/thread | raize_web (64 threads) | M2 |
-| 5 | SQL | `src/sql/` | `meo_sql_` | 3 | flux_orm | M2 |
+| 5 | Typed queries (no query language) | `src/query/` | `meo_q_` | 3 | flux_orm | M2 |
 | 4b | Concurrency v2: WAL + MVCC readers | `src/wal/`, `src/conc/` | `meo_wal_`, `meo_snap_` | 1, 2 | raize_web read-heavy load | later (M5) |
-| 6 | Change feed | `src/feed/` | `meo_feed_` | 1 (pager commit hook), 3 | mistplot live push, raize notifications | built for pager-level writes (`meo_feed_insert`); SQL writes in M4 |
+| 6 | Change feed | `src/feed/` | `meo_feed_` | 1 (pager commit hook), 3 | mistplot live push, raize notifications | built for pager-level writes (`meo_feed_insert`); table writes in M4 |
 | 7 | Graph | `src/graph/` | `meo_graph_` | 3 (node/edge tables, adjacency index) | apps that model relations | later (M6) |
 | 8 | Server + network | `src/net/`, `src/client/` | `meo_srv_`, `meo_cli_` | 5, 6 | remote raize workers, tools | later (M7) |
 | 9 | Replication + fault tolerance | `src/repl/`, `src/raft/` | `meo_repl_`, `meo_raft_` | 4b (WAL is the log), 8 | high availability | later (M8, M9) |
@@ -30,7 +30,7 @@ A consumer imports exactly one root file through `mettle.deps`:
 
 | Root | Contains | For |
 |---|---|---|
-| `src/meo_core.mettle` | layers 0-4a | embedded storage and tables, no SQL |
+| `src/meo_core.mettle` | layers 0-4a | embedded storage and tables, no query layer |
 | `src/meosql.mettle` | meo_core + layer 5 | flux_orm, most apps |
 | `src/meo_server.mettle` (later) | meosql + 6, 8, 11 | a networked node |
 
@@ -42,7 +42,7 @@ Rules: no circular imports (E0006 fails the build), no lower layer imports a hig
 - **Tables.** One b-tree per table. The leaf key is the 8-byte rowid followed by the row bytes. Parents keep only the 8-byte rowid. Max encoded row is 1280 bytes until overflow pages (M3).
 - **Indexes.** Each UNIQUE column and each non-integer PRIMARY KEY gets one b-tree, value -> rowid.
 - **Catalog.** Schemas live in a table tree at `meta.catalog_root`. They are loaded at open.
-- **SQL.** Lexer, recursive-descent parser, planner (rowid lookup, index lookup or full scan) and executor. A SELECT result is built at the first `step` and then read row by row.
+- **Queries.** There is no query language. A caller builds a query with function calls (`meo_q_select`, `meo_q_where`, `meo_q_order`, ...) and passes values as `MeoValue`. A planner picks a rowid lookup, an index lookup or a full scan. A select result is built at the first `meo_q_step` and then read row by row or as a whole. flux_orm translates its own query struct into these calls.
 - **Concurrency v1.** One lock per db handle, built on the runtime's futex mutex and re-entrant for its owner. One thread works inside the engine at a time. An explicit transaction holds the lock until it ends.
 
 ## How later layers fit Mettle's limits
@@ -52,7 +52,7 @@ Rules: no circular imports (E0006 fails the build), no lower layer imports a hig
 | No poll/epoll wrapper in std/net | no event loop from the stdlib | M7 starts thread-per-connection with blocking `accept`, as raize does. An epoll loop through raw `syscall` (epoll_create1 291, epoll_ctl 233, epoll_wait 232) is an option behind the same `meo_srv_` API. |
 | Atomics are int32 only (CAS, xchg, inc, dec) | no 64-bit LSN or txn counter can be updated atomically | 64-bit counters change only under a lock. Lock-free readers use a seqlock: an int32 sequence plus two 32-bit halves. |
 | No condition variables in std/thread | no blocking wait/notify | Feed and WAL waiters use futex wait/wake through `syscall(202)` on an int32 word. pthread condvars (std/thread_posix) collide with std/net_posix, so they are avoided. |
-| No thread-local storage | no per-thread error slot | Errors and counters live on the statement (`meo_sql_changes(st)`), never on the handle. |
+| No thread-local storage | no per-thread error slot | Errors and counters live on the statement (`meo_q_changes(q)`), never on the handle. |
 | No fork/exec in std | no process-per-connection, no helper processes | Threads only. Tests use raw `syscall(57)` fork for crash cases, before any thread starts. |
 | No DNS | no hostnames | Node addresses are IPv4 literals in config. |
 | IPv4 TCP/UDP only | no IPv6 | Fine for a cluster; revisit when std/net grows. |
