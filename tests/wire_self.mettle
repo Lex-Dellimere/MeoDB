@@ -1,0 +1,974 @@
+// wire_self: the wire codec on byte buffers alone, no sockets.
+//
+//   t_round      every request and response kind round-trips, including all
+//                ten statement ops
+//   t_values     NULL, INT64 min/max, -0.0 and NaN bits, empty TEXT/BLOB
+//   t_max        a TEXT and a BLOB that exactly fill the max frame; one byte
+//                more is TOOBIG; a 65535-byte name fits, 65536 is USAGE
+//   t_header     flags/rsv nonzero -> PROTO, len over max -> TOOBIG
+//   t_prefix     every prefix of every frame, and of every payload, is PROTO
+//   t_trailing   one extra byte after any payload or frame is PROTO
+//   t_counts     a count claiming more items than bytes left is PROTO and
+//                allocates nothing
+//   t_fuzz       10,000 seeded random byte flips: no crash, only known
+//                codes, and every decoded view lies inside its exact-size
+//                heap buffer
+//
+// Prints PASS per case, FAIL <label> on a failure, exits non-zero on any.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/mem/arena.mettle";
+import "../src/record/value.mettle";
+import "../src/wire/frame.mettle";
+import "../src/wire/value.mettle";
+import "../src/wire/stmt.mettle";
+import "../src/wire/msg.mettle";
+
+const T_SEED: uint32 = 20261104;
+const T_FLIPS: int32 = 10000;
+const T_MAXF: int32 = 64;
+
+var t_failures: int32 = 0;
+var t_rng: uint32 = 1;
+
+// The frame corpus the prefix, trailing and fuzz cases walk.
+var t_fp: uint8** = 0;
+var t_fn: int32* = 0;
+var t_count: int32 = 0;
+
+fn t_ok(cond: bool, label: string) -> bool {
+  if (cond) { return true; }
+  println("FAIL {label}");
+  t_failures += 1;
+  return false;
+}
+
+fn t_i32(got: int32, want: int32, label: string) -> bool {
+  if (got == want) { return true; }
+  println("FAIL {label}: expected {want}, got {got}");
+  t_failures += 1;
+  return false;
+}
+
+fn t_case(name: string, before: int32) {
+  if (t_failures == before) { println("PASS {name}"); }
+}
+
+fn t_rand() -> uint32 {
+  var x: uint32 = t_rng;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 17);
+  x = x ^ (x << 5);
+  t_rng = x;
+  return x;
+}
+
+fn t_bits(f: float64) -> uint64 {
+  var x: float64 = f;
+  var pf: float64* = &x;
+  var pu: uint64* = (uint64*)pf;
+  return *pu;
+}
+
+fn t_from_bits(u: uint64) -> float64 {
+  var x: uint64 = u;
+  var pu: uint64* = &x;
+  var pf: float64* = (float64*)pu;
+  return *pf;
+}
+
+fn t_copy(p: uint8*, n: int32) -> uint8* {
+  var m: int64 = (int64)n;
+  if (m == 0) { m = 1; }
+  var q: uint8* = (uint8*)malloc(m);
+  meo_bytes_copy(q, p, (int64)n);
+  return q;
+}
+
+fn t_bytes_eq(a: uint8*, an: int32, b: uint8*, bn: int32) -> bool {
+  if (an != bn) { return false; }
+  return meo_bytes_equal(a, b, (int64)an);
+}
+
+fn t_str_eq(a: string, b: string) -> bool {
+  return t_bytes_eq(a.chars, (int32)a.length, b.chars, (int32)b.length);
+}
+
+fn t_val_eq(a: MeoValue*, b: MeoValue*) -> bool {
+  if (a->type != b->type) { return false; }
+  switch (a->type) {
+    case 1: { return a->i == b->i; }
+    case 2: { return t_bits(a->f) == t_bits(b->f); }
+    case 3: { return t_bytes_eq(a->p, a->n, b->p, b->n); }
+    case 4: { return t_bytes_eq(a->p, a->n, b->p, b->n); }
+  }
+  return true;
+}
+
+// Is [q, q + n) inside [p, p + pn)?
+fn t_inside(p: uint8*, pn: int32, q: uint8*, n: int64) -> bool {
+  if (n == 0) { return true; }
+  var lo: int64 = (int64)p;
+  var at: int64 = (int64)q;
+  return at >= lo && at + n <= lo + (int64)pn;
+}
+
+fn t_str_inside(p: uint8*, pn: int32, s: string) -> bool {
+  return t_inside(p, pn, s.chars, (int64)s.length);
+}
+
+fn t_val_inside(p: uint8*, pn: int32, v: MeoValue*) -> bool {
+  if (v->type != MEO_T_TEXT && v->type != MEO_T_BLOB) { return true; }
+  return v->n >= 0 && t_inside(p, pn, v->p, (int64)v->n);
+}
+
+fn t_stmt_inside(p: uint8*, pn: int32, st: MeoWStmt*) -> bool {
+  if (!t_str_inside(p, pn, st->table) || !t_str_inside(p, pn, st->name)) { return false; }
+  var i: int32 = 0;
+  while (i < st->n_cols) {
+    if (!t_str_inside(p, pn, st->cols[i].name)) { return false; }
+    i += 1;
+  }
+  i = 0;
+  while (i < st->n_terms) {
+    if (!t_str_inside(p, pn, st->terms[i].col)) { return false; }
+    i += 1;
+  }
+  i = 0;
+  while (i < st->n_order) {
+    if (!t_str_inside(p, pn, st->order[i].col)) { return false; }
+    i += 1;
+  }
+  i = 0;
+  while (i < st->n_args) {
+    if (!t_val_inside(p, pn, &st->args[i])) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+// Decode one payload by kind; on success, check every view stays in bounds.
+fn t_decode(kind: int32, p: uint8*, n: int32, a: MeoArena*) -> int32 {
+  var r: MeoWRd;
+  meo_wrd_init(&r, p, n);
+  meo_arena_reset(a);
+  var rc: int32 = -MEO_ERR_PROTO;
+  var inside: bool = true;
+  switch (kind) {
+    case 1: {
+      var h: MeoWHello;
+      rc = meo_wire_hello_get(&r, &h);
+      if (rc == MEO_OK) { inside = t_str_inside(p, n, h.token) && t_str_inside(p, n, h.name); }
+    }
+    case 3: {
+      var mode: int32 = 0;
+      rc = meo_wire_begin_get(&r, &mode);
+    }
+    case 6: {
+      var st: MeoWStmt;
+      rc = meo_wire_stmt_get(&r, a, &st);
+      if (rc == MEO_OK) { inside = t_stmt_inside(p, n, &st); }
+    }
+    case 65: {
+      var ho: MeoWHelloOk;
+      rc = meo_wire_hello_ok_get(&r, &ho);
+      if (rc == MEO_OK) { inside = t_str_inside(p, n, ho.name); }
+    }
+    case 66: {
+      var e: MeoWError;
+      rc = meo_wire_error_get(&r, &e);
+      if (rc == MEO_OK) { inside = t_str_inside(p, n, e.msg); }
+    }
+    case 67: {
+      var res: MeoWResult;
+      rc = meo_wire_result_get(&r, a, &res);
+      if (rc == MEO_OK) {
+        var i: int64 = 0;
+        var total: int64 = (int64)res.n_rows * (int64)res.n_cols;
+        while (i < total && inside) {
+          inside = t_val_inside(p, n, &res.cells[i]);
+          i += 1;
+        }
+      }
+    }
+    default: {
+      if (kind == MEO_WIRE_K_PING || kind == MEO_WIRE_K_COMMIT || kind == MEO_WIRE_K_ROLLBACK
+          || kind == MEO_WIRE_K_BYE || kind == MEO_WIRE_K_OK) {
+        rc = meo_wire_empty_get(&r);
+      }
+    }
+  }
+  t_ok(inside, "decoded view outside its buffer, kind {kind}");
+  return rc;
+}
+
+// Finish w as a frame and keep a copy in the corpus.
+fn t_keep(w: MeoWBuf*, kind: int32, rid: uint32) -> int32 {
+  var n: int32 = meo_wbuf_finish(w, kind, rid);
+  if (!t_ok(n >= MEO_WIRE_HDR, "finish kind {kind}: {n}")) { return n; }
+  if (t_count < T_MAXF) {
+    t_fp[t_count] = t_copy(w->p, n);
+    t_fn[t_count] = n;
+    t_count += 1;
+  }
+  return n;
+}
+
+fn t_open(w: MeoWBuf*, r: MeoWRd*, kind: int32, rid: uint32, label: string) -> bool {
+  var h: MeoWHdr;
+  var rc: int32 = meo_wire_open(w->p, w->n, MEO_WIRE_MAX_FRAME, &h, r);
+  if (!t_i32(rc, MEO_OK, "open {label}")) { return false; }
+  t_i32(h.kind, kind, "kind {label}");
+  t_ok(h.rid == rid, "rid {label}");
+  return true;
+}
+
+fn t_str(s: string) -> string {
+  return s;
+}
+
+fn t_stmt_eq(a: MeoWStmt*, b: MeoWStmt*, label: string) {
+  t_i32(b->op, a->op, "{label} op");
+  t_ok(t_str_eq(a->table, b->table), "{label} table");
+  t_ok(t_str_eq(a->name, b->name), "{label} name");
+  t_ok(a->if_not_exists == b->if_not_exists, "{label} if_not_exists");
+  t_ok(a->unique == b->unique, "{label} unique");
+  if (!t_i32(b->n_cols, a->n_cols, "{label} n_cols")) { return; }
+  var i: int32 = 0;
+  while (i < a->n_cols) {
+    t_ok(t_str_eq(a->cols[i].name, b->cols[i].name), "{label} col name");
+    t_i32(b->cols[i].ty, a->cols[i].ty, "{label} col ty");
+    t_i32(b->cols[i].flags, a->cols[i].flags, "{label} col flags");
+    i += 1;
+  }
+  t_i32(b->n_rows, a->n_rows, "{label} n_rows");
+  if (!t_i32(b->n_terms, a->n_terms, "{label} n_terms")) { return; }
+  i = 0;
+  while (i < a->n_terms) {
+    t_ok(t_str_eq(a->terms[i].col, b->terms[i].col), "{label} term col");
+    t_i32(b->terms[i].op, a->terms[i].op, "{label} term op");
+    t_i32(b->terms[i].arg0, a->terms[i].arg0, "{label} term arg0");
+    t_i32(b->terms[i].n_args, a->terms[i].n_args, "{label} term n_args");
+    i += 1;
+  }
+  if (!t_i32(b->n_order, a->n_order, "{label} n_order")) { return; }
+  i = 0;
+  while (i < a->n_order) {
+    t_ok(t_str_eq(a->order[i].col, b->order[i].col), "{label} order col");
+    t_ok(a->order[i].desc == b->order[i].desc, "{label} order desc");
+    i += 1;
+  }
+  t_ok(a->limit == b->limit, "{label} limit");
+  t_ok(a->offset == b->offset, "{label} offset");
+  if (!t_i32(b->n_args, a->n_args, "{label} n_args")) { return; }
+  i = 0;
+  while (i < a->n_args) {
+    t_ok(t_val_eq(&a->args[i], &b->args[i]), "{label} arg {i}");
+    i += 1;
+  }
+}
+
+fn t_stmt_round(w: MeoWBuf*, a: MeoArena*, st: MeoWStmt*, rid: uint32, label: string) {
+  meo_wbuf_begin(w);
+  t_i32(meo_wire_stmt_put(w, st), MEO_OK, "{label} put");
+  t_keep(w, MEO_WIRE_K_QUERY, rid);
+  var r: MeoWRd;
+  if (!t_open(w, &r, MEO_WIRE_K_QUERY, rid, label)) { return; }
+  meo_arena_reset(a);
+  var got: MeoWStmt;
+  if (!t_i32(meo_wire_stmt_get(&r, a, &got), MEO_OK, "{label} get")) { return; }
+  t_stmt_eq(st, &got, label);
+}
+
+fn t_empty_round(w: MeoWBuf*, kind: int32, rid: uint32) {
+  meo_wbuf_begin(w);
+  t_keep(w, kind, rid);
+  var r: MeoWRd;
+  if (!t_open(w, &r, kind, rid, "empty {kind}")) { return; }
+  t_i32(r.n, 0, "empty {kind} len");
+  t_i32(meo_wire_empty_get(&r), MEO_OK, "empty {kind} get");
+}
+
+// The value set every value case uses: 14 cells.
+fn t_fill_values(v: MeoValue*, blob: uint8*) {
+  meo_value_set_null(&v[0]);
+  meo_value_set_int(&v[1], -9223372036854775807 - 1);
+  meo_value_set_int(&v[2], 9223372036854775807);
+  meo_value_set_int(&v[3], 0);
+  meo_value_set_real(&v[4], t_from_bits(0x8000000000000000));
+  meo_value_set_real(&v[5], t_from_bits(0x7FF8000000000123));
+  meo_value_set_real(&v[6], t_from_bits(0xFFF0000000000001));
+  meo_value_set_real(&v[7], 1.5);
+  meo_value_set_text(&v[8], blob, 0);
+  meo_value_set_blob(&v[9], blob, 0);
+  var s: string = "héllo";
+  meo_value_set_text(&v[10], s.chars, (int32)s.length);
+  meo_value_set_blob(&v[11], blob, 8);
+  meo_value_set_null(&v[12]);
+  meo_value_set_int(&v[13], -1);
+}
+
+fn t_round(w: MeoWBuf*, a: MeoArena*) {
+  var f0: int32 = t_failures;
+  var r: MeoWRd;
+
+  var h: MeoWHello;
+  h.major = MEO_WIRE_MAJOR;
+  h.minor = MEO_WIRE_MINOR;
+  h.max_frame = MEO_WIRE_MAX_FRAME;
+  h.token = t_str("s3cret-token");
+  h.name = t_str("wire_self");
+  meo_wbuf_begin(w);
+  meo_wire_hello_put(w, &h);
+  t_keep(w, MEO_WIRE_K_HELLO, 1);
+  if (t_open(w, &r, MEO_WIRE_K_HELLO, 1, "hello")) {
+    var hg: MeoWHello;
+    t_i32(meo_wire_hello_get(&r, &hg), MEO_OK, "hello get");
+    t_i32(hg.major, 1, "hello major");
+    t_i32(hg.minor, 0, "hello minor");
+    t_i32(hg.max_frame, MEO_WIRE_MAX_FRAME, "hello max_frame");
+    t_ok(t_str_eq(hg.token, h.token), "hello token");
+    t_ok(t_str_eq(hg.name, h.name), "hello name");
+    t_ok(meo_bytes_equal(r.p, "MEOS".chars, 4), "hello magic bytes");
+  }
+  // Wrong magic and another major are VERSION, not PROTO.
+  h.major = 2;
+  meo_wbuf_begin(w);
+  meo_wire_hello_put(w, &h);
+  meo_wbuf_finish(w, MEO_WIRE_K_HELLO, 1);
+  if (t_open(w, &r, MEO_WIRE_K_HELLO, 1, "hello v2")) {
+    var hv: MeoWHello;
+    t_i32(meo_wire_hello_get(&r, &hv), -MEO_ERR_VERSION, "hello major 2");
+  }
+  h.major = 1;
+  meo_wbuf_begin(w);
+  meo_wire_hello_put(w, &h);
+  meo_wbuf_finish(w, MEO_WIRE_K_HELLO, 1);
+  w->p[MEO_WIRE_HDR] = 0x4E;
+  if (t_open(w, &r, MEO_WIRE_K_HELLO, 1, "hello magic")) {
+    var hm: MeoWHello;
+    t_i32(meo_wire_hello_get(&r, &hm), -MEO_ERR_VERSION, "hello bad magic");
+  }
+  h.max_frame = 1000;
+  meo_wbuf_begin(w);
+  meo_wire_hello_put(w, &h);
+  t_i32(meo_wbuf_finish(w, MEO_WIRE_K_HELLO, 1), -MEO_ERR_USAGE, "hello small max_frame");
+
+  t_empty_round(w, MEO_WIRE_K_PING, 2);
+  t_empty_round(w, MEO_WIRE_K_COMMIT, 3);
+  t_empty_round(w, MEO_WIRE_K_ROLLBACK, 4);
+  t_empty_round(w, MEO_WIRE_K_BYE, 5);
+  t_empty_round(w, MEO_WIRE_K_OK, 6);
+
+  meo_wbuf_begin(w);
+  meo_wire_begin_put(w, 2);
+  t_keep(w, MEO_WIRE_K_BEGIN, 7);
+  if (t_open(w, &r, MEO_WIRE_K_BEGIN, 7, "begin")) {
+    var mode: int32 = -1;
+    t_i32(meo_wire_begin_get(&r, &mode), MEO_OK, "begin get");
+    t_i32(mode, 2, "begin mode");
+  }
+
+  var ho: MeoWHelloOk;
+  ho.major = 1;
+  ho.minor = 0;
+  ho.max_frame = MEO_WIRE_MAX_FRAME;
+  ho.session = 0xFEDCBA9876543210;
+  ho.caps = MEO_WIRE_CAP_COUNT | MEO_WIRE_CAP_ASSIGN_ADD;
+  ho.name = t_str("meosql 0.1.0");
+  meo_wbuf_begin(w);
+  meo_wire_hello_ok_put(w, &ho);
+  t_keep(w, MEO_WIRE_K_HELLO_OK, 1);
+  if (t_open(w, &r, MEO_WIRE_K_HELLO_OK, 1, "hello_ok")) {
+    var hk: MeoWHelloOk;
+    t_i32(meo_wire_hello_ok_get(&r, &hk), MEO_OK, "hello_ok get");
+    t_i32(hk.max_frame, MEO_WIRE_MAX_FRAME, "hello_ok max_frame");
+    t_ok(hk.session == ho.session, "hello_ok session");
+    t_ok(hk.caps == 3, "hello_ok caps");
+    t_ok(t_str_eq(hk.name, ho.name), "hello_ok name");
+  }
+
+  var e: MeoWError;
+  e.code = MEO_ERR_CONFLICT;
+  e.fatal = true;
+  e.tx = MEO_WIRE_TX_ABORTED;
+  e.msg = t_str("duplicate key in users.email");
+  meo_wbuf_begin(w);
+  meo_wire_error_put(w, &e);
+  t_keep(w, MEO_WIRE_K_ERROR, 9);
+  if (t_open(w, &r, MEO_WIRE_K_ERROR, 9, "error")) {
+    var eg: MeoWError;
+    t_i32(meo_wire_error_get(&r, &eg), MEO_OK, "error get");
+    t_i32(eg.code, MEO_ERR_CONFLICT, "error code");
+    t_ok(eg.fatal, "error fatal");
+    t_i32(eg.tx, 2, "error tx");
+    t_ok(t_str_eq(eg.msg, e.msg), "error msg");
+  }
+
+  // RESULT: 3 rows x 2 cols; column 0 starts NULL so its hint comes from row 1.
+  var blob: uint8* = (uint8*)malloc(8);
+  var k: int32 = 0;
+  while (k < 8) {
+    blob[k] = (uint8)(k * 37);
+    k += 1;
+  }
+  var cells: MeoValue* = (MeoValue*)malloc(6 * (int64)sizeof(MeoValue));
+  meo_value_set_null(&cells[0]);
+  meo_value_set_text(&cells[1], "ab".chars, 2);
+  meo_value_set_int(&cells[2], 42);
+  meo_value_set_null(&cells[3]);
+  meo_value_set_int(&cells[4], -7);
+  meo_value_set_blob(&cells[5], blob, 8);
+  meo_wbuf_begin(w);
+  meo_wire_result_put(w, 0, 99, 2, 3, cells);
+  t_keep(w, MEO_WIRE_K_RESULT, 10);
+  if (t_open(w, &r, MEO_WIRE_K_RESULT, 10, "result")) {
+    var res: MeoWResult;
+    meo_arena_reset(a);
+    if (t_i32(meo_wire_result_get(&r, a, &res), MEO_OK, "result get")) {
+      t_ok(res.affected == 0 && res.last_id == 99, "result header");
+      t_ok(res.n_cols == 2 && res.n_rows == 3, "result shape");
+      t_i32(res.hints[0], MEO_T_INT, "result hint 0");
+      t_i32(res.hints[1], MEO_T_TEXT, "result hint 1");
+      k = 0;
+      while (k < 6) {
+        t_ok(t_val_eq(&cells[k], &res.cells[k]), "result cell {k}");
+        k += 1;
+      }
+    }
+  }
+  // A write: n_cols 0, n_rows 0.
+  meo_wbuf_begin(w);
+  meo_wire_result_put(w, 5, 1234, 0, 0, cells);
+  t_keep(w, MEO_WIRE_K_RESULT, 11);
+  if (t_open(w, &r, MEO_WIRE_K_RESULT, 11, "result write")) {
+    var rw: MeoWResult;
+    meo_arena_reset(a);
+    t_i32(meo_wire_result_get(&r, a, &rw), MEO_OK, "result write get");
+    t_ok(rw.affected == 5 && rw.last_id == 1234 && rw.n_cols == 0 && rw.n_rows == 0, "result write fields");
+  }
+  free((rawptr)cells);
+
+  // Statements: every op, every flag, every term op.
+  var cols: MeoWCol* = (MeoWCol*)malloc(4 * (int64)sizeof(MeoWCol));
+  cols[0].name = t_str("id");
+  cols[0].ty = MEO_T_INT;
+  cols[0].flags = MEO_WIRE_CF_PK;
+  cols[1].name = t_str("email");
+  cols[1].ty = MEO_T_TEXT;
+  cols[1].flags = MEO_WIRE_CF_NOT_NULL | MEO_WIRE_CF_UNIQUE;
+  cols[2].name = t_str("score");
+  cols[2].ty = MEO_T_REAL;
+  cols[2].flags = 0;
+  cols[3].name = t_str("avatar");
+  cols[3].ty = MEO_T_BLOB;
+  cols[3].flags = 0;
+  var terms: MeoWTerm* = (MeoWTerm*)malloc(9 * (int64)sizeof(MeoWTerm));
+  k = 0;
+  while (k < 9) {
+    terms[k].col = t_str("email");
+    terms[k].op = k;
+    terms[k].arg0 = k;
+    terms[k].n_args = 1;
+    k += 1;
+  }
+  terms[6].n_args = 3;
+  terms[7].n_args = 0;
+  terms[8].n_args = 0;
+  var order: MeoWOrder* = (MeoWOrder*)malloc(2 * (int64)sizeof(MeoWOrder));
+  order[0].col = t_str("score");
+  order[0].desc = true;
+  order[1].col = t_str("id");
+  order[1].desc = false;
+  var args: MeoValue* = (MeoValue*)malloc(14 * (int64)sizeof(MeoValue));
+  t_fill_values(args, blob);
+
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE;
+  st.table = t_str("users");
+  st.if_not_exists = true;
+  st.cols = cols;
+  st.n_cols = 4;
+  t_stmt_round(w, a, &st, 20, "create");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = t_str("users");
+  st.cols = cols;
+  st.n_cols = 2;
+  st.n_rows = 7;
+  st.args = args;
+  st.n_args = 14;
+  t_stmt_round(w, a, &st, 21, "insert");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table = t_str("users");
+  st.cols = cols;
+  st.n_cols = 3;
+  st.terms = terms;
+  st.n_terms = 9;
+  st.order = order;
+  st.n_order = 2;
+  st.limit = 50;
+  st.offset = 100;
+  st.args = args;
+  st.n_args = 14;
+  t_stmt_round(w, a, &st, 22, "select");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_UPDATE;
+  st.table = t_str("users");
+  cols[2].flags = MEO_WIRE_CF_ADD;
+  st.cols = &cols[2];
+  st.n_cols = 1;
+  st.terms = terms;
+  st.n_terms = 1;
+  st.args = &args[1];
+  st.n_args = 2;
+  t_stmt_round(w, a, &st, 23, "update add");
+  cols[2].flags = 0;
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DELETE;
+  st.table = t_str("users");
+  st.terms = &terms[7];
+  st.n_terms = 1;
+  t_stmt_round(w, a, &st, 24, "delete");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_COUNT;
+  st.table = t_str("users");
+  st.terms = &terms[6];
+  st.n_terms = 1;
+  st.args = args;
+  st.n_args = 9;
+  t_stmt_round(w, a, &st, 25, "count");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DROP;
+  st.table = t_str("users");
+  st.if_not_exists = true;
+  t_stmt_round(w, a, &st, 26, "drop");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_ADD_COLUMN;
+  st.table = t_str("users");
+  st.cols = &cols[3];
+  st.n_cols = 1;
+  t_stmt_round(w, a, &st, 27, "add column");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE_INDEX;
+  st.table = t_str("users");
+  st.name = t_str("users_email_score");
+  st.unique = true;
+  st.if_not_exists = true;
+  st.cols = &cols[1];
+  st.n_cols = 2;
+  t_stmt_round(w, a, &st, 28, "create index");
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DROP_INDEX;
+  st.table = t_str("users");
+  st.name = t_str("users_email_score");
+  t_stmt_round(w, a, &st, 29, "drop index");
+
+  // An unknown op still decodes; the server answers it with USAGE.
+  meo_wire_stmt_init(&st);
+  st.op = 200;
+  st.table = t_str("t");
+  t_stmt_round(w, a, &st, 30, "op 200");
+
+  // Writer refusals.
+  meo_wire_stmt_init(&st);
+  st.op = 3;
+  st.table = t_str("bad\0name");
+  meo_wbuf_begin(w);
+  t_i32(meo_wire_stmt_put(w, &st), -MEO_ERR_USAGE, "NUL in name");
+  st.table = t_str("t");
+  st.n_cols = 1;
+  meo_wbuf_begin(w);
+  t_i32(meo_wire_stmt_put(w, &st), -MEO_ERR_USAGE, "cols missing");
+
+  free((rawptr)cols);
+  free((rawptr)terms);
+  free((rawptr)order);
+  free((rawptr)args);
+  free((rawptr)blob);
+  t_case("t_round", f0);
+}
+
+fn t_values(w: MeoWBuf*) {
+  var f0: int32 = t_failures;
+  var blob: uint8* = (uint8*)malloc(8);
+  var k: int32 = 0;
+  while (k < 8) {
+    blob[k] = (uint8)(255 - k);
+    k += 1;
+  }
+  blob[3] = 0;
+  var v: MeoValue* = (MeoValue*)malloc(14 * (int64)sizeof(MeoValue));
+  t_fill_values(v, blob);
+  meo_wbuf_begin(w);
+  k = 0;
+  while (k < 14) {
+    meo_wire_val_put(w, &v[k]);
+    k += 1;
+  }
+  t_i32(w->err, MEO_OK, "values put");
+  var r: MeoWRd;
+  meo_wrd_init(&r, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR);
+  k = 0;
+  while (k < 14) {
+    var g: MeoValue;
+    t_i32(meo_wire_val_get(&r, &g), MEO_OK, "value {k} get");
+    t_ok(t_val_eq(&v[k], &g), "value {k} round trip");
+    k += 1;
+  }
+  t_i32(meo_wrd_end(&r), MEO_OK, "values consumed");
+  // Spot-check the bytes: INT64 min is tag 1 then 00..80; -0.0 keeps its sign.
+  var p: uint8* = w->p + MEO_WIRE_HDR;
+  t_ok(p[0] == 0 && p[1] == 1 && meo_get_u64le(p, 2) == 0x8000000000000000, "int64 min bytes");
+  var g2: MeoValue;
+  meo_wrd_init(&r, p + 28, 9);
+  meo_wire_val_get(&r, &g2);
+  t_ok(g2.type == MEO_T_REAL && t_bits(g2.f) == 0x8000000000000000, "-0.0 bits");
+  meo_wrd_init(&r, p + 37, 9);
+  meo_wire_val_get(&r, &g2);
+  t_ok(t_bits(g2.f) == 0x7FF8000000000123, "NaN payload bits");
+
+  // Unknown tag and a bad value on the writer side.
+  var bad: uint8* = (uint8*)malloc(1);
+  bad[0] = 5;
+  meo_wrd_init(&r, bad, 1);
+  t_i32(meo_wire_val_get(&r, &g2), -MEO_ERR_PROTO, "tag 5");
+  free((rawptr)bad);
+  var vb: MeoValue;
+  meo_value_set_text(&vb, blob, -1);
+  meo_wbuf_begin(w);
+  meo_wire_val_put(w, &vb);
+  t_i32(w->err, -MEO_ERR_USAGE, "negative length put");
+  free((rawptr)v);
+  free((rawptr)blob);
+  t_case("t_values", f0);
+}
+
+// A one-cell RESULT whose cell exactly fills the max payload.
+fn t_max_one(w: MeoWBuf*, a: MeoArena*, tag: int32, big: uint8*) {
+  var fixed: int32 = 4 + 8 + 2 + 1 + 4 + 1 + 4;
+  var n: int32 = MEO_WIRE_MAX_FRAME - fixed;
+  var v: MeoValue;
+  if (tag == MEO_T_TEXT) { meo_value_set_text(&v, big, n); } else { meo_value_set_blob(&v, big, n); }
+  meo_wbuf_begin(w);
+  meo_wire_result_put(w, 0, 0, 1, 1, &v);
+  var fn_: int32 = meo_wbuf_finish(w, MEO_WIRE_K_RESULT, 1);
+  t_i32(fn_, MEO_WIRE_HDR + MEO_WIRE_MAX_FRAME, "max cell {tag} frame size");
+  var r: MeoWRd;
+  if (t_open(w, &r, MEO_WIRE_K_RESULT, 1, "max cell")) {
+    var res: MeoWResult;
+    meo_arena_reset(a);
+    if (t_i32(meo_wire_result_get(&r, a, &res), MEO_OK, "max cell {tag} get")) {
+      t_ok(t_val_eq(&v, &res.cells[0]), "max cell {tag} round trip");
+    }
+  }
+  if (tag == MEO_T_TEXT) { meo_value_set_text(&v, big, n + 1); } else { meo_value_set_blob(&v, big, n + 1); }
+  meo_wbuf_begin(w);
+  meo_wire_result_put(w, 0, 0, 1, 1, &v);
+  t_i32(meo_wbuf_finish(w, MEO_WIRE_K_RESULT, 1), -MEO_ERR_TOOBIG, "max cell {tag} + 1");
+}
+
+fn t_max(w: MeoWBuf*, a: MeoArena*) {
+  var f0: int32 = t_failures;
+  var big: uint8* = (uint8*)malloc((int64)MEO_WIRE_MAX_FRAME);
+  var i: int32 = 0;
+  while (i < MEO_WIRE_MAX_FRAME) {
+    big[i] = (uint8)(97 + i % 26);
+    i += 1;
+  }
+  t_max_one(w, a, MEO_T_TEXT, big);
+  t_max_one(w, a, MEO_T_BLOB, big);
+
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table.chars = big;
+  st.table.length = 65535;
+  meo_wbuf_begin(w);
+  t_i32(meo_wire_stmt_put(w, &st), MEO_OK, "65535-byte name");
+  meo_wbuf_finish(w, MEO_WIRE_K_QUERY, 1);
+  var r: MeoWRd;
+  if (t_open(w, &r, MEO_WIRE_K_QUERY, 1, "long name")) {
+    var got: MeoWStmt;
+    meo_arena_reset(a);
+    t_i32(meo_wire_stmt_get(&r, a, &got), MEO_OK, "long name get");
+    t_ok(t_str_eq(got.table, st.table), "long name round trip");
+  }
+  st.table.length = 65536;
+  meo_wbuf_begin(w);
+  t_i32(meo_wire_stmt_put(w, &st), -MEO_ERR_USAGE, "65536-byte name");
+  free((rawptr)big);
+  t_case("t_max", f0);
+}
+
+fn t_header() {
+  var f0: int32 = t_failures;
+  var p: uint8* = (uint8*)malloc(12);
+  var h: MeoWHdr;
+  meo_wire_hdr_put(p, 100, MEO_WIRE_K_PING, 0xDEADBEEF);
+  t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), MEO_OK, "hdr ok");
+  t_ok(h.len == 100 && h.kind == 2 && h.flags == 0 && h.rid == 0xDEADBEEF, "hdr fields");
+  t_ok(p[0] == 100 && p[1] == 0 && p[4] == 2 && p[8] == 0xEF && p[11] == 0xDE, "hdr bytes");
+  meo_wire_hdr_put(p, MEO_WIRE_MAX_FRAME, MEO_WIRE_K_QUERY, 3);
+  t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), MEO_OK, "hdr len = max");
+  meo_wire_hdr_put(p, MEO_WIRE_MAX_FRAME + 1, MEO_WIRE_K_QUERY, 3);
+  t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), -MEO_ERR_TOOBIG, "hdr len over max");
+  t_ok(h.rid == 3 && h.kind == MEO_WIRE_K_QUERY, "hdr rid kept on TOOBIG");
+  meo_put_u32le(p, 0, 0xFFFFFFFF);
+  t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), -MEO_ERR_TOOBIG, "hdr len 2^32-1");
+  meo_wire_hdr_put(p, 0, MEO_WIRE_K_PING, 1);
+  p[5] = 1;
+  t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), -MEO_ERR_PROTO, "hdr flags");
+  p[5] = 0;
+  p[7] = 0x80;
+  t_i32(meo_wire_hdr_get(p, MEO_WIRE_MAX_FRAME, &h), -MEO_ERR_PROTO, "hdr rsv");
+  t_ok(meo_wire_kind_is_request(1) && meo_wire_kind_is_request(7), "request kinds");
+  t_ok(!meo_wire_kind_is_request(8) && !meo_wire_kind_is_request(64) && !meo_wire_kind_is_request(128), "non-request kinds");
+  free((rawptr)p);
+  t_case("t_header", f0);
+}
+
+fn t_prefix(a: MeoArena*) {
+  var f0: int32 = t_failures;
+  var i: int32 = 0;
+  while (i < t_count) {
+    var n: int32 = t_fn[i];
+    var kind: int32 = (int32)t_fp[i][4];
+    var k: int32 = 0;
+    while (k < n) {
+      var q: uint8* = t_copy(t_fp[i], k);
+      var h: MeoWHdr;
+      var r: MeoWRd;
+      t_i32(meo_wire_open(q, k, MEO_WIRE_MAX_FRAME, &h, &r), -MEO_ERR_PROTO, "frame {i} prefix {k}");
+      free((rawptr)q);
+      k += 1;
+    }
+    var len: int32 = n - MEO_WIRE_HDR;
+    var j: int32 = 0;
+    while (j < len) {
+      var pq: uint8* = t_copy(t_fp[i] + MEO_WIRE_HDR, j);
+      t_i32(t_decode(kind, pq, j, a), -MEO_ERR_PROTO, "frame {i} kind {kind} payload prefix {j}");
+      free((rawptr)pq);
+      j += 1;
+    }
+    i += 1;
+  }
+  t_case("t_prefix", f0);
+}
+
+fn t_trailing(a: MeoArena*) {
+  var f0: int32 = t_failures;
+  var i: int32 = 0;
+  while (i < t_count) {
+    var n: int32 = t_fn[i];
+    var kind: int32 = (int32)t_fp[i][4];
+    var len: int32 = n - MEO_WIRE_HDR;
+    var pq: uint8* = (uint8*)malloc((int64)len + 1);
+    meo_bytes_copy(pq, t_fp[i] + MEO_WIRE_HDR, (int64)len);
+    pq[len] = 0;
+    t_i32(t_decode(kind, pq, len, a), MEO_OK, "frame {i} exact");
+    t_i32(t_decode(kind, pq, len + 1, a), -MEO_ERR_PROTO, "frame {i} trailing byte");
+    free((rawptr)pq);
+    // The whole frame with one byte past its header's len.
+    var q: uint8* = (uint8*)malloc((int64)n + 1);
+    meo_bytes_copy(q, t_fp[i], (int64)n);
+    q[n] = 0;
+    var h: MeoWHdr;
+    var r: MeoWRd;
+    t_i32(meo_wire_open(q, n + 1, MEO_WIRE_MAX_FRAME, &h, &r), -MEO_ERR_PROTO, "frame {i} trailing frame byte");
+    free((rawptr)q);
+    i += 1;
+  }
+  t_case("t_trailing", f0);
+}
+
+// Decode a hand-built payload; it must be PROTO and leave the arena untouched.
+fn t_count_one(w: MeoWBuf*, a: MeoArena*, kind: int32, label: string) {
+  meo_arena_reset(a);
+  var cur: uint8* = a->cur;
+  var owns: int64 = a->owns;
+  var r: MeoWRd;
+  meo_wrd_init(&r, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR);
+  var rc: int32 = -1;
+  if (kind == MEO_WIRE_K_QUERY) {
+    var st: MeoWStmt;
+    rc = meo_wire_stmt_get(&r, a, &st);
+  } else {
+    var res: MeoWResult;
+    rc = meo_wire_result_get(&r, a, &res);
+  }
+  t_i32(rc, -MEO_ERR_PROTO, label);
+  t_ok(a->cur == cur && a->owns == owns, "{label}: allocated before refusing");
+}
+
+fn t_stmt_head(w: MeoWBuf*) {
+  meo_wbuf_begin(w);
+  meo_wbuf_u8(w, MEO_WIRE_OP_SELECT);
+  meo_wbuf_u8(w, 0);
+  meo_wbuf_str16(w, "t");
+  meo_wbuf_str16(w, "");
+}
+
+fn t_counts(w: MeoWBuf*, a: MeoArena*) {
+  var f0: int32 = t_failures;
+  t_stmt_head(w);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u32(w, 0);
+  t_count_one(w, a, MEO_WIRE_K_QUERY, "n_cols 65535");
+
+  t_stmt_head(w);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u32(w, 0);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u32(w, 0);
+  t_count_one(w, a, MEO_WIRE_K_QUERY, "n_terms 65535");
+
+  t_stmt_head(w);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u32(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u32(w, 0);
+  t_count_one(w, a, MEO_WIRE_K_QUERY, "n_order 65535");
+
+  t_stmt_head(w);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u32(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_i64(w, -1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u32(w, 0x7FFFFFFF);
+  meo_wbuf_u8(w, 0);
+  t_count_one(w, a, MEO_WIRE_K_QUERY, "n_args 2^31-1");
+
+  t_stmt_head(w);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u32(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_i64(w, -1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u32(w, 0xFFFFFFFF);
+  t_count_one(w, a, MEO_WIRE_K_QUERY, "n_args 2^32-1");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_i32(w, 0);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u16(w, 1);
+  meo_wbuf_u8(w, 1);
+  meo_wbuf_u32(w, 0x7FFFFFFF);
+  meo_wbuf_u8(w, 0);
+  meo_wbuf_u8(w, 0);
+  t_count_one(w, a, MEO_WIRE_K_RESULT, "n_rows 2^31-1");
+
+  meo_wbuf_begin(w);
+  meo_wbuf_i32(w, 0);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u16(w, 65535);
+  meo_wbuf_u8(w, 0);
+  t_count_one(w, a, MEO_WIRE_K_RESULT, "n_cols 65535 hints");
+
+  // Text length past the end of the payload.
+  t_stmt_head(w);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u32(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_u16(w, 0);
+  meo_wbuf_i64(w, -1);
+  meo_wbuf_i64(w, 0);
+  meo_wbuf_u32(w, 1);
+  meo_wbuf_u8(w, MEO_T_TEXT);
+  meo_wbuf_u32(w, 0xFFFFFFF0);
+  var r: MeoWRd;
+  meo_wrd_init(&r, w->p + MEO_WIRE_HDR, w->n - MEO_WIRE_HDR);
+  var st: MeoWStmt;
+  meo_arena_reset(a);
+  t_i32(meo_wire_stmt_get(&r, a, &st), -MEO_ERR_PROTO, "text length past end");
+  t_case("t_counts", f0);
+}
+
+fn t_fuzz(a: MeoArena*) {
+  var f0: int32 = t_failures;
+  t_rng = T_SEED;
+  var ok: int32 = 0;
+  var bad: int32 = 0;
+  var it: int32 = 0;
+  while (it < T_FLIPS) {
+    var i: int32 = (int32)(t_rand() % (uint32)t_count);
+    var n: int32 = t_fn[i];
+    var q: uint8* = t_copy(t_fp[i], n);
+    var flips: int32 = 1 + (int32)(t_rand() % 3);
+    var f: int32 = 0;
+    while (f < flips) {
+      var pos: int32 = (int32)(t_rand() % (uint32)n);
+      // Most flips land in the payload, where the decoders are.
+      if ((it & 3) != 0 && n > MEO_WIRE_HDR) {
+        pos = MEO_WIRE_HDR + (int32)(t_rand() % (uint32)(n - MEO_WIRE_HDR));
+      }
+      q[pos] = q[pos] ^ (uint8)(1 + t_rand() % 255);
+      f += 1;
+    }
+    var h: MeoWHdr;
+    var r: MeoWRd;
+    var rc: int32 = meo_wire_open(q, n, MEO_WIRE_MAX_FRAME, &h, &r);
+    if (rc == MEO_OK) {
+      // Decode from an exact-size copy of the payload alone.
+      var pq: uint8* = t_copy(q + MEO_WIRE_HDR, h.len);
+      rc = t_decode(h.kind, pq, h.len, a);
+      free((rawptr)pq);
+    }
+    if (rc == MEO_OK) { ok += 1; } else { bad += 1; }
+    t_ok(rc == MEO_OK || rc == -MEO_ERR_PROTO || rc == -MEO_ERR_VERSION || rc == -MEO_ERR_TOOBIG,
+         "fuzz {it}: unexpected code {rc}");
+    free((rawptr)q);
+    it += 1;
+  }
+  println("fuzz: {T_FLIPS} frames, {ok} decoded, {bad} refused");
+  t_case("t_fuzz", f0);
+}
+
+fn main() -> int32 {
+  t_fp = (uint8**)malloc((int64)T_MAXF * 8);
+  t_fn = (int32*)malloc((int64)T_MAXF * 4);
+  var a: MeoArena* = meo_arena_new(65536);
+  var w: MeoWBuf;
+  meo_wbuf_init(&w, MEO_WIRE_MAX_FRAME);
+  t_round(&w, a);
+  t_values(&w);
+  t_max(&w, a);
+  t_header();
+  t_prefix(a);
+  t_trailing(a);
+  t_counts(&w, a);
+  t_fuzz(a);
+  meo_wbuf_free(&w);
+  meo_arena_free(a);
+  var i: int32 = 0;
+  while (i < t_count) {
+    free((rawptr)t_fp[i]);
+    i += 1;
+  }
+  free((rawptr)t_fp);
+  free((rawptr)t_fn);
+  if (t_failures != 0) {
+    println("FAIL wire_self: {t_failures} failure(s)");
+    return 1;
+  }
+  println("PASS wire_self");
+  return 0;
+}

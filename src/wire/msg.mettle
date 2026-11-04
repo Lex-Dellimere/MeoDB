@@ -1,0 +1,265 @@
+// wire/msg: the fixed messages around QUERY.
+//
+//   hello     "MEOS"; u16 major; u16 minor; u32 max_frame; str16 token; str16 name
+//   hello_ok  u16 major; u16 minor; u32 max_frame; u64 session; u32 caps; str16 name
+//   error     i32 code; u8 fatal; u8 tx; str16 message
+//   result    i32 affected; i64 last_id; u16 n_cols; n_cols x u8 hint;
+//             u32 n_rows; n_rows x n_cols x val, row-major
+//   begin     u8 mode
+//   PING, COMMIT, ROLLBACK, BYE, OK carry no payload.
+//
+// Every *_get decodes a whole payload: short or trailing bytes are PROTO.
+// Strings and TEXT/BLOB cells are views into the payload.
+
+import "../error/status.mettle";
+import "../mem/arena.mettle";
+import "../record/value.mettle";
+import "frame.mettle";
+import "value.mettle";
+
+export const MEO_WIRE_CAP_COUNT: uint32 = 1;
+export const MEO_WIRE_CAP_ASSIGN_ADD: uint32 = 2;
+
+export const MEO_WIRE_TX_NONE: int32 = 0;
+export const MEO_WIRE_TX_OPEN: int32 = 1;
+export const MEO_WIRE_TX_ABORTED: int32 = 2;
+
+export const MEO_WIRE_NAME_MAX: int32 = 64;     // hello client name
+export const MEO_WIRE_MSG_MAX: int32 = 1024;    // error message
+
+export struct MeoWHello {
+  major: int32;
+  minor: int32;
+  max_frame: int32;
+  token: string;
+  name: string;
+}
+
+export struct MeoWHelloOk {
+  major: int32;
+  minor: int32;
+  max_frame: int32;
+  session: uint64;
+  caps: uint32;
+  name: string;
+}
+
+export struct MeoWError {
+  code: int32;
+  fatal: bool;
+  tx: int32;
+  msg: string;
+}
+
+export struct MeoWResult {
+  affected: int32;
+  last_id: int64;
+  n_cols: int32;
+  hints: int32*;
+  n_rows: int32;
+  cells: MeoValue*;
+}
+
+// A peer's max_frame above int32 range is clamped; it only bounds what we send.
+fn meo_wire_max_get(r: MeoWRd*) -> int32 {
+  var m: uint32 = meo_wrd_u32(r);
+  if (m > 2147483647) { return 2147483647; }
+  return (int32)m;
+}
+
+export fn meo_wire_hello_put(w: MeoWBuf*, h: MeoWHello*) {
+  if (h->max_frame < MEO_WIRE_MIN_FRAME || h->name.length > (uint64)MEO_WIRE_NAME_MAX) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_u8(w, 0x4D);
+  meo_wbuf_u8(w, 0x45);
+  meo_wbuf_u8(w, 0x4F);
+  meo_wbuf_u8(w, 0x53);
+  meo_wbuf_u16(w, h->major);
+  meo_wbuf_u16(w, h->minor);
+  meo_wbuf_u32(w, (uint32)h->max_frame);
+  meo_wbuf_str16(w, h->token);
+  meo_wbuf_str16(w, h->name);
+}
+
+// Wrong magic or another major is VERSION; the rest of such a frame is not read.
+export fn meo_wire_hello_get(r: MeoWRd*, h: MeoWHello*) -> int32 {
+  h->major = 0;
+  h->minor = 0;
+  h->max_frame = 0;
+  h->token.chars = 0;
+  h->token.length = 0;
+  h->name.chars = 0;
+  h->name.length = 0;
+  var m: uint8* = meo_wrd_bytes(r, 4);
+  var major: int32 = meo_wrd_u16(r);
+  if (r->err != MEO_OK) { return r->err; }
+  if (m[0] != 0x4D || m[1] != 0x45 || m[2] != 0x4F || m[3] != 0x53 || major != MEO_WIRE_MAJOR) {
+    meo_wrd_fail(r, -MEO_ERR_VERSION);
+    return r->err;
+  }
+  h->major = major;
+  h->minor = meo_wrd_u16(r);
+  h->max_frame = meo_wire_max_get(r);
+  meo_wrd_str16(r, &h->token);
+  meo_wrd_str16(r, &h->name);
+  if (r->err != MEO_OK) { return r->err; }
+  if (h->max_frame < MEO_WIRE_MIN_FRAME || h->name.length > (uint64)MEO_WIRE_NAME_MAX) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+  }
+  return meo_wrd_end(r);
+}
+
+export fn meo_wire_hello_ok_put(w: MeoWBuf*, h: MeoWHelloOk*) {
+  meo_wbuf_u16(w, h->major);
+  meo_wbuf_u16(w, h->minor);
+  meo_wbuf_u32(w, (uint32)h->max_frame);
+  meo_wbuf_u64(w, h->session);
+  meo_wbuf_u32(w, h->caps);
+  meo_wbuf_str16(w, h->name);
+}
+
+export fn meo_wire_hello_ok_get(r: MeoWRd*, h: MeoWHelloOk*) -> int32 {
+  h->major = meo_wrd_u16(r);
+  h->minor = meo_wrd_u16(r);
+  h->max_frame = meo_wire_max_get(r);
+  h->session = meo_wrd_u64(r);
+  h->caps = meo_wrd_u32(r);
+  meo_wrd_str16(r, &h->name);
+  return meo_wrd_end(r);
+}
+
+// A message over MEO_WIRE_MSG_MAX is cut, not refused: the error matters more.
+export fn meo_wire_error_put(w: MeoWBuf*, e: MeoWError*) {
+  if (e->code <= 0 || e->tx < 0 || e->tx > MEO_WIRE_TX_ABORTED) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  var n: int32 = MEO_WIRE_MSG_MAX;
+  if (e->msg.length < (uint64)n) { n = (int32)e->msg.length; }
+  meo_wbuf_i32(w, e->code);
+  if (e->fatal) { meo_wbuf_u8(w, 1); } else { meo_wbuf_u8(w, 0); }
+  meo_wbuf_u8(w, e->tx);
+  meo_wbuf_str16_bytes(w, e->msg.chars, n);
+}
+
+export fn meo_wire_error_get(r: MeoWRd*, e: MeoWError*) -> int32 {
+  e->code = meo_wrd_i32(r);
+  var f: int32 = meo_wrd_u8(r);
+  e->tx = meo_wrd_u8(r);
+  meo_wrd_str16(r, &e->msg);
+  if (r->err != MEO_OK) { return r->err; }
+  if (e->code <= 0 || f > 1 || e->tx > MEO_WIRE_TX_ABORTED
+      || e->msg.length > (uint64)MEO_WIRE_MSG_MAX) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+  }
+  e->fatal = f == 1;
+  return meo_wrd_end(r);
+}
+
+export fn meo_wire_begin_put(w: MeoWBuf*, mode: int32) {
+  meo_wbuf_u8(w, mode);
+}
+
+// The mode is passed through; its range is the database's to check.
+export fn meo_wire_begin_get(r: MeoWRd*, mode: int32*) -> int32 {
+  *mode = meo_wrd_u8(r);
+  return meo_wrd_end(r);
+}
+
+export fn meo_wire_empty_get(r: MeoWRd*) -> int32 {
+  return meo_wrd_end(r);
+}
+
+// cells is row-major, n_rows x n_cols. Each column's hint is the tag of its
+// first non-NULL cell, 0 if none.
+export fn meo_wire_result_put(w: MeoWBuf*, affected: int32, last_id: int64,
+                              n_cols: int32, n_rows: int32, cells: MeoValue*) {
+  if (n_cols < 0 || n_cols > 65535 || n_rows < 0 || (n_cols == 0 && n_rows != 0)
+      || (n_cols > 0 && n_rows > 0 && cells == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_i32(w, affected);
+  meo_wbuf_i64(w, last_id);
+  meo_wbuf_u16(w, n_cols);
+  var c: int32 = 0;
+  while (c < n_cols) {
+    var hint: int32 = MEO_T_NULL;
+    var row: int32 = 0;
+    while (row < n_rows && hint == MEO_T_NULL) {
+      hint = cells[(int64)row * (int64)n_cols + (int64)c].type;
+      row += 1;
+    }
+    meo_wbuf_u8(w, hint);
+    c += 1;
+  }
+  meo_wbuf_u32(w, (uint32)n_rows);
+  var total: int64 = (int64)n_rows * (int64)n_cols;
+  var i: int64 = 0;
+  while (i < total && w->err == MEO_OK) {
+    meo_wire_val_put(w, &cells[i]);
+    i += 1;
+  }
+}
+
+// The cell count is checked against the bytes left (a cell is at least one
+// byte) before anything is allocated from `a`.
+export fn meo_wire_result_get(r: MeoWRd*, a: MeoArena*, res: MeoWResult*) -> int32 {
+  res->hints = 0;
+  res->cells = 0;
+  res->n_cols = 0;
+  res->n_rows = 0;
+  if (a == 0) {
+    meo_wrd_fail(r, -MEO_ERR_USAGE);
+    return r->err;
+  }
+  res->affected = meo_wrd_i32(r);
+  res->last_id = meo_wrd_i64(r);
+  var nc: int32 = meo_wrd_u16(r);
+  var hb: uint8* = meo_wrd_bytes(r, (int64)nc);
+  var nr: int32 = meo_wrd_count(r);
+  if (r->err != MEO_OK) { return r->err; }
+  var total: int64 = (int64)nr * (int64)nc;
+  if ((nc == 0 && nr != 0) || total > (int64)meo_wrd_left(r)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return r->err;
+  }
+  var c: int32 = 0;
+  while (c < nc) {
+    if (hb[c] > 4) {
+      meo_wrd_fail(r, -MEO_ERR_PROTO);
+      return r->err;
+    }
+    c += 1;
+  }
+  if (nc > 0) {
+    res->hints = (int32*)meo_arena_alloc(a, (int64)nc * 4);
+    if (res->hints == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+    c = 0;
+    while (c < nc) {
+      res->hints[c] = (int32)hb[c];
+      c += 1;
+    }
+  }
+  if (total > 0) {
+    res->cells = (MeoValue*)meo_arena_alloc(a, total * (int64)sizeof(MeoValue));
+    if (res->cells == 0) {
+      meo_wrd_fail(r, -MEO_ERR_NOMEM);
+      return r->err;
+    }
+  }
+  var i: int64 = 0;
+  while (i < total) {
+    meo_wire_val_get(r, &res->cells[i]);
+    i += 1;
+  }
+  if (r->err != MEO_OK) { return r->err; }
+  res->n_cols = nc;
+  res->n_rows = nr;
+  return meo_wrd_end(r);
+}

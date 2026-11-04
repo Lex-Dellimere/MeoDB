@@ -5,7 +5,7 @@
 // the flux_orm mapping silently, and only an exact-value test notices.
 //
 //   w_status_old   codes 1..12 keep their numbers and names (append-only)
-//   w_status_new   codes 13..18 (D8): value, name, known, str
+//   w_status_new   codes 13..21: value, name, known, str
 //   w_f64          meo_put_f64le / meo_get_f64le copy bits: 0.0, -0.0, 1.5,
 //                  max finite, min subnormal, +inf, two NaNs with payloads;
 //                  compared as uint64, plus the little-endian byte layout
@@ -104,10 +104,16 @@ fn w_status_new() {
   w_str(meo_status_name(-16), "SCHEMA", "name -16");
   w_str(meo_status_name(17), "TOOBIG", "name 17");
   w_str(meo_status_name(-18), "MISMATCH", "name -18");
-  w_str(meo_status_name(19), "UNKNOWN", "name 19 unknown");
-  w_str(meo_status_name(-19), "UNKNOWN", "name -19 unknown");
+  w_i32(MEO_ERR_PROTO, 19, "PROTO");
+  w_i32(MEO_ERR_AUTH, 20, "AUTH");
+  w_i32(MEO_ERR_TIMEOUT, 21, "TIMEOUT");
+  w_str(meo_status_name(-19), "PROTO", "name -19");
+  w_str(meo_status_name(20), "AUTH", "name 20");
+  w_str(meo_status_name(-21), "TIMEOUT", "name -21");
+  w_str(meo_status_name(22), "UNKNOWN", "name 22 unknown");
+  w_str(meo_status_name(-22), "UNKNOWN", "name -22 unknown");
   // meo_status_str goes through the known check: a known code formats
-  // without the unknown path, and 19 still takes it.
+  // without the unknown path, and 22 still takes it.
   var s1: MeoStatus = { code: -MEO_ERR_TX, arg: 3 };
   var t1: string = meo_status_str(s1);
   w_str(t1, "tx(15) arg=3", "str 15");
@@ -116,10 +122,14 @@ fn w_status_new() {
   var t2: string = meo_status_str(s2);
   w_str(t2, "mismatch(18) arg=0", "str 18");
   free(t2.chars);
-  var s3: MeoStatus = { code: 19, arg: 0 };
+  var s3: MeoStatus = { code: 22, arg: 0 };
   var t3: string = meo_status_str(s3);
-  w_str(t3, "unknown19(19) arg=0", "str 19");
+  w_str(t3, "unknown22(22) arg=0", "str 22");
   free(t3.chars);
+  var s4: MeoStatus = { code: -MEO_ERR_PROTO, arg: 1 };
+  var t4: string = meo_status_str(s4);
+  w_str(t4, "proto(19) arg=1", "str 19");
+  free(t4.chars);
   w_case("w_status_new", f0);
 }
 

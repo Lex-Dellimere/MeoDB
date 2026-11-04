@@ -111,3 +111,7 @@ main = "tests/query_self.mettle"
 # Sockets: loopback echo, receive timeouts, shutdown wake-ups.
 [bin.sock_self]
 main = "tests/sock_self.mettle"
+
+# Wire codec: every frame kind, truncation and random corruption.
+[bin.wire_self]
+main = "tests/wire_self.mettle"

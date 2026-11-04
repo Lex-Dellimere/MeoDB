@@ -1,12 +1,13 @@
 // error/status: the single status-code contract.
 //
 // Codes 1..12 are fixed by PHASE1.md section 2; 13..18 were appended for the
-// tables and queries (.apex/DECISIONS.md D8). The set is APPEND-ONLY: a new code takes
-// the next free number, and no existing code is ever removed, renumbered or
-// reordered, because on-disk/API compatibility and the flux_orm RC mapping
-// depend on the numbers. Every meo_* function returns MEO_OK (0) or a positive count on
-// success and -MEO_ERR_* on failure; the status helpers accept either the
-// positive constant or the negative form a function returned.
+// tables and queries (.apex/DECISIONS.md D8), 19..21 for the network server.
+// The set is APPEND-ONLY: a new code takes the next free number, and no
+// existing code is ever removed, renumbered or reordered, because on-disk/API
+// compatibility and the flux_orm RC mapping depend on the numbers. Every meo_*
+// function returns MEO_OK (0) or a positive count on success and -MEO_ERR_* on
+// failure; the status helpers accept either the positive constant or the
+// negative form a function returned.
 
 import "std/mem";
 
@@ -29,9 +30,12 @@ export const MEO_ERR_TX: int32 = 15;          // nested begin, none open, wrong 
 export const MEO_ERR_SCHEMA: int32 = 16;      // unknown or duplicate table or column
 export const MEO_ERR_TOOBIG: int32 = 17;      // row or key over the size limit
 export const MEO_ERR_MISMATCH: int32 = 18;    // value type does not fit the request
+export const MEO_ERR_PROTO: int32 = 19;       // malformed or out-of-order wire frame
+export const MEO_ERR_AUTH: int32 = 20;        // wrong or missing token
+export const MEO_ERR_TIMEOUT: int32 = 21;     // socket or session deadline passed
 
 // The highest defined code. Raise it with every appended code.
-const MEO_ERR_LAST: int32 = MEO_ERR_MISMATCH;
+const MEO_ERR_LAST: int32 = MEO_ERR_TIMEOUT;
 
 export struct MeoStatus {
   code: int32;
@@ -82,6 +86,9 @@ export fn meo_status_name(code: int32) -> string {
     case 16: { return "SCHEMA"; }
     case 17: { return "TOOBIG"; }
     case 18: { return "MISMATCH"; }
+    case 19: { return "PROTO"; }
+    case 20: { return "AUTH"; }
+    case 21: { return "TIMEOUT"; }
   }
   return "UNKNOWN";
 }
@@ -128,6 +135,9 @@ fn meo_status_lname(code: int32) -> string {
     case 16: { return "schema"; }
     case 17: { return "toobig"; }
     case 18: { return "mismatch"; }
+    case 19: { return "proto"; }
+    case 20: { return "auth"; }
+    case 21: { return "timeout"; }
   }
   return "unknown{c}";
 }

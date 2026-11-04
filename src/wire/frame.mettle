@@ -1,0 +1,360 @@
+// wire/frame: the frame header, kinds, and the byte writer/reader every
+// message codec is built on. Shared by server and client, so it knows nothing
+// about the engine.
+//
+//   off size field
+//   0   4    len    u32  payload bytes after the header, 0 .. max_frame
+//   4   1    kind   u8   MEO_WIRE_K_*
+//   5   1    flags  u8   0; nonzero -> PROTO
+//   6   2    rsv    u16  0; nonzero -> PROTO
+//   8   4    rid    u32  request id, echoed by the response; 0 = server push
+//
+// All integers are little-endian. Writer and reader errors are sticky: once
+// err is set every later call is a no-op, so a codec checks err once at the
+// end instead of after every field.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+
+export const MEO_WIRE_HDR: int32 = 12;
+export const MEO_WIRE_MAX_FRAME: int32 = 16777216;      // default max payload
+export const MEO_WIRE_MIN_FRAME: int32 = 65536;         // smallest max a peer may set
+export const MEO_WIRE_MAX_FRAME_LIMIT: int32 = 268435456;
+
+export const MEO_WIRE_MAJOR: int32 = 1;
+export const MEO_WIRE_MINOR: int32 = 0;
+
+// Requests.
+export const MEO_WIRE_K_HELLO: int32 = 1;
+export const MEO_WIRE_K_PING: int32 = 2;
+export const MEO_WIRE_K_BEGIN: int32 = 3;
+export const MEO_WIRE_K_COMMIT: int32 = 4;
+export const MEO_WIRE_K_ROLLBACK: int32 = 5;
+export const MEO_WIRE_K_QUERY: int32 = 6;
+export const MEO_WIRE_K_BYE: int32 = 7;
+// Responses.
+export const MEO_WIRE_K_OK: int32 = 64;
+export const MEO_WIRE_K_HELLO_OK: int32 = 65;
+export const MEO_WIRE_K_ERROR: int32 = 66;
+export const MEO_WIRE_K_RESULT: int32 = 67;
+// 0x80..0xFF: server push (rid 0), reserved for remote subscribe.
+export const MEO_WIRE_K_PUSH: int32 = 128;
+
+export struct MeoWHdr {
+  len: int32;
+  kind: int32;
+  flags: int32;
+  rid: uint32;
+}
+
+// A frame under construction: header space first, then the payload.
+// `max` bounds the payload; going past it is TOOBIG, a failed grow NOMEM.
+export struct MeoWBuf {
+  p: uint8*;
+  n: int32;
+  cap: int32;
+  max: int32;
+  err: int32;
+}
+
+// A view over one payload. Reading past `n` is PROTO.
+export struct MeoWRd {
+  p: uint8*;
+  n: int32;
+  at: int32;
+  err: int32;
+}
+
+export fn meo_wire_kind_is_request(kind: int32) -> bool {
+  return kind >= MEO_WIRE_K_HELLO && kind <= MEO_WIRE_K_BYE;
+}
+
+export fn meo_wire_hdr_put(p: uint8*, len: int32, kind: int32, rid: uint32) {
+  meo_put_u32le(p, 0, (uint32)len);
+  p[4] = (uint8)(kind & 0xFF);
+  p[5] = 0;
+  meo_put_u16le(p, 6, 0);
+  meo_put_u32le(p, 8, rid);
+}
+
+// Fills h even on failure (len 0 when it is over the max), so the caller can
+// still answer with the right rid.
+export fn meo_wire_hdr_get(p: uint8*, max_frame: int32, h: MeoWHdr*) -> int32 {
+  var len: uint32 = meo_get_u32le(p, 0);
+  var rsv: uint16 = meo_get_u16le(p, 6);
+  h->len = 0;
+  h->kind = (int32)p[4];
+  h->flags = (int32)p[5];
+  h->rid = meo_get_u32le(p, 8);
+  if (h->flags != 0 || rsv != 0) { return -MEO_ERR_PROTO; }
+  if (max_frame < 0 || (uint64)len > (uint64)max_frame) { return -MEO_ERR_TOOBIG; }
+  h->len = (int32)len;
+  return MEO_OK;
+}
+
+// ---- writer ----
+
+export fn meo_wbuf_init(w: MeoWBuf*, max: int32) {
+  w->p = 0;
+  w->n = 0;
+  w->cap = 0;
+  w->max = max;
+  w->err = MEO_OK;
+}
+
+export fn meo_wbuf_free(w: MeoWBuf*) {
+  if (w->p != 0) { free((rawptr)w->p); }
+  w->p = 0;
+  w->n = 0;
+  w->cap = 0;
+}
+
+fn meo_wbuf_fail(w: MeoWBuf*, code: int32) {
+  if (w->err == MEO_OK) { w->err = code; }
+}
+
+// Make room for k more bytes; false (and err set) if that is not possible.
+fn meo_wbuf_room(w: MeoWBuf*, k: int64) -> bool {
+  if (w->err != MEO_OK) { return false; }
+  var need: int64 = (int64)w->n + k;
+  if (k < 0 || need - (int64)MEO_WIRE_HDR > (int64)w->max) {
+    meo_wbuf_fail(w, -MEO_ERR_TOOBIG);
+    return false;
+  }
+  if (need <= (int64)w->cap) { return true; }
+  var c: int64 = (int64)w->cap * 2;
+  if (c < 256) { c = 256; }
+  if (c < need) { c = need; }
+  if (c > (int64)w->max + (int64)MEO_WIRE_HDR) { c = (int64)w->max + (int64)MEO_WIRE_HDR; }
+  var q: rawptr = realloc((rawptr)w->p, c);
+  if (q == 0) {
+    meo_wbuf_fail(w, -MEO_ERR_NOMEM);
+    return false;
+  }
+  w->p = (uint8*)q;
+  w->cap = (int32)c;
+  return true;
+}
+
+// Start a new frame in w, keeping its memory.
+export fn meo_wbuf_begin(w: MeoWBuf*) {
+  w->n = 0;
+  w->err = MEO_OK;
+  if (meo_wbuf_room(w, (int64)MEO_WIRE_HDR)) { w->n = MEO_WIRE_HDR; }
+}
+
+// Write the header; the frame is w->p[0 .. result). Returns the frame size or
+// the first error.
+export fn meo_wbuf_finish(w: MeoWBuf*, kind: int32, rid: uint32) -> int32 {
+  if (w->err != MEO_OK) { return w->err; }
+  meo_wire_hdr_put(w->p, w->n - MEO_WIRE_HDR, kind, rid);
+  return w->n;
+}
+
+// For codecs that refuse a bad argument mid-frame.
+export fn meo_wbuf_usage(w: MeoWBuf*) {
+  meo_wbuf_fail(w, -MEO_ERR_USAGE);
+}
+
+export fn meo_wbuf_u8(w: MeoWBuf*, v: int32) {
+  if (!meo_wbuf_room(w, 1)) { return; }
+  w->p[w->n] = (uint8)(v & 0xFF);
+  w->n = w->n + 1;
+}
+
+export fn meo_wbuf_u16(w: MeoWBuf*, v: int32) {
+  if (!meo_wbuf_room(w, 2)) { return; }
+  meo_put_u16le(w->p, (int64)w->n, (uint16)(v & 0xFFFF));
+  w->n = w->n + 2;
+}
+
+export fn meo_wbuf_u32(w: MeoWBuf*, v: uint32) {
+  if (!meo_wbuf_room(w, 4)) { return; }
+  meo_put_u32le(w->p, (int64)w->n, v);
+  w->n = w->n + 4;
+}
+
+export fn meo_wbuf_i32(w: MeoWBuf*, v: int32) {
+  meo_wbuf_u32(w, (uint32)v);
+}
+
+export fn meo_wbuf_u64(w: MeoWBuf*, v: uint64) {
+  if (!meo_wbuf_room(w, 8)) { return; }
+  meo_put_u64le(w->p, (int64)w->n, v);
+  w->n = w->n + 8;
+}
+
+export fn meo_wbuf_i64(w: MeoWBuf*, v: int64) {
+  meo_wbuf_u64(w, (uint64)v);
+}
+
+export fn meo_wbuf_f64(w: MeoWBuf*, v: float64) {
+  if (!meo_wbuf_room(w, 8)) { return; }
+  meo_put_f64le(w->p, (int64)w->n, v);
+  w->n = w->n + 8;
+}
+
+export fn meo_wbuf_bytes(w: MeoWBuf*, p: uint8*, n: int32) {
+  if (n < 0 || (n > 0 && p == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  if (!meo_wbuf_room(w, (int64)n)) { return; }
+  meo_bytes_copy(w->p + w->n, p, (int64)n);
+  w->n = w->n + n;
+}
+
+// str16: u16 n + n bytes, no NUL.
+export fn meo_wbuf_str16_bytes(w: MeoWBuf*, p: uint8*, n: int32) {
+  if (n < 0 || n > 65535 || (n > 0 && p == 0)) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    if (p[i] == 0) {
+      meo_wbuf_usage(w);
+      return;
+    }
+    i += 1;
+  }
+  meo_wbuf_u16(w, n);
+  meo_wbuf_bytes(w, p, n);
+}
+
+export fn meo_wbuf_str16(w: MeoWBuf*, s: string) {
+  if (s.length > 65535) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_str16_bytes(w, s.chars, (int32)s.length);
+}
+
+// ---- reader ----
+
+export fn meo_wrd_init(r: MeoWRd*, p: uint8*, n: int32) {
+  r->p = p;
+  r->n = n;
+  r->at = 0;
+  r->err = MEO_OK;
+  if (n < 0 || (n > 0 && p == 0)) {
+    r->n = 0;
+    r->err = -MEO_ERR_USAGE;
+  }
+}
+
+export fn meo_wrd_fail(r: MeoWRd*, code: int32) {
+  if (r->err == MEO_OK) { r->err = code; }
+}
+
+export fn meo_wrd_left(r: MeoWRd*) -> int32 {
+  return r->n - r->at;
+}
+
+// Claim k bytes; their offset, or -1 with err set when fewer are left.
+fn meo_wrd_take(r: MeoWRd*, k: int64) -> int64 {
+  if (r->err != MEO_OK) { return -1; }
+  var at: int32 = r->at;
+  if (k < 0 || k > (int64)(r->n - at)) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return -1;
+  }
+  r->at = at + (int32)k;
+  return (int64)at;
+}
+
+export fn meo_wrd_u8(r: MeoWRd*) -> int32 {
+  var at: int64 = meo_wrd_take(r, 1);
+  if (at < 0) { return 0; }
+  return (int32)r->p[at];
+}
+
+export fn meo_wrd_u16(r: MeoWRd*) -> int32 {
+  var at: int64 = meo_wrd_take(r, 2);
+  if (at < 0) { return 0; }
+  return (int32)meo_get_u16le(r->p, at);
+}
+
+export fn meo_wrd_u32(r: MeoWRd*) -> uint32 {
+  var at: int64 = meo_wrd_take(r, 4);
+  if (at < 0) { return 0; }
+  return meo_get_u32le(r->p, at);
+}
+
+export fn meo_wrd_i32(r: MeoWRd*) -> int32 {
+  return (int32)meo_wrd_u32(r);
+}
+
+// A u32 count or index that must also fit an int32.
+export fn meo_wrd_count(r: MeoWRd*) -> int32 {
+  var v: uint32 = meo_wrd_u32(r);
+  if (v > 2147483647) {
+    meo_wrd_fail(r, -MEO_ERR_PROTO);
+    return 0;
+  }
+  return (int32)v;
+}
+
+export fn meo_wrd_u64(r: MeoWRd*) -> uint64 {
+  var at: int64 = meo_wrd_take(r, 8);
+  if (at < 0) { return 0; }
+  return meo_get_u64le(r->p, at);
+}
+
+export fn meo_wrd_i64(r: MeoWRd*) -> int64 {
+  return (int64)meo_wrd_u64(r);
+}
+
+export fn meo_wrd_f64(r: MeoWRd*) -> float64 {
+  var at: int64 = meo_wrd_take(r, 8);
+  if (at < 0) { return 0.0; }
+  return meo_get_f64le(r->p, at);
+}
+
+// A view of the next n bytes, or 0 with err set.
+export fn meo_wrd_bytes(r: MeoWRd*, n: int64) -> uint8* {
+  var at: int64 = meo_wrd_take(r, n);
+  if (at < 0) { return 0; }
+  return r->p + at;
+}
+
+// A str16 as a view into the payload; a NUL byte is PROTO.
+export fn meo_wrd_str16(r: MeoWRd*, out: string*) -> int32 {
+  out->chars = 0;
+  out->length = 0;
+  var n: int32 = meo_wrd_u16(r);
+  var p: uint8* = meo_wrd_bytes(r, (int64)n);
+  if (r->err != MEO_OK) { return r->err; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (p[i] == 0) {
+      meo_wrd_fail(r, -MEO_ERR_PROTO);
+      return r->err;
+    }
+    i += 1;
+  }
+  out->chars = p;
+  out->length = (uint64)n;
+  return MEO_OK;
+}
+
+// The payload must be consumed exactly: the first error, PROTO for trailing
+// bytes, else OK.
+export fn meo_wrd_end(r: MeoWRd*) -> int32 {
+  if (r->err != MEO_OK) { return r->err; }
+  if (r->at != r->n) { meo_wrd_fail(r, -MEO_ERR_PROTO); }
+  return r->err;
+}
+
+// Split a whole frame held in memory: header into h, payload into r. The
+// header's len must match the bytes given.
+export fn meo_wire_open(p: uint8*, n: int32, max_frame: int32, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  meo_wrd_init(r, p, 0);
+  if (p == 0 || n < MEO_WIRE_HDR) { return -MEO_ERR_PROTO; }
+  var rc: int32 = meo_wire_hdr_get(p, max_frame, h);
+  if (rc < 0) { return rc; }
+  if (h->len != n - MEO_WIRE_HDR) { return -MEO_ERR_PROTO; }
+  meo_wrd_init(r, p + MEO_WIRE_HDR, h->len);
+  return MEO_OK;
+}

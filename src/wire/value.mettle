@@ -1,0 +1,67 @@
+// wire/value: one tagged value on the wire, u8 tag + body.
+//
+//   0 NULL  no body
+//   1 INT   i64
+//   2 REAL  u64 IEEE-754 bits (-0.0 and NaN payloads kept)
+//   3 TEXT  u32 n + n bytes
+//   4 BLOB  u32 n + n bytes
+//
+// Tags are the MEO_T_* numbers. A decoded TEXT/BLOB is a view into the
+// payload, valid as long as the payload buffer is.
+
+import "../error/status.mettle";
+import "../record/value.mettle";
+import "frame.mettle";
+
+export fn meo_wire_val_put(w: MeoWBuf*, v: MeoValue*) {
+  if (meo_value_check(v) < 0) {
+    meo_wbuf_usage(w);
+    return;
+  }
+  meo_wbuf_u8(w, v->type);
+  switch (v->type) {
+    case 1: { meo_wbuf_i64(w, v->i); }
+    case 2: { meo_wbuf_f64(w, v->f); }
+    case 3: {
+      meo_wbuf_u32(w, (uint32)v->n);
+      meo_wbuf_bytes(w, v->p, v->n);
+    }
+    case 4: {
+      meo_wbuf_u32(w, (uint32)v->n);
+      meo_wbuf_bytes(w, v->p, v->n);
+    }
+  }
+}
+
+export fn meo_wire_val_get(r: MeoWRd*, v: MeoValue*) -> int32 {
+  meo_value_set_null(v);
+  var tag: int32 = meo_wrd_u8(r);
+  if (r->err != MEO_OK) { return r->err; }
+  switch (tag) {
+    case 0: { return MEO_OK; }
+    case 1: {
+      var x: int64 = meo_wrd_i64(r);
+      if (r->err == MEO_OK) { meo_value_set_int(v, x); }
+      return r->err;
+    }
+    case 2: {
+      var f: float64 = meo_wrd_f64(r);
+      if (r->err == MEO_OK) { meo_value_set_real(v, f); }
+      return r->err;
+    }
+    case 3: {
+      var n: int32 = meo_wrd_count(r);
+      var p: uint8* = meo_wrd_bytes(r, (int64)n);
+      if (r->err == MEO_OK) { meo_value_set_text(v, p, n); }
+      return r->err;
+    }
+    case 4: {
+      var n2: int32 = meo_wrd_count(r);
+      var p2: uint8* = meo_wrd_bytes(r, (int64)n2);
+      if (r->err == MEO_OK) { meo_value_set_blob(v, p2, n2); }
+      return r->err;
+    }
+  }
+  meo_wrd_fail(r, -MEO_ERR_PROTO);
+  return r->err;
+}
