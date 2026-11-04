@@ -1,6 +1,333 @@
+// pcache_self: the shared reader page cache. Single-threaded hit/miss, BUSY,
+// drop and fill-error behaviour, then two concurrency checks: 8 threads
+// hammering a small cache with random keys (bytes always match the key, no
+// pin leaks, no hangs) and 8 threads missing one key at once (a single frame
+// ends up linked).
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/format/page.mettle";
+import "../src/pager/pcache.mettle";
+
+const PC_THREADS: int32 = 8;
+const PC_GETS: int32 = 200000;
+const PC_KEYS: uint32 = 4096;
+const PC_DEADLINE_MS: uint32 = 120000;
+
+var g_fills: int32 = 0;
+// Nonzero makes the fill callback fail with that code; the slow flag makes it
+// sleep first, so concurrent misses overlap.
+var g_fail: int32 = 0;
+var g_slow: int32 = 0;
+var g_go: int32 = 0;
+
+fn pc_fail(msg: string) -> int32 {
+  println("FAIL pcache_self: {msg}");
+  return 1;
+}
+
+fn pc_load(p: int32*) -> int32 {
+  return atomic_compare_exchange_i32(p, 0, 0);
+}
+
+fn pc_fill(ctx: rawptr, page_no: uint32, src: uint64, out: uint8*) -> int32 {
+  atomic_inc_i32(&g_fills);
+  if (pc_load(&g_slow) != 0) { thread_sleep_ms(20); }
+  var fail: int32 = pc_load(&g_fail);
+  if (fail != 0) { return fail; }
+  var lo: uint32 = (uint32)src;
+  var i: int32 = 0;
+  while (i < 4) {
+    out[i] = (uint8)((page_no >> (uint32)(8 * i)) & (uint32)255);
+    out[4 + i] = (uint8)((lo >> (uint32)(8 * i)) & (uint32)255);
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// Do the frame's bytes spell (page_no, low 32 bits of src)?
+fn pc_matches(f: MeoPcFrame*, page_no: uint32, src: uint64) -> bool {
+  var pg: uint32 = 0;
+  var lo: uint32 = 0;
+  var i: int32 = 0;
+  while (i < 4) {
+    pg = pg | (((uint32)f->data[i]) << (uint32)(8 * i));
+    lo = lo | (((uint32)f->data[4 + i]) << (uint32)(8 * i));
+    i += 1;
+  }
+  return pg == page_no && lo == (uint32)src && f->page_no == page_no;
+}
+
+fn pc_get(c: MeoPcache*, page_no: uint32, src: uint64, err: int32*) -> MeoPcFrame* {
+  *err = MEO_OK;
+  return meo_pcache_get(c, page_no, src, &pc_fill, 0, err);
+}
+
+fn pc_linked(c: MeoPcache*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < c->n) {
+    if (c->frames[i].in_use) { n += 1; }
+    i += 1;
+  }
+  return n;
+}
+
+fn pc_single() -> int32 {
+  var err: int32 = 0;
+  if (meo_pcache_new(8) != 0) { return pc_fail("C0 pcache_new(8) should fail"); }
+
+  // C1: hit/miss counts; the second get is served from the cache.
+  var c: MeoPcache* = meo_pcache_new(MEO_PCACHE_MIN_FRAMES);
+  if (c == 0) { return pc_fail("C1 new"); }
+  if (meo_pcache_frames(c) != MEO_PCACHE_MIN_FRAMES) { return pc_fail("C1 frames"); }
+  var f1: MeoPcFrame* = pc_get(c, 7, 0, &err);
+  if (f1 == 0 || !pc_matches(f1, 7, 0)) { return pc_fail("C1 first get err={err}"); }
+  if (meo_pcache_unpin(c, f1) != MEO_OK) { return pc_fail("C1 unpin"); }
+  var f2: MeoPcFrame* = pc_get(c, 7, 0, &err);
+  if (f2 != f1) { return pc_fail("C1 second get returned another frame"); }
+  if (g_fills != 1) { return pc_fail("C1 fill calls {g_fills}"); }
+  if (meo_pcache_hits(c) != 1 || meo_pcache_misses(c) != 1) {
+    return pc_fail("C1 hits={meo_pcache_hits(c)} misses={meo_pcache_misses(c)}");
+  }
+  // Same page, different source: a different entry.
+  var f3: MeoPcFrame* = pc_get(c, 7, (uint64)5 * 4294967296 + 9, &err);
+  if (f3 == 0 || f3 == f2 || !pc_matches(f3, 7, 9)) { return pc_fail("C1 distinct src"); }
+  if (meo_pcache_pinned(c) != 2) { return pc_fail("C1 pinned {meo_pcache_pinned(c)}"); }
+  meo_pcache_unpin(c, f2);
+  meo_pcache_unpin(c, f3);
+  if (meo_pcache_unpin(c, f3) != -MEO_ERR_USAGE) { return pc_fail("C1 over-unpin"); }
+  if (meo_pcache_pinned(c) != 0) { return pc_fail("C1 pinned after over-unpin"); }
+  meo_pcache_free(c);
+
+  // C2: 16 frames, 16 pinned keys, then BUSY until one is released.
+  c = meo_pcache_new(16);
+  if (c == 0) { return pc_fail("C2 new"); }
+  var held: MeoPcFrame*[16];
+  var i: int32 = 0;
+  while (i < 16) {
+    held[i] = pc_get(c, (uint32)(100 + i), 0, &err);
+    if (held[i] == 0) { return pc_fail("C2 get {i} err={err}"); }
+    i += 1;
+  }
+  if (pc_get(c, 999, 0, &err) != 0 || err != -MEO_ERR_BUSY) { return pc_fail("C2 17th get err={err}"); }
+  meo_pcache_unpin(c, held[3]);
+  var f17: MeoPcFrame* = pc_get(c, 999, 0, &err);
+  if (f17 == 0 || !pc_matches(f17, 999, 0)) { return pc_fail("C2 17th after unpin err={err}"); }
+  meo_pcache_unpin(c, f17);
+  i = 0;
+  while (i < 16) {
+    if (i != 3) { meo_pcache_unpin(c, held[i]); }
+    i += 1;
+  }
+  meo_pcache_free(c);
+
+  // C3: drop of absent, pinned and unpinned keys; a later get refills.
+  c = meo_pcache_new(16);
+  if (c == 0) { return pc_fail("C3 new"); }
+  if (meo_pcache_drop(c, 1, 0) != 0) { return pc_fail("C3 absent"); }
+  var f: MeoPcFrame* = pc_get(c, 1, 0, &err);
+  if (f == 0) { return pc_fail("C3 get"); }
+  if (meo_pcache_drop(c, 1, 0) != -MEO_ERR_BUSY) { return pc_fail("C3 pinned"); }
+  meo_pcache_unpin(c, f);
+  var before: int32 = g_fills;
+  if (meo_pcache_drop(c, 1, 0) != 1) { return pc_fail("C3 unpinned"); }
+  if (pc_linked(c) != 0) { return pc_fail("C3 still linked"); }
+  f = pc_get(c, 1, 0, &err);
+  if (f == 0 || g_fills != before + 1) { return pc_fail("C3 refill"); }
+  meo_pcache_unpin(c, f);
+  meo_pcache_free(c);
+
+  // C4: a fill error comes back as is and the frame is returned.
+  c = meo_pcache_new(16);
+  if (c == 0) { return pc_fail("C4 new"); }
+  atomic_exchange_i32(&g_fail, -MEO_ERR_IO);
+  var pinned_before: int32 = meo_pcache_pinned(c);
+  if (pc_get(c, 3, 0, &err) != 0 || err != -MEO_ERR_IO) { return pc_fail("C4 err={err}"); }
+  atomic_exchange_i32(&g_fail, 0);
+  if (meo_pcache_pinned(c) != pinned_before || pc_linked(c) != 0) { return pc_fail("C4 frame leaked"); }
+  // All 16 frames must still be obtainable.
+  i = 0;
+  while (i < 16) {
+    held[i] = pc_get(c, (uint32)(200 + i), 0, &err);
+    if (held[i] == 0) { return pc_fail("C4 get {i} err={err}"); }
+    i += 1;
+  }
+  i = 0;
+  while (i < 16) {
+    meo_pcache_unpin(c, held[i]);
+    i += 1;
+  }
+  meo_pcache_free(c);
+  return 0;
+}
+
+// --- C5: random keys over a small cache -------------------------------------
+
+struct PcArg {
+  c: MeoPcache*;
+  tid: int32;
+  bad: int32;      // wrong bytes
+  errs: int32;     // failed gets
+  first_err: int32;
+}
+
+fn pc_worker(arg: cstring) -> uint32 {
+  var a: PcArg* = (PcArg*)arg;
+  var x: uint32 = (uint32)(a->tid + 1) * (uint32)2654435761;
+  var n: int32 = 0;
+  while (n < PC_GETS) {
+    x = x ^ (x << (uint32)13);
+    x = x ^ (x >> (uint32)17);
+    x = x ^ (x << (uint32)5);
+    var key: uint32 = x % PC_KEYS;
+    // Half the keys come from a second source so (page, src) pairs both matter.
+    var src: uint64 = (uint64)(key & (uint32)1) * 4294967296 + (uint64)(key >> (uint32)1);
+    var err: int32 = 0;
+    var f: MeoPcFrame* = pc_get(a->c, key, src, &err);
+    if (f == 0) {
+      a->errs += 1;
+      if (a->first_err == 0) { a->first_err = err; }
+    } else {
+      if (!pc_matches(f, key, src)) { a->bad += 1; }
+      if (meo_pcache_unpin(a->c, f) != MEO_OK) { a->bad += 1; }
+    }
+    n += 1;
+  }
+  return 0;
+}
+
+fn pc_stress() -> int32 {
+  var c: MeoPcache* = meo_pcache_new(256);
+  if (c == 0) { return pc_fail("C5 new"); }
+  var args: PcArg*[] = new PcArg*[PC_THREADS];
+  var hs: int64[] = new int64[PC_THREADS];
+  var i: int32 = 0;
+  while (i < PC_THREADS) {
+    args[i] = new PcArg;
+    args[i]->c = c;
+    args[i]->tid = i;
+    hs[i] = CreateThread(0, 0, &pc_worker, (cstring)args[i], 0, 0);
+    if (hs[i] == 0) { return pc_fail("C5 thread {i} did not start"); }
+    i += 1;
+  }
+  i = 0;
+  while (i < PC_THREADS) {
+    if (thread_join(hs[i], PC_DEADLINE_MS) != WAIT_OBJECT_0()) {
+      pc_fail("C5 thread {i} still running (hang?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  i = 0;
+  while (i < PC_THREADS) {
+    if (args[i]->bad != 0) { return pc_fail("C5 thread {i}: {args[i]->bad} wrong frames/unpins"); }
+    if (args[i]->errs != 0) { return pc_fail("C5 thread {i}: {args[i]->errs} failed gets, first err={args[i]->first_err}"); }
+    i += 1;
+  }
+  if (meo_pcache_pinned(c) != 0) { return pc_fail("C5 pin leak: {meo_pcache_pinned(c)}"); }
+  var total: int64 = meo_pcache_hits(c) + meo_pcache_misses(c);
+  if (total != (int64)PC_THREADS * (int64)PC_GETS) { return pc_fail("C5 hits+misses={total}"); }
+  if (pc_linked(c) > 256) { return pc_fail("C5 over-full"); }
+  // Linked frames must be distinct keys: re-getting every one is a hit.
+  var linked: int32 = pc_linked(c);
+  var h0: int64 = meo_pcache_hits(c);
+  var seen: int32 = 0;
+  i = 0;
+  while (i < 256) {
+    var fr: MeoPcFrame* = &c->frames[i];
+    if (fr->in_use) {
+      var err: int32 = 0;
+      var f: MeoPcFrame* = pc_get(c, fr->page_no, c->src[i], &err);
+      if (f != fr) { return pc_fail("C5 duplicate key linked at frame {i}"); }
+      meo_pcache_unpin(c, f);
+      seen += 1;
+    }
+    i += 1;
+  }
+  if (seen != linked || meo_pcache_hits(c) - h0 != (int64)linked) { return pc_fail("C5 re-get hits"); }
+  var hits: int64 = meo_pcache_hits(c);
+  var misses: int64 = meo_pcache_misses(c);
+  meo_pcache_free(c);
+  free((rawptr)args.data);
+  free((rawptr)hs.data);
+  println("pcache_self: C5 hits={hits} misses={misses}");
+  return 0;
+}
+
+// --- C6: everyone misses the same key at once -------------------------------
+
+struct PcOne {
+  c: MeoPcache*;
+  f: MeoPcFrame*;
+  err: int32;
+}
+
+fn pc_one_worker(arg: cstring) -> uint32 {
+  var a: PcOne* = (PcOne*)arg;
+  while (pc_load(&g_go) == 0) { thread_sleep_ms(1); }
+  a->f = pc_get(a->c, 4242, 77, &a->err);
+  return 0;
+}
+
+fn pc_same_key() -> int32 {
+  var c: MeoPcache* = meo_pcache_new(64);
+  if (c == 0) { return pc_fail("C6 new"); }
+  atomic_exchange_i32(&g_slow, 1);
+  atomic_exchange_i32(&g_go, 0);
+  var args: PcOne*[] = new PcOne*[PC_THREADS];
+  var hs: int64[] = new int64[PC_THREADS];
+  var i: int32 = 0;
+  while (i < PC_THREADS) {
+    args[i] = new PcOne;
+    args[i]->c = c;
+    hs[i] = CreateThread(0, 0, &pc_one_worker, (cstring)args[i], 0, 0);
+    if (hs[i] == 0) { return pc_fail("C6 thread {i} did not start"); }
+    i += 1;
+  }
+  atomic_exchange_i32(&g_go, 1);
+  i = 0;
+  while (i < PC_THREADS) {
+    if (thread_join(hs[i], PC_DEADLINE_MS) != WAIT_OBJECT_0()) {
+      pc_fail("C6 thread {i} still running (hang?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  atomic_exchange_i32(&g_slow, 0);
+  i = 0;
+  while (i < PC_THREADS) {
+    if (args[i]->f == 0) { return pc_fail("C6 thread {i} err={args[i]->err}"); }
+    if (!pc_matches(args[i]->f, 4242, 77)) { return pc_fail("C6 thread {i} wrong bytes"); }
+    if (args[i]->f != args[0]->f) { return pc_fail("C6 thread {i} got another frame"); }
+    i += 1;
+  }
+  if (meo_pcache_pinned(c) != 1) { return pc_fail("C6 pinned {meo_pcache_pinned(c)}"); }
+  i = 0;
+  while (i < PC_THREADS) {
+    meo_pcache_unpin(c, args[i]->f);
+    i += 1;
+  }
+  if (meo_pcache_pinned(c) != 0) { return pc_fail("C6 pin leak"); }
+  if (pc_linked(c) != 1) { return pc_fail("C6 linked {pc_linked(c)}"); }
+  var err: int32 = 0;
+  var again: MeoPcFrame* = pc_get(c, 4242, 77, &err);
+  if (again != args[0]->f) { return pc_fail("C6 re-get returned another frame"); }
+  meo_pcache_unpin(c, again);
+  meo_pcache_free(c);
+  free((rawptr)args.data);
+  free((rawptr)hs.data);
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS pcache_self (stub)");
+  if (pc_single() != 0) { return 1; }
+  if (pc_stress() != 0) { return 1; }
+  if (pc_same_key() != 0) { return 1; }
+  println("PASS pcache_self");
   return 0;
 }

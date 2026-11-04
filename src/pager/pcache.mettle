@@ -1,0 +1,316 @@
+// pager/pcache: the shared page cache for snapshot readers.
+//
+// Entries are immutable versions keyed by (page_no, src), where src names the
+// place the bytes came from (0 = the database file, otherwise a WAL frame), so
+// a key never changes meaning and a cached page is never invalidated, only
+// evicted. Any number of reader threads share one cache; the writer's own
+// frame table is a separate thing and never lives here.
+//
+// This module must not import the pager. MeoPcFrame therefore repeats the
+// leading fields of MeoFrame (pager.mettle) in the same order, and the pager
+// casts MeoPcFrame* to MeoFrame*: that cast is the contract, so the two field
+// lists have to stay identical.
+//
+// Frame states, carried in `pin`:
+//   -2 FREE     not linked; any thread may take it with CAS(-2 -> -1)
+//   -1 CLAIMED  owned by one thread, not linked; page_no/src are written only
+//               in this state
+//  >=0 linked   in the chain of stripe(key) with in_use set; pin is the count
+//
+// A linked frame is pinned only under its stripe's lock, so an evictor that
+// holds the same lock and wins CAS(0 -> -1) cannot race a new pin. Unpin is a
+// bare atomic decrement, which can only help the evictor. Misses fill outside
+// every lock, so two threads can fill the same key at once; the loser finds
+// the winner's frame when it links and drops its own copy.
+
+import "std/mem";
+import "std/thread";
+import "../error/status.mettle";
+import "../format/page.mettle";
+
+export const MEO_PCACHE_MIN_FRAMES: int32 = 1024;
+export const MEO_PCACHE_STRIPES: int32 = 64;
+export const MEO_PC_FREE: int32 = -2;
+export const MEO_PC_CLAIMED: int32 = -1;
+
+// Same leading fields as MeoFrame in pager.mettle; keep the two in step.
+export struct MeoPcFrame {
+  data: uint8*;
+  page_no: uint32;
+  pin: int32;
+  in_use: bool;
+  dirty: bool;
+  referenced: bool;
+}
+
+export struct MeoPcache {
+  frames: MeoPcFrame*;
+  src: uint64*;
+  next: int32*;      // chain link, value = frame index + 1, 0 = end
+  buckets: int32*;   // chain head, value = frame index + 1, 0 = empty
+  n: int32;
+  nb: int32;         // power of two, >= 2 * n
+  locks: int32[64];  // spin locks; bucket b belongs to stripe b & 63
+  hand: int32;       // clock hand, atomic
+  hits: int64[64];   // per stripe, under its lock
+  misses: int64[64];
+}
+
+fn meo_pc_bucket(c: MeoPcache*, page_no: uint32, src: uint64) -> int32 {
+  var h: uint32 = (page_no * (uint32)0x9E3779B1) ^ (((uint32)src) * (uint32)0x85EBCA6B) ^ (uint32)(src >> 32);
+  return (int32)(h & (uint32)(c->nb - 1));
+}
+
+fn meo_pc_stripe(b: int32) -> int32 {
+  return b & (MEO_PCACHE_STRIPES - 1);
+}
+
+// Atomic read of a shared word. CAS with equal exchange and comparand never
+// changes the value.
+fn meo_pc_load(p: int32*) -> int32 {
+  return atomic_compare_exchange_i32(p, 0, 0);
+}
+
+fn meo_pc_frame_at(c: MeoPcache*, i: int32) -> MeoPcFrame* {
+  return &c->frames[i];
+}
+
+export fn meo_pcache_new(n_frames: int32) -> MeoPcache* {
+  if (n_frames < 16) { return 0; }
+  var c: MeoPcache* = (MeoPcache*)calloc(1, (int64)sizeof(MeoPcache));
+  if (c == 0) { return 0; }
+  var nb: int32 = 1;
+  while (nb < 2 * n_frames) { nb = nb * 2; }
+  c->n = n_frames;
+  c->nb = nb;
+  c->frames = (MeoPcFrame*)calloc((int64)n_frames, (int64)sizeof(MeoPcFrame));
+  c->src = (uint64*)calloc((int64)n_frames, 8);
+  c->next = (int32*)calloc((int64)n_frames, 4);
+  c->buckets = (int32*)calloc((int64)nb, 4);
+  var ok: bool = c->frames != 0 && c->src != 0 && c->next != 0 && c->buckets != 0;
+  var i: int32 = 0;
+  while (ok && i < n_frames) {
+    var f: MeoPcFrame* = meo_pc_frame_at(c, i);
+    f->data = (uint8*)malloc((int64)MEO_PAGE_SIZE);
+    f->pin = MEO_PC_FREE;
+    if (f->data == 0) { ok = false; }
+    i += 1;
+  }
+  if (!ok) {
+    meo_pcache_free(c);
+    return 0;
+  }
+  return c;
+}
+
+// The caller guarantees no pins and no concurrent use.
+export fn meo_pcache_free(c: MeoPcache*) {
+  if (c == 0) { return; }
+  if (c->frames != 0) {
+    var i: int32 = 0;
+    while (i < c->n) {
+      var f: MeoPcFrame* = meo_pc_frame_at(c, i);
+      if (f->data != 0) { free((rawptr)f->data); }
+      i += 1;
+    }
+    free((rawptr)c->frames);
+  }
+  if (c->src != 0) { free((rawptr)c->src); }
+  if (c->next != 0) { free((rawptr)c->next); }
+  if (c->buckets != 0) { free((rawptr)c->buckets); }
+  free((rawptr)c);
+}
+
+// Frame holding the key, or -1. The stripe lock is held.
+fn meo_pc_find(c: MeoPcache*, b: int32, page_no: uint32, src: uint64) -> int32 {
+  var v: int32 = c->buckets[b];
+  while (v != 0) {
+    var i: int32 = v - 1;
+    if (c->frames[i].page_no == page_no && c->src[i] == src) { return i; }
+    v = c->next[i];
+  }
+  return -1;
+}
+
+// Take frame i out of its chain. The stripe lock is held and the frame is
+// CLAIMED by the caller.
+fn meo_pc_unlink(c: MeoPcache*, i: int32) {
+  var f: MeoPcFrame* = meo_pc_frame_at(c, i);
+  var b: int32 = meo_pc_bucket(c, f->page_no, c->src[i]);
+  var v: int32 = c->buckets[b];
+  var prev: int32 = -1;
+  while (v != 0 && v - 1 != i) {
+    prev = v - 1;
+    v = c->next[prev];
+  }
+  if (v == 0) { return; }
+  if (prev < 0) {
+    c->buckets[b] = c->next[i];
+  } else {
+    c->next[prev] = c->next[i];
+  }
+  c->next[i] = 0;
+  f->in_use = false;
+  f->referenced = false;
+}
+
+// CLAIMED back to FREE.
+fn meo_pc_release(c: MeoPcache*, i: int32) {
+  var f: MeoPcFrame* = meo_pc_frame_at(c, i);
+  f->in_use = false;
+  f->referenced = false;
+  atomic_exchange_i32(&f->pin, MEO_PC_FREE);
+}
+
+// Clock sweep for a frame to fill. Returns it CLAIMED and unlinked, or -1 when
+// every frame is pinned or in someone's hands.
+fn meo_pc_victim(c: MeoPcache*) -> int32 {
+  var tries: int32 = 0;
+  while (tries < 2 * c->n) {
+    tries += 1;
+    var h: int32 = atomic_inc_i32(&c->hand) & 0x7FFFFFFF;
+    var i: int32 = h % c->n;
+    var f: MeoPcFrame* = meo_pc_frame_at(c, i);
+    var pin: int32 = meo_pc_load(&f->pin);
+    if (pin == MEO_PC_FREE) {
+      if (atomic_compare_exchange_i32(&f->pin, MEO_PC_CLAIMED, MEO_PC_FREE) == MEO_PC_FREE) { return i; }
+    } else if (pin == 0) {
+      // The key may be stale (the frame can be mid-claim by someone else), so
+      // the stripe is only a guess: recheck under its lock.
+      var s: int32 = meo_pc_stripe(meo_pc_bucket(c, f->page_no, c->src[i]));
+      spin_lock(&c->locks[s]);
+      var mine: bool = f->in_use && meo_pc_stripe(meo_pc_bucket(c, f->page_no, c->src[i])) == s;
+      if (mine && f->referenced) {
+        f->referenced = false;
+        mine = false;
+      }
+      if (mine && atomic_compare_exchange_i32(&f->pin, MEO_PC_CLAIMED, 0) == 0) {
+        meo_pc_unlink(c, i);
+        spin_unlock(&c->locks[s]);
+        return i;
+      }
+      spin_unlock(&c->locks[s]);
+    }
+  }
+  return -1;
+}
+
+export fn meo_pcache_get(c: MeoPcache*, page_no: uint32, src: uint64,
+    meo_fill_cb: fn(rawptr, uint32, uint64, uint8*) -> int32, ctx: rawptr, err: int32*) -> MeoPcFrame* {
+  var b: int32 = meo_pc_bucket(c, page_no, src);
+  var s: int32 = meo_pc_stripe(b);
+  spin_lock(&c->locks[s]);
+  var hit: int32 = meo_pc_find(c, b, page_no, src);
+  if (hit >= 0) {
+    var hf: MeoPcFrame* = meo_pc_frame_at(c, hit);
+    atomic_inc_i32(&hf->pin);
+    hf->referenced = true;
+    c->hits[s] += 1;
+    spin_unlock(&c->locks[s]);
+    return hf;
+  }
+  c->misses[s] += 1;
+  spin_unlock(&c->locks[s]);
+
+  var vi: int32 = meo_pc_victim(c);
+  if (vi < 0) {
+    *err = -MEO_ERR_BUSY;
+    return 0;
+  }
+  var f: MeoPcFrame* = meo_pc_frame_at(c, vi);
+  var rc: int32 = meo_fill_cb(ctx, page_no, src, f->data);
+  if (rc != MEO_OK) {
+    meo_pc_release(c, vi);
+    *err = rc;
+    return 0;
+  }
+  f->page_no = page_no;
+  c->src[vi] = src;
+
+  spin_lock(&c->locks[s]);
+  var dup: int32 = meo_pc_find(c, b, page_no, src);
+  if (dup >= 0) {
+    var df: MeoPcFrame* = meo_pc_frame_at(c, dup);
+    atomic_inc_i32(&df->pin);
+    df->referenced = true;
+    spin_unlock(&c->locks[s]);
+    meo_pc_release(c, vi);
+    return df;
+  }
+  c->next[vi] = c->buckets[b];
+  c->buckets[b] = vi + 1;
+  f->in_use = true;
+  f->referenced = true;
+  atomic_exchange_i32(&f->pin, 1);
+  spin_unlock(&c->locks[s]);
+  return f;
+}
+
+export fn meo_pcache_unpin(c: MeoPcache*, f: MeoPcFrame*) -> int32 {
+  if (atomic_dec_i32(&f->pin) < 0) {
+    atomic_inc_i32(&f->pin);
+    return -MEO_ERR_USAGE;
+  }
+  return MEO_OK;
+}
+
+// 1 if the entry was removed, 0 if absent, -BUSY if pinned.
+export fn meo_pcache_drop(c: MeoPcache*, page_no: uint32, src: uint64) -> int32 {
+  var b: int32 = meo_pc_bucket(c, page_no, src);
+  var s: int32 = meo_pc_stripe(b);
+  spin_lock(&c->locks[s]);
+  var i: int32 = meo_pc_find(c, b, page_no, src);
+  if (i < 0) {
+    spin_unlock(&c->locks[s]);
+    return 0;
+  }
+  var f: MeoPcFrame* = meo_pc_frame_at(c, i);
+  if (atomic_compare_exchange_i32(&f->pin, MEO_PC_CLAIMED, 0) != 0) {
+    spin_unlock(&c->locks[s]);
+    return -MEO_ERR_BUSY;
+  }
+  meo_pc_unlink(c, i);
+  spin_unlock(&c->locks[s]);
+  meo_pc_release(c, i);
+  return 1;
+}
+
+export fn meo_pcache_hits(c: MeoPcache*) -> int64 {
+  var total: int64 = 0;
+  var s: int32 = 0;
+  while (s < MEO_PCACHE_STRIPES) {
+    spin_lock(&c->locks[s]);
+    total += c->hits[s];
+    spin_unlock(&c->locks[s]);
+    s += 1;
+  }
+  return total;
+}
+
+export fn meo_pcache_misses(c: MeoPcache*) -> int64 {
+  var total: int64 = 0;
+  var s: int32 = 0;
+  while (s < MEO_PCACHE_STRIPES) {
+    spin_lock(&c->locks[s]);
+    total += c->misses[s];
+    spin_unlock(&c->locks[s]);
+    s += 1;
+  }
+  return total;
+}
+
+export fn meo_pcache_frames(c: MeoPcache*) -> int32 {
+  return c->n;
+}
+
+// Frames with a live pin. A racy snapshot: exact only when no one is in the
+// cache.
+export fn meo_pcache_pinned(c: MeoPcache*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < c->n) {
+    if (meo_pc_load(&c->frames[i].pin) > 0) { n += 1; }
+    i += 1;
+  }
+  return n;
+}

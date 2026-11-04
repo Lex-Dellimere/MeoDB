@@ -110,6 +110,8 @@ export const MEO_HOOK_DETACH: int32 = 3;    // pager closing; last call
 
 // --- types ------------------------------------------------------------------
 
+// Snapshot readers cast MeoPcFrame* (pager/pcache.mettle) to MeoFrame*, so the
+// leading fields here and there must stay identical.
 export struct MeoFrame {
   data: uint8*;      // MEO_PAGE_SIZE bytes, owned by the pager
   page_no: uint32;   // meaningful while in_use
