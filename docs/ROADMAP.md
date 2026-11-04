@@ -1,6 +1,6 @@
 # MeoSQL roadmap
 
-Milestones in build order. A milestone is done when every exit criterion is checked by a `[bin.*]` test that passes in debug and release with zero warnings. Layer numbers refer to `docs/ARCHITECTURE.md`.
+Milestones in build order, with one exception: the network server (M7, without remote subscribe) comes straight after M2, because flux_orm reaches MeoSQL over the network instead of compiling it in. Remote subscribe follows M4. A milestone is done when every exit criterion is checked by a `[bin.*]` test that passes in debug and release with zero warnings. Layer numbers refer to `docs/ARCHITECTURE.md`.
 
 ## M0 — Storage (done)
 Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback journal.
