@@ -1,0 +1,235 @@
+// server/main: the `meosql` binary. Opens one database file and serves it.
+//
+// SIGINT/SIGTERM are blocked before any thread starts (threads inherit the
+// mask) and taken synchronously with rt_sigtimedwait, so no handler ever runs
+// inside the runtime's locks.
+
+import "std/io";
+import "std/mem";
+import "../error/status.mettle";
+import "../platform/file.mettle";
+import "../platform/file_linux.mettle";
+import "../db/db.mettle";
+import "server.mettle";
+import "session.mettle";
+
+const SYS_RT_SIGPROCMASK: int64 = 14;
+const SYS_RT_SIGTIMEDWAIT: int64 = 128;
+const SIG_BLOCK: int64 = 0;
+const SIG_MASK_INT_TERM: uint64 = 16386;   // bits for SIGINT (2) and SIGTERM (15)
+
+fn usage() {
+  println("usage: meosql --db PATH [options]");
+  println("  --listen IP:PORT    bind address (default 127.0.0.1:5490)");
+  println("  --port N            port only (0 = ephemeral)");
+  println("  --token-file PATH   client token, 1..256 bytes");
+  println("  --no-token          allow a non-loopback bind without a token");
+  println("  --max-conns N       (64)       --max-frame BYTES (16777216)");
+  println("  --busy-ms N         (10000)    --tx-idle-ms N    (5000)");
+  println("  --tx-max-ms N       (60000)    --idle-ms N       (300000, 0 = none)");
+  println("  --hello-ms N        (5000)     --stop-ms N       (10000)");
+  println("Prints the bound port, then serves until SIGINT or SIGTERM.");
+}
+
+// A view of a NUL-terminated argument.
+fn arg_str(p: cstring) -> string {
+  var b: uint8* = (uint8*)p;
+  var n: int64 = 0;
+  while (b[n] != 0) { n += 1; }
+  var s: string;
+  s.chars = b;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn str_eq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var i: uint64 = 0;
+  while (i < a.length) {
+    if (a.chars[i] != b.chars[i]) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+// Decimal int32 >= 0, or -1.
+fn parse_n(s: string) -> int32 {
+  if (s.length == 0 || s.length > 10) { return -1; }
+  var v: int64 = 0;
+  var i: uint64 = 0;
+  while (i < s.length) {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    v = v * 10 + (int64)(c - 48);
+    i += 1;
+  }
+  if (v > 2147483647) { return -1; }
+  return (int32)v;
+}
+
+fn is_loopback(ip: string) -> bool {
+  return ip.length >= 4 && ip.chars[0] == 49 && ip.chars[1] == 50 && ip.chars[2] == 55
+    && ip.chars[3] == 46;
+}
+
+// Token file: 1..256 bytes after trailing newlines are stripped. Length, or
+// -MEO_ERR_*.
+fn read_token(path: string, buf: uint8*) -> int32 {
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var size: int64 = meo_file_size(f);
+  var rc: int32 = MEO_OK;
+  if (size < 1 || size > 258) { rc = -MEO_ERR_USAGE; }
+  if (rc == MEO_OK) { rc = meo_file_read_at(f, 0, buf, size); }
+  meo_file_close(f);
+  if (rc < 0) { return rc; }
+  var n: int32 = (int32)size;
+  while (n > 0 && (buf[n - 1] == 10 || buf[n - 1] == 13)) { n -= 1; }
+  if (n < 1 || n > 256) { return -MEO_ERR_USAGE; }
+  return n;
+}
+
+fn fail(msg: string) -> int32 {
+  println("meosql: {msg}");
+  return 1;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var c: MeoSrvConfig;
+  meo_srv_config_default(&c);
+  var db_path: string = "";
+  var have_db: bool = false;
+  var token_path: string = "";
+  var have_token: bool = false;
+  var no_token: bool = false;
+  var i: int32 = 1;
+  if (argc < 2) {
+    usage();
+    return 2;
+  }
+  while (i < argc) {
+    var a: string = arg_str(argv[i]);
+    if (str_eq(a, "--help") || str_eq(a, "-h")) {
+      usage();
+      return 0;
+    }
+    if (str_eq(a, "--no-token")) {
+      no_token = true;
+      i += 1;
+      continue;
+    }
+    if (i + 1 >= argc) {
+      usage();
+      return 2;
+    }
+    var v: string = arg_str(argv[i + 1]);
+    var n: int32 = parse_n(v);
+    var bad: bool = false;
+    if (str_eq(a, "--db")) {
+      db_path = v;
+      have_db = true;
+    } else if (str_eq(a, "--token-file")) {
+      token_path = v;
+      have_token = true;
+    } else if (str_eq(a, "--listen")) {
+      var k: int64 = (int64)v.length - 1;
+      while (k >= 0 && v.chars[k] != 58) { k -= 1; }
+      if (k <= 0) {
+        bad = true;
+      } else {
+        var ip: string;
+        ip.chars = v.chars;
+        ip.length = (uint64)k;
+        var ps: string;
+        ps.chars = v.chars + (k + 1);
+        ps.length = v.length - (uint64)(k + 1);
+        c.ip = ip;
+        c.port = parse_n(ps);
+        bad = c.port < 0 || c.port > 65535;
+      }
+    } else if (str_eq(a, "--port")) {
+      c.port = n;
+      bad = n < 0 || n > 65535;
+    } else if (str_eq(a, "--max-conns")) {
+      c.max_conns = n;
+      bad = n < 1;
+    } else if (str_eq(a, "--max-frame")) {
+      c.max_frame = n;
+      bad = n < 0;
+    } else if (str_eq(a, "--busy-ms")) {
+      c.busy_ms = n;
+      bad = n < 0;
+    } else if (str_eq(a, "--tx-idle-ms")) {
+      c.tx_idle_ms = n;
+      bad = n < 1;
+    } else if (str_eq(a, "--tx-max-ms")) {
+      c.tx_max_ms = n;
+      bad = n < 0;
+    } else if (str_eq(a, "--idle-ms")) {
+      c.idle_ms = n;
+      bad = n < 0;
+    } else if (str_eq(a, "--hello-ms")) {
+      c.hello_ms = n;
+      bad = n < 1;
+    } else if (str_eq(a, "--stop-ms")) {
+      c.stop_ms = n;
+      bad = n < 0;
+    } else {
+      println("meosql: unknown option {a}");
+      usage();
+      return 2;
+    }
+    if (bad) { return fail("bad value for {a}: {v}"); }
+    i += 2;
+  }
+  if (!have_db) {
+    usage();
+    return 2;
+  }
+  var tok: uint8[260];
+  if (have_token) {
+    var tn: int32 = read_token(token_path, &tok[0]);
+    if (tn < 0) { return fail("cannot read token file {token_path}: {meo_status_name(-tn)}"); }
+    c.token = &tok[0];
+    c.token_n = tn;
+  }
+  if (!is_loopback(c.ip) && c.token_n == 0 && !no_token) {
+    return fail("refusing a non-loopback bind without --token-file (or --no-token)");
+  }
+
+  var set: uint64 = SIG_MASK_INT_TERM;
+  syscall(SYS_RT_SIGPROCMASK, SIG_BLOCK, (int64)&set, (int64)0, (int64)8);
+
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(db_path, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE, 0, &db);
+  if (rc != MEO_OK) { return fail("cannot open {db_path}: {meo_status_name(-rc)}"); }
+  var srv: MeoSrv* = 0;
+  rc = meo_srv_start(db, &c, &srv);
+  if (rc != MEO_OK) {
+    meo_db_close(db);
+    return fail("cannot listen on {c.ip}:{c.port}: {meo_status_name(-rc)}");
+  }
+  println("meosql listening on {c.ip}:{meo_srv_port(srv)}");
+
+  var info: uint8[128];
+  var ts: int64[2];
+  var sig: int64 = 0;
+  while (sig <= 0) {
+    ts[0] = 1;
+    ts[1] = 0;
+    sig = syscall(SYS_RT_SIGTIMEDWAIT, (int64)&set, (int64)&info[0], (int64)&ts[0], (int64)8);
+  }
+  println("meosql: signal {sig}, stopping");
+  // A session that missed stop_ms still holds its transaction; the hot
+  // journal restores pre-transaction data on the next open.
+  var st: int32 = meo_srv_stop(srv);
+  if (st == MEO_OK) {
+    meo_srv_free(srv);
+    st = meo_db_close(db);
+  }
+  if (st != MEO_OK) {
+    println("meosql: unclean stop: {meo_status_name(-st)}");
+    return 1;
+  }
+  return 0;
+}

@@ -1,0 +1,262 @@
+// server/server: the listener, the acceptor thread and the session slots.
+//
+// One thread per connection. The acceptor reaps finished sessions before it
+// places a new one, so a slot is reused only after its thread was joined.
+// The server never opens or closes the db; its caller does.
+
+import "std/mem";
+import "std/thread";
+import "../error/status.mettle";
+import "../db/db.mettle";
+import "../net/sock.mettle";
+import "../wire/frame.mettle";
+import "session.mettle";
+
+const SRV_BACKLOG: int32 = 128;
+const SRV_BUSY_SEND_MS: int32 = 1000;
+
+export fn meo_srv_config_default(c: MeoSrvConfig*) {
+  c->ip = "127.0.0.1";
+  c->port = 5490;
+  c->max_conns = 64;
+  c->max_frame = MEO_WIRE_MAX_FRAME;
+  c->token = 0;
+  c->token_n = 0;
+  c->busy_ms = 10000;
+  c->tx_idle_ms = 5000;
+  c->tx_max_ms = 60000;
+  c->idle_ms = 300000;
+  c->hello_ms = 5000;
+  c->stop_ms = 10000;
+}
+
+fn srv_config_ok(c: MeoSrvConfig*) -> bool {
+  if (c->port < 0 || c->port > 65535 || c->max_conns < 1) { return false; }
+  if (c->max_frame < MEO_WIRE_MIN_FRAME || c->max_frame > MEO_WIRE_MAX_FRAME_LIMIT) { return false; }
+  if (c->token_n < 0 || c->token_n > 256 || (c->token_n > 0 && c->token == 0)) { return false; }
+  if (c->busy_ms < 0 || c->tx_idle_ms < 1 || c->tx_max_ms < 0 || c->idle_ms < 0) { return false; }
+  return c->hello_ms >= 1 && c->stop_ms >= 0;
+}
+
+// Join and free every session whose thread has finished. Acceptor thread, or
+// after it was joined.
+fn srv_reap(srv: MeoSrv*) {
+  var i: int32 = 0;
+  while (i < srv->cfg.max_conns) {
+    var sl: MeoSrvSlot* = &srv->slots[i];
+    if (sl->s != 0 && atomic_compare_exchange_i32(&sl->done, 0, 0) != 0) {
+      thread_join_infinite(sl->thread);
+      thread_close(sl->thread);
+      meo_srv_session_free(sl->s);
+      mutex_lock_infinite(srv->mtx);
+      sl->s = 0;
+      sl->thread = 0;
+      sl->done = 0;
+      mutex_unlock(srv->mtx);
+    }
+    i += 1;
+  }
+}
+
+fn srv_free_slot(srv: MeoSrv*) -> int32 {
+  var i: int32 = 0;
+  while (i < srv->cfg.max_conns) {
+    if (srv->slots[i].s == 0) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+fn srv_refuse(fd: int64, code: int32) {
+  var w: MeoWBuf;
+  meo_wbuf_init(&w, MEO_WIRE_MIN_FRAME);
+  meo_sock_set_send_timeout(fd, SRV_BUSY_SEND_MS);
+  var n: int32 = meo_srv_error_frame(&w, 0, code, true, 0);
+  if (n > 0) { meo_sock_send_all(fd, w.p, n); }
+  meo_wbuf_free(&w);
+  meo_sock_close(fd);
+}
+
+fn srv_place(srv: MeoSrv*, fd: int64) {
+  srv_reap(srv);
+  var i: int32 = srv_free_slot(srv);
+  if (i < 0) {
+    srv_refuse(fd, MEO_ERR_BUSY);
+    return;
+  }
+  srv->next_id += 1;
+  var s: MeoSrvSession* = meo_srv_session_new(srv, i, fd, srv->next_id);
+  if (s == 0) {
+    srv_refuse(fd, MEO_ERR_NOMEM);
+    return;
+  }
+  mutex_lock_infinite(srv->mtx);
+  srv->slots[i].s = s;
+  srv->slots[i].done = 0;
+  srv->slots[i].thread = 0;
+  mutex_unlock(srv->mtx);
+  var h: int64 = CreateThread(0, 0, &meo_srv_session_run, (cstring)s, 0, 0);
+  if (h == 0) {
+    mutex_lock_infinite(srv->mtx);
+    srv->slots[i].s = 0;
+    mutex_unlock(srv->mtx);
+    meo_srv_session_free(s);
+    srv_refuse(fd, MEO_ERR_NOMEM);
+    return;
+  }
+  srv->slots[i].thread = h;
+}
+
+fn srv_accept_loop(arg: cstring) -> uint32 {
+  var srv: MeoSrv* = (MeoSrv*)arg;
+  while (!meo_srv_stopping(srv)) {
+    var fd: int64 = meo_sock_accept(srv->lfd);
+    if (fd < 0) {
+      if (meo_srv_stopping(srv)) { break; }
+      // Out of descriptors or a transient error: back off, keep serving.
+      Sleep(10);
+    } else if (meo_srv_stopping(srv)) {
+      meo_sock_close(fd);
+    } else {
+      srv_place(srv, fd);
+    }
+  }
+  return 0;
+}
+
+// The acceptor never reads srv->acceptor, so storing it after the start is safe.
+fn srv_spawn_acceptor(srv: MeoSrv*) -> int64 {
+  return CreateThread(0, 0, &srv_accept_loop, (cstring)srv, 0, 0);
+}
+
+// Bind, listen, start the acceptor and return. c is copied, its token too.
+export fn meo_srv_start(db: MeoDb*, c: MeoSrvConfig*, out: MeoSrv**) -> int32 {
+  if (out == 0) { return -MEO_ERR_USAGE; }
+  out[0] = 0;
+  if (db == 0 || c == 0 || !srv_config_ok(c)) { return -MEO_ERR_USAGE; }
+  var srv: MeoSrv* = new MeoSrv;
+  if (srv == 0) { return -MEO_ERR_NOMEM; }
+  srv->db = db;
+  srv->cfg = *c;
+  srv->cfg.token = 0;
+  srv->lfd = -1;
+  srv->port = 0;
+  srv->acceptor = 0;
+  srv->stop = 0;
+  srv->next_id = 0;
+  srv->mtx = mutex_create();
+  srv->slots = (MeoSrvSlot*)calloc((int64)c->max_conns, (int64)sizeof(MeoSrvSlot));
+  if (c->token_n > 0) {
+    srv->cfg.token = (uint8*)malloc((int64)c->token_n);
+    if (srv->cfg.token != 0) { memcpy((rawptr)srv->cfg.token, (rawptr)c->token, (int64)c->token_n); }
+  }
+  var rc: int32 = MEO_OK;
+  if (srv->mtx == 0 || srv->slots == 0 || (c->token_n > 0 && srv->cfg.token == 0)) {
+    rc = -MEO_ERR_NOMEM;
+  }
+  if (rc == MEO_OK) {
+    srv->lfd = meo_sock_listen(c->ip, c->port, SRV_BACKLOG);
+    if (srv->lfd < 0) { rc = (int32)srv->lfd; }
+  }
+  if (rc == MEO_OK) {
+    srv->port = meo_sock_port(srv->lfd);
+    if (srv->port < 0) { rc = srv->port; }
+  }
+  if (rc == MEO_OK) {
+    meo_db_busy_timeout(db, c->busy_ms);
+    srv->acceptor = srv_spawn_acceptor(srv);
+    if (srv->acceptor == 0) { rc = -MEO_ERR_NOMEM; }
+  }
+  if (rc != MEO_OK) {
+    if (srv->lfd >= 0) { meo_sock_close(srv->lfd); }
+    srv->lfd = -1;
+    meo_srv_free(srv);
+    return rc;
+  }
+  out[0] = srv;
+  return MEO_OK;
+}
+
+export fn meo_srv_port(srv: MeoSrv*) -> int32 {
+  if (srv == 0) { return -MEO_ERR_USAGE; }
+  return srv->port;
+}
+
+// Live sessions (finished but not yet reaped ones excluded).
+export fn meo_srv_n_sessions(srv: MeoSrv*) -> int32 {
+  if (srv == 0) { return -MEO_ERR_USAGE; }
+  var n: int32 = 0;
+  mutex_lock_infinite(srv->mtx);
+  var i: int32 = 0;
+  while (i < srv->cfg.max_conns) {
+    var sl: MeoSrvSlot* = &srv->slots[i];
+    if (sl->s != 0 && atomic_compare_exchange_i32(&sl->done, 0, 0) == 0) { n += 1; }
+    i += 1;
+  }
+  mutex_unlock(srv->mtx);
+  return n;
+}
+
+// Close the listener, cut every session's read side (each finishes its frame,
+// reads EOF and rolls back on its own thread), join all within stop_ms.
+// -MEO_ERR_BUSY if a session missed the deadline.
+export fn meo_srv_stop(srv: MeoSrv*) -> int32 {
+  if (srv == 0) { return -MEO_ERR_USAGE; }
+  if (atomic_exchange_i32(&srv->stop, 1) != 0) { return MEO_OK; }
+  if (srv->lfd >= 0) { meo_sock_shutdown(srv->lfd, MEO_SOCK_SHUT_BOTH); }
+  if (srv->acceptor != 0) {
+    thread_join_infinite(srv->acceptor);
+    thread_close(srv->acceptor);
+    srv->acceptor = 0;
+  }
+  if (srv->lfd >= 0) { meo_sock_close(srv->lfd); }
+  srv->lfd = -1;
+  mutex_lock_infinite(srv->mtx);
+  var i: int32 = 0;
+  while (i < srv->cfg.max_conns) {
+    var s: MeoSrvSession* = srv->slots[i].s;
+    if (s != 0 && s->fd >= 0) { meo_sock_shutdown(s->fd, MEO_SOCK_SHUT_RD); }
+    i += 1;
+  }
+  mutex_unlock(srv->mtx);
+  var deadline: int64 = meo_srv_now_ms() + (int64)srv->cfg.stop_ms;
+  var rc: int32 = MEO_OK;
+  i = 0;
+  while (i < srv->cfg.max_conns) {
+    var sl: MeoSrvSlot* = &srv->slots[i];
+    if (sl->s != 0) {
+      var left: int64 = deadline - meo_srv_now_ms();
+      if (left < 0) { left = 0; }
+      if (thread_join(sl->thread, (uint32)left) == WAIT_OBJECT_0()) {
+        thread_close(sl->thread);
+        meo_srv_session_free(sl->s);
+        sl->s = 0;
+        sl->thread = 0;
+        sl->done = 0;
+      } else {
+        rc = -MEO_ERR_BUSY;
+      }
+    }
+    i += 1;
+  }
+  return rc;
+}
+
+// Free a stopped server. -MEO_ERR_BUSY (and nothing freed) while a session
+// thread is still running.
+export fn meo_srv_free(srv: MeoSrv*) -> int32 {
+  if (srv == 0) { return MEO_OK; }
+  if (srv->acceptor != 0) { return -MEO_ERR_USAGE; }
+  if (srv->slots != 0) {
+    var i: int32 = 0;
+    while (i < srv->cfg.max_conns) {
+      if (srv->slots[i].s != 0) { return -MEO_ERR_BUSY; }
+      i += 1;
+    }
+    free((rawptr)srv->slots);
+  }
+  if (srv->cfg.token != 0) { free((rawptr)srv->cfg.token); }
+  if (srv->mtx != 0) { mutex_close(srv->mtx); }
+  free(srv);
+  return MEO_OK;
+}

@@ -1,0 +1,232 @@
+// server/exec: one wire statement -> one MeoQuery -> one RESULT payload.
+//
+// The wire carries flux's numbers (RC_OP_*, RC_W_*); this file is the only
+// place they are translated to meo_q_* calls. Values in st point into the
+// request buffer; the builders copy them, so the buffer can be reused.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../record/value.mettle";
+import "../catalog/schema.mettle";
+import "../db/db.mettle";
+import "../db/flags.mettle";
+import "../query/spec.mettle";
+import "../query/query.mettle";
+import "../wire/frame.mettle";
+import "../wire/stmt.mettle";
+import "../wire/msg.mettle";
+
+// caps this server advertises in HELLO_OK.
+export const MEO_SRV_CAPS: uint32 = 3;   // COUNT | ASSIGN_ADD
+
+// RC_W_* (index) -> MEO_Q_*; IN, NULL and NOT_NULL have their own builders.
+fn srv_term_op(op: int32) -> int32 {
+  switch (op) {
+    case 0: { return MEO_Q_EQ; }
+    case 1: { return MEO_Q_NE; }
+    case 2: { return MEO_Q_LT; }
+    case 3: { return MEO_Q_LE; }
+    case 4: { return MEO_Q_GT; }
+    case 5: { return MEO_Q_GE; }
+  }
+  return 0;
+}
+
+// Wire column flags (PK 1, NOT_NULL 2, UNIQUE 4) -> MEO_COL_*.
+fn srv_col_flags(f: int32) -> int32 {
+  var c: int32 = 0;
+  if ((f & MEO_WIRE_CF_PK) != 0) { c = c | MEO_COL_PK; }
+  if ((f & MEO_WIRE_CF_NOT_NULL) != 0) { c = c | MEO_COL_NOT_NULL; }
+  if ((f & MEO_WIRE_CF_UNIQUE) != 0) { c = c | MEO_COL_UNIQUE; }
+  return c;
+}
+
+// The checks memory safety needs before any meo_q_* call; the rest is the
+// query layer's.
+fn srv_check(st: MeoWStmt*, caps: uint32) -> int32 {
+  if (st->op < MEO_WIRE_OP_CREATE || st->op > MEO_WIRE_OP_DROP_INDEX) { return -MEO_ERR_USAGE; }
+  var i: int32 = 0;
+  while (i < st->n_terms) {
+    var t: MeoWTerm* = &st->terms[i];
+    if (t->op < MEO_WIRE_W_EQ || t->op > MEO_WIRE_W_NOT_NULL) { return -MEO_ERR_USAGE; }
+    if ((int64)t->arg0 + (int64)t->n_args > (int64)st->n_args) { return -MEO_ERR_USAGE; }
+    if (t->op <= MEO_WIRE_W_GE && t->n_args != 1) { return -MEO_ERR_USAGE; }
+    if (t->op == MEO_WIRE_W_IN && t->n_args < 1) { return -MEO_ERR_USAGE; }
+    if (t->op >= MEO_WIRE_W_NULL && t->n_args != 0) { return -MEO_ERR_USAGE; }
+    i += 1;
+  }
+  i = 0;
+  while (i < st->n_cols) {
+    if ((st->cols[i].flags & MEO_WIRE_CF_ADD) != 0) {
+      if (st->op != MEO_WIRE_OP_UPDATE || (caps & MEO_WIRE_CAP_ASSIGN_ADD) == 0) {
+        return -MEO_ERR_USAGE;
+      }
+    }
+    i += 1;
+  }
+  if (st->op == MEO_WIRE_OP_UPDATE && st->n_args < st->n_cols) { return -MEO_ERR_USAGE; }
+  if (st->op == MEO_WIRE_OP_INSERT && (int64)st->n_rows * (int64)st->n_cols != (int64)st->n_args) {
+    return -MEO_ERR_USAGE;
+  }
+  if (st->op == MEO_WIRE_OP_COUNT) {
+    if (st->n_cols != 0 || st->n_order != 0 || st->limit != -1 || st->offset != 0) {
+      return -MEO_ERR_USAGE;
+    }
+  }
+  return MEO_OK;
+}
+
+fn srv_add_terms(q: MeoQuery*, st: MeoWStmt*) -> int32 {
+  var rc: int32 = MEO_OK;
+  var i: int32 = 0;
+  while (i < st->n_terms && rc == MEO_OK) {
+    var t: MeoWTerm* = &st->terms[i];
+    if (t->op <= MEO_WIRE_W_GE) {
+      rc = meo_q_where(q, t->col, srv_term_op(t->op), &st->args[t->arg0]);
+    } else if (t->op == MEO_WIRE_W_IN) {
+      rc = meo_q_where_in(q, t->col, &st->args[t->arg0], t->n_args);
+    } else if (t->op == MEO_WIRE_W_NULL) {
+      rc = meo_q_where_null(q, t->col);
+    } else {
+      rc = meo_q_where_not_null(q, t->col);
+    }
+    i += 1;
+  }
+  return rc;
+}
+
+fn srv_add_defs(q: MeoQuery*, st: MeoWStmt*) -> int32 {
+  var rc: int32 = MEO_OK;
+  var i: int32 = 0;
+  while (i < st->n_cols && rc == MEO_OK) {
+    var c: MeoWCol* = &st->cols[i];
+    rc = meo_q_column_def(q, c->name, c->ty, srv_col_flags(c->flags));
+    i += 1;
+  }
+  return rc;
+}
+
+fn srv_build(q: MeoQuery*, st: MeoWStmt*) -> int32 {
+  var rc: int32 = MEO_OK;
+  var i: int32 = 0;
+  switch (st->op) {
+    case 1: {
+      if (st->if_not_exists) { rc = meo_q_if_not_exists(q); }
+      if (rc == MEO_OK) { rc = srv_add_defs(q, st); }
+    }
+    case 2: {
+      while (i < st->n_cols && rc == MEO_OK) {
+        rc = meo_q_into(q, st->cols[i].name);
+        i += 1;
+      }
+      i = 0;
+      while (i < st->n_args && rc == MEO_OK) {
+        rc = meo_q_value(q, &st->args[i]);
+        i += 1;
+      }
+    }
+    case 3: {
+      while (i < st->n_cols && rc == MEO_OK) {
+        rc = meo_q_pick(q, st->cols[i].name);
+        i += 1;
+      }
+      if (rc == MEO_OK) { rc = srv_add_terms(q, st); }
+      i = 0;
+      while (i < st->n_order && rc == MEO_OK) {
+        rc = meo_q_order(q, st->order[i].col, st->order[i].desc);
+        i += 1;
+      }
+      if (rc == MEO_OK && st->limit >= 0) { rc = meo_q_limit(q, st->limit); }
+      if (rc == MEO_OK && st->offset > 0) { rc = meo_q_offset(q, st->offset); }
+    }
+    case 4: {
+      while (i < st->n_cols && rc == MEO_OK) {
+        var c: MeoWCol* = &st->cols[i];
+        var v: MeoValue* = &st->args[i];
+        if ((c->flags & MEO_WIRE_CF_ADD) != 0) {
+          if (v->type != MEO_T_INT) {
+            rc = -MEO_ERR_MISMATCH;
+          } else {
+            rc = meo_q_assign_add(q, c->name, v->i);
+          }
+        } else {
+          rc = meo_q_assign(q, c->name, v);
+        }
+        i += 1;
+      }
+      if (rc == MEO_OK) { rc = srv_add_terms(q, st); }
+    }
+    case 5: { rc = srv_add_terms(q, st); }
+    case 6: { rc = srv_add_terms(q, st); }
+    case 7: {
+      if (st->if_not_exists) { rc = meo_q_if_not_exists(q); }
+    }
+    case 8: { rc = srv_add_defs(q, st); }
+  }
+  return rc;
+}
+
+fn srv_new_query(db: MeoDb*, st: MeoWStmt*, out: MeoQuery**) -> int32 {
+  switch (st->op) {
+    case 1: { return meo_q_create(db, st->table, out); }
+    case 2: { return meo_q_insert(db, st->table, out); }
+    case 3: { return meo_q_select(db, st->table, out); }
+    case 4: { return meo_q_update(db, st->table, out); }
+    case 5: { return meo_q_delete(db, st->table, out); }
+    case 6: { return meo_q_count(db, st->table, out); }
+    case 7: { return meo_q_drop(db, st->table, out); }
+    case 8: { return meo_q_add_column(db, st->table, out); }
+  }
+  return -MEO_ERR_UNSUPPORTED;
+}
+
+// Copy the whole result into w as a RESULT payload.
+fn srv_put_result(q: MeoQuery*, w: MeoWBuf*) -> int32 {
+  var nc: int32 = meo_q_column_count(q);
+  var nr: int32 = 0;
+  if (nc > 0) { nr = meo_q_row_count(q); }
+  var total: int64 = (int64)nr * (int64)nc;
+  var cells: MeoValue* = 0;
+  if (total > 0) {
+    cells = (MeoValue*)malloc(total * (int64)sizeof(MeoValue));
+    if (cells == 0) { return -MEO_ERR_NOMEM; }
+    var r: int32 = 0;
+    while (r < nr) {
+      var c: int32 = 0;
+      while (c < nc) {
+        var rc: int32 = meo_q_cell(q, r, c, &cells[(int64)r * (int64)nc + (int64)c]);
+        if (rc < 0) {
+          free((rawptr)cells);
+          return rc;
+        }
+        c += 1;
+      }
+      r += 1;
+    }
+  }
+  meo_wire_result_put(w, meo_q_changes(q), meo_q_last_insert_rowid(q), nc, nr, cells);
+  if (cells != 0) { free((rawptr)cells); }
+  return w->err;
+}
+
+// Run st and append its RESULT payload to w (begun by the caller, w->max set
+// to the frame limit). MEO_OK, or -MEO_ERR_* for an ERROR frame; TOOBIG when
+// the result does not fit.
+export fn meo_srv_exec(db: MeoDb*, st: MeoWStmt*, caps: uint32, w: MeoWBuf*) -> int32 {
+  var rc: int32 = srv_check(st, caps);
+  if (rc != MEO_OK) { return rc; }
+  if (st->op == MEO_WIRE_OP_CREATE_INDEX || st->op == MEO_WIRE_OP_DROP_INDEX) {
+    return -MEO_ERR_UNSUPPORTED;
+  }
+  var q: MeoQuery* = 0;
+  rc = srv_new_query(db, st, &q);
+  if (rc != MEO_OK) { return rc; }
+  rc = srv_build(q, st);
+  if (rc == MEO_OK) {
+    rc = meo_q_step(q);
+    if (rc == MEO_ROW || rc == MEO_DONE) { rc = srv_put_result(q, w); }
+  }
+  meo_q_free(q);
+  if (rc > 0) { return -MEO_ERR_USAGE; }
+  return rc;
+}

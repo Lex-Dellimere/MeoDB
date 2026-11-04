@@ -22,8 +22,12 @@ targets = ["linux"]
 [profile.release]
 flags = ["--release"]
 
-[bin.meosql]
+[bin.smoke]
 main = "src/main.mettle"
+
+# The MeoSQL server: owns one database file and serves the wire protocol.
+[bin.meosql]
+main = "src/server/main.mettle"
 
 [bin.s0_self]
 main = "tests/s0_self.mettle"
@@ -123,3 +127,7 @@ main = "tests/schema_self.mettle"
 # The client library against a scripted fake server.
 [bin.cli_self]
 main = "tests/cli_self.mettle"
+
+# The server over loopback with raw frames: handshake, queries, errors.
+[bin.srv_smoke]
+main = "tests/srv_smoke.mettle"

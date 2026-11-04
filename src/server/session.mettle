@@ -1,0 +1,420 @@
+// server/session: one client connection, shaped like an actor.
+//
+// The session's thread owns the socket for the connection's whole life. Each
+// frame is a message, handled to completion; every ending goes through
+// srv_session_exit, which rolls back an open transaction on this same thread
+// (the lock owner) before the socket closes.
+
+import "std/mem";
+import "std/thread";
+import "../error/status.mettle";
+import "../mem/arena.mettle";
+import "../db/db.mettle";
+import "../db/flags.mettle";
+import "../net/sock.mettle";
+import "../wire/frame.mettle";
+import "../wire/stmt.mettle";
+import "../wire/msg.mettle";
+import "exec.mettle";
+
+export const MEO_SRV_S_HELLO: int32 = 0;
+export const MEO_SRV_S_READY: int32 = 1;
+export const MEO_SRV_S_TX: int32 = 2;
+export const MEO_SRV_S_ABORTED: int32 = 3;
+
+// Exit reasons, numbered like alph's so a session can become an actor.
+export const MEO_SRV_EXIT_NORMAL: int64 = 0;     // BYE, or EOF while READY
+export const MEO_SRV_EXIT_KILLED: int64 = 2;     // cut off by a timeout
+export const MEO_SRV_EXIT_CRASHED: int64 = 4;    // protocol violation, bad token
+export const MEO_SRV_EXIT_SHUTDOWN: int64 = 5;   // server stop
+export const MEO_SRV_EXIT_LOST: int64 = 100;     // peer EOF or socket error
+
+const SRV_CONTINUE: int32 = 0;
+const SRV_STOP: int32 = 1;
+const SRV_BUF_KEEP: int32 = 1048576;   // buffers above this are dropped after a frame
+const SRV_HELLO_SEND_MS: int32 = 1000;
+const SRV_READY_SEND_MS: int32 = 30000;
+const SRV_AUTH_DELAY_MS: uint32 = 200;
+
+export struct MeoSrvConfig {
+  ip: string;
+  port: int32;            // 0 = ephemeral; meo_srv_port reads it back
+  max_conns: int32;
+  max_frame: int32;
+  token: uint8*;          // copied by meo_srv_start
+  token_n: int32;         // 0 = no token
+  busy_ms: int32;
+  tx_idle_ms: int32;
+  tx_max_ms: int32;
+  idle_ms: int32;         // 0 = none
+  hello_ms: int32;
+  stop_ms: int32;
+}
+
+export struct MeoSrvSlot {
+  s: MeoSrvSession*;
+  thread: int64;
+  done: int32;            // set by the session thread as its last act
+}
+
+export struct MeoSrv {
+  db: MeoDb*;
+  cfg: MeoSrvConfig;
+  lfd: int64;
+  port: int32;
+  acceptor: int64;
+  stop: int32;
+  mtx: int64;             // guards slots and session fds
+  slots: MeoSrvSlot*;
+  next_id: int64;
+}
+
+export struct MeoSrvSession {
+  id: int64;
+  srv: MeoSrv*;
+  slot: int32;
+  fd: int64;
+  state: int32;
+  tx_start_ms: int64;
+  peer_max: int32;        // largest frame the client accepts
+  rbuf: uint8*;
+  rcap: int32;
+  w: MeoWBuf;
+  arena: MeoArena*;
+  reason: int64;
+}
+
+export fn meo_srv_now_ms() -> int64 {
+  // clock_gettime(CLOCK_MONOTONIC)
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  syscall((int64)228, (int64)1, (int64)&ts[0]);
+  return ts[0] * (int64)1000 + ts[1] / (int64)1000000;
+}
+
+export fn meo_srv_stopping(srv: MeoSrv*) -> bool {
+  return atomic_compare_exchange_i32(&srv->stop, 0, 0) != 0;
+}
+
+// One ERROR frame into w; the frame size or the codec's error.
+export fn meo_srv_error_frame(w: MeoWBuf*, rid: uint32, code: int32, fatal: bool, tx: int32) -> int32 {
+  var e: MeoWError;
+  e.code = code;
+  e.fatal = fatal;
+  e.tx = tx;
+  e.msg = meo_status_name(code);
+  meo_wbuf_begin(w);
+  meo_wire_error_put(w, &e);
+  return meo_wbuf_finish(w, MEO_WIRE_K_ERROR, rid);
+}
+
+export fn meo_srv_session_new(srv: MeoSrv*, slot: int32, fd: int64, id: int64) -> MeoSrvSession* {
+  var s: MeoSrvSession* = new MeoSrvSession;
+  if (s == 0) { return 0; }
+  s->id = id;
+  s->srv = srv;
+  s->slot = slot;
+  s->fd = fd;
+  s->state = MEO_SRV_S_HELLO;
+  s->tx_start_ms = 0;
+  s->peer_max = MEO_WIRE_MIN_FRAME;
+  s->rbuf = 0;
+  s->rcap = 0;
+  meo_wbuf_init(&s->w, srv->cfg.max_frame);
+  s->arena = meo_arena_new(4096);
+  s->reason = MEO_SRV_EXIT_NORMAL;
+  if (s->arena == 0) {
+    free(s);
+    return 0;
+  }
+  return s;
+}
+
+export fn meo_srv_session_free(s: MeoSrvSession*) {
+  if (s == 0) { return; }
+  meo_wbuf_free(&s->w);
+  if (s->rbuf != 0) { free((rawptr)s->rbuf); }
+  if (s->arena != 0) { meo_arena_free(s->arena); }
+  free(s);
+}
+
+fn srv_tx_byte(s: MeoSrvSession*) -> int32 {
+  if (s->state == MEO_SRV_S_TX) { return MEO_WIRE_TX_OPEN; }
+  if (s->state == MEO_SRV_S_ABORTED) { return MEO_WIRE_TX_ABORTED; }
+  return MEO_WIRE_TX_NONE;
+}
+
+fn srv_set_state(s: MeoSrvSession*, state: int32) {
+  s->state = state;
+  var c: MeoSrvConfig* = &s->srv->cfg;
+  if (state == MEO_SRV_S_HELLO) {
+    meo_sock_set_recv_timeout(s->fd, c->hello_ms);
+    meo_sock_set_send_timeout(s->fd, SRV_HELLO_SEND_MS);
+  } else if (state == MEO_SRV_S_READY) {
+    meo_sock_set_recv_timeout(s->fd, c->idle_ms);
+    meo_sock_set_send_timeout(s->fd, SRV_READY_SEND_MS);
+  } else {
+    meo_sock_set_recv_timeout(s->fd, c->tx_idle_ms);
+    meo_sock_set_send_timeout(s->fd, c->tx_idle_ms);
+  }
+}
+
+// Undo an open transaction on this thread, which releases the db lock.
+fn srv_rollback(s: MeoSrvSession*) {
+  if (s->state == MEO_SRV_S_TX) {
+    meo_db_rollback(s->srv->db);
+    srv_set_state(s, MEO_SRV_S_ABORTED);
+  }
+}
+
+fn srv_send(s: MeoSrvSession*, n: int32) -> int32 {
+  if (n < 0) { return n; }
+  var rc: int32 = meo_sock_send_all(s->fd, s->w.p, n);
+  if (s->w.cap > SRV_BUF_KEEP) {
+    meo_wbuf_free(&s->w);
+    meo_wbuf_init(&s->w, s->srv->cfg.max_frame);
+  }
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+fn srv_reply_empty(s: MeoSrvSession*, kind: int32, rid: uint32) -> int32 {
+  meo_wbuf_begin(&s->w);
+  return srv_send(s, meo_wbuf_finish(&s->w, kind, rid));
+}
+
+fn srv_reply_error(s: MeoSrvSession*, rid: uint32, code: int32, fatal: bool) -> int32 {
+  return srv_send(s, meo_srv_error_frame(&s->w, rid, code, fatal, srv_tx_byte(s)));
+}
+
+// A fatal error: roll back first so ERROR.tx tells the truth, answer, stop.
+fn srv_fatal(s: MeoSrvSession*, rid: uint32, code: int32, reason: int64) -> int32 {
+  srv_rollback(s);
+  if (s->state == MEO_SRV_S_ABORTED) { s->state = MEO_SRV_S_READY; }
+  srv_reply_error(s, rid, code, true);
+  s->reason = reason;
+  return SRV_STOP;
+}
+
+// After a reply: a failed send ends the session.
+fn srv_after(s: MeoSrvSession*, rc: int32) -> int32 {
+  if (rc < 0) {
+    s->reason = MEO_SRV_EXIT_LOST;
+    return SRV_STOP;
+  }
+  return SRV_CONTINUE;
+}
+
+// Longer of the two lengths, so the time does not depend on where they differ.
+fn srv_token_ok(srv: MeoSrv*, t: string) -> bool {
+  var want: int32 = srv->cfg.token_n;
+  var got: int32 = (int32)t.length;
+  var n: int32 = want;
+  if (got > n) { n = got; }
+  var diff: int32 = 0;
+  if (got != want) { diff = 1; }
+  var i: int32 = 0;
+  while (i < n) {
+    var a: int32 = 0;
+    var b: int32 = 0;
+    if (i < want) { a = (int32)srv->cfg.token[i]; }
+    if (i < got) { b = (int32)t.chars[i]; }
+    diff = diff | (a ^ b);
+    i += 1;
+  }
+  return diff == 0;
+}
+
+fn srv_on_hello(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  var hello: MeoWHello;
+  var rc: int32 = meo_wire_hello_get(r, &hello);
+  if (rc == -MEO_ERR_VERSION) {
+    return srv_fatal(s, h->rid, MEO_ERR_VERSION, MEO_SRV_EXIT_CRASHED);
+  }
+  if (rc < 0) { return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED); }
+  if (s->srv->cfg.token_n > 0 && !srv_token_ok(s->srv, hello.token)) {
+    Sleep(SRV_AUTH_DELAY_MS);
+    return srv_fatal(s, h->rid, MEO_ERR_AUTH, MEO_SRV_EXIT_CRASHED);
+  }
+  s->peer_max = hello.max_frame;
+  var ok: MeoWHelloOk;
+  ok.major = MEO_WIRE_MAJOR;
+  ok.minor = hello.minor;
+  if (ok.minor > MEO_WIRE_MINOR) { ok.minor = MEO_WIRE_MINOR; }
+  ok.max_frame = s->srv->cfg.max_frame;
+  ok.session = (uint64)s->id;
+  ok.caps = MEO_SRV_CAPS;
+  ok.name = "meosql 0.1.0";
+  meo_wbuf_begin(&s->w);
+  meo_wire_hello_ok_put(&s->w, &ok);
+  rc = srv_send(s, meo_wbuf_finish(&s->w, MEO_WIRE_K_HELLO_OK, h->rid));
+  if (rc == MEO_OK) { srv_set_state(s, MEO_SRV_S_READY); }
+  return srv_after(s, rc);
+}
+
+fn srv_on_query(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  meo_arena_reset(s->arena);
+  var st: MeoWStmt;
+  var rc: int32 = meo_wire_stmt_get(r, s->arena, &st);
+  if (rc == -MEO_ERR_NOMEM) { return srv_after(s, srv_reply_error(s, h->rid, MEO_ERR_NOMEM, false)); }
+  if (rc < 0) { return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED); }
+  if (s->state == MEO_SRV_S_ABORTED) {
+    return srv_after(s, srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+  }
+  var max: int32 = s->srv->cfg.max_frame;
+  if (s->peer_max < max) { max = s->peer_max; }
+  s->w.max = max;
+  meo_wbuf_begin(&s->w);
+  rc = meo_srv_exec(s->srv->db, &st, MEO_SRV_CAPS, &s->w);
+  s->w.max = s->srv->cfg.max_frame;
+  if (rc < 0) { return srv_after(s, srv_reply_error(s, h->rid, -rc, false)); }
+  return srv_after(s, srv_send(s, meo_wbuf_finish(&s->w, MEO_WIRE_K_RESULT, h->rid)));
+}
+
+// Handle one frame to completion: SRV_CONTINUE, or SRV_STOP with s->reason set.
+fn srv_session_handle(s: MeoSrvSession*, h: MeoWHdr*, body: uint8*) -> int32 {
+  var r: MeoWRd;
+  meo_wrd_init(&r, body, h->len);
+  if (!meo_wire_kind_is_request(h->kind)) {
+    return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+  }
+  if (s->state == MEO_SRV_S_HELLO) {
+    if (h->kind != MEO_WIRE_K_HELLO) {
+      return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+    }
+    return srv_on_hello(s, h, &r);
+  }
+  if (h->kind == MEO_WIRE_K_HELLO) {
+    return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+  }
+  if (s->state == MEO_SRV_S_TX) {
+    var cap: int32 = s->srv->cfg.tx_max_ms;
+    if (cap > 0 && meo_srv_now_ms() - s->tx_start_ms > (int64)cap) { srv_rollback(s); }
+  }
+  var db: MeoDb* = s->srv->db;
+  var rc: int32 = MEO_OK;
+  if (h->kind == MEO_WIRE_K_QUERY) { return srv_on_query(s, h, &r); }
+  if (h->kind == MEO_WIRE_K_BEGIN) {
+    var mode: int32 = 0;
+    if (meo_wire_begin_get(&r, &mode) < 0) {
+      return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+    }
+    if (s->state != MEO_SRV_S_READY) {
+      return srv_after(s, srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+    }
+    rc = meo_db_begin(db, mode);
+    if (rc < 0) { return srv_after(s, srv_reply_error(s, h->rid, -rc, false)); }
+    s->tx_start_ms = meo_srv_now_ms();
+    srv_set_state(s, MEO_SRV_S_TX);
+    return srv_after(s, srv_reply_empty(s, MEO_WIRE_K_OK, h->rid));
+  }
+  if (meo_wire_empty_get(&r) < 0) {
+    return srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+  }
+  if (h->kind == MEO_WIRE_K_PING) {
+    return srv_after(s, srv_reply_empty(s, MEO_WIRE_K_OK, h->rid));
+  }
+  if (h->kind == MEO_WIRE_K_COMMIT) {
+    if (s->state != MEO_SRV_S_TX) {
+      return srv_after(s, srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+    }
+    // A failed commit leaves the transaction open: only ROLLBACK clears it.
+    rc = meo_db_commit(db);
+    if (rc < 0) { return srv_after(s, srv_reply_error(s, h->rid, -rc, false)); }
+    srv_set_state(s, MEO_SRV_S_READY);
+    return srv_after(s, srv_reply_empty(s, MEO_WIRE_K_OK, h->rid));
+  }
+  if (h->kind == MEO_WIRE_K_ROLLBACK) {
+    if (s->state == MEO_SRV_S_READY) {
+      return srv_after(s, srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+    }
+    srv_rollback(s);
+    srv_set_state(s, MEO_SRV_S_READY);
+    return srv_after(s, srv_reply_empty(s, MEO_WIRE_K_OK, h->rid));
+  }
+  // BYE
+  srv_reply_empty(s, MEO_WIRE_K_OK, h->rid);
+  s->reason = MEO_SRV_EXIT_NORMAL;
+  return SRV_STOP;
+}
+
+// EOF or a socket error: which exit it is depends on why.
+fn srv_lost(s: MeoSrvSession*) -> int64 {
+  if (meo_srv_stopping(s->srv)) { return MEO_SRV_EXIT_SHUTDOWN; }
+  if (s->state == MEO_SRV_S_READY) { return MEO_SRV_EXIT_NORMAL; }
+  return MEO_SRV_EXIT_LOST;
+}
+
+fn srv_session_loop(s: MeoSrvSession*) -> int64 {
+  var hb: uint8[12];
+  var h: MeoWHdr;
+  meo_sock_set_nodelay(s->fd, true);
+  srv_set_state(s, MEO_SRV_S_HELLO);
+  while (true) {
+    var rc: int32 = meo_sock_recv_exact(s->fd, &hb[0], MEO_WIRE_HDR);
+    if (rc == -MEO_ERR_TIMEOUT) {
+      if (meo_srv_stopping(s->srv)) { return MEO_SRV_EXIT_SHUTDOWN; }
+      srv_fatal(s, 0, MEO_ERR_TIMEOUT, MEO_SRV_EXIT_KILLED);
+      return s->reason;
+    }
+    if (rc <= 0) { return srv_lost(s); }
+    rc = meo_wire_hdr_get(&hb[0], s->srv->cfg.max_frame, &h);
+    if (rc == -MEO_ERR_TOOBIG) {
+      srv_fatal(s, h.rid, MEO_ERR_TOOBIG, MEO_SRV_EXIT_CRASHED);
+      return s->reason;
+    }
+    if (rc < 0) {
+      srv_fatal(s, h.rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+      return s->reason;
+    }
+    if (h.len > s->rcap) {
+      var p: rawptr = realloc((rawptr)s->rbuf, (int64)h.len);
+      if (p == 0) {
+        srv_fatal(s, h.rid, MEO_ERR_NOMEM, MEO_SRV_EXIT_CRASHED);
+        return s->reason;
+      }
+      s->rbuf = (uint8*)p;
+      s->rcap = h.len;
+    }
+    if (h.len > 0) {
+      rc = meo_sock_recv_exact(s->fd, s->rbuf, h.len);
+      if (rc == -MEO_ERR_TIMEOUT && !meo_srv_stopping(s->srv)) {
+        srv_fatal(s, 0, MEO_ERR_TIMEOUT, MEO_SRV_EXIT_KILLED);
+        return s->reason;
+      }
+      if (rc != h.len) { return srv_lost(s); }
+    }
+    if (srv_session_handle(s, &h, s->rbuf) == SRV_STOP) { return s->reason; }
+    if (s->rcap > SRV_BUF_KEEP) {
+      free((rawptr)s->rbuf);
+      s->rbuf = 0;
+      s->rcap = 0;
+    }
+  }
+  return MEO_SRV_EXIT_LOST;
+}
+
+// The one way out: roll back on this thread, close, mark the slot done.
+fn srv_session_exit(s: MeoSrvSession*, reason: int64) {
+  srv_rollback(s);
+  s->reason = reason;
+  var srv: MeoSrv* = s->srv;
+  mutex_lock_infinite(srv->mtx);
+  meo_sock_close(s->fd);
+  s->fd = -1;
+  mutex_unlock(srv->mtx);
+  meo_wbuf_free(&s->w);
+  if (s->rbuf != 0) { free((rawptr)s->rbuf); }
+  s->rbuf = 0;
+  s->rcap = 0;
+  atomic_exchange_i32(&srv->slots[s->slot].done, 1);
+}
+
+// Thread entry; arg is the MeoSrvSession*. The session struct itself is freed
+// by whoever joins this thread.
+export fn meo_srv_session_run(arg: cstring) -> uint32 {
+  var s: MeoSrvSession* = (MeoSrvSession*)arg;
+  srv_session_exit(s, srv_session_loop(s));
+  return 0;
+}

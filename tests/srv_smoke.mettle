@@ -1,0 +1,491 @@
+// srv_smoke: the server embedded on 127.0.0.1 port 0, driven with raw frames.
+// Handshake errors (PROTO before HELLO, wrong token), a CREATE/INSERT/SELECT
+// round trip, COUNT and UPDATE, DROP and ADD COLUMN, refused ops, a client
+// that drops its socket mid-transaction, an oversize result, and a stop with
+// a transaction still open.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/mem/arena.mettle";
+import "../src/meo_server.mettle";
+
+// Red-check switch: 1 expects the dropped client's row to survive.
+// Must be 0 when committed.
+const SMK_RED: int32 = 0;
+const SMK_DB: string = "build/srv_smoke.db";
+const SMK_IP: string = "127.0.0.1";
+const SMK_TOKEN: string = "sekrit";
+const SMK_FRAME: int32 = 65536;
+const SMK_BIG: int32 = 1000;
+
+var g_port: int32 = 0;
+var g_rid: uint32 = 0;
+var g_w: MeoWBuf;
+var g_buf: uint8* = 0;
+var g_hdr: MeoWHdr;
+var g_rd: MeoWRd;
+var g_arena: MeoArena* = 0;
+var g_err: MeoWError;
+var g_res: MeoWResult;
+
+fn smk_fail(msg: string) -> int32 {
+  println("FAIL srv_smoke: {msg}");
+  return 1;
+}
+
+fn smk_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn smk_connect() -> int64 {
+  var fd: int64 = meo_sock_connect(SMK_IP, g_port);
+  if (fd >= 0) { meo_sock_set_recv_timeout(fd, 3000); }
+  return fd;
+}
+
+fn smk_send(fd: int64, kind: int32) -> int32 {
+  g_rid += 1;
+  var n: int32 = meo_wbuf_finish(&g_w, kind, g_rid);
+  if (n < 0) { return n; }
+  var rc: int32 = meo_sock_send_all(fd, g_w.p, n);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// Read one frame into g_hdr / g_rd: its kind, 0 on EOF, or -MEO_ERR_*.
+fn smk_recv(fd: int64) -> int32 {
+  var rc: int32 = meo_sock_recv_exact(fd, g_buf, MEO_WIRE_HDR);
+  if (rc <= 0) { return rc; }
+  rc = meo_wire_hdr_get(g_buf, SMK_FRAME, &g_hdr);
+  if (rc < 0) { return rc; }
+  if (g_hdr.len > 0) {
+    rc = meo_sock_recv_exact(fd, g_buf + MEO_WIRE_HDR, g_hdr.len);
+    if (rc != g_hdr.len) { return -MEO_ERR_IO; }
+  }
+  meo_wrd_init(&g_rd, g_buf + MEO_WIRE_HDR, g_hdr.len);
+  return g_hdr.kind;
+}
+
+// Send an empty request; the response kind. An ERROR is decoded into g_err.
+fn smk_call(fd: int64, kind: int32) -> int32 {
+  meo_wbuf_begin(&g_w);
+  var rc: int32 = smk_send(fd, kind);
+  if (rc < 0) { return rc; }
+  return smk_reply(fd);
+}
+
+fn smk_reply(fd: int64) -> int32 {
+  var k: int32 = smk_recv(fd);
+  if (k == MEO_WIRE_K_ERROR) {
+    if (meo_wire_error_get(&g_rd, &g_err) < 0) { return -MEO_ERR_PROTO; }
+  } else if (k == MEO_WIRE_K_RESULT) {
+    meo_arena_reset(g_arena);
+    if (meo_wire_result_get(&g_rd, g_arena, &g_res) < 0) { return -MEO_ERR_PROTO; }
+  }
+  if (k > 0 && g_hdr.rid != g_rid && g_hdr.rid != 0) { return -MEO_ERR_PROTO; }
+  return k;
+}
+
+fn smk_hello(fd: int64, token: string) -> int32 {
+  var h: MeoWHello;
+  h.major = MEO_WIRE_MAJOR;
+  h.minor = MEO_WIRE_MINOR;
+  h.max_frame = SMK_FRAME;
+  h.token = token;
+  h.name = "srv_smoke";
+  meo_wbuf_begin(&g_w);
+  meo_wire_hello_put(&g_w, &h);
+  var rc: int32 = smk_send(fd, MEO_WIRE_K_HELLO);
+  if (rc < 0) { return rc; }
+  return smk_reply(fd);
+}
+
+// Connected and past HELLO, or a negative code.
+fn smk_open() -> int64 {
+  var fd: int64 = smk_connect();
+  if (fd < 0) { return fd; }
+  var k: int32 = smk_hello(fd, SMK_TOKEN);
+  if (k != MEO_WIRE_K_HELLO_OK) {
+    meo_sock_close(fd);
+    return (int64)(-MEO_ERR_PROTO);
+  }
+  return fd;
+}
+
+fn smk_query(fd: int64, st: MeoWStmt*) -> int32 {
+  meo_wbuf_begin(&g_w);
+  var rc: int32 = meo_wire_stmt_put(&g_w, st);
+  if (rc < 0) { return rc; }
+  rc = smk_send(fd, MEO_WIRE_K_QUERY);
+  if (rc < 0) { return rc; }
+  return smk_reply(fd);
+}
+
+fn smk_begin(fd: int64) -> int32 {
+  meo_wbuf_begin(&g_w);
+  meo_wire_begin_put(&g_w, 0);
+  var rc: int32 = smk_send(fd, MEO_WIRE_K_BEGIN);
+  if (rc < 0) { return rc; }
+  return smk_reply(fd);
+}
+
+fn smk_col(c: MeoWCol*, name: string, ty: int32, flags: int32) {
+  c->name = name;
+  c->ty = ty;
+  c->flags = flags;
+}
+
+// INSERT INTO t(id, name) one row per id in [lo, hi), name = n bytes of 'x'.
+fn smk_insert(fd: int64, lo: int64, hi: int64, n: int32) -> int32 {
+  var cols: MeoWCol[2];
+  smk_col(&cols[0], "id", 0, 0);
+  smk_col(&cols[1], "name", 0, 0);
+  var rows: int32 = (int32)(hi - lo);
+  var args: MeoValue* = (MeoValue*)malloc((int64)rows * 2 * (int64)sizeof(MeoValue));
+  var text: uint8* = (uint8*)malloc((int64)n + 1);
+  memset((rawptr)text, 120, (int64)n + 1);
+  var i: int32 = 0;
+  while (i < rows) {
+    meo_value_set_int(&args[i * 2], lo + (int64)i);
+    meo_value_set_text(&args[i * 2 + 1], text, n);
+    i += 1;
+  }
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  st.n_rows = rows;
+  st.args = args;
+  st.n_args = rows * 2;
+  var k: int32 = smk_query(fd, &st);
+  free((rawptr)args);
+  free((rawptr)text);
+  return k;
+}
+
+// SELECT id FROM t WHERE id = x: rows found, or a negative code.
+fn smk_find(fd: int64, x: int64) -> int32 {
+  var cols: MeoWCol[1];
+  smk_col(&cols[0], "id", 0, 0);
+  var terms: MeoWTerm[1];
+  terms[0].col = "id";
+  terms[0].op = MEO_WIRE_W_EQ;
+  terms[0].arg0 = 0;
+  terms[0].n_args = 1;
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  st.args = &v;
+  st.n_args = 1;
+  var k: int32 = smk_query(fd, &st);
+  if (k != MEO_WIRE_K_RESULT) { return -MEO_ERR_PROTO; }
+  return g_res.n_rows;
+}
+
+fn smk_expect_error(k: int32, code: int32, fatal: bool, what: string) -> int32 {
+  if (k != MEO_WIRE_K_ERROR) { return smk_fail("{what}: kind {k}"); }
+  if (g_err.code != code || g_err.fatal != fatal) {
+    return smk_fail("{what}: code {g_err.code} fatal {g_err.fatal}");
+  }
+  return 0;
+}
+
+fn smk_handshake() -> int32 {
+  var fd: int64 = smk_connect();
+  if (fd < 0) { return smk_fail("connect rc={fd}"); }
+  if (smk_expect_error(smk_call(fd, MEO_WIRE_K_PING), MEO_ERR_PROTO, true, "ping before hello") != 0) {
+    return 1;
+  }
+  if (smk_recv(fd) != 0) { return smk_fail("no close after PROTO"); }
+  meo_sock_close(fd);
+
+  fd = smk_connect();
+  if (smk_expect_error(smk_hello(fd, "wrong"), MEO_ERR_AUTH, true, "bad token") != 0) { return 1; }
+  if (smk_recv(fd) != 0) { return smk_fail("no close after AUTH"); }
+  meo_sock_close(fd);
+
+  fd = smk_connect();
+  if (smk_hello(fd, SMK_TOKEN) != MEO_WIRE_K_HELLO_OK) { return smk_fail("hello"); }
+  var ok: MeoWHelloOk;
+  if (meo_wire_hello_ok_get(&g_rd, &ok) < 0) { return smk_fail("hello_ok decode"); }
+  if (ok.caps != 3 || ok.major != 1 || ok.max_frame != SMK_FRAME) {
+    return smk_fail("hello_ok caps={ok.caps} max={ok.max_frame}");
+  }
+  if (smk_call(fd, MEO_WIRE_K_PING) != MEO_WIRE_K_OK) { return smk_fail("ping"); }
+  if (smk_expect_error(smk_hello(fd, SMK_TOKEN), MEO_ERR_PROTO, true, "second hello") != 0) {
+    return 1;
+  }
+  meo_sock_close(fd);
+  return 0;
+}
+
+fn smk_round_trip(fd: int64) -> int32 {
+  var cols: MeoWCol[2];
+  smk_col(&cols[0], "id", 1, MEO_WIRE_CF_PK);
+  smk_col(&cols[1], "name", 3, 0);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("create"); }
+  if (smk_insert(fd, 1, 3, 5) != MEO_WIRE_K_RESULT || g_res.affected != 2) {
+    return smk_fail("insert");
+  }
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table = "t";
+  var ord: MeoWOrder[1];
+  ord[0].col = "id";
+  ord[0].desc = true;
+  st.order = &ord[0];
+  st.n_order = 1;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("select"); }
+  if (g_res.n_rows != 2 || g_res.n_cols != 2) {
+    return smk_fail("select shape {g_res.n_rows}x{g_res.n_cols}");
+  }
+  var c0: MeoValue* = &g_res.cells[0];
+  var c1: MeoValue* = &g_res.cells[1];
+  if (c0->type != MEO_T_INT || c0->i != 2 || c1->type != MEO_T_TEXT || c1->n != 5 || c1->p[0] != 120) {
+    return smk_fail("select cells");
+  }
+
+  // UPDATE t SET name = 'y', id = id + 10 WHERE id = 1 (ASSIGN_ADD), then COUNT.
+  var up: MeoWCol[2];
+  smk_col(&up[0], "name", 0, 0);
+  smk_col(&up[1], "id", 0, MEO_WIRE_CF_ADD);
+  var terms: MeoWTerm[1];
+  terms[0].col = "id";
+  terms[0].op = MEO_WIRE_W_EQ;
+  terms[0].arg0 = 2;
+  terms[0].n_args = 1;
+  var y: uint8[1];
+  y[0] = 121;
+  var args: MeoValue[3];
+  meo_value_set_text(&args[0], &y[0], 1);
+  meo_value_set_int(&args[1], 10);
+  meo_value_set_int(&args[2], 1);
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_UPDATE;
+  st.table = "t";
+  st.cols = &up[0];
+  st.n_cols = 2;
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  st.args = &args[0];
+  st.n_args = 3;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT || g_res.affected != 1) { return smk_fail("update"); }
+  if (smk_find(fd, 11) != 1) { return smk_fail("update did not add"); }
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_COUNT;
+  st.table = "t";
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT || g_res.n_rows != 1 || g_res.cells[0].i != 2) {
+    return smk_fail("count");
+  }
+  return 0;
+}
+
+fn smk_schema(fd: int64) -> int32 {
+  var cols: MeoWCol[1];
+  smk_col(&cols[0], "a", 1, 0);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE;
+  st.table = "d";
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("create d"); }
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DROP;
+  st.table = "d";
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("drop"); }
+  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_SCHEMA, false, "drop missing") != 0) { return 1; }
+  st.if_not_exists = true;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("drop if exists"); }
+
+  // ALTER TABLE t ADD COLUMN extra REAL; existing rows read NULL.
+  smk_col(&cols[0], "extra", 2, 0);
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_ADD_COLUMN;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("add column"); }
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table = "t";
+  smk_col(&cols[0], "extra", 0, 0);
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT || g_res.n_rows != 2 || g_res.cells[0].type != MEO_T_NULL) {
+    return smk_fail("select added column");
+  }
+
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE_INDEX;
+  st.table = "t";
+  st.name = "ix";
+  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_UNSUPPORTED, false, "create index") != 0) {
+    return 1;
+  }
+  if (g_err.tx != MEO_WIRE_TX_NONE) { return smk_fail("create index tx"); }
+  st.op = 11;
+  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_USAGE, false, "op 11") != 0) { return 1; }
+  var terms: MeoWTerm[1];
+  terms[0].col = "id";
+  terms[0].op = 9;
+  terms[0].arg0 = 0;
+  terms[0].n_args = 0;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DELETE;
+  st.table = "t";
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_USAGE, false, "term op 9") != 0) { return 1; }
+  return 0;
+}
+
+// A client drops its socket inside a transaction: the next BEGIN gets the lock
+// within 1 s and the row is gone.
+fn smk_drop_mid_tx() -> int32 {
+  var a: int64 = smk_open();
+  if (a < 0) { return smk_fail("open a"); }
+  if (smk_begin(a) != MEO_WIRE_K_OK) { return smk_fail("begin a"); }
+  if (smk_insert(a, 100, 101, 3) != MEO_WIRE_K_RESULT) { return smk_fail("insert a"); }
+  meo_sock_close(a);
+  var b: int64 = smk_open();
+  if (b < 0) { return smk_fail("open b"); }
+  var t0: int64 = meo_srv_now_ms();
+  if (smk_begin(b) != MEO_WIRE_K_OK) { return smk_fail("begin b code {g_err.code}"); }
+  var ms: int64 = meo_srv_now_ms() - t0;
+  if (ms > 1000) { return smk_fail("begin b took {ms} ms"); }
+  var found: int32 = smk_find(b, 100);
+  var want: int32 = 0;
+  if (SMK_RED != 0) { want = 1; }
+  if (found != want) { return smk_fail("dropped client's row: found {found}"); }
+  if (smk_call(b, MEO_WIRE_K_ROLLBACK) != MEO_WIRE_K_OK) { return smk_fail("rollback b"); }
+  meo_sock_close(b);
+  return 0;
+}
+
+fn smk_toobig(fd: int64) -> int32 {
+  if (smk_insert(fd, 1000, 1040, SMK_BIG) != MEO_WIRE_K_RESULT) { return smk_fail("big insert 1"); }
+  if (smk_insert(fd, 1040, 1080, SMK_BIG) != MEO_WIRE_K_RESULT) { return smk_fail("big insert 2"); }
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_SELECT;
+  st.table = "t";
+  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_TOOBIG, false, "big select") != 0) { return 1; }
+  if (smk_call(fd, MEO_WIRE_K_PING) != MEO_WIRE_K_OK) { return smk_fail("ping after TOOBIG"); }
+  st.limit = 10;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT || g_res.n_rows != 10) { return smk_fail("paged select"); }
+  return 0;
+}
+
+// Stop with a transaction open: the session rolls it back before stop returns.
+fn smk_stop(srv: MeoSrv*, db: MeoDb*) -> int32 {
+  var c: int64 = smk_open();
+  if (c < 0) { return smk_fail("open c"); }
+  if (smk_begin(c) != MEO_WIRE_K_OK) { return smk_fail("begin c"); }
+  if (smk_insert(c, 200, 201, 3) != MEO_WIRE_K_RESULT) { return smk_fail("insert c"); }
+  if (meo_srv_n_sessions(srv) != 1) { return smk_fail("sessions {meo_srv_n_sessions(srv)}"); }
+  var rc: int32 = meo_srv_stop(srv);
+  if (rc != MEO_OK) { return smk_fail("stop rc={rc}"); }
+  if (smk_recv(c) != 0) { return smk_fail("no EOF after stop"); }
+  meo_sock_close(c);
+  if (meo_db_in_tx(db)) { return smk_fail("transaction still open after stop"); }
+  var q: MeoQuery* = 0;
+  meo_q_count(db, "t", &q);
+  var v: MeoValue;
+  meo_value_set_int(&v, 200);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var n: int64 = -1;
+  if (rc == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  if (n != 0) { return smk_fail("row of the stopped txn: count {n} rc={rc}"); }
+  return 0;
+}
+
+fn smk_run() -> int32 {
+  if (smk_reset(SMK_DB) != MEO_OK) { return smk_fail("reset db"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(SMK_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return smk_fail("open db rc={rc}"); }
+  var tok: string = SMK_TOKEN;
+  var c: MeoSrvConfig;
+  meo_srv_config_default(&c);
+  c.port = 0;
+  c.max_frame = SMK_FRAME;
+  c.token = tok.chars;
+  c.token_n = (int32)tok.length;
+  var srv: MeoSrv* = 0;
+  rc = meo_srv_start(db, &c, &srv);
+  if (rc != MEO_OK) { return smk_fail("start rc={rc}"); }
+  g_port = meo_srv_port(srv);
+  if (g_port <= 0) { return smk_fail("port {g_port}"); }
+
+  var bad: int32 = smk_handshake();
+  var fd: int64 = 0;
+  if (bad == 0) {
+    fd = smk_open();
+    if (fd < 0) { bad = smk_fail("open main"); }
+  }
+  if (bad == 0) { bad = smk_round_trip(fd); }
+  if (bad == 0) { bad = smk_schema(fd); }
+  if (bad == 0) { bad = smk_drop_mid_tx(); }
+  if (bad == 0) { bad = smk_toobig(fd); }
+  if (fd > 0) {
+    if (bad == 0 && smk_call(fd, MEO_WIRE_K_BYE) != MEO_WIRE_K_OK) { bad = smk_fail("bye"); }
+    meo_sock_close(fd);
+  }
+  if (bad == 0) {
+    // Let the BYE session finish so only the next one is live.
+    var tries: int32 = 0;
+    while (meo_srv_n_sessions(srv) > 0 && tries < 200) {
+      Sleep(5);
+      tries += 1;
+    }
+    bad = smk_stop(srv, db);
+  }
+  meo_srv_stop(srv);
+  if (meo_srv_free(srv) != MEO_OK && bad == 0) { bad = smk_fail("free"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK && bad == 0) { bad = smk_fail("close rc={rc}"); }
+  return bad;
+}
+
+fn main() -> int32 {
+  meo_wbuf_init(&g_w, 1048576);
+  g_buf = (uint8*)malloc(1048576 + 64);
+  g_arena = meo_arena_new(65536);
+  var bad: int32 = smk_run();
+  meo_wbuf_free(&g_w);
+  free((rawptr)g_buf);
+  meo_arena_free(g_arena);
+  if (bad != 0) { return 1; }
+  println("PASS srv_smoke");
+  return 0;
+}
