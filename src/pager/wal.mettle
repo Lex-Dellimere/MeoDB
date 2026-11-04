@@ -30,6 +30,7 @@ import "../platform/file.mettle";
 import "../platform/file_linux.mettle" if linux;
 import "../platform/clock_linux.mettle" if linux;
 import "../platform/futex_linux.mettle" if linux;
+import "pcache.mettle";
 
 // --- constants --------------------------------------------------------------
 
@@ -277,7 +278,7 @@ fn wal_new_gen(w: MeoWal*, prev_gen: int32, prev_s1: uint32, prev_s2: uint32) {
   var mix: uint32 = (uint32)gen * (uint32)0x9E3779B1;
   var s2: uint32 = (uint32)(meo_clock_realtime_us() ^ (int64)mix);
   if (s2 == prev_s2) { s2 = s2 + (uint32)1; }
-  w->gen = gen;
+  meo_atomic_store_i32(&w->gen, gen);
   w->salt1 = prev_s1 + (uint32)1;
   w->salt2 = s2;
   w->hdr_pending = true;
@@ -627,6 +628,21 @@ export fn meo_wal_commit_write(w: MeoWal*, page0: uint8*, db_size: uint32,
   if (w == 0 || page0 == 0 || frame_out == 0) { return -MEO_ERR_USAGE; }
   if (db_size == 0 || db_size > WAL_MAX_PAGES) { return -MEO_ERR_USAGE; }
   if (meo_atomic_load_i32(&w->failed) != 0) { return -MEO_ERR_IO; }
+  // The queue is only ever pushed by this thread, so waiting out its oldest
+  // entry is enough to make room.
+  while (true) {
+    spin_lock(&w->hdr_lock);
+    var full: bool = w->pend_n >= MEO_WAL_MAX_PENDING;
+    var head: uint64 = 0;
+    if (full) {
+      head = (((uint64)(uint32)meo_atomic_load_i32(&w->gen)) << 32)
+        | (uint64)w->pend[w->pend_head].frame;
+    }
+    spin_unlock(&w->hdr_lock);
+    if (!full) { break; }
+    var wrc: int32 = meo_wal_wait(w, head);
+    if (wrc != MEO_OK) { return wrc; }
+  }
   var rc: int32 = wal_put_frame(w, 0, db_size, page0, true);
   if (rc != MEO_OK) { return rc; }
   *frame_out = (uint32)w->end;
@@ -732,15 +748,396 @@ fn wal_lead_sync(w: MeoWal*) -> int32 {
   return MEO_OK;
 }
 
-// Make everything appended durable. Single-threaded version.
-export fn meo_wal_sync(w: MeoWal*) -> int32 {
+// Frames not yet copied into the db file.
+fn wal_left(w: MeoWal*) -> int32 {
+  spin_lock(&w->hdr_lock);
+  var n: int32 = meo_atomic_load_i32(&w->durable) - w->nbackfill;
+  spin_unlock(&w->hdr_lock);
+  return n;
+}
+
+// --- checkpoint -------------------------------------------------------------
+
+// In-place heapsort of packed (page_no << 32 | frame) keys: no recursion, no
+// allocation, and the keys are distinct.
+fn wal_sift(a: uint64*, start: int64, n: int64) {
+  var root: int64 = start;
+  while (true) {
+    var child: int64 = root * 2 + 1;
+    if (child >= n) { break; }
+    if (child + 1 < n && a[child] < a[child + 1]) { child += 1; }
+    if (a[root] >= a[child]) { break; }
+    var t: uint64 = a[root];
+    a[root] = a[child];
+    a[child] = t;
+    root = child;
+  }
+}
+
+fn wal_sort_keys(a: uint64*, n: int64) {
+  var i: int64 = n / 2 - 1;
+  while (i >= 0) {
+    wal_sift(a, i, n);
+    i -= 1;
+  }
+  var end: int64 = n - 1;
+  while (end > 0) {
+    var t: uint64 = a[0];
+    a[0] = a[end];
+    a[end] = t;
+    wal_sift(a, 0, end);
+    end -= 1;
+  }
+}
+
+// Page number of frame f, read from the index.
+fn wal_pgno(w: MeoWal*, f: int32) -> uint32 {
+  var seg: MeoWalSeg* = (MeoWalSeg*)w->segs[(f - 1) / MEO_WAL_SEG_FRAMES];
+  return seg->pgno[(f - 1) % MEO_WAL_SEG_FRAMES];
+}
+
+// Make the db file exactly as long as the database was at `frame`.
+fn wal_fit_db(w: MeoWal*, frame: int32) -> int32 {
+  if (frame <= 0) { return MEO_OK; }
+  var pages: uint32 = meo_wal_frame_db_size(w, (uint32)frame);
+  if (pages == 0) { return MEO_OK; }
+  var want: int64 = (int64)pages * (int64)MEO_PAGE_SIZE;
+  var cur: int64 = meo_file_size(w->db_file);
+  if (cur < 0) { return (int32)cur; }
+  if (cur == want) { return MEO_OK; }
+  return meo_file_truncate(w->db_file, want);
+}
+
+// The body of a checkpoint, with ckpt_lock held.
+fn wal_ckpt_run(w: MeoWal*, mode: int32) -> int32 {
+  // mxSafe: a db-file-only reader pins the db file as it is, so nothing moves;
+  // otherwise stop at the oldest snapshot still reading the WAL.
+  spin_lock(&w->hdr_lock);
+  var nb: int32 = w->nbackfill;
+  var dur: int32 = meo_atomic_load_i32(&w->durable);
+  var safe: int32 = dur;
+  if (w->marks[0].count > 0) {
+    safe = nb;
+  } else {
+    var i: int32 = 1;
+    while (i < MEO_WAL_MARKS) {
+      if (w->marks[i].count > 0 && (int32)w->marks[i].mark < safe) {
+        safe = (int32)w->marks[i].mark;
+      }
+      i += 1;
+    }
+  }
+  spin_unlock(&w->hdr_lock);
+
+  if (safe <= nb) {
+    // Nothing to copy, but a FULL checkpoint that finds everything copied
+    // already still owes the db file its final size.
+    if (mode == MEO_CKPT_FULL && nb == dur) {
+      var frc: int32 = wal_fit_db(w, dur);
+      if (frc != MEO_OK) { return frc; }
+    }
+    return dur - nb;
+  }
+
+  // Keep only the newest frame of each page up to mxSafe, in page order so the
+  // db file is written front to back.
+  var count: int64 = (int64)(safe - nb);
+  var keys: uint64* = (uint64*)malloc(count * 8);
+  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (keys == 0 || buf == 0) {
+    if (keys != 0) { free((rawptr)keys); }
+    if (buf != 0) { free(buf); }
+    return -MEO_ERR_NOMEM;
+  }
+  var n: int64 = 0;
+  var f: int32 = nb + 1;
+  while (f <= safe) {
+    var pg: uint32 = wal_pgno(w, f);
+    if (meo_wal_find(w, pg, (uint32)safe) == (uint32)f) {
+      keys[n] = (((uint64)pg) << 32) | (uint64)(uint32)f;
+      n += 1;
+    }
+    f += 1;
+  }
+  wal_sort_keys(keys, n);
+
+  var rc: int32 = MEO_OK;
+  var pc: MeoPcache* = (MeoPcache*)w->pcache;
+  var k: int64 = 0;
+  while (k < n && rc == MEO_OK) {
+    var pg: uint32 = (uint32)(keys[k] >> 32);
+    var fr: uint32 = (uint32)(keys[k] & (uint64)0xFFFFFFFF);
+    rc = meo_wal_read_page(w, fr, buf);
+    if (rc == MEO_OK && meo_page_verify(buf) != MEO_OK) { rc = -MEO_ERR_CORRUPT; }
+    if (rc == MEO_OK) {
+      rc = wal_pwrite(w->db_file, (int64)pg * (int64)MEO_PAGE_SIZE, buf,
+        (int64)MEO_PAGE_SIZE, false);
+    }
+    if (rc == MEO_OK && pc != 0) {
+      // A cached copy of the db-file version is stale from here on.
+      meo_pcache_drop(pc, pg, (uint64)0);
+    }
+    k += 1;
+  }
+  free((rawptr)keys);
+  free(buf);
+  if (rc != MEO_OK) { return rc; }
+
+  rc = wal_fsync(w->db_file, false);
+  if (rc != MEO_OK) { return rc; }
+  spin_lock(&w->hdr_lock);
+  w->nbackfill = safe;
+  spin_unlock(&w->hdr_lock);
+  if (mode == MEO_CKPT_FULL && safe == meo_atomic_load_i32(&w->durable)) {
+    rc = wal_fit_db(w, safe);
+    if (rc != MEO_OK) { return rc; }
+  }
+  return wal_left(w);
+}
+
+// Copy committed frames into the db file, as far as the readers allow. PASSIVE
+// gives up if another checkpoint is running; FULL waits for it. Returns the
+// frames still in the WAL, or a negative code. An I/O failure here leaves
+// nbackfill alone and does not fail the WAL.
+export fn meo_wal_checkpoint(w: MeoWal*, mode: int32) -> int32 {
+  if (w == 0) { return -MEO_ERR_USAGE; }
+  if (mode != MEO_CKPT_PASSIVE && mode != MEO_CKPT_FULL) { return -MEO_ERR_USAGE; }
+  if (w->read_only) { return -MEO_ERR_READONLY; }
+  if (mode == MEO_CKPT_FULL) {
+    spin_lock(&w->ckpt_lock);
+  } else if (spin_try_lock(&w->ckpt_lock) == 0) {
+    return wal_left(w);
+  }
+  var rc: int32 = wal_ckpt_run(w, mode);
+  spin_unlock(&w->ckpt_lock);
+  return rc;
+}
+
+// After a successful sync: run a PASSIVE checkpoint when enough frames piled up.
+fn wal_auto_ckpt(w: MeoWal*) {
+  var limit: int32 = meo_atomic_load_i32(&w->ckpt_frames);
+  if (w->read_only || limit <= 0) { return; }
+  if (wal_left(w) >= limit) { meo_wal_checkpoint(w, MEO_CKPT_PASSIVE); }
+}
+
+export fn meo_wal_set_autockpt(w: MeoWal*, frames: int32) -> int32 {
+  if (w == 0 || frames < 0) { return -MEO_ERR_USAGE; }
+  meo_atomic_store_i32(&w->ckpt_frames, frames);
+  return MEO_OK;
+}
+
+// --- sync -------------------------------------------------------------------
+
+export fn meo_wal_set_pcache(w: MeoWal*, c: MeoPcache*) {
+  w->pcache = (rawptr)c;
+}
+
+export fn meo_wal_set_note(w: MeoWal*, ctx: rawptr,
+    meo_note_cb: fn(rawptr, int32, uint64) -> void) {
+  spin_lock(&w->sync_lock);
+  w->note_ctx = ctx;
+  w->note_cb = meo_note_cb;
+  spin_unlock(&w->sync_lock);
+}
+
+// Held by the pager while it swaps the feed hook, so no leader is mid-delivery.
+export fn meo_wal_sync_lock(w: MeoWal*) {
+  spin_lock(&w->sync_lock);
+}
+
+export fn meo_wal_sync_unlock(w: MeoWal*) {
+  spin_unlock(&w->sync_lock);
+}
+
+export fn meo_wal_failed(w: MeoWal*) -> bool {
+  return meo_atomic_load_i32(&w->failed) != 0;
+}
+
+// Block until the commit named by `ticket` is durable. Whoever gets sync_lock
+// first is the leader and one fsync covers every commit appended so far; the
+// others sleep on the durable word. Any thread, no db lock.
+export fn meo_wal_wait(w: MeoWal*, ticket: uint64) -> int32 {
+  if (w == 0) { return -MEO_ERR_USAGE; }
+  if (ticket == 0) { return MEO_OK; }
+  var tgen: int32 = (int32)(ticket >> 32);
+  var tframe: int32 = (int32)(ticket & (uint64)0xFFFFFFFF);
+  while (true) {
+    if (meo_atomic_load_i32(&w->failed) != 0) { return -MEO_ERR_IO; }
+    // A restart only happens with everything durable, so an older generation's
+    // ticket is done.
+    if (meo_atomic_load_i32(&w->gen) > tgen) { return MEO_OK; }
+    var d: int32 = meo_atomic_load_i32(&w->durable);
+    if (d >= tframe) { return MEO_OK; }
+    if (spin_try_lock(&w->sync_lock) != 0) {
+      var rc: int32 = MEO_OK;
+      var led: bool = false;
+      if (meo_atomic_load_i32(&w->failed) == 0
+          && meo_atomic_load_i32(&w->gen) <= tgen
+          && meo_atomic_load_i32(&w->durable) < tframe) {
+        rc = wal_lead_sync(w);
+        led = true;
+      }
+      spin_unlock(&w->sync_lock);
+      if (rc != MEO_OK) { return rc; }
+      if (led) { wal_auto_ckpt(w); }
+    } else {
+      meo_futex_wait(&w->durable, d, 5);
+    }
+  }
+  return MEO_OK;
+}
+
+// Wait for everything appended so far. With no commit pending it still fsyncs
+// once when non-commit frames are unsynced. Writer only.
+export fn meo_wal_wait_all(w: MeoWal*) -> int32 {
   if (w == 0) { return -MEO_ERR_USAGE; }
   if (meo_atomic_load_i32(&w->failed) != 0) { return -MEO_ERR_IO; }
+  var app: int32 = meo_atomic_load_i32(&w->appended);
+  if (app > meo_atomic_load_i32(&w->durable)) {
+    var ticket: uint64 = (((uint64)(uint32)meo_atomic_load_i32(&w->gen)) << 32)
+      | (uint64)(uint32)app;
+    return meo_wal_wait(w, ticket);
+  }
+  if (w->end <= meo_atomic_load_i32(&w->durable)) { return MEO_OK; }
   var rc: int32 = MEO_OK;
   spin_lock(&w->sync_lock);
-  if (w->end > meo_atomic_load_i32(&w->durable)) { rc = wal_lead_sync(w); }
+  if (meo_atomic_load_i32(&w->failed) != 0) {
+    rc = -MEO_ERR_IO;
+  } else {
+    rc = wal_lead_sync(w);
+  }
   spin_unlock(&w->sync_lock);
+  if (rc == MEO_OK) { wal_auto_ckpt(w); }
   return rc;
+}
+
+// Make everything appended durable.
+export fn meo_wal_sync(w: MeoWal*) -> int32 {
+  return meo_wal_wait_all(w);
+}
+
+export fn meo_wal_n_syncs(w: MeoWal*) -> int64 {
+  spin_lock(&w->sync_lock);
+  var n: int64 = w->n_syncs;
+  spin_unlock(&w->sync_lock);
+  return n;
+}
+
+// --- snapshots --------------------------------------------------------------
+
+// Pin a consistent view: the durable edge now, or the db file alone when
+// everything durable is already in it. When all 15 mark slots are busy with
+// other values the reader joins the newest one, an older but consistent view.
+export fn meo_wal_snap_begin(w: MeoWal*, s: MeoWalSnap*) -> int32 {
+  if (w == 0 || s == 0) { return -MEO_ERR_USAGE; }
+  spin_lock(&w->hdr_lock);
+  var mx: int32 = meo_atomic_load_i32(&w->durable);
+  var slot: int32 = 0;
+  if (mx <= w->nbackfill) {
+    mx = 0;
+  } else {
+    var same: int32 = -1;
+    var empty: int32 = -1;
+    var newest: int32 = -1;
+    var i: int32 = 1;
+    while (i < MEO_WAL_MARKS) {
+      if (w->marks[i].count > 0) {
+        if ((int32)w->marks[i].mark == mx) { same = i; }
+        if (newest < 0 || w->marks[i].mark > w->marks[newest].mark) { newest = i; }
+      } else if (empty < 0) {
+        empty = i;
+      }
+      i += 1;
+    }
+    if (same >= 0) {
+      slot = same;
+    } else if (empty >= 0) {
+      slot = empty;
+      w->marks[slot].mark = (uint32)mx;
+    } else {
+      slot = newest;
+      mx = (int32)w->marks[slot].mark;
+    }
+  }
+  w->marks[slot].count += 1;
+  w->n_readers += 1;
+  s->mx = (uint32)mx;
+  s->gen = (uint32)meo_atomic_load_i32(&w->gen);
+  s->slot = slot;
+  spin_unlock(&w->hdr_lock);
+  return MEO_OK;
+}
+
+export fn meo_wal_snap_end(w: MeoWal*, s: MeoWalSnap*) {
+  spin_lock(&w->hdr_lock);
+  w->marks[s->slot].count -= 1;
+  w->n_readers -= 1;
+  spin_unlock(&w->hdr_lock);
+}
+
+export fn meo_wal_readers(w: MeoWal*) -> int32 {
+  spin_lock(&w->hdr_lock);
+  var n: int32 = w->n_readers;
+  spin_unlock(&w->hdr_lock);
+  return n;
+}
+
+// --- restart ----------------------------------------------------------------
+
+// Start a new generation once the whole log is in the db file and nobody reads
+// it: the log starts over from frame 1 without a file rewrite. Writer only,
+// and only when no commit is waiting on a sync or a checkpoint.
+export fn meo_wal_try_restart(w: MeoWal*) -> bool {
+  if (w == 0 || w->read_only) { return false; }
+  if (w->end != meo_atomic_load_i32(&w->appended)) { return false; }
+  if (spin_try_lock(&w->sync_lock) == 0) { return false; }
+  if (spin_try_lock(&w->ckpt_lock) == 0) {
+    spin_unlock(&w->sync_lock);
+    return false;
+  }
+  var ok: bool = meo_atomic_load_i32(&w->failed) == 0;
+  spin_lock(&w->hdr_lock);
+  var app: int32 = meo_atomic_load_i32(&w->appended);
+  if (meo_atomic_load_i32(&w->durable) != app || w->nbackfill != app || app <= 0) {
+    ok = false;
+  }
+  var i: int32 = 1;
+  while (i < MEO_WAL_MARKS) {
+    if (w->marks[i].count > 0) { ok = false; }
+    i += 1;
+  }
+  if (ok) {
+    // The new generation also gets a fresh salt, so the old frames still in
+    // the file can never validate.
+    wal_new_gen(w, w->gen, w->salt1, w->salt2);
+    meo_atomic_store_i32(&w->appended, 0);
+    meo_atomic_store_i32(&w->durable, 0);
+    w->nbackfill = 0;
+    w->end = 0;
+    w->ck = w->hdr_crc;
+    w->ck_appended = w->hdr_crc;
+    w->pend_head = 0;
+    w->pend_n = 0;
+  }
+  spin_unlock(&w->hdr_lock);
+  if (ok) {
+    // No snapshot above 0 exists and the writer is this thread, so nothing
+    // reads or inserts while the segments are cleared.
+    var s: int32 = 0;
+    while (s < MEO_WAL_MAX_SEGS) {
+      if (w->segs[s] != 0) { meo_bytes_zero((uint8*)w->segs[s], (int64)sizeof(MeoWalSeg)); }
+      s += 1;
+    }
+  }
+  spin_unlock(&w->ckpt_lock);
+  spin_unlock(&w->sync_lock);
+  if (!ok) { return false; }
+  meo_futex_wake(&w->durable, 2147483647);
+  if (w->file.is_open && meo_file_size(w->file) > MEO_WAL_TRUNC_BYTES) {
+    wal_point();
+    meo_file_truncate(w->file, 0);
+  }
+  return true;
 }
 
 // --- accessors --------------------------------------------------------------
