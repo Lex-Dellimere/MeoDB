@@ -1,0 +1,1008 @@
+// srv_e2e: every flux_shapes statement, plus DROP, ADD_COLUMN, bit-exact
+// values, error codes and transactions, sent through meo_cli_query to a server
+// running in this process, and run through meo_q_* on a second, embedded db.
+// Both dbs start empty and get the same statements, so every result must match:
+// code, column and row count, every cell (REAL by bits), changes, last rowid.
+// Each case also checks the expected values, so both sides cannot agree on a
+// wrong answer.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meo_server.mettle";
+import "../src/meo_client.mettle";
+
+// Red-check switch: 1 sends -0.0 as +0.0 to the embedded side only, which the
+// cell compare must catch. Must be 0 when committed.
+const SE_RED: int32 = 0;
+const SE_SRV_DB: string = "build/srv_e2e_srv.db";
+const SE_EMB_DB: string = "build/srv_e2e_emb.db";
+const SE_IP: string = "127.0.0.1";
+const SE_CAP: int32 = 32;
+
+// flux's RC_OP_* and RC_W_* numbers, as sent on the wire.
+const OP_CREATE: int32 = 1;
+const OP_INSERT: int32 = 2;
+const OP_SELECT: int32 = 3;
+const OP_UPDATE: int32 = 4;
+const OP_DELETE: int32 = 5;
+const OP_COUNT: int32 = 6;
+const OP_DROP: int32 = 7;
+const OP_ADD_COLUMN: int32 = 8;
+const OP_CREATE_INDEX: int32 = 9;
+const OP_DROP_INDEX: int32 = 10;
+const W_EQ: int32 = 0;
+const W_NE: int32 = 1;
+const W_LT: int32 = 2;
+const W_LE: int32 = 3;
+const W_GT: int32 = 4;
+const W_GE: int32 = 5;
+const W_IN: int32 = 6;
+const W_NULL: int32 = 7;
+const W_NOT_NULL: int32 = 8;
+
+// Wire column types and flags (not flux's numbers).
+const T_INT: int32 = 1;
+const T_REAL: int32 = 2;
+const T_TEXT: int32 = 3;
+const T_BLOB: int32 = 4;
+const CF_PK: int32 = 1;
+const CF_NN: int32 = 2;
+const CF_UQ: int32 = 4;
+
+struct SeCtx {
+  db: MeoDb*;          // the embedded side
+  cli: MeoCli*;        // the server side
+}
+
+struct SeRes {
+  rc: int32;           // MEO_OK or -MEO_ERR_*
+  rows: int32;
+  cols: int32;
+  changes: int32;
+  last_id: int64;
+  out: string;         // column `col` of every row joined by ",", N for NULL, R for REAL
+}
+
+fn se_fail(msg: string) -> int32 {
+  println("FAIL srv_e2e: {msg}");
+  return 1;
+}
+
+fn se_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn vi(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn vr(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+fn vt(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn vb(p: uint8*, n: int32) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_blob(&v, p, n);
+  return v;
+}
+
+fn vn() -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_null(&v);
+  return v;
+}
+
+fn f64_bits(x: float64) -> uint64 {
+  var b: uint8[8];
+  meo_put_f64le(&b[0], 0, x);
+  return meo_get_u64le(&b[0], 0);
+}
+
+fn f64_from(bits: uint64) -> float64 {
+  var b: uint8[8];
+  meo_put_u64le(&b[0], 0, bits);
+  return meo_get_f64le(&b[0], 0);
+}
+
+fn i64_min() -> int64 { return (int64)((uint64)1 << 63); }
+fn i64_max() -> int64 { return (int64)(((uint64)1 << 63) - (uint64)1); }
+
+fn se_same_str(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  return meo_bytes_equal(a.chars, b.chars, (int64)a.length);
+}
+
+// Same type and same bits (REAL by bits, so -0.0 and NaN payloads count).
+fn se_same(a: MeoValue*, b: MeoValue*) -> bool {
+  if (a->type != b->type) { return false; }
+  if (a->type == MEO_T_INT) { return a->i == b->i; }
+  if (a->type == MEO_T_REAL) { return f64_bits(a->f) == f64_bits(b->f); }
+  if (a->type == MEO_T_TEXT || a->type == MEO_T_BLOB) {
+    if (a->n != b->n) { return false; }
+    if (a->n == 0) { return true; }
+    return meo_bytes_equal(a->p, b->p, (int64)a->n);
+  }
+  return true;
+}
+
+// --- the wire statement --------------------------------------------------------
+
+fn se_new(st: MeoWStmt*, op: int32, table: string) {
+  meo_wire_stmt_init(st);
+  st->op = op;
+  st->table = table;
+  st->cols = (MeoWCol*)malloc((int64)SE_CAP * (int64)sizeof(MeoWCol));
+  st->terms = (MeoWTerm*)malloc((int64)SE_CAP * (int64)sizeof(MeoWTerm));
+  st->order = (MeoWOrder*)malloc((int64)SE_CAP * (int64)sizeof(MeoWOrder));
+  st->args = (MeoValue*)malloc((int64)SE_CAP * (int64)sizeof(MeoValue));
+}
+
+fn se_free(st: MeoWStmt*) {
+  free(st->cols);
+  free(st->terms);
+  free(st->order);
+  free(st->args);
+}
+
+fn se_col(st: MeoWStmt*, name: string, ty: int32, flags: int32) {
+  st->cols[st->n_cols].name = name;
+  st->cols[st->n_cols].ty = ty;
+  st->cols[st->n_cols].flags = flags;
+  st->n_cols += 1;
+}
+
+fn se_arg(st: MeoWStmt*, v: MeoValue) {
+  st->args[st->n_args] = v;
+  st->n_args += 1;
+  if (st->op == OP_INSERT && st->n_cols > 0) { st->n_rows = st->n_args / st->n_cols; }
+}
+
+// A term over the last n argv entries, like flux's builder.
+fn se_term(st: MeoWStmt*, col: string, op: int32, n: int32) {
+  st->terms[st->n_terms].col = col;
+  st->terms[st->n_terms].op = op;
+  st->terms[st->n_terms].arg0 = st->n_args - n;
+  st->terms[st->n_terms].n_args = n;
+  st->n_terms += 1;
+}
+
+fn se_order(st: MeoWStmt*, col: string, desc: bool) {
+  st->order[st->n_order].col = col;
+  st->order[st->n_order].desc = desc;
+  st->n_order += 1;
+}
+
+// --- the embedded translation (what the server does, written independently) ---
+
+fn e_flags(f: int32) -> int32 {
+  var c: int32 = 0;
+  if ((f & CF_PK) != 0) { c = c | MEO_COL_PK; }
+  if ((f & CF_NN) != 0) { c = c | MEO_COL_NOT_NULL; }
+  if ((f & CF_UQ) != 0) { c = c | MEO_COL_UNIQUE; }
+  return c;
+}
+
+fn e_type(t: int32) -> int32 {
+  if (t == T_INT) { return MEO_T_INT; }
+  if (t == T_REAL) { return MEO_T_REAL; }
+  if (t == T_TEXT) { return MEO_T_TEXT; }
+  return MEO_T_BLOB;
+}
+
+fn e_cmp(op: int32) -> int32 {
+  if (op == W_EQ) { return MEO_Q_EQ; }
+  if (op == W_NE) { return MEO_Q_NE; }
+  if (op == W_LT) { return MEO_Q_LT; }
+  if (op == W_LE) { return MEO_Q_LE; }
+  if (op == W_GT) { return MEO_Q_GT; }
+  return MEO_Q_GE;
+}
+
+fn e_kind(db: MeoDb*, st: MeoWStmt*, q: MeoQuery**) -> int32 {
+  if (st->op == OP_CREATE) { return meo_q_create(db, st->table, q); }
+  if (st->op == OP_INSERT) { return meo_q_insert(db, st->table, q); }
+  if (st->op == OP_SELECT) { return meo_q_select(db, st->table, q); }
+  if (st->op == OP_UPDATE) { return meo_q_update(db, st->table, q); }
+  if (st->op == OP_DELETE) { return meo_q_delete(db, st->table, q); }
+  if (st->op == OP_COUNT) { return meo_q_count(db, st->table, q); }
+  if (st->op == OP_DROP) { return meo_q_drop(db, st->table, q); }
+  return meo_q_add_column(db, st->table, q);
+}
+
+fn e_build(st: MeoWStmt*, q: MeoQuery*) -> int32 {
+  var rc: int32 = MEO_OK;
+  if ((st->op == OP_CREATE || st->op == OP_DROP) && st->if_not_exists) {
+    rc = meo_q_if_not_exists(q);
+  }
+  var i: int32 = 0;
+  while (i < st->n_cols && rc == MEO_OK) {
+    var c: MeoWCol* = &st->cols[i];
+    if (st->op == OP_CREATE || st->op == OP_ADD_COLUMN) {
+      rc = meo_q_column_def(q, c->name, e_type(c->ty), e_flags(c->flags));
+    }
+    if (st->op == OP_INSERT) { rc = meo_q_into(q, c->name); }
+    if (st->op == OP_SELECT) { rc = meo_q_pick(q, c->name); }
+    if (st->op == OP_UPDATE) { rc = meo_q_assign(q, c->name, &st->args[i]); }
+    i += 1;
+  }
+  if (st->op == OP_INSERT) {
+    i = 0;
+    while (i < st->n_args && rc == MEO_OK) {
+      rc = meo_q_value(q, &st->args[i]);
+      i += 1;
+    }
+  }
+  i = 0;
+  while (i < st->n_terms && rc == MEO_OK) {
+    var t: MeoWTerm* = &st->terms[i];
+    if (t->op == W_IN) {
+      rc = meo_q_where_in(q, t->col, &st->args[t->arg0], t->n_args);
+    } else if (t->op == W_NULL) {
+      rc = meo_q_where_null(q, t->col);
+    } else if (t->op == W_NOT_NULL) {
+      rc = meo_q_where_not_null(q, t->col);
+    } else {
+      rc = meo_q_where(q, t->col, e_cmp(t->op), &st->args[t->arg0]);
+    }
+    i += 1;
+  }
+  i = 0;
+  while (i < st->n_order && rc == MEO_OK) {
+    rc = meo_q_order(q, st->order[i].col, st->order[i].desc);
+    i += 1;
+  }
+  if (rc == MEO_OK && st->limit >= 0) { rc = meo_q_limit(q, st->limit); }
+  if (rc == MEO_OK && st->offset > 0) { rc = meo_q_offset(q, st->offset); }
+  return rc;
+}
+
+fn se_part(v: MeoValue*) -> string {
+  if (v->type == MEO_T_INT) { return "{v->i}"; }
+  if (v->type == MEO_T_TEXT) { return str_from_bytes((cstring)v->p, (int64)v->n); }
+  if (v->type == MEO_T_REAL) { return "R"; }
+  if (v->type == MEO_T_BLOB) { return "B"; }
+  return "N";
+}
+
+// Compare a finished wire result with a stepped embedded query.
+fn se_compare(name: string, w: MeoCliResult*, q: MeoQuery*) -> int32 {
+  var cols: int32 = meo_q_column_count(q);
+  var rows: int32 = meo_q_row_count(q);
+  if (meo_cli_col_count(w) != cols) {
+    return se_fail("{name}: wire {meo_cli_col_count(w)} cols, embedded {cols}");
+  }
+  if (meo_cli_row_count(w) != rows) {
+    return se_fail("{name}: wire {meo_cli_row_count(w)} rows, embedded {rows}");
+  }
+  if (meo_cli_affected(w) != meo_q_changes(q)) {
+    return se_fail("{name}: wire changes {meo_cli_affected(w)}, embedded {meo_q_changes(q)}");
+  }
+  if (meo_cli_last_id(w) != meo_q_last_insert_rowid(q)) {
+    return se_fail("{name}: wire last id {meo_cli_last_id(w)}, embedded {meo_q_last_insert_rowid(q)}");
+  }
+  var r: int32 = 0;
+  while (r < rows) {
+    var c: int32 = 0;
+    while (c < cols) {
+      var a: MeoValue;
+      var b: MeoValue;
+      var rc: int32 = meo_cli_cell(w, r, c, &a);
+      if (rc == MEO_OK) { rc = meo_q_cell(q, r, c, &b); }
+      if (rc != MEO_OK) { return se_fail("{name}: cell {r},{c} rc={rc}"); }
+      if (!se_same(&a, &b)) {
+        return se_fail("{name}: cell {r},{c} wire type {a.type} [{se_part(&a)}], embedded type {b.type} [{se_part(&b)}]");
+      }
+      c += 1;
+    }
+    r += 1;
+  }
+  return 0;
+}
+
+// Run st on both sides, compare, and copy the embedded result to res. Frees st.
+fn se_run(cx: SeCtx*, name: string, st: MeoWStmt*, col: int32, res: SeRes*) -> int32 {
+  res->rc = MEO_OK;
+  res->rows = 0;
+  res->cols = 0;
+  res->changes = 0;
+  res->last_id = 0;
+  res->out = "";
+  var w: MeoCliResult;
+  var rw: int32 = meo_cli_query(cx->cli, st, &w);
+  if (SE_RED == 1 && st->op == OP_INSERT) {
+    var k: int32 = 0;
+    while (k < st->n_args) {
+      if (st->args[k].type == MEO_T_REAL && f64_bits(st->args[k].f) == (uint64)1 << 63) {
+        st->args[k].f = 0.0;
+      }
+      k += 1;
+    }
+  }
+  var q: MeoQuery* = 0;
+  var re: int32 = e_kind(cx->db, st, &q);
+  if (re == MEO_OK) { re = e_build(st, q); }
+  if (re == MEO_OK) { re = meo_q_step(q); }
+  if (re == MEO_ROW || re == MEO_DONE) { re = MEO_OK; }
+  var bad: int32 = 0;
+  if (rw != re) {
+    bad = se_fail("{name}: wire rc {rw}, embedded rc {re} (wire err {meo_cli_err_code(cx->cli)})");
+  } else if (rw < 0) {
+    if (!meo_cli_connected(cx->cli) || meo_cli_err_fatal(cx->cli) || meo_cli_err_code(cx->cli) != -rw) {
+      bad = se_fail("{name}: error {rw} left the connection unusable");
+    }
+  } else {
+    bad = se_compare(name, &w, q);
+    if (bad == 0) {
+      res->rows = meo_q_row_count(q);
+      res->cols = meo_q_column_count(q);
+      res->changes = meo_q_changes(q);
+      res->last_id = meo_q_last_insert_rowid(q);
+      var r: int32 = 0;
+      while (r < res->rows && col < res->cols) {
+        var v: MeoValue;
+        meo_q_cell(q, r, col, &v);
+        if (r > 0) { res->out = res->out + ","; }
+        res->out = res->out + se_part(&v);
+        r += 1;
+      }
+    }
+  }
+  res->rc = re;
+  if (rw == MEO_OK) { meo_cli_result_free(&w); }
+  if (q != 0) { meo_q_free(q); }
+  se_free(st);
+  return bad;
+}
+
+// Parity, then rc, rows, changes, last rowid and column `col` as wanted.
+fn se_ck(cx: SeCtx*, name: string, st: MeoWStmt*, col: int32, rc: int32, rows: int32,
+    changes: int32, last: int64, out: string) -> int32 {
+  var res: SeRes;
+  if (se_run(cx, name, st, col, &res) != 0) { return 1; }
+  if (res.rc != rc) { return se_fail("{name}: rc {res.rc} want {rc}"); }
+  if (res.rows != rows) { return se_fail("{name}: {res.rows} rows want {rows}"); }
+  if (res.changes != changes) { return se_fail("{name}: changes {res.changes} want {changes}"); }
+  if (res.last_id != last) { return se_fail("{name}: last id {res.last_id} want {last}"); }
+  if (!se_same_str(res.out, out)) { return se_fail("{name}: got [{res.out}] want [{out}]"); }
+  return 0;
+}
+
+// BEGIN / COMMIT / ROLLBACK on both sides; which: 0 begin, 1 commit, 2 rollback.
+fn se_tx(cx: SeCtx*, which: int32) -> int32 {
+  var rw: int32 = 0;
+  var re: int32 = 0;
+  if (which == 0) {
+    rw = meo_cli_begin(cx->cli, MEO_TX_DEFAULT);
+    re = meo_db_begin(cx->db, MEO_TX_DEFAULT);
+  } else if (which == 1) {
+    rw = meo_cli_commit(cx->cli);
+    re = meo_db_commit(cx->db);
+  } else {
+    rw = meo_cli_rollback(cx->cli);
+    re = meo_db_rollback(cx->db);
+  }
+  if (rw != MEO_OK || re != MEO_OK) { return se_fail("tx {which}: wire {rw} embedded {re}"); }
+  return 0;
+}
+
+fn se_ping(cx: SeCtx*, name: string) -> int32 {
+  var rc: int32 = meo_cli_ping(cx->cli);
+  if (rc != MEO_OK) { return se_fail("{name}: ping after it rc={rc}"); }
+  return 0;
+}
+
+// --- the user model (as flux_shapes) --------------------------------------------
+
+fn se_user_cols(st: MeoWStmt*, with_pk: bool) {
+  if (with_pk) { se_col(st, "id", T_INT, CF_PK); }
+  se_col(st, "email", T_TEXT, CF_UQ | CF_NN);
+  se_col(st, "name", T_TEXT, CF_NN);
+  se_col(st, "age", T_INT, 0);
+  se_col(st, "active", T_INT, CF_NN);
+  se_col(st, "score", T_REAL, 0);
+  se_col(st, "created_at", T_INT, CF_NN);
+  se_col(st, "role", T_INT, 0);
+}
+
+fn se_user_args(st: MeoWStmt*, email: string, name: MeoValue, age: int64, active: int64,
+    score: MeoValue, created: int64, role: int64) {
+  se_arg(st, vt(email));
+  se_arg(st, name);
+  se_arg(st, vi(age));
+  se_arg(st, vi(active));
+  se_arg(st, score);
+  se_arg(st, vi(created));
+  se_arg(st, vi(role));
+}
+
+fn se_users_select(st: MeoWStmt*) {
+  se_new(st, OP_SELECT, "users");
+  se_user_cols(st, true);
+}
+
+// --- cases ---------------------------------------------------------------------
+
+fn c_migrations(cx: SeCtx*) -> int32 {
+  if (se_tx(cx, 0) != 0) { return 1; }
+  var k: int32 = 0;
+  while (k < 2) {
+    var st: MeoWStmt;
+    se_new(&st, OP_CREATE, "schema_migrations");
+    st.if_not_exists = true;
+    se_col(&st, "version", T_INT, CF_PK);
+    se_col(&st, "name", T_TEXT, CF_NN);
+    se_col(&st, "applied_at", T_INT, CF_NN);
+    if (se_ck(cx, "ledger ddl {k}", &st, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+    k += 1;
+  }
+  var sel: MeoWStmt;
+  se_new(&sel, OP_SELECT, "schema_migrations");
+  se_col(&sel, "version", 0, 0);
+  se_order(&sel, "version", false);
+  if (se_ck(cx, "ledger select empty", &sel, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+
+  var cr: MeoWStmt;
+  se_new(&cr, OP_CREATE, "users");
+  cr.if_not_exists = true;
+  se_user_cols(&cr, true);
+  if (se_ck(cx, "create users", &cr, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var cn: MeoWStmt;
+  se_new(&cn, OP_CREATE, "notes");
+  cn.if_not_exists = true;
+  se_col(&cn, "id", T_INT, CF_PK);
+  se_col(&cn, "text", T_TEXT, 0);
+  se_col(&cn, "version", T_INT, CF_NN);
+  se_col(&cn, "created_at", T_INT, CF_NN);
+  se_col(&cn, "updated_at", T_INT, CF_NN);
+  if (se_ck(cx, "create notes", &cn, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var cp: MeoWStmt;
+  se_new(&cp, OP_CREATE, "posts");
+  cp.if_not_exists = true;
+  se_col(&cp, "id", T_INT, CF_PK);
+  se_col(&cp, "user_id", T_INT, CF_NN);
+  se_col(&cp, "title", T_TEXT, 0);
+  if (se_ck(cx, "create posts", &cp, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var cv: MeoWStmt;
+  se_new(&cv, OP_CREATE, "vals");
+  se_col(&cv, "id", T_INT, CF_PK);
+  se_col(&cv, "i", T_INT, 0);
+  se_col(&cv, "r", T_REAL, 0);
+  se_col(&cv, "t", T_TEXT, 0);
+  se_col(&cv, "b", T_BLOB, 0);
+  if (se_ck(cx, "create vals", &cv, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+
+  var v: int64 = 2;
+  while (v >= 1) {
+    var ins: MeoWStmt;
+    se_new(&ins, OP_INSERT, "schema_migrations");
+    se_col(&ins, "version", 0, 0);
+    se_col(&ins, "name", 0, 0);
+    se_col(&ins, "applied_at", 0, 0);
+    // The value only points at its text, so the text must outlive the run.
+    var nm: string = "m{v}";
+    se_arg(&ins, vi(v));
+    se_arg(&ins, vt(nm));
+    se_arg(&ins, vi(1700000000000000 + v));
+    var bad: int32 = se_ck(cx, "ledger insert {v}", &ins, 0, MEO_OK, 0, 1, v, "");
+    free(nm.chars);
+    if (bad != 0) { return 1; }
+    v -= 1;
+  }
+  var sel2: MeoWStmt;
+  se_new(&sel2, OP_SELECT, "schema_migrations");
+  se_col(&sel2, "version", 0, 0);
+  se_col(&sel2, "name", 0, 0);
+  se_order(&sel2, "version", false);
+  if (se_ck(cx, "ledger select", &sel2, 1, MEO_OK, 2, 0, 0, "m1,m2") != 0) { return 1; }
+  return se_tx(cx, 1);
+}
+
+fn c_inserts(cx: SeCtx*) -> int32 {
+  var one: MeoWStmt;
+  se_new(&one, OP_INSERT, "users");
+  se_user_cols(&one, false);
+  se_user_args(&one, "a@x", vt("ann"), 30, 1, vr(9.5), 1, 1);
+  if (se_ck(cx, "persist insert", &one, 0, MEO_OK, 0, 1, 1, "") != 0) { return 1; }
+  var two: MeoWStmt;
+  se_new(&two, OP_INSERT, "users");
+  se_user_cols(&two, false);
+  se_user_args(&two, "b@x", vt("bob"), 31, 1, vn(), 3, 2);
+  se_user_args(&two, "c@x", vt("cy"), 45, 0, vr(1.0), 8, 2);
+  if (se_ck(cx, "insert batch", &two, 0, MEO_OK, 0, 2, 3, "") != 0) { return 1; }
+  // The pk sent as NULL picks the next rowid.
+  var three: MeoWStmt;
+  se_new(&three, OP_INSERT, "users");
+  se_user_cols(&three, true);
+  se_arg(&three, vn());
+  se_user_args(&three, "d@x", vt("dee"), 22, 1, vn(), 9, 3);
+  if (se_ck(cx, "insert null id", &three, 0, MEO_OK, 0, 1, 4, "") != 0) { return 1; }
+  var dup: MeoWStmt;
+  se_new(&dup, OP_INSERT, "users");
+  se_user_cols(&dup, false);
+  se_user_args(&dup, "a@x", vt("again"), 1, 1, vn(), 1, 1);
+  if (se_ck(cx, "insert dup", &dup, 0, -MEO_ERR_CONFLICT, 0, 0, 0, "") != 0) { return 1; }
+  if (se_ping(cx, "conflict") != 0) { return 1; }
+
+  var posts: MeoWStmt;
+  se_new(&posts, OP_INSERT, "posts");
+  se_col(&posts, "id", 0, 0);
+  se_col(&posts, "user_id", 0, 0);
+  se_col(&posts, "title", 0, 0);
+  var uid: int64[4];
+  uid[0] = 1;
+  uid[1] = 2;
+  uid[2] = 1;
+  uid[3] = 4;
+  var title: string[4];
+  title[0] = "p1";
+  title[1] = "p2";
+  title[2] = "p3";
+  title[3] = "p4";
+  var i: int32 = 0;
+  while (i < 4) {
+    se_arg(&posts, vn());
+    se_arg(&posts, vi(uid[i]));
+    se_arg(&posts, vt(title[i]));
+    i += 1;
+  }
+  return se_ck(cx, "insert posts null ids", &posts, 0, MEO_OK, 0, 4, 4, "");
+}
+
+fn c_selects(cx: SeCtx*) -> int32 {
+  var all: MeoWStmt;
+  se_users_select(&all);
+  if (se_ck(cx, "select all", &all, 0, MEO_OK, 4, 0, 0, "1,2,3,4") != 0) { return 1; }
+
+  var eq: MeoWStmt;
+  se_users_select(&eq);
+  se_arg(&eq, vt("b@x"));
+  se_term(&eq, "email", W_EQ, 1);
+  if (se_ck(cx, "where_eq", &eq, 2, MEO_OK, 1, 0, 0, "bob") != 0) { return 1; }
+
+  var nul: MeoWStmt;
+  se_users_select(&nul);
+  se_term(&nul, "score", W_NULL, 0);
+  if (se_ck(cx, "where_null", &nul, 0, MEO_OK, 2, 0, 0, "2,4") != 0) { return 1; }
+
+  var nn: MeoWStmt;
+  se_users_select(&nn);
+  se_term(&nn, "score", W_NOT_NULL, 0);
+  if (se_ck(cx, "where_not_null", &nn, 0, MEO_OK, 2, 0, 0, "1,3") != 0) { return 1; }
+
+  // Every comparison on age (30, 31, 45, 22).
+  var ops: int32[6];
+  ops[0] = W_EQ;
+  ops[1] = W_NE;
+  ops[2] = W_LT;
+  ops[3] = W_LE;
+  ops[4] = W_GT;
+  ops[5] = W_GE;
+  var want: string[6];
+  want[0] = "1";
+  want[1] = "2,3,4";
+  want[2] = "4";
+  want[3] = "1,4";
+  want[4] = "2,3";
+  want[5] = "1,2,3";
+  var i: int32 = 0;
+  while (i < 6) {
+    var cmp: MeoWStmt;
+    se_users_select(&cmp);
+    se_arg(&cmp, vi(30));
+    se_term(&cmp, "age", ops[i], 1);
+    var n: int32 = 1 + (int32)(want[i].length / 2);
+    if (se_ck(cx, "where_cmp {ops[i]}", &cmp, 0, MEO_OK, n, 0, 0, want[i]) != 0) { return 1; }
+    i += 1;
+  }
+
+  var inq: MeoWStmt;
+  se_users_select(&inq);
+  se_arg(&inq, vi(30));
+  se_arg(&inq, vi(31));
+  se_term(&inq, "age", W_IN, 2);
+  if (se_ck(cx, "where_in", &inq, 0, MEO_OK, 2, 0, 0, "1,2") != 0) { return 1; }
+
+  var ord: MeoWStmt;
+  se_users_select(&ord);
+  se_order(&ord, "name", true);
+  ord.limit = 2;
+  ord.offset = 1;
+  if (se_ck(cx, "order desc limit offset", &ord, 2, MEO_OK, 2, 0, 0, "cy,bob") != 0) { return 1; }
+
+  // active asc, then name desc: cy (0), then dee, bob, ann (1).
+  var multi: MeoWStmt;
+  se_users_select(&multi);
+  se_order(&multi, "active", false);
+  se_order(&multi, "name", true);
+  if (se_ck(cx, "order multi", &multi, 0, MEO_OK, 4, 0, 0, "3,4,2,1") != 0) { return 1; }
+
+  var k: int32 = 0;
+  while (k < 2) {
+    var big: MeoWStmt;
+    se_users_select(&big);
+    if (k == 0) { se_arg(&big, vt("a@x")); } else { se_arg(&big, vt("b@x")); }
+    se_term(&big, "email", W_EQ, 1);
+    se_arg(&big, vi(30));
+    se_arg(&big, vi(31));
+    se_term(&big, "age", W_IN, 2);
+    se_term(&big, "score", W_NULL, 0);
+    se_arg(&big, vi(1));
+    se_term(&big, "role", W_GE, 1);
+    se_term(&big, "active", W_NOT_NULL, 0);
+    big.limit = 10;
+    if (k == 0) {
+      se_order(&big, "name", true);
+      big.offset = 20;
+      if (se_ck(cx, "check_select shape", &big, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+    } else {
+      if (se_ck(cx, "check_select shape hit", &big, 0, MEO_OK, 1, 0, 0, "2") != 0) { return 1; }
+    }
+    k += 1;
+  }
+
+  var load: MeoWStmt;
+  se_users_select(&load);
+  se_arg(&load, vi(3));
+  se_term(&load, "id", W_EQ, 1);
+  load.limit = 1;
+  if (se_ck(cx, "persist load", &load, 1, MEO_OK, 1, 0, 0, "c@x") != 0) { return 1; }
+
+  var pre: MeoWStmt;
+  se_new(&pre, OP_SELECT, "posts");
+  se_col(&pre, "id", 0, 0);
+  se_col(&pre, "user_id", 0, 0);
+  se_col(&pre, "title", 0, 0);
+  se_arg(&pre, vi(1));
+  se_arg(&pre, vi(3));
+  se_arg(&pre, vi(4));
+  se_term(&pre, "user_id", W_IN, 3);
+  if (se_ck(cx, "preload in", &pre, 2, MEO_OK, 3, 0, 0, "p1,p3,p4") != 0) { return 1; }
+
+  var cnt: MeoWStmt;
+  se_new(&cnt, OP_COUNT, "users");
+  se_arg(&cnt, vi(30));
+  se_term(&cnt, "age", W_GE, 1);
+  se_arg(&cnt, vi(1));
+  se_term(&cnt, "active", W_EQ, 1);
+  return se_ck(cx, "count with terms", &cnt, 0, MEO_OK, 1, 0, 0, "2");
+}
+
+fn c_versioned(cx: SeCtx*) -> int32 {
+  var t0: int64 = 1730000000123456;
+  var ins: MeoWStmt;
+  se_new(&ins, OP_INSERT, "notes");
+  se_col(&ins, "text", 0, 0);
+  se_col(&ins, "version", 0, 0);
+  se_col(&ins, "created_at", 0, 0);
+  se_col(&ins, "updated_at", 0, 0);
+  se_arg(&ins, vt("first"));
+  se_arg(&ins, vi(1));
+  se_arg(&ins, vi(t0));
+  se_arg(&ins, vi(t0));
+  if (se_ck(cx, "note insert", &ins, 0, MEO_OK, 0, 1, 1, "") != 0) { return 1; }
+
+  // SET values then term args: [text, t1, 2, id 1, version 1]. The second run
+  // is stale and changes nothing.
+  var k: int32 = 0;
+  while (k < 2) {
+    var up: MeoWStmt;
+    se_new(&up, OP_UPDATE, "notes");
+    se_col(&up, "text", 0, 0);
+    se_col(&up, "updated_at", 0, 0);
+    se_col(&up, "version", 0, 0);
+    se_arg(&up, vt("second"));
+    se_arg(&up, vi(t0 + 1000));
+    se_arg(&up, vi(2));
+    se_arg(&up, vi(1));
+    se_term(&up, "id", W_EQ, 1);
+    se_arg(&up, vi(1));
+    se_term(&up, "version", W_EQ, 1);
+    var ch: int32 = 1;
+    if (k == 1) { ch = 0; }
+    if (se_ck(cx, "versioned save {k}", &up, 0, MEO_OK, 0, ch, 0, "") != 0) { return 1; }
+    k += 1;
+  }
+  var rd: MeoWStmt;
+  se_new(&rd, OP_SELECT, "notes");
+  se_col(&rd, "text", 0, 0);
+  se_col(&rd, "version", 0, 0);
+  se_col(&rd, "created_at", 0, 0);
+  se_col(&rd, "updated_at", 0, 0);
+  if (se_ck(cx, "note after save", &rd, 0, MEO_OK, 1, 0, 0, "second") != 0) { return 1; }
+
+  var d1: MeoWStmt;
+  se_new(&d1, OP_DELETE, "notes");
+  se_arg(&d1, vi(1));
+  se_term(&d1, "id", W_EQ, 1);
+  se_arg(&d1, vi(1));
+  se_term(&d1, "version", W_EQ, 1);
+  if (se_ck(cx, "versioned delete stale", &d1, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var d2: MeoWStmt;
+  se_new(&d2, OP_DELETE, "notes");
+  se_arg(&d2, vi(1));
+  se_term(&d2, "id", W_EQ, 1);
+  se_arg(&d2, vi(2));
+  se_term(&d2, "version", W_EQ, 1);
+  return se_ck(cx, "versioned delete", &d2, 0, MEO_OK, 0, 1, 0, "");
+}
+
+fn c_bulk(cx: SeCtx*) -> int32 {
+  var ua: MeoWStmt;
+  se_new(&ua, OP_UPDATE, "users");
+  se_col(&ua, "active", 0, 0);
+  se_arg(&ua, vi(0));
+  se_arg(&ua, vi(5));
+  se_term(&ua, "created_at", W_LT, 1);
+  if (se_ck(cx, "update_all", &ua, 0, MEO_OK, 0, 2, 0, "") != 0) { return 1; }
+
+  var up: MeoWStmt;
+  se_new(&up, OP_UPDATE, "users");
+  se_col(&up, "name", 0, 0);
+  se_col(&up, "score", 0, 0);
+  se_arg(&up, vt("dora"));
+  se_arg(&up, vr(4.25));
+  se_arg(&up, vi(4));
+  se_term(&up, "id", W_EQ, 1);
+  if (se_ck(cx, "update by pk", &up, 0, MEO_OK, 0, 1, 0, "") != 0) { return 1; }
+
+  var da: MeoWStmt;
+  se_new(&da, OP_DELETE, "users");
+  se_arg(&da, vi(0));
+  se_term(&da, "active", W_EQ, 1);
+  if (se_ck(cx, "delete_all", &da, 0, MEO_OK, 0, 3, 0, "") != 0) { return 1; }
+
+  var pd: MeoWStmt;
+  se_new(&pd, OP_DELETE, "posts");
+  se_arg(&pd, vi(2));
+  se_term(&pd, "id", W_EQ, 1);
+  if (se_ck(cx, "persist delete", &pd, 0, MEO_OK, 0, 1, 0, "") != 0) { return 1; }
+
+  var left: MeoWStmt;
+  se_users_select(&left);
+  if (se_ck(cx, "users left", &left, 2, MEO_OK, 1, 0, 0, "dora") != 0) { return 1; }
+  var cnt: MeoWStmt;
+  se_new(&cnt, OP_COUNT, "posts");
+  return se_ck(cx, "count posts", &cnt, 0, MEO_OK, 1, 0, 0, "3");
+}
+
+// Every value kind at its edges, compared cell by cell.
+fn c_values(cx: SeCtx*) -> int32 {
+  var blob: uint8* = (uint8*)malloc(4);
+  blob[0] = 0;
+  blob[1] = 255;
+  blob[2] = 0;
+  blob[3] = 7;
+  var ins: MeoWStmt;
+  se_new(&ins, OP_INSERT, "vals");
+  se_col(&ins, "i", 0, 0);
+  se_col(&ins, "r", 0, 0);
+  se_col(&ins, "t", 0, 0);
+  se_col(&ins, "b", 0, 0);
+  se_arg(&ins, vi(i64_min()));
+  se_arg(&ins, vr(f64_from((uint64)1 << 63)));
+  se_arg(&ins, vt(""));
+  se_arg(&ins, vb(blob, 4));
+  se_arg(&ins, vi(i64_max()));
+  se_arg(&ins, vr(f64_from((uint64)0x7FF8000000000123)));
+  se_arg(&ins, vt("héllo"));
+  se_arg(&ins, vb(blob, 0));
+  se_arg(&ins, vn());
+  se_arg(&ins, vn());
+  se_arg(&ins, vn());
+  se_arg(&ins, vn());
+  se_arg(&ins, vi(0));
+  se_arg(&ins, vr(-1.5));
+  se_arg(&ins, vt("z"));
+  se_arg(&ins, vn());
+  var rc: int32 = se_ck(cx, "values insert", &ins, 0, MEO_OK, 0, 4, 4, "");
+  free(blob);
+  if (rc != 0) { return 1; }
+  var sel: MeoWStmt;
+  se_new(&sel, OP_SELECT, "vals");
+  se_order(&sel, "id", false);
+  if (se_ck(cx, "values select", &sel, 2, MEO_OK, 4, 0, 0, "R,R,N,R") != 0) { return 1; }
+  var neg: MeoWStmt;
+  se_new(&neg, OP_SELECT, "vals");
+  se_col(&neg, "id", 0, 0);
+  se_arg(&neg, vi(0));
+  se_term(&neg, "i", W_LT, 1);
+  return se_ck(cx, "values int64 min", &neg, 0, MEO_OK, 1, 0, 0, "1");
+}
+
+fn c_ddl(cx: SeCtx*) -> int32 {
+  var add: MeoWStmt;
+  se_new(&add, OP_ADD_COLUMN, "posts");
+  se_col(&add, "bio", T_TEXT, 0);
+  if (se_ck(cx, "add column", &add, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var ins: MeoWStmt;
+  se_new(&ins, OP_INSERT, "posts");
+  se_col(&ins, "user_id", 0, 0);
+  se_col(&ins, "title", 0, 0);
+  se_col(&ins, "bio", 0, 0);
+  se_arg(&ins, vi(4));
+  se_arg(&ins, vt("p5"));
+  se_arg(&ins, vt("new"));
+  if (se_ck(cx, "insert with new column", &ins, 0, MEO_OK, 0, 1, 5, "") != 0) { return 1; }
+  var sel: MeoWStmt;
+  se_new(&sel, OP_SELECT, "posts");
+  se_col(&sel, "id", 0, 0);
+  se_col(&sel, "bio", 0, 0);
+  se_order(&sel, "id", false);
+  if (se_ck(cx, "old rows null", &sel, 1, MEO_OK, 4, 0, 0, "N,N,N,new") != 0) { return 1; }
+  var dup: MeoWStmt;
+  se_new(&dup, OP_ADD_COLUMN, "posts");
+  se_col(&dup, "bio", T_TEXT, 0);
+  if (se_ck(cx, "add column twice", &dup, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
+
+  var k: int32 = 0;
+  while (k < 3) {
+    // drop, drop again (SCHEMA), drop if exists (no-op).
+    var dr: MeoWStmt;
+    se_new(&dr, OP_DROP, "vals");
+    var want: int32 = MEO_OK;
+    if (k == 1) { want = -MEO_ERR_SCHEMA; }
+    if (k == 2) { dr.if_not_exists = true; }
+    if (se_ck(cx, "drop {k}", &dr, 0, want, 0, 0, 0, "") != 0) { return 1; }
+    k += 1;
+  }
+  var gone: MeoWStmt;
+  se_new(&gone, OP_SELECT, "vals");
+  return se_ck(cx, "dropped table", &gone, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "");
+}
+
+fn c_errors(cx: SeCtx*) -> int32 {
+  var nn: MeoWStmt;
+  se_new(&nn, OP_INSERT, "users");
+  se_user_cols(&nn, false);
+  se_user_args(&nn, "z@x", vn(), 1, 1, vn(), 1, 1);
+  if (se_ck(cx, "not null", &nn, 0, -MEO_ERR_CONSTRAINT, 0, 0, 0, "") != 0) { return 1; }
+  if (se_ping(cx, "constraint") != 0) { return 1; }
+  var mm: MeoWStmt;
+  se_new(&mm, OP_INSERT, "users");
+  se_user_cols(&mm, false);
+  se_user_args(&mm, "z@x", vt("zed"), 1, 1, vt("high"), 1, 1);
+  if (se_ck(cx, "text into REAL", &mm, 0, -MEO_ERR_MISMATCH, 0, 0, 0, "") != 0) { return 1; }
+  if (se_ping(cx, "mismatch") != 0) { return 1; }
+  var ut: MeoWStmt;
+  se_new(&ut, OP_SELECT, "nope");
+  if (se_ck(cx, "unknown table", &ut, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
+  var uc: MeoWStmt;
+  se_users_select(&uc);
+  se_term(&uc, "nope", W_NULL, 0);
+  if (se_ck(cx, "unknown column", &uc, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
+  if (se_ping(cx, "schema") != 0) { return 1; }
+
+  // Index ops are wire-only: refused, connection kept.
+  var op: int32 = OP_CREATE_INDEX;
+  while (op <= OP_DROP_INDEX) {
+    var ix: MeoWStmt;
+    se_new(&ix, op, "users");
+    ix.name = "users_age";
+    if (op == OP_CREATE_INDEX) { se_col(&ix, "age", 0, 0); }
+    var w: MeoCliResult;
+    var rc: int32 = meo_cli_query(cx->cli, &ix, &w);
+    se_free(&ix);
+    if (rc == MEO_OK) { meo_cli_result_free(&w); }
+    if (rc != -MEO_ERR_UNSUPPORTED || !meo_cli_connected(cx->cli)) {
+      return se_fail("index op {op}: rc={rc}");
+    }
+    if (se_ping(cx, "index op") != 0) { return 1; }
+    op += 1;
+  }
+  var cnt: MeoWStmt;
+  se_new(&cnt, OP_COUNT, "users");
+  return se_ck(cx, "nothing written", &cnt, 0, MEO_OK, 1, 0, 0, "1");
+}
+
+fn se_post(st: MeoWStmt*, title: string) {
+  se_new(st, OP_INSERT, "posts");
+  se_col(st, "user_id", 0, 0);
+  se_col(st, "title", 0, 0);
+  se_arg(st, vi(4));
+  se_arg(st, vt(title));
+}
+
+fn c_tx(cx: SeCtx*, other: SeCtx*) -> int32 {
+  if (se_tx(cx, 0) != 0) { return 1; }
+  var a: MeoWStmt;
+  se_post(&a, "r1");
+  if (se_ck(cx, "tx insert r1", &a, 0, MEO_OK, 0, 1, 6, "") != 0) { return 1; }
+  var b: MeoWStmt;
+  se_post(&b, "r2");
+  if (se_ck(cx, "tx insert r2", &b, 0, MEO_OK, 0, 1, 7, "") != 0) { return 1; }
+  if (se_tx(cx, 2) != 0) { return 1; }
+  var c0: MeoWStmt;
+  se_new(&c0, OP_COUNT, "posts");
+  if (se_ck(cx, "after rollback", &c0, 0, MEO_OK, 1, 0, 0, "4") != 0) { return 1; }
+
+  if (se_tx(cx, 0) != 0) { return 1; }
+  var c: MeoWStmt;
+  se_post(&c, "k1");
+  if (se_ck(cx, "tx insert k1", &c, 0, MEO_OK, 0, 1, 6, "") != 0) { return 1; }
+  var d: MeoWStmt;
+  se_post(&d, "k2");
+  if (se_ck(cx, "tx insert k2", &d, 0, MEO_OK, 0, 1, 7, "") != 0) { return 1; }
+  if (se_tx(cx, 1) != 0) { return 1; }
+  // A second connection sees the committed rows.
+  var sel: MeoWStmt;
+  se_new(&sel, OP_SELECT, "posts");
+  se_col(&sel, "title", 0, 0);
+  se_order(&sel, "id", false);
+  return se_ck(other, "committed, second client", &sel, 0, MEO_OK, 6, 0, 0, "p1,p3,p4,p5,k1,k2");
+}
+
+fn se_cases(cx: SeCtx*, other: SeCtx*) -> int32 {
+  if (c_migrations(cx) != 0) { return 1; }
+  if (c_inserts(cx) != 0) { return 1; }
+  if (c_selects(cx) != 0) { return 1; }
+  if (c_versioned(cx) != 0) { return 1; }
+  if (c_bulk(cx) != 0) { return 1; }
+  if (c_values(cx) != 0) { return 1; }
+  if (c_ddl(cx) != 0) { return 1; }
+  if (c_errors(cx) != 0) { return 1; }
+  return c_tx(cx, other);
+}
+
+fn se_main() -> int32 {
+  if (se_reset(SE_SRV_DB) != MEO_OK || se_reset(SE_EMB_DB) != MEO_OK) { return se_fail("reset"); }
+  var flags: int32 = MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE;
+  var sdb: MeoDb* = 0;
+  var rc: int32 = meo_db_open(SE_SRV_DB, flags, 0, &sdb);
+  if (rc != MEO_OK) { return se_fail("open server db rc={rc}"); }
+  var edb: MeoDb* = 0;
+  rc = meo_db_open(SE_EMB_DB, flags, 0, &edb);
+  if (rc != MEO_OK) { return se_fail("open embedded db rc={rc}"); }
+  var cfg: MeoSrvConfig;
+  meo_srv_config_default(&cfg);
+  cfg.ip = SE_IP;
+  cfg.port = 0;
+  var srv: MeoSrv* = 0;
+  rc = meo_srv_start(sdb, &cfg, &srv);
+  if (rc != MEO_OK) { return se_fail("server start rc={rc}"); }
+  var port: int32 = meo_srv_port(srv);
+  var cx: SeCtx;
+  cx.db = edb;
+  rc = meo_cli_connect(SE_IP, port, 0, 0, 0, &cx.cli);
+  if (rc != MEO_OK) { return se_fail("connect rc={rc}"); }
+  var other: SeCtx;
+  other.db = edb;
+  rc = meo_cli_connect(SE_IP, port, 0, 0, 0, &other.cli);
+  if (rc != MEO_OK) { return se_fail("connect 2 rc={rc}"); }
+
+  var bad: int32 = se_cases(&cx, &other);
+  meo_cli_close(cx.cli);
+  meo_cli_close(other.cli);
+  rc = meo_srv_stop(srv);
+  if (rc != MEO_OK) { return se_fail("server stop rc={rc}"); }
+  meo_srv_free(srv);
+  if (meo_db_close(sdb) != MEO_OK || meo_db_close(edb) != MEO_OK) { return se_fail("close"); }
+  return bad;
+}
+
+fn main() -> int32 {
+  if (se_main() != 0) { return 1; }
+  println("PASS srv_e2e");
+  return 0;
+}

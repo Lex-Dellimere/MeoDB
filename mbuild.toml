@@ -159,3 +159,7 @@ main = "tests/srv_limits.mettle"
 # Stopping the server with open transactions.
 [bin.srv_stop]
 main = "tests/srv_stop.mettle"
+
+# The full query suite through the client, compared with embedded results.
+[bin.srv_e2e]
+main = "tests/srv_e2e.mettle"
