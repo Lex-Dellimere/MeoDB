@@ -1,0 +1,297 @@
+// srv_kill: a client that dies or hangs inside a transaction.
+// (a) A forked child connects, BEGINs, inserts 100 rows and dies with
+//     exit_group: no BYE, no close. Another connection's BEGIN gets the lock
+//     within 1 s and none of the 100 rows is there.
+// (b) With tx_idle_ms = 500 a client BEGINs, inserts and goes quiet. Within
+//     1.5 s its transaction is rolled back and another BEGIN succeeds; the
+//     hung client's next call is -MEO_ERR_TX and its rollback is OK.
+//
+// The fork happens before the server (or any thread) starts; the child does
+// its client work in the forked image and gets the port through a pipe.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meo_server.mettle";
+import "../src/meo_client.mettle";
+
+// Red-check switch: 1 expects the dead child's rows to survive. Must be 0
+// when committed.
+const KILL_RED: int32 = 0;
+const KILL_DB: string = "/dev/shm/meosql_srv_kill.db";
+const KILL_IP: string = "127.0.0.1";
+const KILL_ROWS: int32 = 100;
+const KILL_HUNG_ROWS: int32 = 5;
+const KILL_TX_IDLE_MS: int32 = 500;
+
+fn kill_fail(msg: string) -> int32 {
+  println("FAIL srv_kill: {msg}");
+  return 1;
+}
+
+fn kill_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn kill_read(fd: int32, p: uint8*, n: int32) -> int64 {
+  return syscall(0, (int64)fd, (int64)p, (int64)n);
+}
+
+fn kill_write(fd: int32, p: uint8*, n: int32) -> int64 {
+  return syscall(1, (int64)fd, (int64)p, (int64)n);
+}
+
+fn kill_close(fd: int32) {
+  syscall(3, (int64)fd);
+}
+
+// INSERT INTO t(tag, n) VALUES (tag, n).
+fn kill_insert(c: MeoCli*, tag: int64, n: int64) -> int32 {
+  var cols: MeoWCol[2];
+  cols[0].name = "tag";
+  cols[0].ty = 0;
+  cols[0].flags = 0;
+  cols[1].name = "n";
+  cols[1].ty = 0;
+  cols[1].flags = 0;
+  var args: MeoValue[2];
+  meo_value_set_int(&args[0], tag);
+  meo_value_set_int(&args[1], n);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  st.n_rows = 1;
+  st.args = &args[0];
+  st.n_args = 2;
+  var r: MeoCliResult;
+  var rc: int32 = meo_cli_query(c, &st, &r);
+  if (rc != MEO_OK) { return rc; }
+  var ch: int32 = meo_cli_affected(&r);
+  meo_cli_result_free(&r);
+  if (ch != 1) { return -MEO_ERR_CORRUPT; }
+  return MEO_OK;
+}
+
+// COUNT WHERE tag = tag through c, or a negative code.
+fn kill_count(c: MeoCli*, tag: int64) -> int64 {
+  var terms: MeoWTerm[1];
+  terms[0].col = "tag";
+  terms[0].op = MEO_WIRE_W_EQ;
+  terms[0].arg0 = 0;
+  terms[0].n_args = 1;
+  var v: MeoValue;
+  meo_value_set_int(&v, tag);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_COUNT;
+  st.table = "t";
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  st.args = &v;
+  st.n_args = 1;
+  var r: MeoCliResult;
+  var rc: int32 = meo_cli_query(c, &st, &r);
+  if (rc != MEO_OK) { return (int64)rc; }
+  var n: int64 = -1;
+  var cell: MeoValue;
+  if (meo_cli_cell(&r, 0, 0, &cell) == MEO_OK && cell.type == MEO_T_INT) { n = cell.i; }
+  meo_cli_result_free(&r);
+  return n;
+}
+
+// The forked child: port in, one status byte out (0 = BEGIN and 100 inserts
+// done), then it waits for the word and dies without COMMIT, BYE or close.
+fn kill_child(rd: int32, wr: int32) {
+  var port: int32 = 0;
+  var st: uint8[1];
+  st[0] = 1;
+  if (kill_read(rd, (uint8*)&port, 4) == 4) {
+    var c: MeoCli* = 0;
+    var rc: int32 = meo_cli_connect(KILL_IP, port, 0, 0, 0, &c);
+    if (rc == MEO_OK) { rc = meo_cli_begin(c, 0); }
+    var i: int32 = 0;
+    while (rc == MEO_OK && i < KILL_ROWS) {
+      rc = kill_insert(c, 1, (int64)i);
+      i += 1;
+    }
+    if (rc == MEO_OK) { st[0] = 0; } else { st[0] = 2; }
+  }
+  kill_write(wr, &st[0], 1);
+  kill_read(rd, &st[0], 1);
+  syscall(231, (int64)0);
+}
+
+fn kill_open(db: MeoDb**) -> int32 {
+  var rc: int32 = kill_reset(KILL_DB);
+  if (rc != MEO_OK) { return kill_fail("reset rc={rc}"); }
+  rc = meo_db_open(KILL_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, db);
+  if (rc != MEO_OK) { return kill_fail("open rc={rc}"); }
+  var q: MeoQuery* = 0;
+  meo_q_create(db[0], "t", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "tag", MEO_T_INT, MEO_COL_NOT_NULL);
+  meo_q_column_def(q, "n", MEO_T_INT, MEO_COL_NOT_NULL);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return kill_fail("create t rc={rc}"); }
+  return 0;
+}
+
+fn kill_start(db: MeoDb*, tx_idle_ms: int32, out: MeoSrv**) -> int32 {
+  var cfg: MeoSrvConfig;
+  meo_srv_config_default(&cfg);
+  cfg.ip = KILL_IP;
+  cfg.port = 0;
+  cfg.tx_idle_ms = tx_idle_ms;
+  var rc: int32 = meo_srv_start(db, &cfg, out);
+  if (rc != MEO_OK) { return kill_fail("start rc={rc}"); }
+  return 0;
+}
+
+// Parent side of (a). down: parent -> child, up: child -> parent.
+fn kill_dead_child(db: MeoDb*, pid: int64, down: int32, up: int32) -> int32 {
+  var srv: MeoSrv* = 0;
+  if (kill_start(db, 5000, &srv) != 0) { return 1; }
+  var bad: int32 = 0;
+  var port: int32 = meo_srv_port(srv);
+  var st: uint8[1];
+  st[0] = 9;
+  if (kill_write(down, (uint8*)&port, 4) != 4) { bad = kill_fail("pipe write"); }
+  if (bad == 0 && (kill_read(up, &st[0], 1) != 1 || st[0] != 0)) {
+    bad = kill_fail("child status {st[0]}");
+  }
+  if (bad == 0 && !meo_db_in_tx(db)) { bad = kill_fail("child's transaction not open"); }
+  kill_write(down, &st[0], 1);
+  var status: int32 = 0;
+  syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  var t0: int64 = meo_srv_now_ms();
+  var b: MeoCli* = 0;
+  if (bad == 0) {
+    var rc: int32 = meo_cli_connect(KILL_IP, port, 0, 0, 0, &b);
+    if (rc != MEO_OK) { bad = kill_fail("connect b rc={rc}"); }
+  }
+  if (bad == 0) {
+    var rc2: int32 = meo_cli_begin(b, 0);
+    var ms: int64 = meo_srv_now_ms() - t0;
+    if (rc2 != MEO_OK) {
+      bad = kill_fail("begin after child death rc={rc2} after {ms} ms");
+    } else if (ms > 1000) {
+      bad = kill_fail("begin after child death took {ms} ms");
+    } else {
+      println("srv_kill: lock free {ms} ms after the child died");
+    }
+  }
+  if (bad == 0) {
+    var n: int64 = kill_count(b, 1);
+    var want: int64 = 0;
+    if (KILL_RED != 0) { want = (int64)KILL_ROWS; }
+    if (n != want) { bad = kill_fail("dead child's rows: count {n}"); }
+    if (meo_cli_rollback(b) != MEO_OK && bad == 0) { bad = kill_fail("rollback b"); }
+  }
+  if (b != 0) { meo_cli_close(b); }
+  if (meo_srv_stop(srv) != MEO_OK && bad == 0) { bad = kill_fail("stop a"); }
+  meo_srv_free(srv);
+  return bad;
+}
+
+fn kill_hung(db: MeoDb*) -> int32 {
+  var srv: MeoSrv* = 0;
+  if (kill_start(db, KILL_TX_IDLE_MS, &srv) != 0) { return 1; }
+  var port: int32 = meo_srv_port(srv);
+  var bad: int32 = 0;
+  var h: MeoCli* = 0;
+  var b: MeoCli* = 0;
+  var rc: int32 = meo_cli_connect(KILL_IP, port, 0, 0, 0, &h);
+  if (rc != MEO_OK) { bad = kill_fail("connect h rc={rc}"); }
+  if (bad == 0 && meo_cli_begin(h, 0) != MEO_OK) { bad = kill_fail("begin h"); }
+  var i: int32 = 0;
+  while (bad == 0 && i < KILL_HUNG_ROWS) {
+    rc = kill_insert(h, 2, (int64)i);
+    if (rc != MEO_OK) { bad = kill_fail("insert h rc={rc}"); }
+    i += 1;
+  }
+  // h goes quiet from here on; b waits on the lock h holds.
+  var t0: int64 = meo_srv_now_ms();
+  if (bad == 0) {
+    rc = meo_cli_connect(KILL_IP, port, 0, 0, 0, &b);
+    if (rc != MEO_OK) { bad = kill_fail("connect b rc={rc}"); }
+  }
+  if (bad == 0) {
+    rc = meo_cli_begin(b, 0);
+    var ms: int64 = meo_srv_now_ms() - t0;
+    if (rc != MEO_OK) {
+      bad = kill_fail("begin while h hangs rc={rc} after {ms} ms");
+    } else if (ms > (int64)KILL_TX_IDLE_MS + 1000) {
+      bad = kill_fail("lock free only after {ms} ms");
+    } else {
+      println("srv_kill: hung client's lock free after {ms} ms");
+    }
+  }
+  if (bad == 0) {
+    var n: int64 = kill_count(b, 2);
+    if (n != 0) { bad = kill_fail("hung client's rows: count {n}"); }
+    if (meo_cli_commit(b) != MEO_OK && bad == 0) { bad = kill_fail("commit b"); }
+  }
+  if (bad == 0) {
+    rc = meo_cli_ping(h);
+    if (rc != -MEO_ERR_TX) { bad = kill_fail("hung client's next call rc={rc}, want -TX"); }
+  }
+  if (bad == 0 && meo_cli_tx_state(h) != MEO_CLI_TX_LOST) { bad = kill_fail("h tx state"); }
+  if (bad == 0 && meo_cli_commit(h) != -MEO_ERR_TX) { bad = kill_fail("commit after loss not -TX"); }
+  if (bad == 0 && meo_cli_rollback(h) != MEO_OK) { bad = kill_fail("rollback after loss"); }
+  if (bad == 0) {
+    rc = meo_cli_ping(h);
+    if (rc != MEO_OK) { bad = kill_fail("ping after rollback rc={rc}"); }
+  }
+  if (h != 0) { meo_cli_close(h); }
+  if (b != 0) { meo_cli_close(b); }
+  if (meo_srv_stop(srv) != MEO_OK && bad == 0) { bad = kill_fail("stop b"); }
+  meo_srv_free(srv);
+  return bad;
+}
+
+fn main() -> int32 {
+  var down: int32[2];
+  var up: int32[2];
+  if (syscall(22, (int64)&down[0]) != 0 || syscall(22, (int64)&up[0]) != 0) {
+    return kill_fail("pipe");
+  }
+  var pid: int64 = syscall(57);
+  if (pid < 0) { return kill_fail("fork"); }
+  if (pid == 0) {
+    kill_close(down[1]);
+    kill_close(up[0]);
+    kill_child(down[0], up[1]);
+  }
+  kill_close(down[0]);
+  kill_close(up[1]);
+  var db: MeoDb* = 0;
+  var bad: int32 = kill_open(&db);
+  if (bad != 0) {
+    // Unblock the child so it exits.
+    kill_close(down[1]);
+    return 1;
+  }
+  bad = kill_dead_child(db, pid, down[1], up[0]);
+  kill_close(down[1]);
+  kill_close(up[0]);
+  if (bad == 0) { bad = kill_hung(db); }
+  var rc: int32 = meo_db_close(db);
+  if (bad == 0 && rc != MEO_OK) { bad = kill_fail("close rc={rc}"); }
+  meo_file_unlink(KILL_DB);
+  if (bad != 0) { return 1; }
+  println("PASS srv_kill");
+  return 0;
+}

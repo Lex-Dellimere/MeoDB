@@ -163,3 +163,11 @@ main = "tests/srv_stop.mettle"
 # The full query suite through the client, compared with embedded results.
 [bin.srv_e2e]
 main = "tests/srv_e2e.mettle"
+
+# 64 clients over TCP at once.
+[bin.srv_mt]
+main = "tests/srv_mt.mettle"
+
+# A client killed or hung mid-transaction.
+[bin.srv_kill]
+main = "tests/srv_kill.mettle"
