@@ -151,3 +151,11 @@ main = "tests/flux_shapes.mettle"
 # Imports only meo_core.mettle, proving tables work without the query layer.
 [bin.core_only]
 main = "tests/core_only.mettle"
+
+# Protocol limits: sizes, versions, tokens, connection cap.
+[bin.srv_limits]
+main = "tests/srv_limits.mettle"
+
+# Stopping the server with open transactions.
+[bin.srv_stop]
+main = "tests/srv_stop.mettle"

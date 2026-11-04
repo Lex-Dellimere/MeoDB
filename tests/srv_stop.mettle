@@ -1,0 +1,369 @@
+// srv_stop: meo_srv_stop with live sessions. Ten clients: one holds a
+// transaction with uncommitted inserts, nine wait for the lock in BEGIN (the
+// db has one writer, so only one transaction can be open at a time). Stop
+// returns within stop_ms, every session ends, and after a close and reopen
+// the db holds exactly the rows committed before. Also: stop with no clients,
+// and stop while the embedding program itself holds the lock.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/mem/arena.mettle";
+import "../src/meo_server.mettle";
+
+// Red-check switch: 1 expects the stopped transaction's rows to survive.
+// Must be 0 when committed.
+const STP_RED: int32 = 0;
+const STP_DB: string = "build/srv_stop.db";
+const STP_IP: string = "127.0.0.1";
+const STP_FRAME: int32 = 65536;
+const STP_CLIENTS: int32 = 10;
+const STP_STOP_MS: int32 = 3000;
+const STP_COMMITTED: int64 = 60;
+
+var g_port: int32 = 0;
+var g_rid: uint32 = 0;
+var g_w: MeoWBuf;
+var g_buf: uint8* = 0;
+var g_hdr: MeoWHdr;
+var g_rd: MeoWRd;
+var g_arena: MeoArena* = 0;
+var g_err: MeoWError;
+var g_res: MeoWResult;
+
+fn stp_fail(msg: string) -> int32 {
+  println("FAIL srv_stop: {msg}");
+  return 1;
+}
+
+fn stp_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn stp_connect() -> int64 {
+  var fd: int64 = meo_sock_connect(STP_IP, g_port);
+  if (fd >= 0) { meo_sock_set_recv_timeout(fd, 5000); }
+  return fd;
+}
+
+fn stp_send(fd: int64, kind: int32) -> int32 {
+  g_rid += 1;
+  var n: int32 = meo_wbuf_finish(&g_w, kind, g_rid);
+  if (n < 0) { return n; }
+  var rc: int32 = meo_sock_send_all(fd, g_w.p, n);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// Read one frame into g_hdr / g_rd: its kind, 0 on EOF, or -MEO_ERR_*. An
+// ERROR lands in g_err, a RESULT in g_res.
+fn stp_recv(fd: int64) -> int32 {
+  var rc: int32 = meo_sock_recv_exact(fd, g_buf, MEO_WIRE_HDR);
+  if (rc <= 0) { return rc; }
+  rc = meo_wire_hdr_get(g_buf, STP_FRAME, &g_hdr);
+  if (rc < 0) { return rc; }
+  if (g_hdr.len > 0) {
+    rc = meo_sock_recv_exact(fd, g_buf + MEO_WIRE_HDR, g_hdr.len);
+    if (rc != g_hdr.len) { return -MEO_ERR_IO; }
+  }
+  meo_wrd_init(&g_rd, g_buf + MEO_WIRE_HDR, g_hdr.len);
+  if (g_hdr.kind == MEO_WIRE_K_ERROR) {
+    if (meo_wire_error_get(&g_rd, &g_err) < 0) { return -MEO_ERR_PROTO; }
+  } else if (g_hdr.kind == MEO_WIRE_K_RESULT) {
+    meo_arena_reset(g_arena);
+    if (meo_wire_result_get(&g_rd, g_arena, &g_res) < 0) { return -MEO_ERR_PROTO; }
+  }
+  return g_hdr.kind;
+}
+
+fn stp_call(fd: int64, kind: int32) -> int32 {
+  meo_wbuf_begin(&g_w);
+  var rc: int32 = stp_send(fd, kind);
+  if (rc < 0) { return rc; }
+  return stp_recv(fd);
+}
+
+fn stp_open() -> int64 {
+  var fd: int64 = stp_connect();
+  if (fd < 0) { return fd; }
+  var h: MeoWHello;
+  h.major = MEO_WIRE_MAJOR;
+  h.minor = MEO_WIRE_MINOR;
+  h.max_frame = STP_FRAME;
+  h.token = "";
+  h.name = "srv_stop";
+  meo_wbuf_begin(&g_w);
+  meo_wire_hello_put(&g_w, &h);
+  if (stp_send(fd, MEO_WIRE_K_HELLO) < 0 || stp_recv(fd) != MEO_WIRE_K_HELLO_OK) {
+    meo_sock_close(fd);
+    return (int64)(-MEO_ERR_PROTO);
+  }
+  return fd;
+}
+
+// BEGIN without waiting for the answer: the session may be stuck on the lock.
+fn stp_send_begin(fd: int64) -> int32 {
+  meo_wbuf_begin(&g_w);
+  meo_wire_begin_put(&g_w, 0);
+  return stp_send(fd, MEO_WIRE_K_BEGIN);
+}
+
+fn stp_begin(fd: int64) -> int32 {
+  var rc: int32 = stp_send_begin(fd);
+  if (rc < 0) { return rc; }
+  return stp_recv(fd);
+}
+
+fn stp_col(c: MeoWCol*, name: string, ty: int32, flags: int32) {
+  c->name = name;
+  c->ty = ty;
+  c->flags = flags;
+}
+
+fn stp_create(fd: int64) -> int32 {
+  var cols: MeoWCol[2];
+  stp_col(&cols[0], "id", 1, MEO_WIRE_CF_PK);
+  stp_col(&cols[1], "v", 1, 0);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  meo_wbuf_begin(&g_w);
+  var rc: int32 = meo_wire_stmt_put(&g_w, &st);
+  if (rc < 0) { return rc; }
+  rc = stp_send(fd, MEO_WIRE_K_QUERY);
+  if (rc < 0) { return rc; }
+  return stp_recv(fd);
+}
+
+// INSERT INTO t(id, v) one row per id in [lo, hi).
+fn stp_insert(fd: int64, lo: int64, hi: int64) -> int32 {
+  var cols: MeoWCol[2];
+  stp_col(&cols[0], "id", 0, 0);
+  stp_col(&cols[1], "v", 0, 0);
+  var rows: int32 = (int32)(hi - lo);
+  var args: MeoValue* = (MeoValue*)malloc((int64)rows * 2 * (int64)sizeof(MeoValue));
+  var i: int32 = 0;
+  while (i < rows) {
+    meo_value_set_int(&args[i * 2], lo + (int64)i);
+    meo_value_set_int(&args[i * 2 + 1], 7);
+    i += 1;
+  }
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = "t";
+  st.cols = &cols[0];
+  st.n_cols = 2;
+  st.n_rows = rows;
+  st.args = args;
+  st.n_args = rows * 2;
+  meo_wbuf_begin(&g_w);
+  var rc: int32 = meo_wire_stmt_put(&g_w, &st);
+  free((rawptr)args);
+  if (rc < 0) { return rc; }
+  rc = stp_send(fd, MEO_WIRE_K_QUERY);
+  if (rc < 0) { return rc; }
+  return stp_recv(fd);
+}
+
+// COUNT(*) FROM t WHERE id >= lo, straight on the db; -1 on error.
+fn stp_count(db: MeoDb*, lo: int64) -> int64 {
+  var q: MeoQuery* = 0;
+  if (meo_q_count(db, "t", &q) != MEO_OK) { return -1; }
+  var v: MeoValue;
+  meo_value_set_int(&v, lo);
+  meo_q_where(q, "id", MEO_Q_GE, &v);
+  var n: int64 = -1;
+  if (meo_q_step(q) == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+fn stp_start(db: MeoDb*, out: MeoSrv**) -> int32 {
+  var c: MeoSrvConfig;
+  meo_srv_config_default(&c);
+  c.port = 0;
+  c.max_frame = STP_FRAME;
+  c.stop_ms = STP_STOP_MS;
+  c.busy_ms = 10000;
+  var rc: int32 = meo_srv_start(db, &c, out);
+  if (rc != MEO_OK) { return stp_fail("start rc={rc}"); }
+  g_port = meo_srv_port(out[0]);
+  if (g_port <= 0) { return stp_fail("port {g_port}"); }
+  return 0;
+}
+
+// Stop timed: 0 if it returned `want` within the deadline.
+fn stp_timed_stop(srv: MeoSrv*, want: int32, what: string) -> int32 {
+  var t0: int64 = meo_srv_now_ms();
+  var rc: int32 = meo_srv_stop(srv);
+  var ms: int64 = meo_srv_now_ms() - t0;
+  if (rc != want) { return stp_fail("{what}: stop rc={rc}"); }
+  if (ms > (int64)STP_STOP_MS + 500) { return stp_fail("{what}: stop took {ms} ms"); }
+  return 0;
+}
+
+// No clients ever, then clients that already left: stop returns at once.
+fn stp_empty(db: MeoDb*) -> int32 {
+  var srv: MeoSrv* = 0;
+  if (stp_start(db, &srv) != 0) { return 1; }
+  if (stp_timed_stop(srv, MEO_OK, "no clients") != 0) { return 1; }
+  if (meo_srv_free(srv) != MEO_OK) { return stp_fail("free, no clients"); }
+
+  var srv2: MeoSrv* = 0;
+  if (stp_start(db, &srv2) != 0) { return 1; }
+  var fd: int64 = stp_open();
+  if (fd < 0) { return stp_fail("open"); }
+  if (stp_create(fd) != MEO_WIRE_K_RESULT) { return stp_fail("create"); }
+  if (stp_call(fd, MEO_WIRE_K_BYE) != MEO_WIRE_K_OK) { return stp_fail("bye"); }
+  meo_sock_close(fd);
+  var t0: int64 = meo_srv_now_ms();
+  if (stp_timed_stop(srv2, MEO_OK, "after bye") != 0) { return 1; }
+  if (meo_srv_now_ms() - t0 > 200) { return stp_fail("stop with no live sessions was slow"); }
+  if (meo_srv_free(srv2) != MEO_OK) { return stp_fail("free after bye"); }
+  return 0;
+}
+
+// Rows committed autocommit and in a transaction, then the ten clients.
+fn stp_ten(db: MeoDb*, srv: MeoSrv*) -> int32 {
+  var c: int64 = stp_open();
+  if (c < 0) { return stp_fail("open c"); }
+  if (stp_insert(c, 1, 41) != MEO_WIRE_K_RESULT) { return stp_fail("autocommit insert"); }
+  if (stp_begin(c) != MEO_WIRE_K_OK) { return stp_fail("begin c"); }
+  if (stp_insert(c, 41, 1 + STP_COMMITTED) != MEO_WIRE_K_RESULT) { return stp_fail("insert c"); }
+  if (stp_call(c, MEO_WIRE_K_COMMIT) != MEO_WIRE_K_OK) { return stp_fail("commit c"); }
+  meo_sock_close(c);
+
+  var fds: int64[10];
+  var i: int32 = 0;
+  while (i < STP_CLIENTS) {
+    fds[i] = stp_open();
+    if (fds[i] < 0) { return stp_fail("open client {i}"); }
+    i += 1;
+  }
+  if (stp_begin(fds[0]) != MEO_WIRE_K_OK) { return stp_fail("begin holder"); }
+  if (stp_insert(fds[0], 1000, 1010) != MEO_WIRE_K_RESULT) { return stp_fail("insert holder"); }
+  i = 1;
+  while (i < STP_CLIENTS) {
+    if (stp_send_begin(fds[i]) < 0) { return stp_fail("send begin {i}"); }
+    i += 1;
+  }
+  // Let every BEGIN reach the lock wait.
+  Sleep(150);
+  var tries: int32 = 0;
+  while (meo_srv_n_sessions(srv) != STP_CLIENTS && tries < 200) {
+    Sleep(5);
+    tries += 1;
+  }
+  if (meo_srv_n_sessions(srv) != STP_CLIENTS) { return stp_fail("sessions {meo_srv_n_sessions(srv)}"); }
+  if (!meo_db_in_tx(db)) { return stp_fail("holder's transaction not open"); }
+
+  if (stp_timed_stop(srv, MEO_OK, "ten clients") != 0) { return 1; }
+  if (meo_srv_n_sessions(srv) != 0) { return stp_fail("sessions after stop {meo_srv_n_sessions(srv)}"); }
+  if (meo_db_in_tx(db)) { return stp_fail("transaction still open after stop"); }
+
+  // The holder sees EOF. A waiter's BEGIN was answered (it got the lock as
+  // the one before it rolled back), then EOF.
+  if (stp_recv(fds[0]) != 0) { return stp_fail("holder: no EOF"); }
+  i = 1;
+  while (i < STP_CLIENTS) {
+    var k: int32 = stp_recv(fds[i]);
+    if (k != MEO_WIRE_K_OK && k != MEO_WIRE_K_ERROR) { return stp_fail("waiter {i}: kind {k}"); }
+    if (stp_recv(fds[i]) != 0) { return stp_fail("waiter {i}: no EOF"); }
+    i += 1;
+  }
+  i = 0;
+  while (i < STP_CLIENTS) {
+    meo_sock_close(fds[i]);
+    i += 1;
+  }
+  return 0;
+}
+
+// The embedding program holds the lock, so a waiting session cannot finish:
+// stop gives up at stop_ms with BUSY instead of hanging.
+fn stp_held_by_host(db: MeoDb*) -> int32 {
+  var srv: MeoSrv* = 0;
+  if (stp_start(db, &srv) != 0) { return 1; }
+  if (meo_db_begin(db, 0) != MEO_OK) { return stp_fail("host begin"); }
+  var fd: int64 = stp_open();
+  if (fd < 0) { return stp_fail("open waiter"); }
+  if (stp_send_begin(fd) < 0) { return stp_fail("send begin"); }
+  Sleep(100);
+  var bad: int32 = stp_timed_stop(srv, -MEO_ERR_BUSY, "host holds the lock");
+  meo_db_rollback(db);
+  // Once the lock is free the session finishes on its own.
+  if (bad == 0 && stp_recv(fd) != MEO_WIRE_K_OK) { bad = stp_fail("waiter's begin after host rollback"); }
+  if (bad == 0 && stp_recv(fd) != 0) { bad = stp_fail("waiter: no EOF"); }
+  meo_sock_close(fd);
+  var tries: int32 = 0;
+  while (meo_srv_n_sessions(srv) != 0 && tries < 400) {
+    Sleep(5);
+    tries += 1;
+  }
+  if (bad == 0 && meo_srv_n_sessions(srv) != 0) { bad = stp_fail("waiter session never ended"); }
+  if (bad == 0 && meo_db_in_tx(db)) { bad = stp_fail("waiter's transaction left open"); }
+  // Not freed: after a missed deadline meo_srv_free stays BUSY even once the
+  // session has ended, so this server is left to the process exit.
+  return bad;
+}
+
+fn stp_run() -> int32 {
+  if (stp_reset(STP_DB) != MEO_OK) { return stp_fail("reset db"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(STP_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return stp_fail("open db rc={rc}"); }
+  var bad: int32 = stp_empty(db);
+  if (bad == 0) {
+    var srv: MeoSrv* = 0;
+    bad = stp_start(db, &srv);
+    if (bad == 0) {
+      bad = stp_ten(db, srv);
+      meo_srv_stop(srv);
+      if (meo_srv_free(srv) != MEO_OK && bad == 0) { bad = stp_fail("free"); }
+    }
+  }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK && bad == 0) { bad = stp_fail("close rc={rc}"); }
+  if (bad != 0) { return bad; }
+
+  var db2: MeoDb* = 0;
+  rc = meo_db_open(STP_DB, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db2);
+  if (rc != MEO_OK) { return stp_fail("reopen rc={rc}"); }
+  var all: int64 = stp_count(db2, 0);
+  var lost: int64 = stp_count(db2, 1000);
+  var want: int64 = 0;
+  if (STP_RED != 0) { want = 10; }
+  if (all != STP_COMMITTED + want || lost != want) {
+    bad = stp_fail("after reopen: {all} rows, {lost} from the stopped txn");
+  }
+  if (bad == 0) { bad = stp_held_by_host(db2); }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK && bad == 0) { bad = stp_fail("close after reopen rc={rc}"); }
+  return bad;
+}
+
+fn main() -> int32 {
+  meo_wbuf_init(&g_w, STP_FRAME);
+  g_buf = (uint8*)malloc((int64)STP_FRAME + 64);
+  g_arena = meo_arena_new(65536);
+  var bad: int32 = stp_run();
+  meo_wbuf_free(&g_w);
+  free((rawptr)g_buf);
+  meo_arena_free(g_arena);
+  if (bad != 0) { return 1; }
+  println("PASS srv_stop");
+  return 0;
+}
