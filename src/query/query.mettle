@@ -31,6 +31,7 @@ fn q_release(q: MeoQuery*) {
   if (q->val_cap != 0) { free(q->val_cap); }
   if (q->vals != 0) { free(q->vals); }
   if (q->res != 0) { free(q->res); }
+  if (q->perm != 0) { free(q->perm); }
   if (q->res_arena != 0) { meo_arena_free(q->res_arena); }
   if (q->plan_arena != 0) { meo_arena_free(q->plan_arena); }
   meo_qspec_free(&q->spec);
@@ -56,7 +57,12 @@ fn q_new(db: MeoDb*, kind: int32, table: string, out: MeoQuery**) -> int32 {
   q->sticky = MEO_OK;
   q->res = 0;
   q->res_cap = 0;
+  q->res_w = 0;
   q->res_arena = 0;
+  q->perm = 0;
+  q->perm_cap = 0;
+  q->use_perm = false;
+  q->row0 = 0;
   q->n_rows = 0;
   q->n_cols = 0;
   q->cur = 0;
@@ -98,6 +104,12 @@ export fn meo_q_delete(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
   return q_new(db, MEO_Q_K_DELETE, table, out);
 }
 
+// Count the rows the filters accept: one row with one INTEGER column, then
+// MEO_DONE. Counts while scanning, no rows are materialized.
+export fn meo_q_count(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_COUNT, table, out);
+}
+
 // --- builders ---------------------------------------------------------------
 
 // Record a builder failure so the next step reports it.
@@ -113,9 +125,9 @@ fn q_check(q: MeoQuery*, a: int32, b: int32) -> int32 {
   return MEO_OK;
 }
 
-// Filters apply to SELECT, UPDATE and DELETE (kinds 3..5).
+// Filters apply to SELECT, UPDATE, DELETE and COUNT (kinds 3..6).
 fn q_check_filter(q: MeoQuery*) -> int32 {
-  return q_check(q, MEO_Q_K_SELECT, MEO_Q_K_DELETE);
+  return q_check(q, MEO_Q_K_SELECT, MEO_Q_K_COUNT);
 }
 
 fn q_check_value(q: MeoQuery*, v: MeoValue*) -> int32 {
@@ -209,6 +221,29 @@ export fn meo_q_assign(q: MeoQuery*, name: string, v: MeoValue*) -> int32 {
     return q_fail(q, k);
   }
   a->v = k;
+  a->add = false;
+  a->delta = 0;
+  s->n_sets += 1;
+  return MEO_OK;
+}
+
+// UPDATE assignment col = col + delta for an INTEGER column. Takes no value
+// slot. A row whose current value is not an INTEGER (NULL included) fails the
+// run with -MEO_ERR_MISMATCH, an int64 overflow with -MEO_ERR_RANGE.
+export fn meo_q_assign_add(q: MeoQuery*, name: string, delta: int64) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_UPDATE, MEO_Q_K_UPDATE);
+  if (rc != MEO_OK) { return rc; }
+  var s: MeoQSpec* = &q->spec;
+  var np: MeoQAssign* = meo_qspec_grow(s->sets, s->n_sets, &s->cap_sets, (int64)sizeof(MeoQAssign));
+  if (np == 0) { return q_fail(q, -MEO_ERR_NOMEM); }
+  s->sets = np;
+  var a: MeoQAssign* = &s->sets[s->n_sets];
+  rc = meo_qspec_name(&a->col, name);
+  if (rc != MEO_OK) { return q_fail(q, rc); }
+  a->v = -1;
+  a->add = true;
+  a->delta = delta;
   s->n_sets += 1;
   return MEO_OK;
 }

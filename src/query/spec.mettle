@@ -17,6 +17,7 @@ export const MEO_Q_K_INSERT: int32 = 2;
 export const MEO_Q_K_SELECT: int32 = 3;
 export const MEO_Q_K_UPDATE: int32 = 4;
 export const MEO_Q_K_DELETE: int32 = 5;
+export const MEO_Q_K_COUNT: int32 = 6;
 
 // Filter kinds (MeoQTerm.kind).
 export const MEO_Q_EQ: int32 = 1;
@@ -54,7 +55,9 @@ export struct MeoQOrder {
 
 export struct MeoQAssign {
   col: MeoQName;
-  v: int32;              // value slot
+  v: int32;              // value slot; -1 for an increment
+  add: bool;             // col = col + delta (INTEGER only)
+  delta: int64;
 }
 
 export struct MeoQSpec {

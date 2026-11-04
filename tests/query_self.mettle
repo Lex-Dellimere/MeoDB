@@ -1,0 +1,690 @@
+// query_self: the typed query engine. Every filter op with the INT/REAL,
+// type-mismatch and NULL rules; IN with duplicates; each access path; multi-
+// column ORDER BY with NULLs; LIMIT/OFFSET edges; UPDATE of a unique column
+// (old value freed, conflict writes nothing); DELETE then reinsert; UPDATE and
+// DELETE with no filter; COUNT over 10,000 rows; versioned UPDATE with
+// meo_q_assign_add; and a 10,000-run reset/set_value/step loop whose arenas,
+// buffers and RSS must not grow.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/mem/arena.mettle";
+import "../src/meosql.mettle";
+
+// Red-check switch: 1 expects one row too many in the 10,000-row count.
+// Must be 0 when committed.
+const QS_RED: int32 = 0;
+const QS_BIG: int32 = 10000;
+
+fn qs_fail(msg: string) -> int32 {
+  println("FAIL query_self: {msg}");
+  return 1;
+}
+
+fn qs_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn vi(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn vr(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+fn vt(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn vb(p: uint8*, n: int32) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_blob(&v, p, n);
+  return v;
+}
+
+fn vn() -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_null(&v);
+  return v;
+}
+
+fn qs_same(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  return meo_bytes_equal(a.chars, b.chars, (int64)a.length);
+}
+
+// Step q to the end: column 0 of every row joined by ",", "N" for NULL, or
+// "ERR<rc>".
+fn qs_out(q: MeoQuery*) -> string {
+  var acc: string = "";
+  var first: bool = true;
+  while (true) {
+    var rc: int32 = meo_q_step(q);
+    if (rc == MEO_DONE) { break; }
+    if (rc != MEO_ROW) { return "ERR{rc}"; }
+    var part: string = "N";
+    if (meo_q_column_type(q, 0) == MEO_T_INT) { part = "{meo_q_column_int64(q, 0)}"; }
+    if (!first) { acc = acc + ","; }
+    acc = acc + part;
+    first = false;
+  }
+  return acc;
+}
+
+// Run q, compare its ids with want, check the access path (0 = any), free q.
+fn qs_expect(name: string, q: MeoQuery*, want: string, path: int32) -> int32 {
+  var got: string = qs_out(q);
+  var used: int32 = q->plan.access;
+  meo_q_free(q);
+  if (!qs_same(got, want)) { return qs_fail("{name}: got [{got}] want [{want}]"); }
+  if (path != 0 && used != path) { return qs_fail("{name}: path {used} want {path}"); }
+  return 0;
+}
+
+fn qs_sel(db: MeoDb*, tbl: string) -> MeoQuery* {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, tbl, &q);
+  meo_q_pick(q, "id");
+  return q;
+}
+
+// SELECT id FROM n WHERE col op v.
+fn qs_w(db: MeoDb*, name: string, col: string, op: int32, v: MeoValue, want: string,
+    path: int32) -> int32 {
+  var q: MeoQuery* = qs_sel(db, "n");
+  meo_q_where(q, col, op, &v);
+  return qs_expect(name, q, want, path);
+}
+
+fn qs_in(db: MeoDb*, name: string, col: string, vals: MeoValue*, n: int32, want: string,
+    path: int32) -> int32 {
+  var q: MeoQuery* = qs_sel(db, "n");
+  meo_q_where_in(q, col, vals, n);
+  return qs_expect(name, q, want, path);
+}
+
+fn qs_ins(db: MeoDb*, tbl: string, vals: MeoValue*, n: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, tbl, &q);
+  var i: int32 = 0;
+  while (i < n) {
+    meo_q_value(q, &vals[i]);
+    i += 1;
+  }
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+fn qs_count(db: MeoDb*, tbl: string) -> int64 {
+  var q: MeoQuery* = 0;
+  meo_q_count(db, tbl, &q);
+  var rc: int32 = meo_q_step(q);
+  var n: int64 = -1;
+  if (rc == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+// n(id INT PK, i INT, r REAL, s TEXT, b BLOB, u TEXT UNIQUE), five rows.
+fn qs_setup(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "n", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "i", MEO_T_INT, 0);
+  meo_q_column_def(q, "r", MEO_T_REAL, 0);
+  meo_q_column_def(q, "s", MEO_T_TEXT, 0);
+  meo_q_column_def(q, "b", MEO_T_BLOB, 0);
+  meo_q_column_def(q, "u", MEO_T_TEXT, MEO_COL_UNIQUE);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return qs_fail("create n rc={rc}"); }
+  var b12: uint8* = malloc(2);
+  b12[0] = 1;
+  b12[1] = 2;
+  var b2: uint8* = b12 + 1;
+  var row: MeoValue[6];
+  row[0] = vi(1); row[1] = vi(10); row[2] = vr(1.5); row[3] = vt("apple");
+  row[4] = vb(b12, 2); row[5] = vt("a");
+  rc = qs_ins(db, "n", &row[0], 6);
+  row[0] = vi(2); row[1] = vi(20); row[2] = vr(2.0); row[3] = vt("banana");
+  row[4] = vb(b12, 1); row[5] = vt("b");
+  if (rc == MEO_DONE) { rc = qs_ins(db, "n", &row[0], 6); }
+  row[0] = vi(3); row[1] = vn(); row[2] = vn(); row[3] = vn(); row[4] = vn(); row[5] = vn();
+  if (rc == MEO_DONE) { rc = qs_ins(db, "n", &row[0], 6); }
+  row[0] = vi(4); row[1] = vi(20); row[2] = vr(-3.0); row[3] = vt("cherry");
+  row[4] = vb(b2, 1); row[5] = vt("d");
+  if (rc == MEO_DONE) { rc = qs_ins(db, "n", &row[0], 6); }
+  row[0] = vi(5); row[1] = vi(5); row[2] = vi(20); row[3] = vt("apple"); row[4] = vn();
+  row[5] = vn();
+  if (rc == MEO_DONE) { rc = qs_ins(db, "n", &row[0], 6); }
+  free(b12);
+  if (rc != MEO_DONE) { return qs_fail("insert n rc={rc}"); }
+  return 0;
+}
+
+fn qs_filters(db: MeoDb*) -> int32 {
+  var f: int32 = 0;
+  var fs: int32 = MEO_PATH_FULL_SCAN;
+  f += qs_w(db, "i = 20", "i", MEO_Q_EQ, vi(20), "2,4", fs);
+  f += qs_w(db, "i = 20.0", "i", MEO_Q_EQ, vr(20.0), "2,4", fs);
+  f += qs_w(db, "r = 2", "r", MEO_Q_EQ, vi(2), "2", fs);
+  f += qs_w(db, "r = 20 (stored from INT)", "r", MEO_Q_EQ, vi(20), "5", fs);
+  f += qs_w(db, "i <> 20", "i", MEO_Q_NE, vi(20), "1,5", fs);
+  f += qs_w(db, "i < 10", "i", MEO_Q_LT, vi(10), "5", fs);
+  f += qs_w(db, "i <= 10", "i", MEO_Q_LE, vi(10), "1,5", fs);
+  f += qs_w(db, "i > 10", "i", MEO_Q_GT, vi(10), "2,4", fs);
+  f += qs_w(db, "i >= 10.0", "i", MEO_Q_GE, vr(10.0), "1,2,4", fs);
+  f += qs_w(db, "i < 10.5", "i", MEO_Q_LT, vr(10.5), "1,5", fs);
+  f += qs_w(db, "r > 1", "r", MEO_Q_GT, vi(1), "1,2,5", fs);
+  f += qs_w(db, "i = '20' mismatch", "i", MEO_Q_EQ, vt("20"), "", fs);
+  f += qs_w(db, "s = 5 mismatch", "s", MEO_Q_EQ, vi(5), "", fs);
+  f += qs_w(db, "s <> 5 mismatch", "s", MEO_Q_NE, vi(5), "", fs);
+  f += qs_w(db, "i = NULL", "i", MEO_Q_EQ, vn(), "", fs);
+  f += qs_w(db, "i <> NULL", "i", MEO_Q_NE, vn(), "", fs);
+  f += qs_w(db, "s = apple", "s", MEO_Q_EQ, vt("apple"), "1,5", fs);
+  f += qs_w(db, "s > b", "s", MEO_Q_GT, vt("b"), "2,4", fs);
+  f += qs_w(db, "s < apple", "s", MEO_Q_LT, vt("apple"), "", fs);
+  f += qs_w(db, "s >= apple", "s", MEO_Q_GE, vt("apple"), "1,2,4,5", fs);
+  var bb: uint8* = malloc(2);
+  bb[0] = 1;
+  bb[1] = 2;
+  f += qs_w(db, "b < x0102", "b", MEO_Q_LT, vb(bb, 2), "2", fs);
+  f += qs_w(db, "b = x0102", "b", MEO_Q_EQ, vb(bb, 2), "1", fs);
+  f += qs_w(db, "b >= x02", "b", MEO_Q_GE, vb(bb + 1, 1), "4", fs);
+  f += qs_w(db, "b = text mismatch", "b", MEO_Q_EQ, vt("x"), "", fs);
+  free(bb);
+  var q: MeoQuery* = qs_sel(db, "n");
+  meo_q_where_null(q, "i");
+  f += qs_expect("i IS NULL", q, "3", fs);
+  q = qs_sel(db, "n");
+  meo_q_where_not_null(q, "i");
+  f += qs_expect("i IS NOT NULL", q, "1,2,4,5", fs);
+  q = qs_sel(db, "n");
+  var five: MeoValue = vi(5);
+  var apple: MeoValue = vt("apple");
+  meo_q_where(q, "i", MEO_Q_GE, &five);
+  meo_q_where(q, "s", MEO_Q_EQ, &apple);
+  f += qs_expect("i >= 5 AND s = apple", q, "1,5", fs);
+  return f;
+}
+
+fn qs_paths(db: MeoDb*) -> int32 {
+  var f: int32 = 0;
+  var l: MeoValue[4];
+  l[0] = vi(20); l[1] = vi(20); l[2] = vi(5); l[3] = vn();
+  f += qs_in(db, "i IN (20,20,5,NULL)", "i", &l[0], 4, "2,4,5", MEO_PATH_FULL_SCAN);
+  l[0] = vi(3); l[1] = vi(1); l[2] = vi(1); l[3] = vi(3);
+  f += qs_in(db, "id IN (3,1,1,3)", "id", &l[0], 4, "1,3", MEO_PATH_ROWID_IN);
+  l[0] = vt("a"); l[1] = vt("a"); l[2] = vt("d"); l[3] = vi(7);
+  f += qs_in(db, "u IN (a,a,d,7)", "u", &l[0], 4, "1,4", MEO_PATH_UNIQUE_IN);
+  l[0] = vn(); l[1] = vr(2.5);
+  f += qs_in(db, "id IN (NULL,2.5)", "id", &l[0], 2, "", MEO_PATH_ROWID_IN);
+  f += qs_w(db, "id = 2", "id", MEO_Q_EQ, vi(2), "2", MEO_PATH_ROWID_EQ);
+  f += qs_w(db, "id = 2.0", "id", MEO_Q_EQ, vr(2.0), "2", MEO_PATH_ROWID_EQ);
+  f += qs_w(db, "id = 2.5", "id", MEO_Q_EQ, vr(2.5), "", MEO_PATH_ROWID_EQ);
+  f += qs_w(db, "id = 99", "id", MEO_Q_EQ, vi(99), "", MEO_PATH_ROWID_EQ);
+  f += qs_w(db, "u = b", "u", MEO_Q_EQ, vt("b"), "2", MEO_PATH_UNIQUE_EQ);
+  f += qs_w(db, "u = NULL", "u", MEO_Q_EQ, vn(), "", MEO_PATH_UNIQUE_EQ);
+  f += qs_w(db, "id > 3", "id", MEO_Q_GT, vi(3), "4,5", MEO_PATH_FULL_SCAN);
+  // The residual filter re-checks rows a point path finds.
+  var q: MeoQuery* = qs_sel(db, "n");
+  l[0] = vi(1); l[1] = vi(2); l[2] = vi(4);
+  var twenty: MeoValue = vi(20);
+  meo_q_where_in(q, "id", &l[0], 3);
+  meo_q_where(q, "i", MEO_Q_EQ, &twenty);
+  f += qs_expect("id IN (1,2,4) AND i = 20", q, "2,4", MEO_PATH_ROWID_IN);
+  q = qs_sel(db, "n");
+  var ua: MeoValue = vt("a");
+  var one: MeoValue = vi(1);
+  var nn: MeoValue = vi(99);
+  meo_q_where(q, "u", MEO_Q_EQ, &ua);
+  meo_q_where(q, "i", MEO_Q_EQ, &nn);
+  f += qs_expect("u = a AND i = 99", q, "", MEO_PATH_UNIQUE_EQ);
+  q = qs_sel(db, "n");
+  meo_q_where(q, "u", MEO_Q_EQ, &ua);
+  meo_q_where(q, "id", MEO_Q_EQ, &one);
+  f += qs_expect("u = a AND id = 1 prefers rowid", q, "1", MEO_PATH_ROWID_EQ);
+  return f;
+}
+
+// SELECT id FROM n ORDER BY c1 [, c2] OFFSET off LIMIT lim (-1 = none).
+fn qs_ord(db: MeoDb*, name: string, c1: string, d1: bool, c2: string, d2: bool, off: int64,
+    lim: int64, want: string) -> int32 {
+  var q: MeoQuery* = qs_sel(db, "n");
+  meo_q_order(q, c1, d1);
+  if (c2.length > 0) { meo_q_order(q, c2, d2); }
+  if (off >= 0) { meo_q_offset(q, off); }
+  if (lim >= 0) { meo_q_limit(q, lim); }
+  return qs_expect(name, q, want, 0);
+}
+
+fn qs_order(db: MeoDb*) -> int32 {
+  var f: int32 = 0;
+  f += qs_ord(db, "i asc", "i", false, "", false, -1, -1, "3,5,1,2,4");
+  f += qs_ord(db, "i desc", "i", true, "", false, -1, -1, "2,4,1,5,3");
+  f += qs_ord(db, "i desc, id desc", "i", true, "id", true, -1, -1, "4,2,1,5,3");
+  f += qs_ord(db, "s asc, r desc", "s", false, "r", true, -1, -1, "3,5,1,2,4");
+  f += qs_ord(db, "u desc", "u", true, "", false, -1, -1, "4,2,1,3,5");
+  f += qs_ord(db, "id desc", "id", true, "", false, -1, -1, "5,4,3,2,1");
+  // Edges, unsorted (rowid asc on a scan skips the sort) and sorted.
+  f += qs_ord(db, "id limit 0", "id", false, "", false, -1, 0, "");
+  f += qs_ord(db, "id limit 2", "id", false, "", false, -1, 2, "1,2");
+  f += qs_ord(db, "id offset 3", "id", false, "", false, 3, -1, "4,5");
+  f += qs_ord(db, "id offset 5", "id", false, "", false, 5, -1, "");
+  f += qs_ord(db, "id offset 9 limit 1", "id", false, "", false, 9, 1, "");
+  f += qs_ord(db, "id offset 4 limit 10", "id", false, "", false, 4, 10, "5");
+  f += qs_ord(db, "i offset 1 limit 2", "i", false, "", false, 1, 2, "5,1");
+  f += qs_ord(db, "i offset 99", "i", false, "", false, 99, -1, "");
+  f += qs_ord(db, "i limit 0", "i", false, "", false, -1, 0, "");
+  f += qs_ord(db, "i desc offset 4 limit 5", "i", true, "", false, 4, 5, "3");
+  var q: MeoQuery* = qs_sel(db, "n");
+  meo_q_order(q, "id", false);
+  var got: string = qs_out(q);
+  if (q->plan.need_sort) { f += qs_fail("rowid asc on a scan sorted"); }
+  meo_q_free(q);
+  if (!qs_same(got, "1,2,3,4,5")) { f += qs_fail("id asc [{got}]"); }
+  q = qs_sel(db, "n");
+  meo_q_offset(q, 2);
+  meo_q_limit(q, 2);
+  f += qs_expect("no order offset 2 limit 2", q, "3,4", 0);
+  return f;
+}
+
+fn qs_upd_u(db: MeoDb*, id: int64, u: string) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "n", &q);
+  var uv: MeoValue = vt(u);
+  var iv: MeoValue = vi(id);
+  meo_q_assign(q, "u", &uv);
+  meo_q_where(q, "id", MEO_Q_EQ, &iv);
+  var rc: int32 = meo_q_step(q);
+  if (rc == MEO_DONE) { rc = meo_q_changes(q); }
+  meo_q_free(q);
+  return rc;
+}
+
+fn qs_writes(db: MeoDb*) -> int32 {
+  var f: int32 = 0;
+  var rc: int32 = qs_upd_u(db, 1, "z");
+  if (rc != 1) { f += qs_fail("update u = z rc/changes {rc}"); }
+  f += qs_w(db, "old u gone", "u", MEO_Q_EQ, vt("a"), "", MEO_PATH_UNIQUE_EQ);
+  f += qs_w(db, "new u found", "u", MEO_Q_EQ, vt("z"), "1", MEO_PATH_UNIQUE_EQ);
+  var row: MeoValue[6];
+  row[0] = vi(6); row[1] = vi(1); row[2] = vn(); row[3] = vt("fig"); row[4] = vn();
+  row[5] = vt("a");
+  rc = qs_ins(db, "n", &row[0], 6);
+  if (rc != MEO_DONE) { f += qs_fail("insert of the freed u rc={rc}"); }
+  rc = qs_upd_u(db, 1, "b");
+  if (rc != -MEO_ERR_CONFLICT) { f += qs_fail("update to a taken u: {rc}"); }
+  f += qs_w(db, "conflict wrote nothing", "u", MEO_Q_EQ, vt("z"), "1", 0);
+  f += qs_w(db, "conflict kept b", "u", MEO_Q_EQ, vt("b"), "2", 0);
+  // Two rows to one unique value: CONFLICT, both kept.
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "n", &q);
+  var qv: MeoValue = vt("q");
+  meo_q_assign(q, "u", &qv);
+  var l: MeoValue[2];
+  l[0] = vi(1); l[1] = vi(2);
+  meo_q_where_in(q, "id", &l[0], 2);
+  rc = meo_q_step(q);
+  var ch: int32 = meo_q_changes(q);
+  meo_q_free(q);
+  if (rc != -MEO_ERR_CONFLICT || ch != 0) { f += qs_fail("two rows one u: rc={rc} ch={ch}"); }
+  f += qs_w(db, "u = q absent", "u", MEO_Q_EQ, vt("q"), "", 0);
+  // DELETE with a filter, then reinsert a deleted row with its unique value.
+  q = 0;
+  meo_q_delete(db, "n", &q);
+  var ap: MeoValue = vt("apple");
+  meo_q_where(q, "s", MEO_Q_EQ, &ap);
+  rc = meo_q_step(q);
+  ch = meo_q_changes(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE || ch != 2) { f += qs_fail("delete s = apple: rc={rc} ch={ch}"); }
+  var left: int64 = qs_count(db, "n");
+  if (left != 4) { f += qs_fail("count after delete {left}"); }
+  f += qs_w(db, "deleted u gone", "u", MEO_Q_EQ, vt("z"), "", 0);
+  row[0] = vi(1); row[1] = vi(11); row[2] = vn(); row[3] = vt("again"); row[4] = vn();
+  row[5] = vt("z");
+  rc = qs_ins(db, "n", &row[0], 6);
+  if (rc != MEO_DONE) { f += qs_fail("reinsert rc={rc}"); }
+  f += qs_w(db, "reinserted", "u", MEO_Q_EQ, vt("z"), "1", 0);
+  return f;
+}
+
+// UPDATE and DELETE with no filter: the whole table.
+fn qs_whole(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "w", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "k", MEO_T_INT, 0);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  var row: MeoValue[2];
+  var i: int32 = 0;
+  while (i < 3 && rc == MEO_DONE) {
+    row[0] = vn();
+    row[1] = vi((int64)i);
+    rc = qs_ins(db, "w", &row[0], 2);
+    i += 1;
+  }
+  if (rc != MEO_DONE) { return qs_fail("w setup rc={rc}"); }
+  var q1: MeoQuery* = 0;
+  meo_q_update(db, "w", &q1);
+  var seven: MeoValue = vi(7);
+  meo_q_assign(q1, "k", &seven);
+  rc = meo_q_step(q1);
+  var ch: int32 = meo_q_changes(q1);
+  meo_q_free(q1);
+  if (rc != MEO_DONE || ch != 3) { return qs_fail("update all: rc={rc} ch={ch}"); }
+  var q2: MeoQuery* = 0;
+  meo_q_count(db, "w", &q2);
+  meo_q_where(q2, "k", MEO_Q_EQ, &seven);
+  rc = meo_q_step(q2);
+  if (rc != MEO_ROW || meo_q_column_int64(q2, 0) != 3) { return qs_fail("count k = 7 rc={rc}"); }
+  meo_q_free(q2);
+  var q3: MeoQuery* = 0;
+  meo_q_delete(db, "w", &q3);
+  rc = meo_q_step(q3);
+  ch = meo_q_changes(q3);
+  if (rc != MEO_DONE || ch != 3) { return qs_fail("delete all: rc={rc} ch={ch}"); }
+  meo_q_reset(q3);
+  rc = meo_q_step(q3);
+  ch = meo_q_changes(q3);
+  meo_q_free(q3);
+  if (rc != MEO_DONE || ch != 0) { return qs_fail("delete all again: rc={rc} ch={ch}"); }
+  if (qs_count(db, "w") != 0) { return qs_fail("w not empty"); }
+  return 0;
+}
+
+// big(id INT PK, g INT, tag TEXT UNIQUE): QS_BIG rows in one transaction.
+fn qs_big(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "big", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "g", MEO_T_INT, 0);
+  meo_q_column_def(q, "tag", MEO_T_TEXT, MEO_COL_UNIQUE);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return qs_fail("create big rc={rc}"); }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return qs_fail("begin rc={rc}"); }
+  var q1: MeoQuery* = 0;
+  meo_q_insert(db, "big", &q1);
+  var v: MeoValue = vi(0);
+  meo_q_value(q1, &v);
+  meo_q_value(q1, &v);
+  meo_q_value(q1, &v);
+  var i: int32 = 1;
+  while (i <= QS_BIG) {
+    var tag: string = "t{i}";
+    v = vi((int64)i);
+    meo_q_set_value(q1, 0, &v);
+    v = vi((int64)(i % 10));
+    meo_q_set_value(q1, 1, &v);
+    v = vt(tag);
+    meo_q_set_value(q1, 2, &v);
+    free(tag.chars);
+    rc = meo_q_step(q1);
+    if (rc != MEO_DONE) { return qs_fail("big insert {i} rc={rc}"); }
+    meo_q_reset(q1);
+    i += 1;
+  }
+  meo_q_free(q1);
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return qs_fail("commit rc={rc}"); }
+  return 0;
+}
+
+fn qs_counts(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_count(db, "big", &q);
+  var rc: int32 = meo_q_step(q);
+  if (rc != MEO_ROW || meo_q_column_count(q) != 1 || meo_q_column_type(q, 0) != MEO_T_INT) {
+    return qs_fail("count shape rc={rc}");
+  }
+  var n: int64 = meo_q_column_int64(q, 0);
+  if (n != (int64)(QS_BIG + QS_RED)) { return qs_fail("count all {n}"); }
+  // Counted while scanning: the result holds the one count row only.
+  if (meo_q_row_count(q) != 1 || q->res_cap > 64) { return qs_fail("count materialized rows"); }
+  rc = meo_q_step(q);
+  if (rc != MEO_DONE) { return qs_fail("count second step rc={rc}"); }
+  meo_q_free(q);
+  var q1: MeoQuery* = 0;
+  meo_q_count(db, "big", &q1);
+  var three: MeoValue = vi(3);
+  meo_q_where(q1, "g", MEO_Q_EQ, &three);
+  rc = meo_q_step(q1);
+  if (rc != MEO_ROW || meo_q_column_int64(q1, 0) != 1000) { return qs_fail("count g = 3"); }
+  meo_q_free(q1);
+  var q2: MeoQuery* = 0;
+  meo_q_count(db, "big", &q2);
+  var hi: MeoValue = vi(9990);
+  meo_q_where(q2, "id", MEO_Q_GT, &hi);
+  rc = meo_q_step(q2);
+  if (rc != MEO_ROW || meo_q_column_int64(q2, 0) != 10) { return qs_fail("count id > 9990"); }
+  meo_q_free(q2);
+  var q3: MeoQuery* = 0;
+  meo_q_count(db, "big", &q3);
+  var l: MeoValue[3];
+  l[0] = vt("t5"); l[1] = vt("t5"); l[2] = vt("t7");
+  meo_q_where_in(q3, "tag", &l[0], 3);
+  rc = meo_q_step(q3);
+  if (rc != MEO_ROW || meo_q_column_int64(q3, 0) != 2 || q3->plan.access != MEO_PATH_UNIQUE_IN) {
+    return qs_fail("count tag IN (t5,t5,t7)");
+  }
+  meo_q_free(q3);
+  return 0;
+}
+
+// flux's versioned save: SET name, version = version + 1 WHERE id AND version.
+fn qs_versioned(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "ver", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "name", MEO_T_TEXT, 0);
+  meo_q_column_def(q, "version", MEO_T_INT, 0);
+  meo_q_step(q);
+  meo_q_free(q);
+  var row: MeoValue[3];
+  row[0] = vi(1); row[1] = vt("x"); row[2] = vi(1);
+  var rc: int32 = qs_ins(db, "ver", &row[0], 3);
+  row[0] = vi(2); row[1] = vt("n"); row[2] = vn();
+  if (rc == MEO_DONE) { rc = qs_ins(db, "ver", &row[0], 3); }
+  if (rc != MEO_DONE) { return qs_fail("ver setup rc={rc}"); }
+  var q1: MeoQuery* = 0;
+  meo_q_update(db, "ver", &q1);
+  var nm: MeoValue = vt("y");
+  var id: MeoValue = vi(1);
+  var ver: MeoValue = vi(1);
+  var b1: int32 = meo_q_assign(q1, "name", &nm);
+  var b2: int32 = meo_q_assign_add(q1, "version", 1);
+  meo_q_where(q1, "id", MEO_Q_EQ, &id);
+  meo_q_where(q1, "version", MEO_Q_EQ, &ver);
+  if (b1 != MEO_OK || b2 != MEO_OK || meo_q_n_values(q1) != 3) {
+    return qs_fail("assign_add builders {b1} {b2} slots {meo_q_n_values(q1)}");
+  }
+  rc = meo_q_step(q1);
+  if (rc != MEO_DONE || meo_q_changes(q1) != 1) { return qs_fail("versioned save rc={rc}"); }
+  meo_q_reset(q1);
+  rc = meo_q_step(q1);
+  if (rc != MEO_DONE || meo_q_changes(q1) != 0) { return qs_fail("stale version not 0 changes"); }
+  meo_q_reset(q1);
+  ver = vi(2);
+  meo_q_set_value(q1, 2, &ver);
+  rc = meo_q_step(q1);
+  if (rc != MEO_DONE || meo_q_changes(q1) != 1) { return qs_fail("save at version 2 rc={rc}"); }
+  meo_q_free(q1);
+  var q2: MeoQuery* = 0;
+  meo_q_select(db, "ver", &q2);
+  meo_q_pick(q2, "version");
+  meo_q_where(q2, "id", MEO_Q_EQ, &id);
+  rc = meo_q_step(q2);
+  if (rc != MEO_ROW || meo_q_column_int64(q2, 0) != 3) { return qs_fail("version not 3"); }
+  meo_q_free(q2);
+  // NULL and TEXT current values do not increment.
+  var q3: MeoQuery* = 0;
+  meo_q_update(db, "ver", &q3);
+  meo_q_assign_add(q3, "version", 1);
+  var two: MeoValue = vi(2);
+  meo_q_where(q3, "id", MEO_Q_EQ, &two);
+  rc = meo_q_step(q3);
+  meo_q_free(q3);
+  if (rc != -MEO_ERR_MISMATCH) { return qs_fail("assign_add on NULL: {rc}"); }
+  var q4: MeoQuery* = 0;
+  meo_q_update(db, "ver", &q4);
+  meo_q_assign_add(q4, "name", 1);
+  rc = meo_q_step(q4);
+  meo_q_free(q4);
+  if (rc != -MEO_ERR_MISMATCH) { return qs_fail("assign_add on TEXT: {rc}"); }
+  var q5: MeoQuery* = 0;
+  meo_q_select(db, "ver", &q5);
+  meo_q_where_null(q5, "version");
+  meo_q_pick(q5, "id");
+  return qs_expect("NULL version kept", q5, "2", 0);
+}
+
+// Resident pages from /proc/self/statm, or -1.
+fn qs_rss() -> int64 {
+  var f: MeoFile = meo_file_open("/proc/self/statm", MEO_OPEN_READ);
+  if (!f.is_open) { return -1; }
+  var buf: uint8* = malloc(128);
+  var n: int32 = meo_file_read_at(f, 0, buf, 127);
+  meo_file_close(f);
+  var i: int32 = 0;
+  while (i < n && buf[i] != ' ') { i += 1; }
+  i += 1;
+  var v: int64 = 0;
+  while (i < n && buf[i] >= '0' && buf[i] <= '9') {
+    v = v * 10 + (int64)(buf[i] - '0');
+    i += 1;
+  }
+  free(buf);
+  return v;
+}
+
+// Bytes a query holds in arenas and reusable buffers.
+fn qs_held(q: MeoQuery*) -> int64 {
+  var n: int64 = q->res_arena->owns + q->plan_arena->owns;
+  n += (int64)q->res_cap * (int64)sizeof(MeoValue) + (int64)q->perm_cap * 4;
+  var k: int32 = 0;
+  while (k < q->n_vals) {
+    n += (int64)q->val_cap[k];
+    k += 1;
+  }
+  return n;
+}
+
+fn qs_reuse(db: MeoDb*) -> int32 {
+  var qa: MeoQuery* = 0;
+  var qb: MeoQuery* = 0;
+  var qc: MeoQuery* = 0;
+  var v: MeoValue = vi(1);
+  // The longest tag first, so each slot buffer is at full size before the
+  // snapshot.
+  var tv: MeoValue = vt("t10000");
+  meo_q_select(db, "big", &qa);
+  meo_q_pick(qa, "id");
+  meo_q_pick(qa, "g");
+  meo_q_where(qa, "id", MEO_Q_EQ, &v);
+  meo_q_where(qa, "tag", MEO_Q_EQ, &tv);
+  var l: MeoValue[2];
+  l[0] = vi(1); l[1] = vi(2);
+  meo_q_select(db, "big", &qb);
+  meo_q_pick(qb, "id");
+  meo_q_where_in(qb, "id", &l[0], 2);
+  meo_q_order(qb, "id", true);
+  meo_q_count(db, "big", &qc);
+  meo_q_where(qc, "tag", MEO_Q_EQ, &tv);
+  var held: int64 = 0;
+  var rss: int64 = 0;
+  var i: int32 = 1;
+  while (i <= QS_BIG) {
+    var id: int64 = (int64)((i * 7919) % QS_BIG + 1);
+    var id2: int64 = id % (int64)QS_BIG + 1;
+    var tag: string = "t{id}";
+    v = vi(id);
+    tv = vt(tag);
+    meo_q_set_value(qa, 0, &v);
+    meo_q_set_value(qa, 1, &tv);
+    meo_q_set_value(qb, 0, &v);
+    v = vi(id2);
+    meo_q_set_value(qb, 1, &v);
+    meo_q_set_value(qc, 0, &tv);
+    free(tag.chars);
+    var rc: int32 = meo_q_step(qa);
+    if (rc != MEO_ROW || meo_q_column_int64(qa, 0) != id || meo_q_column_int64(qa, 1) != id % 10) {
+      return qs_fail("reuse {i}: select id {id} rc={rc}");
+    }
+    if (meo_q_step(qa) != MEO_DONE) { return qs_fail("reuse {i}: select not done"); }
+    var top: int64 = id;
+    if (id2 > top) { top = id2; }
+    rc = meo_q_step(qb);
+    if (rc != MEO_ROW || meo_q_column_int64(qb, 0) != top || meo_q_row_count(qb) != 2) {
+      return qs_fail("reuse {i}: IN desc rc={rc}");
+    }
+    rc = meo_q_step(qc);
+    if (rc != MEO_ROW || meo_q_column_int64(qc, 0) != 1) { return qs_fail("reuse {i}: count"); }
+    meo_q_reset(qa);
+    meo_q_reset(qb);
+    meo_q_reset(qc);
+    if (i == 1000) {
+      held = qs_held(qa) + qs_held(qb) + qs_held(qc);
+      rss = qs_rss();
+    }
+    i += 1;
+  }
+  var held2: int64 = qs_held(qa) + qs_held(qb) + qs_held(qc);
+  var rss2: int64 = qs_rss();
+  meo_q_free(qa);
+  meo_q_free(qb);
+  meo_q_free(qc);
+  if (held2 != held) { return qs_fail("query buffers grew {held} -> {held2}"); }
+  if (rss < 0 || rss2 - rss > 64) { return qs_fail("rss grew {rss} -> {rss2} pages"); }
+  println("  reuse x{QS_BIG}: held {held2} bytes, rss {rss} -> {rss2} pages");
+  return 0;
+}
+
+fn main() -> int32 {
+  var path: string = "build/query_self.dat";
+  if (qs_reset(path) != MEO_OK) { return qs_fail("reset"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return qs_fail("open rc={rc}"); }
+  var f: int32 = qs_setup(db);
+  if (f == 0) { f += qs_filters(db); }
+  if (f == 0) { f += qs_paths(db); }
+  if (f == 0) { f += qs_order(db); }
+  if (f == 0) { f += qs_writes(db); }
+  if (f == 0) { f += qs_whole(db); }
+  if (f == 0) { f += qs_big(db); }
+  if (f == 0) { f += qs_counts(db); }
+  if (f == 0) { f += qs_versioned(db); }
+  if (f == 0) { f += qs_reuse(db); }
+  if (f != 0) {
+    println("FAIL query_self ({f})");
+    return 1;
+  }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return qs_fail("close rc={rc}"); }
+  println("PASS query_self");
+  return 0;
+}

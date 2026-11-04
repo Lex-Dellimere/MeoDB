@@ -103,3 +103,7 @@ main = "tests/catalog_self.mettle"
 # Table rows, unique indexes, delete and update.
 [bin.table_self]
 main = "tests/table_self.mettle"
+
+# Typed queries: filters, access paths, ordering, limits, update, delete, count.
+[bin.query_self]
+main = "tests/query_self.mettle"

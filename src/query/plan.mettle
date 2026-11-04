@@ -1,7 +1,8 @@
 // query/plan: resolve a MeoQSpec against one MeoTable and pick the access
 // path. Sees schemas only; the caller looks the table up under the db lock.
-// Real: CREATE, INSERT, SELECT with FULL_SCAN.
-// Not yet: filters, ORDER BY, LIMIT/OFFSET, UPDATE, DELETE.
+// Access path: an EQ on the rowid alias, else an EQ on a unique column, else
+// an IN on the rowid alias, else an IN on a unique column, else a full scan.
+// Every term is still re-checked on every row the path yields.
 
 import "../error/status.mettle";
 import "../record/value.mettle";
@@ -161,6 +162,44 @@ fn plan_insert(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> in
   return MEO_OK;
 }
 
+// Resolve the filter columns and pick the access path.
+fn plan_terms(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
+  pl->term_cols = plan_ints(arena, s->n_terms);
+  if (pl->term_cols == 0) { return -MEO_ERR_NOMEM; }
+  var rank: int32 = 0;   // 4 rowid EQ, 3 unique EQ, 2 rowid IN, 1 unique IN
+  var k: int32 = 0;
+  while (k < s->n_terms) {
+    var c: int32 = meo_plan_col(t, &s->terms[k].col);
+    if (c < 0) { return -MEO_ERR_SCHEMA; }
+    pl->term_cols[k] = c;
+    var kind: int32 = s->terms[k].kind;
+    var alias: bool = (t->columns[c].cflags & MEO_COL_ROWID_ALIAS) != 0;
+    var uniq: bool = !alias && (t->columns[c].cflags & (MEO_COL_UNIQUE | MEO_COL_PK)) != 0;
+    var r: int32 = 0;
+    var path: int32 = MEO_PATH_FULL_SCAN;
+    if (kind == MEO_Q_EQ && alias) {
+      r = 4;
+      path = MEO_PATH_ROWID_EQ;
+    } else if (kind == MEO_Q_EQ && uniq) {
+      r = 3;
+      path = MEO_PATH_UNIQUE_EQ;
+    } else if (kind == MEO_Q_IN && alias) {
+      r = 2;
+      path = MEO_PATH_ROWID_IN;
+    } else if (kind == MEO_Q_IN && uniq) {
+      r = 1;
+      path = MEO_PATH_UNIQUE_IN;
+    }
+    if (r > rank) {
+      rank = r;
+      pl->access = path;
+      pl->access_term = k;
+    }
+    k += 1;
+  }
+  return MEO_OK;
+}
+
 fn plan_select(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
   var i: int32 = 0;
   if (s->n_names == 0) {
@@ -182,17 +221,47 @@ fn plan_select(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> in
       i += 1;
     }
   }
-  // Filters, access paths, ORDER BY and LIMIT/OFFSET come with the engine work.
-  if (s->n_terms > 0 || s->n_order > 0 || s->limit >= 0 || s->offset > 0) {
-    return -MEO_ERR_UNSUPPORTED;
+  var rc: int32 = plan_terms(s, t, arena, pl);
+  if (rc != MEO_OK) { return rc; }
+  pl->order_cols = plan_ints(arena, s->n_order);
+  if (pl->order_cols == 0) { return -MEO_ERR_NOMEM; }
+  i = 0;
+  while (i < s->n_order) {
+    var c: int32 = meo_plan_col(t, &s->order[i].col);
+    if (c < 0) { return -MEO_ERR_SCHEMA; }
+    pl->order_cols[i] = c;
+    i += 1;
   }
-  pl->access = MEO_PATH_FULL_SCAN;
+  pl->need_sort = s->n_order > 0;
+  // A scan already yields rowid order.
+  if (s->n_order == 1 && !s->order[0].desc && pl->access == MEO_PATH_FULL_SCAN
+      && (t->columns[pl->order_cols[0]].cflags & MEO_COL_ROWID_ALIAS) != 0) {
+    pl->need_sort = false;
+  }
   return MEO_OK;
+}
+
+fn plan_update(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
+  pl->set_cols = plan_ints(arena, s->n_sets);
+  if (pl->set_cols == 0) { return -MEO_ERR_NOMEM; }
+  var i: int32 = 0;
+  while (i < s->n_sets) {
+    var c: int32 = meo_plan_col(t, &s->sets[i].col);
+    if (c < 0) { return -MEO_ERR_SCHEMA; }
+    var j: int32 = 0;
+    while (j < i) {
+      if (pl->set_cols[j] == c) { return -MEO_ERR_SCHEMA; }   // assigned twice
+      j += 1;
+    }
+    pl->set_cols[i] = c;
+    i += 1;
+  }
+  return plan_terms(s, t, arena, pl);
 }
 
 // Build the plan for `s` against table `t` (0 only for CREATE). MEO_OK,
 // -MEO_ERR_SCHEMA (unknown table or column, bad definition), -MEO_ERR_USAGE
-// (shape), -MEO_ERR_UNSUPPORTED, -MEO_ERR_NOMEM.
+// (shape), -MEO_ERR_NOMEM.
 export fn meo_plan_build(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPlan*) -> int32 {
   if (s == 0 || arena == 0 || pl == 0) { return -MEO_ERR_USAGE; }
   meo_plan_init(pl);
@@ -203,5 +272,10 @@ export fn meo_plan_build(s: MeoQSpec*, t: MeoTable*, arena: MeoArena*, pl: MeoPl
   pl->t = t;
   if (s->kind == MEO_Q_K_INSERT) { return plan_insert(s, t, arena, pl); }
   if (s->kind == MEO_Q_K_SELECT) { return plan_select(s, t, arena, pl); }
-  return -MEO_ERR_UNSUPPORTED;   // UPDATE and DELETE come with the engine work
+  if (s->kind == MEO_Q_K_UPDATE) { return plan_update(s, t, arena, pl); }
+  if (s->kind == MEO_Q_K_COUNT) { pl->n_out = 1; }
+  if (s->kind == MEO_Q_K_DELETE || s->kind == MEO_Q_K_COUNT) {
+    return plan_terms(s, t, arena, pl);
+  }
+  return -MEO_ERR_USAGE;
 }

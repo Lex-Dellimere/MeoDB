@@ -2,8 +2,8 @@
 // Names resolve and the plan is rebuilt on every run, so a table dropped by a
 // rollback reload shows up as -MEO_ERR_SCHEMA rather than a stale pointer.
 // SELECT is materialized; later steps walk the buffer without the lock.
-// Real: CREATE, INSERT, SELECT over FULL_SCAN.
-// Not yet: filters, point/index paths, sort, LIMIT, UPDATE, DELETE.
+// COUNT counts while scanning. UPDATE and DELETE collect their target rowids
+// first, so no cursor is held while they write.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -39,10 +39,15 @@ export struct MeoQuery {
   err: int32;             // the negative code while ERROR
   sticky: int32;          // a failed builder call; every step returns it
 
-  res: MeoValue*;         // n_rows * n_cols, row-major (malloc)
+  res: MeoValue*;         // rows of res_w cells, row-major (malloc)
   res_cap: int32;         // rows res can hold
+  res_w: int32;           // cells per stored row: n_cols, then the sort keys
   res_arena: MeoArena*;   // result text/blob bytes
-  n_rows: int32;
+  perm: int32*;           // sorted order of the stored rows, kept across runs
+  perm_cap: int32;
+  use_perm: bool;
+  row0: int32;            // first visible stored row (OFFSET after a sort)
+  n_rows: int32;          // visible rows once the run is done
   n_cols: int32;
   cur: int32;             // current row while ROWS
 
@@ -123,7 +128,7 @@ fn exec_res_row(q: MeoQuery*) -> MeoValue* {
   if (q->n_rows == q->res_cap) {
     var nc: int32 = q->res_cap * 2;
     if (nc < 64) { nc = 64; }
-    var w: int32 = q->n_cols;
+    var w: int32 = q->res_w;
     if (w < 1) { w = 1; }
     var nr: MeoValue* = (MeoValue*)malloc((int64)nc * (int64)w * (int64)sizeof(MeoValue));
     if (nr == 0) { return 0; }
@@ -137,7 +142,7 @@ fn exec_res_row(q: MeoQuery*) -> MeoValue* {
     q->res = nr;
     q->res_cap = nc;
   }
-  var r: MeoValue* = q->res + (int64)q->n_rows * (int64)q->n_cols;
+  var r: MeoValue* = q->res + (int64)q->n_rows * (int64)q->res_w;
   q->n_rows += 1;
   return r;
 }
@@ -222,33 +227,527 @@ fn exec_insert(q: MeoQuery*, t: MeoTable*) -> int32 {
   return meo_db_stmt_end(db, started, wrote, rc);
 }
 
-fn exec_select(q: MeoQuery*, t: MeoTable*) -> int32 {
-  var db: MeoDb* = q->db;
-  if (q->plan.access != MEO_PATH_FULL_SCAN) { return -MEO_ERR_UNSUPPORTED; }
-  var sc: MeoTblScan;
-  var rc: int32 = meo_tbl_scan_open(db, t, &sc);
-  if (rc != MEO_OK) { return rc; }
-  var row: MeoTblRow;
-  while (true) {
-    rc = meo_tbl_scan_next(&sc, &row);
-    if (rc != 0) { break; }
-    var dst: MeoValue* = exec_res_row(q);
-    if (dst == 0) {
-      rc = -MEO_ERR_NOMEM;
-      break;
+// --- filters ----------------------------------------------------------------
+
+fn exec_is_num(v: MeoValue*) -> bool {
+  return v->type == MEO_T_INT || v->type == MEO_T_REAL;
+}
+
+fn exec_num(v: MeoValue*) -> float64 {
+  if (v->type == MEO_T_INT) { return (float64)v->i; }
+  return v->f;
+}
+
+fn exec_bytes_cmp(a: MeoValue*, b: MeoValue*) -> int32 {
+  var n: int32 = a->n;
+  if (b->n < n) { n = b->n; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (a->p[i] != b->p[i]) {
+      if (a->p[i] < b->p[i]) { return -1; }
+      return 1;
     }
-    var i: int32 = 0;
-    while (i < q->plan.n_out && rc == 0) {
-      var v: MeoValue;
-      rc = meo_tbl_row_get(t, &row, q->plan.out_cols[i], &v);
-      if (rc == MEO_OK) { rc = exec_res_put(q, &dst[i], &v); }
+    i += 1;
+  }
+  if (a->n < b->n) { return -1; }
+  if (a->n > b->n) { return 1; }
+  return 0;
+}
+
+// Three-way compare of two non-NULL values. *ok = false when they do not
+// compare: INT and REAL compare as numbers, TEXT and BLOB bytewise with their
+// own type only.
+fn exec_cmp(a: MeoValue*, b: MeoValue*, ok: bool*) -> int32 {
+  ok[0] = true;
+  if (a->type == MEO_T_INT && b->type == MEO_T_INT) {
+    if (a->i < b->i) { return -1; }
+    if (a->i > b->i) { return 1; }
+    return 0;
+  }
+  if (exec_is_num(a) && exec_is_num(b)) {
+    var x: float64 = exec_num(a);
+    var y: float64 = exec_num(b);
+    if (x < y) { return -1; }
+    if (x > y) { return 1; }
+    if (x == y) { return 0; }
+    ok[0] = false;   // NaN
+    return 0;
+  }
+  if (a->type == b->type && (a->type == MEO_T_TEXT || a->type == MEO_T_BLOB)) {
+    return exec_bytes_cmp(a, b);
+  }
+  ok[0] = false;
+  return 0;
+}
+
+fn exec_term_ok(q: MeoQuery*, tm: MeoQTerm*, v: MeoValue*) -> bool {
+  if (tm->kind == MEO_Q_IS_NULL) { return v->type == MEO_T_NULL; }
+  if (tm->kind == MEO_Q_NOT_NULL) { return v->type != MEO_T_NULL; }
+  if (v->type == MEO_T_NULL) { return false; }
+  var ok: bool = false;
+  var c: int32 = 0;
+  if (tm->kind == MEO_Q_IN) {
+    var j: int32 = 0;
+    while (j < tm->n_v) {
+      var w: MeoValue* = &q->vals[tm->v0 + j];
+      if (w->type != MEO_T_NULL) {
+        c = exec_cmp(v, w, &ok);
+        if (ok && c == 0) { return true; }
+      }
+      j += 1;
+    }
+    return false;
+  }
+  var w: MeoValue* = &q->vals[tm->v0];
+  if (w->type == MEO_T_NULL) { return false; }
+  c = exec_cmp(v, w, &ok);
+  if (!ok) { return false; }
+  if (tm->kind == MEO_Q_EQ) { return c == 0; }
+  if (tm->kind == MEO_Q_NE) { return c != 0; }
+  if (tm->kind == MEO_Q_LT) { return c < 0; }
+  if (tm->kind == MEO_Q_LE) { return c <= 0; }
+  if (tm->kind == MEO_Q_GT) { return c > 0; }
+  if (tm->kind == MEO_Q_GE) { return c >= 0; }
+  return false;
+}
+
+// Every term holds for the row. A decode failure sets *rc.
+fn exec_match(q: MeoQuery*, t: MeoTable*, row: MeoTblRow*, rc: int32*) -> bool {
+  var k: int32 = 0;
+  while (k < q->spec.n_terms) {
+    var v: MeoValue;
+    var r: int32 = meo_tbl_row_get(t, row, q->plan.term_cols[k], &v);
+    if (r != MEO_OK) {
+      rc[0] = r;
+      return false;
+    }
+    if (!exec_term_ok(q, &q->spec.terms[k], &v)) { return false; }
+    k += 1;
+  }
+  return true;
+}
+
+// --- row sources ------------------------------------------------------------
+
+const EXEC_V_SELECT: int32 = 1;
+const EXEC_V_COUNT: int32 = 2;
+const EXEC_V_COLLECT: int32 = 3;
+
+struct ExecVisit {
+  mode: int32;           // EXEC_V_*
+  seen: int64;           // matches so far, for OFFSET without a sort
+  count: int64;
+  ids: int64*;           // COLLECT: matching rowids (malloc)
+  n_ids: int32;
+  cap_ids: int32;
+  stop: bool;            // LIMIT reached
+}
+
+fn exec_visit_init(vs: ExecVisit*, mode: int32) {
+  vs->mode = mode;
+  vs->seen = 0;
+  vs->count = 0;
+  vs->ids = 0;
+  vs->n_ids = 0;
+  vs->cap_ids = 0;
+  vs->stop = false;
+}
+
+// A value as an exact int64 rowid (an integral REAL counts).
+fn exec_as_int(v: MeoValue*, out: int64*) -> bool {
+  if (v->type == MEO_T_INT) {
+    out[0] = v->i;
+    return true;
+  }
+  if (v->type != MEO_T_REAL) { return false; }
+  var f: float64 = v->f;
+  if (!(f >= -9223372036854775808.0 && f < 9223372036854775808.0)) { return false; }
+  var i: int64 = (int64)f;
+  if ((float64)i != f) { return false; }
+  out[0] = i;
+  return true;
+}
+
+fn exec_sort_ids(a: int64*, n: int32) {
+  var gap: int32 = n / 2;
+  while (gap > 0) {
+    var i: int32 = gap;
+    while (i < n) {
+      var x: int64 = a[i];
+      var j: int32 = i;
+      while (j >= gap && a[j - gap] > x) {
+        a[j] = a[j - gap];
+        j -= gap;
+      }
+      a[j] = x;
       i += 1;
     }
-    if (rc != 0) { break; }
+    gap = gap / 2;
   }
-  meo_tbl_scan_close(&sc);
-  if (rc < 0) { return rc; }
+}
+
+// The rowids a point path visits, ascending, no duplicates, in the plan
+// arena. Their count, or a negative code.
+fn exec_candidates(q: MeoQuery*, t: MeoTable*, out: int64**) -> int32 {
+  var tm: MeoQTerm* = &q->spec.terms[q->plan.access_term];
+  var col: int32 = q->plan.term_cols[q->plan.access_term];
+  var by_rowid: bool = q->plan.access == MEO_PATH_ROWID_EQ || q->plan.access == MEO_PATH_ROWID_IN;
+  var ids: int64* = (int64*)meo_arena_alloc(q->plan_arena, (int64)tm->n_v * 8 + 8);
+  if (ids == 0) { return -MEO_ERR_NOMEM; }
+  var n: int32 = 0;
+  var j: int32 = 0;
+  while (j < tm->n_v) {
+    var v: MeoValue = q->vals[tm->v0 + j];
+    var id: int64 = 0;
+    if (by_rowid) {
+      if (exec_as_int(&v, &id)) {
+        ids[n] = id;
+        n += 1;
+      }
+    } else {
+      // The index holds the column's own type; an integral REAL can match INT.
+      var skip: bool = false;
+      if (t->columns[col].affinity == MEO_T_INT && v.type == MEO_T_REAL) {
+        if (exec_as_int(&v, &id)) {
+          meo_value_set_int(&v, id);
+        } else {
+          skip = true;
+        }
+      }
+      if (!skip) {
+        var r: int32 = meo_tbl_index_lookup(q->db, t, col, &v, &id);
+        if (r < 0) { return r; }
+        if (r == MEO_OK) {
+          ids[n] = id;
+          n += 1;
+        }
+      }
+    }
+    j += 1;
+  }
+  exec_sort_ids(ids, n);
+  var m: int32 = 0;
+  j = 0;
+  while (j < n) {
+    if (m == 0 || ids[m - 1] != ids[j]) {
+      ids[m] = ids[j];
+      m += 1;
+    }
+    j += 1;
+  }
+  out[0] = ids;
+  return m;
+}
+
+// One matching row. MEO_OK or a negative code.
+fn exec_take(q: MeoQuery*, t: MeoTable*, row: MeoTblRow*, vs: ExecVisit*) -> int32 {
+  if (vs->mode == EXEC_V_COUNT) {
+    vs->count += 1;
+    return MEO_OK;
+  }
+  if (vs->mode == EXEC_V_COLLECT) {
+    if (vs->n_ids == vs->cap_ids) {
+      var nc: int32 = vs->cap_ids * 2;
+      if (nc < 64) { nc = 64; }
+      var ni: int64* = (int64*)realloc(vs->ids, (int64)nc * 8);
+      if (ni == 0) { return -MEO_ERR_NOMEM; }
+      vs->ids = ni;
+      vs->cap_ids = nc;
+    }
+    vs->ids[vs->n_ids] = row->rowid;
+    vs->n_ids += 1;
+    return MEO_OK;
+  }
+  var sorted: bool = q->plan.need_sort;
+  if (!sorted) {
+    // Unsorted: OFFSET and LIMIT apply as rows arrive.
+    vs->seen += 1;
+    if (vs->seen <= q->spec.offset) { return MEO_OK; }
+    if (q->spec.limit >= 0 && (int64)q->n_rows >= q->spec.limit) {
+      vs->stop = true;
+      return MEO_OK;
+    }
+  }
+  var dst: MeoValue* = exec_res_row(q);
+  if (dst == 0) { return -MEO_ERR_NOMEM; }
+  var rc: int32 = MEO_OK;
+  var v: MeoValue;
+  var i: int32 = 0;
+  while (i < q->plan.n_out && rc == MEO_OK) {
+    rc = meo_tbl_row_get(t, row, q->plan.out_cols[i], &v);
+    if (rc == MEO_OK) { rc = exec_res_put(q, &dst[i], &v); }
+    i += 1;
+  }
+  if (sorted) {
+    var k: int32 = 0;
+    while (k < q->spec.n_order && rc == MEO_OK) {
+      rc = meo_tbl_row_get(t, row, q->plan.order_cols[k], &v);
+      if (rc == MEO_OK) { rc = exec_res_put(q, &dst[q->plan.n_out + k], &v); }
+      k += 1;
+    }
+  } else if (q->spec.limit >= 0 && (int64)q->n_rows >= q->spec.limit) {
+    vs->stop = true;
+  }
+  return rc;
+}
+
+// Feed every row the access path yields and the filter accepts to exec_take.
+fn exec_visit(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
+  var db: MeoDb* = q->db;
+  var row: MeoTblRow;
+  var rc: int32 = MEO_OK;
+  if (q->spec.kind == MEO_Q_K_SELECT && q->spec.limit == 0) { return MEO_OK; }
+  if (q->plan.access == MEO_PATH_FULL_SCAN) {
+    var sc: MeoTblScan;
+    rc = meo_tbl_scan_open(db, t, &sc);
+    if (rc != MEO_OK) { return rc; }
+    while (true) {
+      rc = meo_tbl_scan_next(&sc, &row);
+      if (rc != 0) { break; }
+      if (exec_match(q, t, &row, &rc)) { rc = exec_take(q, t, &row, vs); }
+      if (rc != MEO_OK || vs->stop) { break; }
+    }
+    meo_tbl_scan_close(&sc);
+    if (rc < 0) { return rc; }
+    return MEO_OK;
+  }
+  var ids: int64* = 0;
+  var n: int32 = exec_candidates(q, t, &ids);
+  if (n < 0) { return n; }
+  var buf: uint8* = malloc((int64)MEO_REC_MAX);
+  if (buf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(buf);
+  var j: int32 = 0;
+  while (j < n) {
+    rc = meo_tbl_lookup_rowid(db, t, ids[j], buf, MEO_REC_MAX, &row);
+    if (rc < 0) { return rc; }
+    if (rc == MEO_OK) {
+      if (exec_match(q, t, &row, &rc)) { rc = exec_take(q, t, &row, vs); }
+      if (rc != MEO_OK) { return rc; }
+      if (vs->stop) { return MEO_OK; }
+    }
+    j += 1;
+  }
   return MEO_OK;
+}
+
+// --- SELECT -----------------------------------------------------------------
+
+// Sort order of two key cells: NULL, then numbers, TEXT, BLOB.
+fn exec_key_cmp(a: MeoValue*, b: MeoValue*) -> int32 {
+  var ra: int32 = a->type;
+  var rb: int32 = b->type;
+  if (ra == MEO_T_REAL) { ra = MEO_T_INT; }
+  if (rb == MEO_T_REAL) { rb = MEO_T_INT; }
+  if (ra != rb) {
+    if (ra < rb) { return -1; }
+    return 1;
+  }
+  if (ra == MEO_T_NULL) { return 0; }
+  var ok: bool = false;
+  return exec_cmp(a, b, &ok);
+}
+
+fn exec_row_cmp(q: MeoQuery*, a: int32, b: int32) -> int32 {
+  var ka: MeoValue* = q->res + (int64)a * (int64)q->res_w + (int64)q->plan.n_out;
+  var kb: MeoValue* = q->res + (int64)b * (int64)q->res_w + (int64)q->plan.n_out;
+  var k: int32 = 0;
+  while (k < q->spec.n_order) {
+    var c: int32 = exec_key_cmp(&ka[k], &kb[k]);
+    if (q->spec.order[k].desc) { c = -c; }
+    if (c != 0) { return c; }
+    k += 1;
+  }
+  return 0;
+}
+
+// Stable bottom-up merge sort of the n stored rows into q->perm.
+fn exec_sort(q: MeoQuery*, n: int32) -> int32 {
+  if (q->perm_cap < n) {
+    var np: int32* = (int32*)realloc(q->perm, (int64)n * 4);
+    if (np == 0) { return -MEO_ERR_NOMEM; }
+    q->perm = np;
+    q->perm_cap = n;
+  }
+  var tmp: int32* = (int32*)malloc((int64)n * 4 + 4);
+  if (tmp == 0) { return -MEO_ERR_NOMEM; }
+  var src: int32* = q->perm;
+  var dst: int32* = tmp;
+  var i: int32 = 0;
+  while (i < n) {
+    src[i] = i;
+    i += 1;
+  }
+  var width: int32 = 1;
+  while (width < n) {
+    var lo: int32 = 0;
+    while (lo < n) {
+      var mid: int32 = lo + width;
+      if (mid > n) { mid = n; }
+      var hi: int32 = lo + width * 2;
+      if (hi > n) { hi = n; }
+      var a: int32 = lo;
+      var b: int32 = mid;
+      var k: int32 = lo;
+      while (k < hi) {
+        if (a < mid && (b >= hi || exec_row_cmp(q, src[a], src[b]) <= 0)) {
+          dst[k] = src[a];
+          a += 1;
+        } else {
+          dst[k] = src[b];
+          b += 1;
+        }
+        k += 1;
+      }
+      lo = hi;
+    }
+    var sw: int32* = src;
+    src = dst;
+    dst = sw;
+    width = width * 2;
+  }
+  if (src != q->perm) {
+    i = 0;
+    while (i < n) {
+      q->perm[i] = src[i];
+      i += 1;
+    }
+  }
+  free(tmp);
+  return MEO_OK;
+}
+
+fn exec_select(q: MeoQuery*, t: MeoTable*) -> int32 {
+  q->res_w = q->plan.n_out;
+  if (q->plan.need_sort) { q->res_w = q->plan.n_out + q->spec.n_order; }
+  var vs: ExecVisit;
+  exec_visit_init(&vs, EXEC_V_SELECT);
+  var rc: int32 = exec_visit(q, t, &vs);
+  if (rc != MEO_OK || !q->plan.need_sort) { return rc; }
+  var n: int32 = q->n_rows;
+  rc = exec_sort(q, n);
+  if (rc != MEO_OK) { return rc; }
+  q->use_perm = true;
+  var first: int64 = q->spec.offset;
+  if (first > (int64)n) { first = (int64)n; }
+  var left: int64 = (int64)n - first;
+  if (q->spec.limit >= 0 && q->spec.limit < left) { left = q->spec.limit; }
+  q->row0 = (int32)first;
+  q->n_rows = (int32)left;
+  return MEO_OK;
+}
+
+fn exec_count(q: MeoQuery*, t: MeoTable*) -> int32 {
+  q->res_w = 1;
+  var vs: ExecVisit;
+  exec_visit_init(&vs, EXEC_V_COUNT);
+  var rc: int32 = exec_visit(q, t, &vs);
+  if (rc != MEO_OK) { return rc; }
+  var dst: MeoValue* = exec_res_row(q);
+  if (dst == 0) { return -MEO_ERR_NOMEM; }
+  meo_value_set_int(dst, vs.count);
+  return MEO_OK;
+}
+
+// --- UPDATE / DELETE --------------------------------------------------------
+
+// New values for the n target rows, Phase A, then Phase B. *wrote is set once
+// the first write starts.
+fn exec_update_rows(q: MeoQuery*, t: MeoTable*, ids: int64*, n: int32, wrote: bool*) -> int32 {
+  var db: MeoDb* = q->db;
+  var nc: int32 = t->n_cols;
+  var rows: MeoValue* = (MeoValue*)malloc((int64)n * (int64)nc * (int64)sizeof(MeoValue));
+  var buf: uint8* = malloc((int64)MEO_REC_MAX);
+  var tmp: MeoArena* = meo_arena_new(65536);
+  if (rows == 0 || buf == 0 || tmp == 0) {
+    if (rows != 0) { free(rows); }
+    if (buf != 0) { free(buf); }
+    if (tmp != 0) { meo_arena_free(tmp); }
+    return -MEO_ERR_NOMEM;
+  }
+  defer free(rows);
+  defer free(buf);
+  defer meo_arena_free(tmp);
+  var int64_min: int64 = (int64)((uint64)1 << 63);
+  var int64_max: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
+  var row: MeoTblRow;
+  var rc: int32 = MEO_OK;
+  var r: int32 = 0;
+  while (r < n) {
+    rc = meo_tbl_lookup_rowid(db, t, ids[r], buf, MEO_REC_MAX, &row);
+    if (rc == 1) { return -MEO_ERR_CORRUPT; }   // collected under the same lock
+    if (rc != MEO_OK) { return rc; }
+    var vals: MeoValue* = rows + (int64)r * (int64)nc;
+    var c: int32 = 0;
+    while (c < nc) {
+      var v: MeoValue;
+      rc = meo_tbl_row_get(t, &row, c, &v);
+      if (rc != MEO_OK) { return rc; }
+      vals[c] = v;
+      if (v.type == MEO_T_TEXT || v.type == MEO_T_BLOB) {
+        // buf is reused for the next row, so the bytes move to tmp.
+        var p: uint8* = meo_arena_alloc(tmp, (int64)v.n + 1);
+        if (p == 0) { return -MEO_ERR_NOMEM; }
+        meo_bytes_copy(p, v.p, (int64)v.n);
+        vals[c].p = p;
+      }
+      c += 1;
+    }
+    var i: int32 = 0;
+    while (i < q->spec.n_sets) {
+      var a: MeoQAssign* = &q->spec.sets[i];
+      var dst: MeoValue* = &vals[q->plan.set_cols[i]];
+      if (a->add) {
+        if (dst->type != MEO_T_INT) { return -MEO_ERR_MISMATCH; }
+        if (a->delta > 0 && dst->i > int64_max - a->delta) { return -MEO_ERR_RANGE; }
+        if (a->delta < 0 && dst->i < int64_min - a->delta) { return -MEO_ERR_RANGE; }
+        dst->i = dst->i + a->delta;
+      } else {
+        dst[0] = q->vals[a->v];
+      }
+      i += 1;
+    }
+    r += 1;
+  }
+  rc = meo_tbl_check_update(db, t, ids, n, rows, nc, tmp);
+  if (rc != MEO_OK) { return rc; }
+  r = 0;
+  while (r < n) {
+    wrote[0] = true;
+    rc = meo_tbl_update(db, t, ids[r], rows + (int64)r * (int64)nc, nc);
+    if (rc == 1) { return -MEO_ERR_CORRUPT; }
+    if (rc != MEO_OK) { return rc; }
+    q->changes += 1;
+    r += 1;
+  }
+  return MEO_OK;
+}
+
+fn exec_write(q: MeoQuery*, t: MeoTable*) -> int32 {
+  var db: MeoDb* = q->db;
+  var started: bool = false;
+  var rc: int32 = meo_db_stmt_begin(db, &started);
+  if (rc != MEO_OK) { return rc; }
+  var vs: ExecVisit;
+  exec_visit_init(&vs, EXEC_V_COLLECT);
+  rc = exec_visit(q, t, &vs);
+  var wrote: bool = false;
+  if (rc == MEO_OK && vs.n_ids > 0) {
+    if (q->spec.kind == MEO_Q_K_UPDATE) {
+      rc = exec_update_rows(q, t, vs.ids, vs.n_ids, &wrote);
+    } else {
+      var r: int32 = 0;
+      while (r < vs.n_ids && rc == MEO_OK) {
+        wrote = true;
+        rc = meo_tbl_delete(db, t, vs.ids[r]);
+        if (rc == 1) { rc = -MEO_ERR_CORRUPT; }
+        if (rc == MEO_OK) { q->changes += 1; }
+        r += 1;
+      }
+    }
+  }
+  if (vs.ids != 0) { free(vs.ids); }
+  return meo_db_stmt_end(db, started, wrote, rc);
 }
 
 // Run the query once (first step). Lock held for the whole run.
@@ -260,6 +759,9 @@ fn exec_run(q: MeoQuery*) -> int32 {
   q->last_rowid = 0;
   q->n_rows = 0;
   q->n_cols = 0;
+  q->res_w = 0;
+  q->use_perm = false;
+  q->row0 = 0;
   meo_arena_reset(q->plan_arena);
   var t: MeoTable* = 0;
   if (q->spec.kind != MEO_Q_K_CREATE) {
@@ -274,8 +776,10 @@ fn exec_run(q: MeoQuery*) -> int32 {
       rc = exec_insert(q, t);
     } else if (q->spec.kind == MEO_Q_K_SELECT) {
       rc = exec_select(q, t);
+    } else if (q->spec.kind == MEO_Q_K_COUNT) {
+      rc = exec_count(q, t);
     } else {
-      rc = -MEO_ERR_UNSUPPORTED;   // UPDATE and DELETE come with the engine work
+      rc = exec_write(q, t);
     }
   }
   meo_db_leave(db);
@@ -314,6 +818,8 @@ export fn meo_exec_reset(q: MeoQuery*) -> int32 {
   q->err = MEO_OK;
   q->n_rows = 0;
   q->cur = 0;
+  q->use_perm = false;
+  q->row0 = 0;
   if (q->res_arena != 0) { meo_arena_reset(q->res_arena); }
   return MEO_OK;
 }
@@ -322,7 +828,9 @@ export fn meo_exec_reset(q: MeoQuery*) -> int32 {
 export fn meo_exec_cell_at(q: MeoQuery*, row: int32, col: int32) -> MeoValue* {
   if (q == 0 || (q->state != MEO_Q_ROWS && q->state != MEO_Q_DONE)) { return 0; }
   if (row < 0 || row >= q->n_rows || col < 0 || col >= q->n_cols) { return 0; }
-  return q->res + (int64)row * (int64)q->n_cols + (int64)col;
+  var at: int32 = q->row0 + row;
+  if (q->use_perm) { at = q->perm[at]; }
+  return q->res + (int64)at * (int64)q->res_w + (int64)col;
 }
 
 // The current row's column i, or 0 when there is no such cell.
