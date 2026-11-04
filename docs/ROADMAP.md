@@ -2,7 +2,7 @@
 
 Milestones in build order, with one exception: the network server (M7, without remote subscribe) comes straight after M2, because flux_orm reaches MeoDB over the network instead of compiling it in. Remote subscribe follows M4. A milestone is done when every exit criterion is checked by a `[bin.*]` test that passes in debug and release with zero warnings. Layer numbers refer to `docs/ARCHITECTURE.md`.
 
-Direction: one ordered storage engine with every data model as a layer on top (tables, documents, graph, key-value, time series, search), all in one transaction system and one change feed. Realtime comes from live queries kept up to date incrementally. Fault tolerance and scale come from running each shard as an alph actor with Raft replication. Techniques are copied from systems that proved them: PostgreSQL (MVCC, constraints, row-level security), SQLite (WAL), FoundationDB and TigerBeetle (deterministic simulation), CockroachDB and TiKV (range sharding, Raft per range), Materialize and RethinkDB (live queries), Firebase (client sync, security rules), Neo4j (graph model). Order: a solid single node (M5, M13, M7b), then realtime (M7 subscribe, M11), then fault tolerance (M12, M8, M9), then scale (M10), then more models (M6, M15).
+Direction: MeoDB is used the way PostgreSQL is used from Elixir. Apps reach the `meodb` server through flux_orm (our Ecto, with its own connection pool); the server is the product, and shared data is never opened by embedding the library (the file lock allows one process, the server). mist_plot and raize_web read and subscribe through the server like any other client. Underneath: one ordered storage engine with every data model as a layer (tables, documents, graph, key-value, time series, search) in one transaction system and one change feed; realtime from a committed-change stream over the wire (like logical replication) and live queries; many connections from alph processes (one per connection, supervised); concurrent writers from row-level MVCC; fault tolerance and scale from Raft replication and shards as alph actors. Techniques come from systems that proved them: PostgreSQL (row MVCC, constraints, row-level security), SQLite (WAL), FoundationDB and TigerBeetle (deterministic simulation), CockroachDB and TiKV (range sharding, Raft per range), Materialize and RethinkDB (live queries), Firebase (client sync, security rules), Neo4j (graph model). Order: wire subscribe and streaming scans (M7), the server on alph (M12), concurrent writers (M16), then replication and failover (M8, M9), live queries (M11), documents and relational integrity (M13), sharding (M10), more models (M6, M15). Every feature ships with a wire operation flux_orm can call.
 
 ## M0 — Storage (done)
 Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback journal.
@@ -69,7 +69,8 @@ Layers 8 and 11. Consumer: flux_orm, which reaches MeoDB over TCP instead of com
 - [x] An oversize frame gets TOOBIG, a wrong version gets VERSION, a wrong token gets AUTH, and a result over the frame limit gets TOOBIG with the connection still usable (`srv_limits`).
 - [x] Stopping the server rolls back open transactions. Reopening shows only committed data (`srv_stop`).
 - [x] flux_orm's network adapter passes its tests against a running server (flux_orm `tests/live_meodb.mettle`).
-- [ ] After M4: remote `SUBSCRIBE table` pushes events within 50 ms p99 on localhost, and raize can relay them to browsers.
+- [ ] After M4: remote `SUBSCRIBE table` pushes events within 50 ms p99 on localhost, and raize can relay them to browsers. Events carry the row, commit order, commit sequence and GAP markers, like the in-process feed.
+- [ ] A streaming `SCAN_XY` / `SCAN_XYG` operation sends (x, y) pairs in chunks over one snapshot and reports that snapshot's commit sequence, so mist_plot charts server data without embedding the engine.
 
 ## M7b — Authentication and access control
 Layer 8d. Consumers: every network client (flux_orm, raize_web apps). Hashing, key derivation and encryption come from a separate Mettle security library; MeoDB calls it and implements no crypto of its own.
@@ -129,3 +130,10 @@ Layer 7. Each model is a layer over the same tables and transactions.
 - [ ] Key-value with expiry (sessions, rate limits).
 - [ ] Time series retention and downsampling.
 - [ ] Full-text search (inverted index, BM25) and vector search (HNSW).
+
+## M16 — Concurrent writers (row-level MVCC)
+Layers 4b and 5. Copies PostgreSQL. Today writes are serialized (one writer at a time, sharing fsyncs).
+- [ ] Rows carry versions; readers see their snapshot's version, so readers and writers never block each other.
+- [ ] Transactions that touch different rows commit concurrently; two transactions updating the same row: the second waits or fails with CONFLICT, never a lost update (fault-injection and Jepsen-style tests).
+- [ ] Old row versions are reclaimed in the background (vacuum) without blocking writers.
+- [ ] Write throughput at 16 connections is several times that at 1 connection.

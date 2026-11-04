@@ -1,7 +1,10 @@
 # MeoDB
 
-A relational database written in Mettle, and the storage backend for
-[flux_orm](../flux_orm).
+A database written in Mettle. Apps use it through
+[flux_orm](https://github.com/Lex-Dellimere/FluxORM), which talks to the `meodb`
+server over TCP, the way an Elixir app uses PostgreSQL through Ecto. The
+embedded `meo_*` API below is the engine the server is built on; use it
+directly only for a database file that one program owns.
 
 ## Goals
 
@@ -45,6 +48,9 @@ distribution and replication.
 `src/meodb.mettle` imports everything.
 
 ## Using MeoDB
+
+The normal path is flux_orm against a running `meodb` server (see
+[Server](#server)). The rest of this section is the embedded engine API.
 
 Import `src/meodb.mettle`. Every call returns `MEO_OK` (0), `MEO_ROW` /
 `MEO_DONE` from a step, or a negative `-MEO_ERR_*` code; checks are left out
