@@ -1,0 +1,150 @@
+// table/overflow: records too large for a leaf, stored as a chain of
+// MEO_PAGE_OVERFLOW pages.
+//
+// Page layout: the standard 16-byte header as meo_page_init writes it (no
+// cells, so meo_page_check accepts the page), then
+//
+//   16  next page(u32, 0 = last)   20  payload bytes(u16)   22  payload
+//
+// A chain of ceil(len / OVF_PAYLOAD) pages holds `len` bytes: every page but
+// the last is full, the last holds the remainder, and the reader checks all of
+// it, so a chain that is shorter, longer or mis-sized is CORRUPT.
+//
+// The chain is written tail first, so each page knows its successor when it is
+// written and a failure part way has a valid chain to give back. Everything
+// runs inside a transaction the caller owns; there is no locking here. A
+// chain that loops is stopped by the page count, never followed forever.
+
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../format/page.mettle";
+import "../pager/pager.mettle";
+import "../catalog/schema.mettle";
+
+const OVF_OFF_NEXT: int32 = MEO_PAGE_HDR;
+const OVF_OFF_COUNT: int32 = MEO_PAGE_HDR + 4;
+const OVF_OFF_DATA: int32 = MEO_PAGE_HDR + 6;
+
+// Bytes of record per page.
+export const MEO_OVF_PAYLOAD: int32 = MEO_PAGE_SIZE - OVF_OFF_DATA;
+
+// Pages a chain of `len` bytes occupies.
+fn ovf_pages(len: int32) -> int32 {
+  return (len + MEO_OVF_PAYLOAD - 1) / MEO_OVF_PAYLOAD;
+}
+
+// The failure code the pager recorded for a call that answered 0.
+fn ovf_err(p: MeoPager*) -> int32 {
+  if (p->err == MEO_OK) { return -MEO_ERR_CORRUPT; }
+  return 0 - p->err;
+}
+
+// Give back the first `n` pages of a chain whose links were written by
+// meo_ovf_write or checked by ovf_walk. Stops at the first failure.
+fn ovf_release(p: MeoPager*, first: uint32, n: int32) -> int32 {
+  var page_no: uint32 = first;
+  var i: int32 = 0;
+  while (i < n) {
+    var f: MeoFrame* = meo_pager_get(p, page_no, false);
+    if (f == 0) { return ovf_err(p); }
+    var next: uint32 = meo_get_u32le(f->data, (int64)OVF_OFF_NEXT);
+    meo_pager_release(p, f, false);
+    var rc: int32 = meo_pager_free_page(p, page_no);
+    if (rc != MEO_OK) { return rc; }
+    page_no = next;
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// Follow a chain of `len` bytes, proving every page on the way, and copy the
+// payload to `out` when it is not 0.
+fn ovf_walk(p: MeoPager*, first: uint32, len: int32, out: uint8*) -> int32 {
+  var n: int32 = ovf_pages(len);
+  var page_no: uint32 = first;
+  var i: int32 = 0;
+  while (i < n) {
+    if (page_no == 0 || (int64)page_no >= (int64)p->page_count) {
+      return -MEO_ERR_CORRUPT;
+    }
+    var f: MeoFrame* = meo_pager_get(p, page_no, false);
+    if (f == 0) { return ovf_err(p); }
+    var d: uint8* = f->data;
+    var rc: int32 = meo_page_check(d);
+    if (rc == MEO_OK && meo_page_type(d) != MEO_PAGE_OVERFLOW) {
+      rc = -MEO_ERR_CORRUPT;
+    }
+    var next: uint32 = meo_get_u32le(d, (int64)OVF_OFF_NEXT);
+    var count: int32 = (int32)meo_get_u16le(d, (int64)OVF_OFF_COUNT);
+    var want: int32 = MEO_OVF_PAYLOAD;
+    if (i == n - 1) {
+      want = len - i * MEO_OVF_PAYLOAD;
+      if (next != 0) { rc = -MEO_ERR_CORRUPT; }
+    } else if (next == 0) {
+      rc = -MEO_ERR_CORRUPT;
+    }
+    if (rc == MEO_OK && count != want) { rc = -MEO_ERR_CORRUPT; }
+    if (rc == MEO_OK && out != 0) {
+      meo_bytes_copy(out + (int64)i * (int64)MEO_OVF_PAYLOAD,
+        d + (int64)OVF_OFF_DATA, (int64)count);
+    }
+    meo_pager_release(p, f, false);
+    if (rc != MEO_OK) { return rc; }
+    page_no = next;
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// Store `len` bytes (1..MEO_ROW_MAX) in a new chain; *first_out is its first
+// page. On failure the pages already taken are freed (best effort: handing
+// them back can fail the same way the write did, and the caller's rollback
+// then undoes them) and *first_out is left alone.
+export fn meo_ovf_write(p: MeoPager*, data: uint8*, len: int32,
+    first_out: uint32*) -> int32 {
+  if (p == 0 || data == 0 || first_out == 0) { return -MEO_ERR_USAGE; }
+  if (len < 1 || len > MEO_ROW_MAX) { return -MEO_ERR_USAGE; }
+  var n: int32 = ovf_pages(len);
+  var next: uint32 = 0;
+  var k: int32 = n - 1;
+  while (k >= 0) {
+    var off: int32 = k * MEO_OVF_PAYLOAD;
+    var chunk: int32 = len - off;
+    if (chunk > MEO_OVF_PAYLOAD) { chunk = MEO_OVF_PAYLOAD; }
+    var f: MeoFrame* = meo_pager_alloc(p);
+    if (f == 0) {
+      var rc: int32 = ovf_err(p);
+      if (next != 0) { ovf_release(p, next, n - 1 - k); }
+      return rc;
+    }
+    meo_page_init(f->data, MEO_PAGE_OVERFLOW);
+    meo_put_u32le(f->data, (int64)OVF_OFF_NEXT, next);
+    meo_put_u16le(f->data, (int64)OVF_OFF_COUNT, (uint16)chunk);
+    meo_bytes_copy(f->data + (int64)OVF_OFF_DATA, data + (int64)off,
+      (int64)chunk);
+    next = f->page_no;
+    meo_pager_release(p, f, true);
+    k -= 1;
+  }
+  *first_out = next;
+  return MEO_OK;
+}
+
+// Copy exactly `len` bytes of the chain starting at `first` into `out`.
+export fn meo_ovf_read(p: MeoPager*, first: uint32, len: int32,
+    out: uint8*) -> int32 {
+  if (p == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  if (len < 1 || len > MEO_ROW_MAX) { return -MEO_ERR_USAGE; }
+  return ovf_walk(p, first, len, out);
+}
+
+// Free every page of the chain. The chain is proved first, so a damaged one
+// frees nothing; a chain that loops back on itself is stopped by the pager's
+// double-free check.
+export fn meo_ovf_free(p: MeoPager*, first: uint32, len: int32) -> int32 {
+  if (p == 0) { return -MEO_ERR_USAGE; }
+  if (len < 1 || len > MEO_ROW_MAX) { return -MEO_ERR_USAGE; }
+  var rc: int32 = ovf_walk(p, first, len, 0);
+  if (rc != MEO_OK) { return rc; }
+  return ovf_release(p, first, ovf_pages(len));
+}

@@ -1,0 +1,472 @@
+// ovf_self: overflow page chains (table/overflow.mettle).
+//
+// A program, not @test functions: every case needs a real pager file. Prints
+// "PASS <case>" per case and "FAIL <case>: <detail>" per failing check.
+//
+//   o1_round_trip   lengths 1, payload-1, payload, payload+1, 3*payload+7,
+//                   1 MiB and 16 MiB written in one transaction, committed,
+//                   reopened and read back byte for byte.
+//   o2_reuse        write + free + write cycles reuse the freed pages, so the
+//                   file stops growing after the first cycle.
+//   o3_corrupt      a bad next pointer, a wrong page type, a loop, a wrong
+//                   byte count and a wrong length are CORRUPT, never a crash,
+//                   and a damaged chain frees nothing.
+//   o4_usage        length 0 and over MEO_ROW_MAX, null arguments.
+//   o5_rollback     a rolled-back write or free leaves page count, freelist
+//                   and chains as they were, also after reopen.
+//   o6_write_fail   a write that runs out of journal fails with NOSPC and
+//                   the rollback leaves the freelist as it was.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/format/page.mettle";
+import "../src/catalog/schema.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/table/overflow.mettle";
+import "tinytest.mettle";
+
+const OV_DB: string = "/dev/shm/meodb_ovf_self.dat";
+const OV_FRAMES: int32 = 16;
+const OV_MIB: int32 = 1048576;
+const OV_NLEN: int32 = 7;
+
+// --- helpers ---------------------------------------------------------------
+
+fn ov_remove() {
+  meo_file_unlink(OV_DB);
+  var jpath: string = OV_DB + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+}
+
+fn ov_open() -> MeoPager* {
+  return meo_pager_open(OV_DB, OV_FRAMES, MEO_PAGER_CREATE);
+}
+
+fn ov_close(p: MeoPager*) {
+  meo_pager_close(p);
+  meo_pager_free(p);
+}
+
+// Byte i of a record seeded `salt`. The high bits of i are mixed in so two
+// pages with the same offset inside the page still differ.
+fn ov_byte(i: int32, salt: int32) -> uint8 {
+  return (uint8)((i * 7 + (i >> 8) * 13 + (i >> 16) * 31 + salt) & 0xFF);
+}
+
+fn ov_fill(buf: uint8*, len: int32, salt: int32) {
+  var i: int32 = 0;
+  while (i < len) {
+    buf[i] = ov_byte(i, salt);
+    i += 1;
+  }
+}
+
+// -1 when `buf` holds the record, else the first differing index.
+fn ov_diff(buf: uint8*, len: int32, salt: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < len) {
+    if (buf[i] != ov_byte(i, salt)) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+fn ov_len(k: int32) -> int32 {
+  if (k == 0) { return 1; }
+  if (k == 1) { return MEO_OVF_PAYLOAD - 1; }
+  if (k == 2) { return MEO_OVF_PAYLOAD; }
+  if (k == 3) { return MEO_OVF_PAYLOAD + 1; }
+  if (k == 4) { return 3 * MEO_OVF_PAYLOAD + 7; }
+  if (k == 5) { return OV_MIB; }
+  return MEO_ROW_MAX;
+}
+
+// Write `len` bytes of record `salt` and answer the first page, 0 on failure.
+fn ov_put(p: MeoPager*, len: int32, salt: int32, name: string) -> uint32 {
+  var buf: uint8* = malloc((int64)len);
+  ov_fill(buf, len, salt);
+  var first: uint32 = 0;
+  var rc: int32 = meo_ovf_write(p, buf, len, &first);
+  free(buf);
+  if (!meo_t_check_i64(rc, MEO_OK, "{name}: write")) { return 0; }
+  return first;
+}
+
+// True when the chain reads back as record `salt`. The byte after the record
+// must stay untouched.
+fn ov_check(p: MeoPager*, first: uint32, len: int32, salt: int32,
+    name: string) -> bool {
+  var buf: uint8* = malloc((int64)len + 1);
+  buf[len] = 0xA5;
+  var rc: int32 = meo_ovf_read(p, first, len, buf);
+  var at: int32 = -1;
+  var ok: bool = false;
+  if (meo_t_check_i64(rc, MEO_OK, "{name}: read")) {
+    at = ov_diff(buf, len, salt);
+    ok = meo_t_check_i64(at, -1, "{name}: first differing byte");
+    if (ok) { ok = meo_t_check_i64((int64)buf[len], 0xA5, "{name}: no overrun"); }
+  }
+  free(buf);
+  return ok;
+}
+
+// Overwrite a u32 / u16 at `off` of page `page_no`, answering the old value.
+fn ov_poke32(p: MeoPager*, page_no: uint32, off: int32, v: uint32) -> uint32 {
+  var f: MeoFrame* = meo_pager_get(p, page_no, true);
+  var old: uint32 = meo_get_u32le(f->data, (int64)off);
+  meo_put_u32le(f->data, (int64)off, v);
+  meo_pager_release(p, f, true);
+  return old;
+}
+
+fn ov_poke16(p: MeoPager*, page_no: uint32, off: int32, v: uint16) -> uint16 {
+  var f: MeoFrame* = meo_pager_get(p, page_no, true);
+  var old: uint16 = meo_get_u16le(f->data, (int64)off);
+  meo_put_u16le(f->data, (int64)off, v);
+  meo_pager_release(p, f, true);
+  return old;
+}
+
+// The page that follows `page_no` in its chain.
+fn ov_next(p: MeoPager*, page_no: uint32) -> uint32 {
+  var f: MeoFrame* = meo_pager_get(p, page_no, false);
+  var next: uint32 = meo_get_u32le(f->data, (int64)MEO_PAGE_HDR);
+  meo_pager_release(p, f, false);
+  return next;
+}
+
+// --- cases -----------------------------------------------------------------
+
+fn o1_round_trip() -> int32 {
+  ov_remove();
+  var p: MeoPager* = ov_open();
+  if (!meo_t_check(p != 0, "o1: create")) { return 1; }
+  var firsts: uint32[] = new uint32[OV_NLEN];
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o1: begin")) { return 1; }
+  var k: int32 = 0;
+  while (k < OV_NLEN) {
+    firsts[k] = ov_put(p, ov_len(k), 100 + k, "o1 len {ov_len(k)}");
+    if (firsts[k] == 0) { return 1; }
+    // Read back before the commit too: the pages are still in the cache.
+    if (!ov_check(p, firsts[k], ov_len(k), 100 + k, "o1 live len {ov_len(k)}")) {
+      return 1;
+    }
+    k += 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "o1: commit")) { return 1; }
+  ov_close(p);
+
+  p = ov_open();
+  if (!meo_t_check(p != 0, "o1: reopen")) { return 1; }
+  k = 0;
+  while (k < OV_NLEN) {
+    if (!ov_check(p, firsts[k], ov_len(k), 100 + k, "o1 reopened len {ov_len(k)}")) {
+      return 1;
+    }
+    k += 1;
+  }
+  ov_close(p);
+  println("PASS o1_round_trip");
+  return 0;
+}
+
+fn o2_reuse() -> int32 {
+  ov_remove();
+  var p: MeoPager* = ov_open();
+  if (!meo_t_check(p != 0, "o2: create")) { return 1; }
+  var first: uint32 = 0;
+  var settled: uint32 = 0;
+  var cycle: int32 = 0;
+  while (cycle < 6) {
+    if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o2: begin")) { return 1; }
+    if (first != 0) {
+      if (!meo_t_check_i64(meo_ovf_free(p, first, OV_MIB), MEO_OK, "o2: free")) {
+        return 1;
+      }
+      if (!meo_t_check(meo_free_count(p) > 200, "o2: pages on the freelist")) {
+        return 1;
+      }
+    }
+    first = ov_put(p, OV_MIB, 7 + cycle, "o2 cycle {cycle}");
+    if (first == 0) { return 1; }
+    if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "o2: commit")) { return 1; }
+    // The first cycle grows the file; from the second on it must hold still.
+    if (cycle == 1) { settled = meo_pager_page_count(p); }
+    if (cycle > 1 && !meo_t_check_i64((int64)meo_pager_page_count(p),
+        (int64)settled, "o2 cycle {cycle}: page count")) {
+      return 1;
+    }
+    cycle += 1;
+  }
+  if (!ov_check(p, first, OV_MIB, 7 + 5, "o2: last record")) { return 1; }
+  // 1 MiB is 258 pages, so the file is a little over that and not a multiple.
+  if (!meo_t_check((int64)settled < 300, "o2: file size")) { return 1; }
+  ov_close(p);
+  println("PASS o2_reuse");
+  return 0;
+}
+
+fn o3_corrupt() -> int32 {
+  ov_remove();
+  var p: MeoPager* = ov_open();
+  if (!meo_t_check(p != 0, "o3: create")) { return 1; }
+  var len: int32 = 3 * MEO_OVF_PAYLOAD + 7;
+  var buf: uint8* = malloc((int64)len);
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o3: begin")) { return 1; }
+  var p1: uint32 = ov_put(p, len, 3, "o3");
+  if (p1 == 0) { return 1; }
+  var p2: uint32 = ov_next(p, p1);
+  var p3: uint32 = ov_next(p, p2);
+  var p4: uint32 = ov_next(p, p3);
+  if (!meo_t_check(p2 != 0 && p3 != 0 && p4 != 0, "o3: four pages")) { return 1; }
+  if (!meo_t_check_i64((int64)ov_next(p, p4), 0, "o3: last link")) { return 1; }
+
+  // A page that is not an overflow page at all.
+  var leaf: MeoFrame* = meo_pager_alloc(p);
+  meo_page_init(leaf->data, MEO_PAGE_BTREE_LEAF);
+  var leaf_no: uint32 = leaf->page_no;
+  meo_pager_release(p, leaf, true);
+  var count: uint32 = meo_pager_page_count(p);
+  var link: int32 = MEO_PAGE_HDR;
+  var cnt: int32 = MEO_PAGE_HDR + 4;
+  var free0: int64 = meo_free_count(p);
+
+  // Each damage: the read says CORRUPT, free says CORRUPT and frees nothing.
+  var old: uint32 = 0;
+  var old16: uint16 = (uint16)0;
+
+  old = ov_poke32(p, p2, link, count + 5);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: next past the file")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_free(p, p1, len), -MEO_ERR_CORRUPT,
+      "o3: free next past the file")) { return 1; }
+  ov_poke32(p, p2, link, old);
+
+  old = ov_poke32(p, p2, link, 0);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: chain shorter than len")) { return 1; }
+  ov_poke32(p, p2, link, old);
+
+  old = ov_poke32(p, p3, link, leaf_no);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: next is a b-tree page")) { return 1; }
+  ov_poke32(p, p3, link, old);
+
+  old = ov_poke32(p, p3, link, p2);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: loop")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_free(p, p1, len), -MEO_ERR_CORRUPT,
+      "o3: free a loop")) { return 1; }
+  ov_poke32(p, p3, link, old);
+
+  old = ov_poke32(p, p4, link, p1);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: chain longer than len")) { return 1; }
+  ov_poke32(p, p4, link, old);
+
+  old = ov_poke32(p, p1, link, 0);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: first page ends the chain")) { return 1; }
+  ov_poke32(p, p1, link, old);
+
+  old16 = ov_poke16(p, p2, cnt, (uint16)(MEO_OVF_PAYLOAD + 1));
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: count over the payload")) { return 1; }
+  ov_poke16(p, p2, cnt, (uint16)(MEO_OVF_PAYLOAD - 1));
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: count short of a full page")) { return 1; }
+  ov_poke16(p, p2, cnt, old16);
+
+  old16 = ov_poke16(p, p4, cnt, (uint16)6);
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len, buf), -MEO_ERR_CORRUPT,
+      "o3: last count wrong")) { return 1; }
+  ov_poke16(p, p4, cnt, old16);
+
+  // A first page that is not an overflow page, zero, or past the file.
+  if (!meo_t_check_i64(meo_ovf_read(p, leaf_no, len, buf), -MEO_ERR_CORRUPT,
+      "o3: first is a b-tree page")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_read(p, 0, len, buf), -MEO_ERR_CORRUPT,
+      "o3: first is page 0")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_read(p, count + 9, len, buf), -MEO_ERR_CORRUPT,
+      "o3: first past the file")) { return 1; }
+
+  // A length that disagrees with the chain, in both directions.
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len - MEO_OVF_PAYLOAD, buf),
+      -MEO_ERR_CORRUPT, "o3: len too small")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_read(p, p1, len + MEO_OVF_PAYLOAD, buf),
+      -MEO_ERR_CORRUPT, "o3: len too large")) { return 1; }
+
+  // Nothing above freed a page, and the repaired chain still reads.
+  if (!meo_t_check_i64(meo_free_count(p), free0, "o3: nothing freed")) {
+    return 1;
+  }
+  if (!ov_check(p, p1, len, 3, "o3: repaired chain")) { return 1; }
+  free(buf);
+  meo_pager_rollback(p);
+  ov_close(p);
+  println("PASS o3_corrupt");
+  return 0;
+}
+
+fn o4_usage() -> int32 {
+  ov_remove();
+  var p: MeoPager* = ov_open();
+  if (!meo_t_check(p != 0, "o4: create")) { return 1; }
+  var buf: uint8* = malloc(16);
+  var first: uint32 = 0;
+  var count: uint32 = meo_pager_page_count(p);
+  if (!meo_t_check_i64(meo_ovf_write(p, buf, 0, &first), -MEO_ERR_USAGE,
+      "o4: write len 0")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_write(p, buf, MEO_ROW_MAX + 1, &first),
+      -MEO_ERR_USAGE, "o4: write over the row max")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_write(p, 0, 16, &first), -MEO_ERR_USAGE,
+      "o4: write null data")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_write(p, buf, 16, 0), -MEO_ERR_USAGE,
+      "o4: write null out")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_write(0, buf, 16, &first), -MEO_ERR_USAGE,
+      "o4: write null pager")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_read(p, 1, 0, buf), -MEO_ERR_USAGE,
+      "o4: read len 0")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_read(p, 1, 16, 0), -MEO_ERR_USAGE,
+      "o4: read null out")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_free(p, 1, MEO_ROW_MAX + 1), -MEO_ERR_USAGE,
+      "o4: free over the row max")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)count,
+      "o4: no page taken")) { return 1; }
+  // The upper bound itself is allowed.
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o4: begin")) { return 1; }
+  var big: uint32 = ov_put(p, MEO_ROW_MAX, 1, "o4 row max");
+  if (big == 0) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_free(p, big, MEO_ROW_MAX), MEO_OK,
+      "o4: free row max")) { return 1; }
+  meo_pager_rollback(p);
+  free(buf);
+  ov_close(p);
+  println("PASS o4_usage");
+  return 0;
+}
+
+fn o5_rollback() -> int32 {
+  ov_remove();
+  var p: MeoPager* = ov_open();
+  if (!meo_t_check(p != 0, "o5: create")) { return 1; }
+  var len: int32 = 300 * MEO_OVF_PAYLOAD + 11;
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o5: begin base")) { return 1; }
+  var base: uint32 = ov_put(p, len, 21, "o5 base");
+  if (base == 0) { return 1; }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "o5: commit base")) { return 1; }
+  var count: uint32 = meo_pager_page_count(p);
+  var free0: int64 = meo_free_count(p);
+  ov_close(p);
+
+  // 1. a write that is rolled back, with the file grown and reopened around it.
+  p = ov_open();
+  if (!meo_t_check(p != 0, "o5: reopen")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o5: begin write")) { return 1; }
+  if (ov_put(p, OV_MIB, 22, "o5 rolled back") == 0) { return 1; }
+  if (!meo_t_check_i64(meo_pager_rollback(p), MEO_OK, "o5: rollback write")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)count,
+      "o5: page count after rollback")) { return 1; }
+  ov_close(p);
+
+  p = ov_open();
+  if (!meo_t_check(p != 0, "o5: reopen 2")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)count,
+      "o5: page count after reopen")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(p), free0, "o5: freelist after reopen")) {
+    return 1;
+  }
+  if (!ov_check(p, base, len, 21, "o5: base after write rollback")) { return 1; }
+
+  // 2. free + write rolled back: the old chain is whole again.
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o5: begin free")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_free(p, base, len), MEO_OK, "o5: free")) {
+    return 1;
+  }
+  if (ov_put(p, len, 23, "o5 replacement") == 0) { return 1; }
+  if (!meo_t_check_i64(meo_pager_rollback(p), MEO_OK, "o5: rollback free")) {
+    return 1;
+  }
+  ov_close(p);
+
+  p = ov_open();
+  if (!meo_t_check(p != 0, "o5: reopen 3")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)count,
+      "o5: page count after free rollback")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(p), free0, "o5: freelist after free rollback")) {
+    return 1;
+  }
+  if (!ov_check(p, base, len, 21, "o5: base after free rollback")) { return 1; }
+  ov_close(p);
+  println("PASS o5_rollback");
+  return 0;
+}
+
+fn o6_write_fail() -> int32 {
+  ov_remove();
+  var p: MeoPager* = ov_open();
+  if (!meo_t_check(p != 0, "o6: create")) { return 1; }
+  // Build 300 free pages, so the next write reuses pages whose before-images
+  // the journal has to hold.
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o6: begin")) { return 1; }
+  var first: uint32 = ov_put(p, 300 * MEO_OVF_PAYLOAD, 5, "o6 fill");
+  if (first == 0) { return 1; }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "o6: commit")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o6: begin free")) { return 1; }
+  if (!meo_t_check_i64(meo_ovf_free(p, first, 300 * MEO_OVF_PAYLOAD), MEO_OK,
+      "o6: free")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "o6: commit free")) {
+    return 1;
+  }
+  var count: uint32 = meo_pager_page_count(p);
+  var free0: int64 = meo_free_count(p);
+
+  // The cap is read at begin.
+  if (!meo_t_check_i64(meo_pager_set_journal_cap(p, 20), MEO_OK, "o6: cap")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "o6: begin fail")) { return 1; }
+  var len: int32 = 250 * MEO_OVF_PAYLOAD;
+  var buf: uint8* = malloc((int64)len);
+  ov_fill(buf, len, 6);
+  var out: uint32 = 0;
+  var rc: int32 = meo_ovf_write(p, buf, len, &out);
+  free(buf);
+  if (!meo_t_check_i64(rc, -MEO_ERR_NOSPC, "o6: write runs out of journal")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)out, 0, "o6: first_out untouched")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)count,
+      "o6: file did not grow")) { return 1; }
+  // Handing the pages back needs journal room too, so inside the doomed
+  // transaction that is best effort; the rollback is what makes it exact.
+  if (!meo_t_check_i64(meo_pager_rollback(p), MEO_OK, "o6: rollback")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_pager_page_count(p), (int64)count,
+      "o6: page count after rollback")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(p), free0, "o6: freelist after rollback")) {
+    return 1;
+  }
+  ov_close(p);
+  println("PASS o6_write_fail");
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = o1_round_trip();
+  if (rc == 0) { rc = o2_reuse(); }
+  if (rc == 0) { rc = o3_corrupt(); }
+  if (rc == 0) { rc = o4_usage(); }
+  if (rc == 0) { rc = o5_rollback(); }
+  if (rc == 0) { rc = o6_write_fail(); }
+  ov_remove();
+  return meo_t_report();
+}

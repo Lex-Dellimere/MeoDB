@@ -27,9 +27,11 @@ export const MEO_COL_UNIQUE: int32 = 4;
 export const MEO_COL_ROWID_ALIAS: int32 = 8;   // INTEGER PRIMARY KEY: value is the rowid
 export const MEO_COL_INDEXED: int32 = 16;      // a non-unique index (CREATE INDEX)
 
-// Limits: columns per table, and encoded record / index key bytes.
+// Limits: columns per table, the encoded record / index key bytes that stay in
+// a leaf, and the largest encoded record (the rest lives in overflow pages).
 export const MEO_MAX_COLS: int32 = 64;
 export const MEO_REC_MAX: int32 = 1280;
+export const MEO_ROW_MAX: int32 = 16777216;
 
 export struct MeoColumn {
   name: uint8*;          // owned by the catalog; not NUL-terminated

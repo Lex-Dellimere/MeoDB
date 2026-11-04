@@ -56,6 +56,9 @@ fn project() {
   // sorted-array oracle.
   mb_bin("btdel_self", "tests/btdel_self.mettle");
 
+  // Overflow page chains for records larger than a leaf.
+  mb_bin("ovf_self", "tests/ovf_self.mettle");
+
   // Pager, freelist and b-tree together.
   mb_bin("phase2", "tests/phase2.mettle");
 
