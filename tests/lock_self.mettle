@@ -1,0 +1,213 @@
+// lock_self: the database lock (src/conc/lock.mettle) under real threads.
+//
+//   mbuild run lock_self        (and -r for release)
+//
+// Cases, each with the bug it exists to catch:
+//   l1_count     64 threads x 10,000 enter/leave around a plain int64
+//                increment end at exactly 640,000, and the 64 thread ids are
+//                distinct and non-zero. Catches a lock that lets two holders in.
+//   l2_reenter   enter, enter, leave, leave by one thread; a second thread
+//                stays blocked until the final leave. Catches a depth that
+//                unlocks early.
+//   l3_timeout   a waiter with a 50 ms timeout gets BUSY while another thread
+//                holds the lock, and its leave is USAGE. Catches a wait that
+//                never gives up, or a non-owner taken for the owner.
+//   l4_misuse    leave of a free lock is USAGE; destroy of a held lock is BUSY.
+
+import "std/io";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/conc/lock.mettle";
+import "tinytest.mettle";
+
+const L_THREADS: int32 = 64;
+const L_ITERS: int32 = 10000;
+
+var g_lock: MeoLock* = 0;
+var g_count: int64 = 0;     // plain, guarded only by g_lock
+var g_started: int32 = 0;   // atomic
+var g_got: int32 = 0;       // atomic: the second thread got the lock
+var g_rc: int32 = 0;        // a worker's enter/leave result
+
+struct LArg {
+  id: int32;
+  err: int32;
+}
+
+// --- l1: counter ------------------------------------------------------------
+
+fn l1_worker(arg: cstring) -> uint32 {
+  var a: LArg* = (LArg*)arg;
+  a->id = (int32)GetCurrentThreadId();
+  // Keep every thread alive until all have their id, so no id is reused.
+  atomic_inc_i32(&g_started);
+  while (atomic_compare_exchange_i32(&g_started, 0, 0) < L_THREADS) {
+    thread_sleep_ms(1);
+  }
+  var i: int32 = 0;
+  while (i < L_ITERS) {
+    if (meo_lock_enter(g_lock, -1) != MEO_OK) {
+      a->err = 1;
+      break;
+    }
+    g_count += 1;
+    if (meo_lock_leave(g_lock) != MEO_OK) {
+      a->err = 2;
+      break;
+    }
+    i += 1;
+  }
+  return 0;
+}
+
+fn l1_count() -> int32 {
+  var args: LArg*[] = new LArg*[64];
+  var hs: int64[] = new int64[64];
+  var started: int32 = 0;
+  var i: int32 = 0;
+  while (i < L_THREADS) {
+    args[i] = new LArg;
+    args[i]->id = 0;
+    args[i]->err = 0;
+    hs[i] = CreateThread(0, 0, &l1_worker, (cstring)args[i], 0, 0);
+    if (hs[i] != 0) { started += 1; }
+    i += 1;
+  }
+  i = 0;
+  while (i < L_THREADS) {
+    if (hs[i] != 0) {
+      thread_join_infinite(hs[i]);
+      thread_close(hs[i]);
+    }
+    i += 1;
+  }
+  var ok: bool = meo_t_check_i64(started, L_THREADS, "l1: 64 threads started");
+  var errs: int32 = 0;
+  var bad_ids: int32 = 0;
+  i = 0;
+  while (i < L_THREADS) {
+    if (args[i]->err != 0) { errs += 1; }
+    if (args[i]->id == 0) { bad_ids += 1; }
+    var j: int32 = i + 1;
+    while (j < L_THREADS) {
+      if (args[i]->id == args[j]->id) { bad_ids += 1; }
+      j += 1;
+    }
+    i += 1;
+  }
+  ok = meo_t_check_i64(errs, 0, "l1: every enter/leave MEO_OK") && ok;
+  ok = meo_t_check_i64(bad_ids, 0, "l1: thread ids distinct and non-zero") && ok;
+  ok = meo_t_check_i64(g_count, (int64)L_THREADS * (int64)L_ITERS,
+      "l1: count is exactly 640000") && ok;
+  i = 0;
+  while (i < L_THREADS) {
+    free(args[i]);
+    i += 1;
+  }
+  free(args.data);
+  free(hs.data);
+  if (!ok) { return 1; }
+  println("PASS l1_count");
+  return 0;
+}
+
+// --- l2: re-entrancy --------------------------------------------------------
+
+fn l2_waiter(arg: cstring) -> uint32 {
+  var rc: int32 = meo_lock_enter(g_lock, -1);
+  atomic_exchange_i32(&g_got, 1);
+  if (rc == MEO_OK) { rc = meo_lock_leave(g_lock); }
+  atomic_exchange_i32(&g_rc, rc);
+  return 0;
+}
+
+fn l2_reenter() -> int32 {
+  atomic_exchange_i32(&g_got, 0);
+  atomic_exchange_i32(&g_rc, -1);
+  var ok: bool = meo_t_check_i64(meo_lock_enter(g_lock, 0), MEO_OK, "l2: enter");
+  ok = meo_t_check_i64(meo_lock_enter(g_lock, 0), MEO_OK, "l2: re-enter") && ok;
+  ok = meo_t_check(meo_lock_held(g_lock), "l2: held after two enters") && ok;
+  var h: int64 = CreateThread(0, 0, &l2_waiter, 0, 0, 0);
+  if (!meo_t_check(h != 0, "l2: thread started")) { return 1; }
+  thread_sleep_ms(100);
+  ok = meo_t_check_i64(atomic_compare_exchange_i32(&g_got, 0, 0), 0,
+      "l2: waiter blocked at depth 2") && ok;
+  ok = meo_t_check_i64(meo_lock_leave(g_lock), MEO_OK, "l2: first leave") && ok;
+  ok = meo_t_check(meo_lock_held(g_lock), "l2: still held at depth 1") && ok;
+  thread_sleep_ms(100);
+  ok = meo_t_check_i64(atomic_compare_exchange_i32(&g_got, 0, 0), 0,
+      "l2: waiter blocked at depth 1") && ok;
+  ok = meo_t_check_i64(meo_lock_leave(g_lock), MEO_OK, "l2: final leave") && ok;
+  thread_join_infinite(h);
+  thread_close(h);
+  ok = meo_t_check_i64(atomic_compare_exchange_i32(&g_got, 0, 0), 1,
+      "l2: waiter got the lock after the final leave") && ok;
+  ok = meo_t_check_i64(atomic_compare_exchange_i32(&g_rc, 0, 0), MEO_OK,
+      "l2: waiter enter/leave MEO_OK") && ok;
+  ok = meo_t_check_false(meo_lock_held(g_lock), "l2: free at the end") && ok;
+  if (!ok) { return 1; }
+  println("PASS l2_reenter");
+  return 0;
+}
+
+// --- l3: timeout and non-owner leave ----------------------------------------
+
+fn l3_waiter(arg: cstring) -> uint32 {
+  var a: LArg* = (LArg*)arg;
+  if (meo_lock_enter(g_lock, 50) != -MEO_ERR_BUSY) { a->err = 1; }
+  if (meo_lock_held(g_lock)) { a->err = 2; }
+  if (meo_lock_leave(g_lock) != -MEO_ERR_USAGE) { a->err = 3; }
+  a->id = 1;
+  return 0;
+}
+
+fn l3_timeout() -> int32 {
+  var a: LArg* = new LArg;
+  a->id = 0;
+  a->err = 0;
+  var ok: bool = meo_t_check_i64(meo_lock_enter(g_lock, 0), MEO_OK, "l3: enter");
+  var h: int64 = CreateThread(0, 0, &l3_waiter, (cstring)a, 0, 0);
+  if (!meo_t_check(h != 0, "l3: thread started")) { return 1; }
+  ok = meo_t_check_i64(thread_join(h, 5000), WAIT_OBJECT_0(),
+      "l3: waiter gave up while the lock was held") && ok;
+  thread_join_infinite(h);
+  thread_close(h);
+  ok = meo_t_check_i64(a->id, 1, "l3: waiter ran") && ok;
+  ok = meo_t_check_i64(a->err, 0,
+      "l3: waiter got BUSY, not held, leave USAGE") && ok;
+  ok = meo_t_check(meo_lock_held(g_lock), "l3: owner still holds it") && ok;
+  ok = meo_t_check_i64(meo_lock_leave(g_lock), MEO_OK, "l3: leave") && ok;
+  free(a);
+  if (!ok) { return 1; }
+  println("PASS l3_timeout");
+  return 0;
+}
+
+// --- l4: misuse -------------------------------------------------------------
+
+fn l4_misuse() -> int32 {
+  var ok: bool = meo_t_check_i64(meo_lock_leave(g_lock), -MEO_ERR_USAGE,
+      "l4: leave of a free lock");
+  ok = meo_t_check_i64(meo_lock_enter(g_lock, 0), MEO_OK, "l4: enter") && ok;
+  ok = meo_t_check_i64(meo_lock_destroy(g_lock), -MEO_ERR_BUSY,
+      "l4: destroy while held") && ok;
+  ok = meo_t_check_i64(meo_lock_leave(g_lock), MEO_OK, "l4: leave") && ok;
+  ok = meo_t_check_i64(meo_lock_destroy(g_lock), MEO_OK, "l4: destroy") && ok;
+  if (!ok) { return 1; }
+  println("PASS l4_misuse");
+  return 0;
+}
+
+fn main() -> int32 {
+  g_lock = new MeoLock;
+  if (!meo_t_check_i64(meo_lock_init(g_lock), MEO_OK, "init")) {
+    return meo_t_report();
+  }
+  var rc: int32 = l1_count();
+  if (rc == 0) { rc = l2_reenter(); }
+  if (rc == 0) { rc = l3_timeout(); }
+  if (rc == 0) { rc = l4_misuse(); }
+  free(g_lock);
+  if (rc == 0) { println("PASS lock_self"); }
+  return meo_t_report();
+}

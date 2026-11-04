@@ -86,3 +86,7 @@ main = "tests/draft.mettle"
 # Record codec round trips and corrupt-input checks.
 [bin.record_self]
 main = "tests/record_self.mettle"
+
+# The db lock under 64 threads.
+[bin.lock_self]
+main = "tests/lock_self.mettle"
