@@ -593,13 +593,13 @@ fn tbl_finish(db: MeoDb*, t: MeoTable*, rc: int32, dirty: bool) -> int32 {
 // Report one finished row write to the attached feed, if any. Called only
 // after the whole write succeeded; a rollback drops what it recorded.
 fn tbl_feed(db: MeoDb*, t: MeoTable*, kind: int32, rowid: int64, old_rowid: int64,
-    rec: uint8*, rec_len: int32) {
+    rec: uint8*, rec_len: int32, old_rec: uint8*, old_rec_len: int32) {
   var f: MeoFeed* = meo_feed_of(db->pager);
   if (f == 0) { return; }
   var k: uint8[8];
   meo_key_rowid(&k[0], 8, rowid);
   meo_feed_capture(f, (uint32)t->id, kind, &k[0], 8, (uint64)rowid, (uint64)old_rowid,
-    rec, rec_len);
+    rec, rec_len, old_rec, old_rec_len);
 }
 
 // Phase B: write one row that meo_tbl_check_rows accepted, under `rowid`, and
@@ -622,7 +622,7 @@ export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
   if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, rowid, true, kbuf, &dirty); }
   free(kbuf);
   rc = tbl_finish(db, t, rc, dirty);
-  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_INSERT, rowid, 0, buf + 8, len - 8); }
+  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_INSERT, rowid, 0, buf + 8, len - 8, 0, 0); }
   free(buf);
   if (rc != MEO_OK) { return rc; }
   db->last_rowid = rowid;
@@ -649,7 +649,7 @@ export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   if (rc == 1) { return -MEO_ERR_CORRUPT; }
   if (rc == MEO_OK && first != 0) { rc = meo_ovf_free(db->pager, first, row.rec_len); }
   rc = tbl_finish(db, t, rc, dirty);
-  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_DELETE, rowid, 0, row.rec, row.rec_len); }
+  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_DELETE, rowid, 0, row.rec, row.rec_len, 0, 0); }
   return rc;
 }
 
@@ -690,7 +690,8 @@ export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*
   if (rc == MEO_OK && first != 0) { rc = meo_ovf_free(db->pager, first, row.rec_len); }
   if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, nid, true, kbuf, &dirty); }
   rc = tbl_finish(db, t, rc, dirty);
-  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_REPLACE, nid, rowid, buf + 8, len - 8); }
+  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_REPLACE, nid, rowid, buf + 8, len - 8, row.rec,
+    row.rec_len); }
   return rc;
 }
 
@@ -1086,6 +1087,29 @@ export fn meo_tbl_row_get(t: MeoTable*, row: MeoTblRow*, col: int32, out: MeoVal
     return MEO_OK;
   }
   return meo_rec_get(row->rec, row->rec_len, col, out);
+}
+
+// Decode every column of a stored record (a feed event's val or old_val, or a
+// row's rec) into out[0..n), n == t->n_cols. The rowid alias column gets the
+// rowid as an INT; a column past the record's end (written before ADD COLUMN)
+// is NULL. TEXT and BLOB values borrow rec. MEO_OK, -MEO_ERR_USAGE for bad
+// arguments, -MEO_ERR_CORRUPT for a malformed record.
+export fn meo_tbl_row_values(t: MeoTable*, rowid: int64, rec: uint8*, rec_len: int32,
+    out: MeoValue*, n: int32) -> int32 {
+  if (t == 0 || out == 0 || n != t->n_cols || (rec == 0 && rec_len > 0)) {
+    return -MEO_ERR_USAGE;
+  }
+  var row: MeoTblRow;
+  row.rowid = rowid;
+  row.rec = rec;
+  row.rec_len = rec_len;
+  var i: int32 = 0;
+  while (i < n) {
+    var rc: int32 = meo_tbl_row_get(t, &row, i, &out[i]);
+    if (rc != MEO_OK) { return rc; }
+    i += 1;
+  }
+  return MEO_OK;
 }
 
 // Build an index tree over every row of t for column `col` into *root (0 on

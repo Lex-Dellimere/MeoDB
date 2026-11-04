@@ -484,6 +484,12 @@ export fn meo_db_snap_begin(db: MeoDb*, out: MeoDb**) -> int32 {
   return MEO_OK;
 }
 
+// The commit_seq a view's snapshot reads, 0 for a handle that is not a view.
+export fn meo_db_snap_commit_seq(v: MeoDb*) -> uint64 {
+  if (v == 0 || v->view_of == 0) { return 0; }
+  return meo_pager_commit_seq(v->pager);
+}
+
 // End a view. -MEO_ERR_BUSY, with nothing ended, while a page is pinned.
 export fn meo_db_snap_end(v: MeoDb*) -> int32 {
   if (v == 0 || v->view_of == 0) { return -MEO_ERR_USAGE; }

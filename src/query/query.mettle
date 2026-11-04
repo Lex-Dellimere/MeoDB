@@ -693,13 +693,22 @@ fn q_scan_locked(db: MeoDb*, table: string, x: string, y: string, group: string,
   return q_scan_full(db, t, sc);
 }
 
-fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QScan*) -> int32 {
+// seq_out (may be 0) gets the commit_seq the scan read.
+fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QScan*,
+    seq_out: uint64*) -> int32 {
+  if (seq_out != 0) { seq_out[0] = 0; }
+  // A snapshot view the caller owns: scan it as it stands.
+  if (db->view_of != 0) {
+    if (seq_out != 0) { seq_out[0] = meo_db_snap_commit_seq(db); }
+    return q_scan_locked(db, table, x, y, group, sc);
+  }
   // WAL mode, no lock held by this thread: scan a snapshot, never block on a
   // writer. A thread inside its own transaction scans its own writes.
   if (db->wal && !meo_lock_held(&db->lock)) {
     var v: MeoDb* = 0;
     var src: int32 = meo_db_snap_begin(db, &v);
     if (src != MEO_OK) { return src; }
+    if (seq_out != 0) { seq_out[0] = meo_db_snap_commit_seq(v); }
     src = q_scan_locked(v, table, x, y, group, sc);
     var e: int32 = meo_db_snap_end(v);
     if (src >= 0 && e < 0) { src = e; }
@@ -707,6 +716,7 @@ fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QS
   }
   var rc: int32 = meo_db_enter(db);
   if (rc != MEO_OK) { return rc; }
+  if (seq_out != 0) { seq_out[0] = meo_pager_commit_seq(db->pager); }
   rc = q_scan_locked(db, table, x, y, group, sc);
   meo_db_leave(db);
   return rc;
@@ -724,9 +734,19 @@ fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QS
 //
 // The callback runs with a page pinned: keep it quick and do not call back
 // into this db. In rollback mode it runs under the db lock; in WAL mode it
-// runs on a snapshot, holding it (not the lock) for the whole scan.
+// runs on a snapshot, holding it (not the lock) for the whole scan. A db that
+// is a snapshot view (meo_db_snap_begin) is scanned as it stands, no lock.
 export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: float64,
     hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32, ctx: rawptr) -> int32 {
+  return meo_q_scan_xy_seq(db, table, x, y, lo, hi, meo_scan_cb, ctx, 0);
+}
+
+// meo_q_scan_xy that also reports, in *seq_out, the commit_seq the scan read:
+// the snapshot's in WAL mode, the pager's under the lock otherwise (inside the
+// caller's own transaction, the value as of its last commit).
+export fn meo_q_scan_xy_seq(db: MeoDb*, table: string, x: string, y: string, lo: float64,
+    hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32, ctx: rawptr,
+    seq_out: uint64*) -> int32 {
   if (db == 0 || meo_scan_cb == 0) { return -MEO_ERR_USAGE; }
   var sc: QScan;
   sc.fn_xy = meo_scan_cb;
@@ -735,7 +755,7 @@ export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: flo
   sc.grouped = false;
   sc.lo = lo;
   sc.hi = hi;
-  return q_scan(db, table, x, y, "", &sc);
+  return q_scan(db, table, x, y, "", &sc, seq_out);
 }
 
 // meo_q_scan_xy with a grouping column: meo_scan_gcb(ctx, group, x, y). The
@@ -744,6 +764,15 @@ export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: flo
 export fn meo_q_scan_xyg(db: MeoDb*, table: string, x: string, y: string, group: string,
     lo: float64, hi: float64, meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32,
     ctx: rawptr) -> int32 {
+  return meo_q_scan_xyg_seq(db, table, x, y, group, lo, hi, meo_scan_gcb, ctx, 0);
+}
+
+// meo_q_scan_xyg that also reports the commit_seq the scan read, as
+// meo_q_scan_xy_seq does.
+export fn meo_q_scan_xyg_seq(db: MeoDb*, table: string, x: string, y: string,
+    group: string, lo: float64, hi: float64,
+    meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32, ctx: rawptr,
+    seq_out: uint64*) -> int32 {
   if (db == 0 || meo_scan_gcb == 0) { return -MEO_ERR_USAGE; }
   var sc: QScan;
   sc.fn_xy = 0;
@@ -752,5 +781,5 @@ export fn meo_q_scan_xyg(db: MeoDb*, table: string, x: string, y: string, group:
   sc.grouped = true;
   sc.lo = lo;
   sc.hi = hi;
-  return q_scan(db, table, x, y, group, &sc);
+  return q_scan(db, table, x, y, group, &sc, seq_out);
 }

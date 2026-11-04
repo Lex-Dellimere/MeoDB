@@ -67,6 +67,10 @@
 //   and its cursor jumps to the oldest retained event. A GAP, from either
 //   source, means "reload fully, then continue".
 //
+// Waiting: meo_feed_wait sleeps on a futex word (MeoFeed.wake) that every
+// publish bumps under the lock, so a reader that saw nothing pending and then
+// sleeps on the word it read cannot miss a publish.
+//
 // Threading: ONE writer thread per pager (the pager is not thread-safe, and
 // the pending buffer, the overflow flag and the attachment are writer-only).
 // Readers (meo_feed_read, meo_feed_pending_for, meo_feed_last_commit,
@@ -78,6 +82,8 @@ import "std/mem";
 import "std/thread";
 import "../error/status.mettle";
 import "../format/bytes.mettle";
+import "../platform/clock_linux.mettle" if linux;
+import "../platform/futex_linux.mettle" if linux;
 import "../pager/pager.mettle";
 import "../btree/btree.mettle";
 
@@ -91,7 +97,7 @@ export const MEO_CHANGE_DELETE: int32 = 5;    // row deleted; val = the deleted 
 export const MEO_FEED_PENDING_MAX: int32 = 65536;
 // Largest ring meo_feed_new accepts.
 export const MEO_FEED_MAX_CAP: int32 = 1048576;
-// A key buffer of this many bytes holds any one event's key plus value, so a
+// A key buffer of this many bytes holds any one event's key plus values, so a
 // reader passing keycap >= MEO_FEED_MAX_KEY always makes progress.
 export const MEO_FEED_MAX_KEY: int32 = 4096;
 
@@ -111,7 +117,8 @@ export const MEO_FEED_STAGE_MAX: int32 = 512;
 // (new row), REPLACE (update; old_rowid = rowid before, rowid = rowid after,
 // equal unless the INTEGER PRIMARY KEY changed; val = the new row), DELETE
 // (val = the deleted row). table_id is the catalog table id (MeoTable.id,
-// stable for the db's lifetime). Table writes never emit ROOT_MOVED.
+// stable for the db's lifetime). Table writes never emit ROOT_MOVED. A REPLACE
+// from a table write also carries the row it replaced as old_val.
 export struct MeoChange {
   seq: uint64;        // global event sequence, 1, 2, 3...; never reused
   commit_seq: uint64; // the persisted commit counter of the commit
@@ -124,6 +131,8 @@ export struct MeoChange {
   old_rowid: uint64;  // REPLACE: the previous rowid; ROOT_MOVED: the old root
   val: uint8*;        // into keybuf right after the key; 0 when val_len == 0
   val_len: int32;
+  old_val: uint8*;    // into keybuf right after val; 0 when old_val_len == 0
+  old_val_len: int32; // REPLACE from a table write: the replaced row's record
 }
 
 // A reader's position: the seq of the next event it wants. A zeroed cursor
@@ -149,11 +158,15 @@ export struct MeoFeedRec {
   val: uint8*;
   val_len: int32;
   val_cap: int32;
+  old_val: uint8*;
+  old_val_len: int32;
+  old_val_cap: int32;
 }
 
 // The feed. Fields are private to this module; use the functions.
 export struct MeoFeed {
   lock: int32;          // spin lock over ring, the seq counters, the stage FIFO
+  wake: int32;          // futex word, bumped under the lock on every publish
   ring: MeoFeedRec*;
   cap: int32;
   first_seq: uint64;    // oldest retained event
@@ -208,6 +221,7 @@ export fn meo_feed_new(cap: int32) -> MeoFeed* {
     return 0;
   }
   f->lock = 0;
+  f->wake = 0;
   f->ring = ring.data;
   f->cap = cap;
   f->first_seq = 1;
@@ -239,6 +253,10 @@ fn feed_free_keys(recs: MeoFeedRec*, n: int32) {
     if (recs[i].val != 0) {
       free(recs[i].val);
       recs[i].val = 0;
+    }
+    if (recs[i].old_val != 0) {
+      free(recs[i].old_val);
+      recs[i].old_val = 0;
     }
     i += 1;
   }
@@ -312,10 +330,10 @@ fn feed_pend_reserve(f: MeoFeed*) -> bool {
 // describes has already happened.
 fn feed_pend(f: MeoFeed*, table_id: uint32, kind: int32, key: uint8*,
     key_len: int32, rowid: uint64, old_rowid: uint64, val: uint8*,
-    val_len: int32) {
+    val_len: int32, old_val: uint8*, old_val_len: int32) {
   if (f->overflowed) { return; }
   // One event must fit a reader's MEO_FEED_MAX_KEY buffer, or it could stall.
-  if (key_len + val_len > MEO_FEED_MAX_KEY) {
+  if (key_len + val_len + old_val_len > MEO_FEED_MAX_KEY) {
     feed_overflow(f);
     return;
   }
@@ -344,10 +362,22 @@ fn feed_pend(f: MeoFeed*, table_id: uint32, kind: int32, key: uint8*,
     r->val = vbuf;
     r->val_cap = val_len;
   }
+  if (old_val_len > r->old_val_cap) {
+    var obuf: uint8* = malloc((int64)old_val_len);
+    if (obuf == 0) {
+      feed_overflow(f);
+      return;
+    }
+    if (r->old_val != 0) { free(r->old_val); }
+    r->old_val = obuf;
+    r->old_val_cap = old_val_len;
+  }
   if (key_len > 0) { meo_bytes_copy(r->key, key, (int64)key_len); }
   if (val_len > 0) { meo_bytes_copy(r->val, val, (int64)val_len); }
+  if (old_val_len > 0) { meo_bytes_copy(r->old_val, old_val, (int64)old_val_len); }
   r->key_len = key_len;
   r->val_len = val_len;
+  r->old_val_len = old_val_len;
   r->seq = 0;
   r->commit_seq = 0;
   r->time_us = 0;
@@ -372,12 +402,17 @@ fn feed_ring_push(f: MeoFeed*, src: MeoFeedRec*, kind: int32,
     var kc: int32 = slot->key_cap;
     var v: uint8* = slot->val;
     var vc: int32 = slot->val_cap;
+    var ov: uint8* = slot->old_val;
+    var ovc: int32 = slot->old_val_cap;
     slot->key = src->key;
     slot->key_cap = src->key_cap;
     slot->key_len = src->key_len;
     slot->val = src->val;
     slot->val_cap = src->val_cap;
     slot->val_len = src->val_len;
+    slot->old_val = src->old_val;
+    slot->old_val_cap = src->old_val_cap;
+    slot->old_val_len = src->old_val_len;
     slot->table_id = src->table_id;
     slot->rowid = src->rowid;
     slot->old_rowid = src->old_rowid;
@@ -387,9 +422,13 @@ fn feed_ring_push(f: MeoFeed*, src: MeoFeedRec*, kind: int32,
     src->val = v;
     src->val_cap = vc;
     src->val_len = 0;
+    src->old_val = ov;
+    src->old_val_cap = ovc;
+    src->old_val_len = 0;
   } else {
     slot->key_len = 0;
     slot->val_len = 0;
+    slot->old_val_len = 0;
     slot->table_id = 0;
     slot->rowid = 0;
     slot->old_rowid = 0;
@@ -402,6 +441,12 @@ fn feed_ring_push(f: MeoFeed*, src: MeoFeedRec*, kind: int32,
   if (f->next_seq - f->first_seq > (uint64)f->cap) {
     f->first_seq = f->next_seq - (uint64)f->cap;
   }
+}
+
+// Tell waiters something was published. Caller holds the lock; the futex wake
+// follows after it is released.
+fn feed_bump(f: MeoFeed*) {
+  f->wake += 1;
 }
 
 // Move the pending events (or one GAP) into the ring as staged events, past
@@ -463,7 +508,9 @@ fn feed_commit_staged(f: MeoFeed*, commit_seq: uint64, t: int64) {
   }
   f->last_commit = commit_seq;
   f->last_time = t;
+  feed_bump(f);
   spin_unlock(&f->lock);
+  meo_futex_wake(&f->wake, 2147483647);
 }
 
 // hook_commit: the transaction is durable. Publish its pending events (or one
@@ -490,7 +537,9 @@ fn meo_feed_on_commit(ctx: rawptr, commit_seq: uint64, time_us: int64) {
   f->visible_seq = f->next_seq;
   f->last_commit = commit_seq;
   f->last_time = t;
+  feed_bump(f);
   spin_unlock(&f->lock);
+  meo_futex_wake(&f->wake, 2147483647);
   f->overflowed = false;
   feed_drop_pending(f);
 }
@@ -510,7 +559,9 @@ fn meo_feed_on_event(ctx: rawptr, code: int32) {
     f->st_head = 0;
     f->st_n = 0;
     f->gap_next = true;
+    feed_bump(f);
     spin_unlock(&f->lock);
+    meo_futex_wake(&f->wake, 2147483647);
     return;
   }
   feed_drop_pending(f);
@@ -592,11 +643,11 @@ export fn meo_feed_insert(f: MeoFeed*, p: MeoPager*, table_id: uint32,
   }
   var rc: int32 = meo_bt_insert(p, root, meo_cmp_cb, key, rowid);
   if (rc != MEO_OK) { return rc; }
-  feed_pend(f, table_id, kind, key.data, key.len, rowid, old_rowid, 0, 0);
+  feed_pend(f, table_id, kind, key.data, key.len, rowid, old_rowid, 0, 0, 0, 0);
   var new_root: uint32 = root[0];
   if (new_root != old_root) {
     feed_pend(f, table_id, MEO_CHANGE_ROOT_MOVED, 0, 0, (uint64)new_root,
-      (uint64)old_root, 0, 0);
+      (uint64)old_root, 0, 0, 0, 0);
   }
   return MEO_OK;
 }
@@ -611,9 +662,10 @@ export fn meo_feed_of(p: MeoPager*) -> MeoFeed* {
 // db lock. A no-op when f == 0; never fails (same rule as feed_pend).
 export fn meo_feed_capture(f: MeoFeed*, table_id: uint32, kind: int32,
     key: uint8*, key_len: int32, rowid: uint64, old_rowid: uint64,
-    val: uint8*, val_len: int32) {
+    val: uint8*, val_len: int32, old_val: uint8*, old_val_len: int32) {
   if (f == 0) { return; }
-  feed_pend(f, table_id, kind, key, key_len, rowid, old_rowid, val, val_len);
+  feed_pend(f, table_id, kind, key, key_len, rowid, old_rowid, val, val_len,
+    old_val, old_val_len);
 }
 
 // --- readers (any thread) --------------------------------------------------
@@ -628,9 +680,9 @@ fn feed_cursor_pos(cur: MeoFeedCursor*) -> uint64 {
 // the cursor. Returns the count (0 = nothing new). A cursor behind the ring
 // first receives one MEO_CHANGE_GAP (seq = the newest lost seq, commit_seq and time_us = those of
 // the newest published commit) and jumps to the oldest retained event. Stops
-// early when the next key plus value would not fit keybuf; -MEO_ERR_FULL only
+// early when the next key plus values would not fit keybuf; -MEO_ERR_FULL only
 // when not even one event fits (MEO_FEED_MAX_KEY bytes hold any one event's key
-// plus value, so keycap >= MEO_FEED_MAX_KEY always fits). -MEO_ERR_USAGE for
+// plus values, so keycap >= MEO_FEED_MAX_KEY always fits). -MEO_ERR_USAGE for
 // bad arguments or a cursor past the newest event (one from another feed).
 export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
     cap: int32, keybuf: uint8*, keycap: int32) -> int32 {
@@ -658,6 +710,8 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
     g->key_len = 0;
     g->val = 0;
     g->val_len = 0;
+    g->old_val = 0;
+    g->old_val_len = 0;
     g->rowid = 0;
     g->old_rowid = 0;
     n = 1;
@@ -665,7 +719,7 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
   }
   while (n < cap && pos < f->visible_seq) {
     var r: MeoFeedRec* = &f->ring[(int64)((pos - 1) % (uint64)f->cap)];
-    if (r->key_len + r->val_len > keycap - used) {
+    if (r->key_len + r->val_len + r->old_val_len > keycap - used) {
       if (n == 0) { rc = -MEO_ERR_FULL; }
       break;
     }
@@ -693,6 +747,14 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
       c->val = 0;
     }
     used += r->val_len;
+    c->old_val_len = r->old_val_len;
+    if (r->old_val_len > 0) {
+      meo_bytes_copy(keybuf + used, r->old_val, (int64)r->old_val_len);
+      c->old_val = keybuf + used;
+    } else {
+      c->old_val = 0;
+    }
+    used += r->old_val_len;
     n += 1;
     pos += 1;
   }
@@ -711,6 +773,32 @@ export fn meo_feed_pending_for(f: MeoFeed*, cur: MeoFeedCursor*) -> bool {
   var more: bool = pos < f->visible_seq;
   spin_unlock(&f->lock);
   return more;
+}
+
+// Wait until something is pending for the cursor, up to timeout_ms (< 0 waits
+// without limit). 1 when there is, 0 on timeout; -MEO_ERR_USAGE for bad
+// arguments. Any thread. Does not move the cursor.
+export fn meo_feed_wait(f: MeoFeed*, cur: MeoFeedCursor*, timeout_ms: int32) -> int32 {
+  if (f == 0 || cur == 0) { return -MEO_ERR_USAGE; }
+  var pos: uint64 = feed_cursor_pos(cur);
+  var t0: int64 = meo_clock_monotonic_us();
+  while (true) {
+    // The word and the check are read under one lock hold: a publish after
+    // this changes the word, so the futex wait below returns at once.
+    spin_lock(&f->lock);
+    var more: bool = pos < f->visible_seq;
+    var w: int32 = f->wake;
+    spin_unlock(&f->lock);
+    if (more) { return 1; }
+    var left: int32 = -1;
+    if (timeout_ms >= 0) {
+      var spent: int64 = (meo_clock_monotonic_us() - t0 + 999) / 1000;
+      if (spent >= (int64)timeout_ms) { return 0; }
+      left = timeout_ms - (int32)spent;
+    }
+    meo_futex_wait(&f->wake, w, left);
+  }
+  return 0;
 }
 
 // commit_seq of the newest commit this feed published, 0 before the first.
