@@ -4,7 +4,7 @@ Milestones in build order. A milestone is done when every exit criterion is chec
 
 ## M0 — Storage (done)
 Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback journal.
-- [x] 12 bins green debug + release, 0 warnings (commit 65b533f).
+- [x] 12 bins green debug + release, 0 warnings (commit afae010).
 
 ## M1 — Phase-3 gate (done)
 The b-tree is proven on top of the journal before SQL depends on it.
