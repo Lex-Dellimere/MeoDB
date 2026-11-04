@@ -2,6 +2,8 @@
 
 Milestones in build order, with one exception: the network server (M7, without remote subscribe) comes straight after M2, because flux_orm reaches MeoDB over the network instead of compiling it in. Remote subscribe follows M4. A milestone is done when every exit criterion is checked by a `[bin.*]` test that passes in debug and release with zero warnings. Layer numbers refer to `docs/ARCHITECTURE.md`.
 
+Direction: one ordered storage engine with every data model as a layer on top (tables, documents, graph, key-value, time series, search), all in one transaction system and one change feed. Realtime comes from live queries kept up to date incrementally. Fault tolerance and scale come from running each shard as an alph actor with Raft replication. Techniques are copied from systems that proved them: PostgreSQL (MVCC, constraints, row-level security), SQLite (WAL), FoundationDB and TigerBeetle (deterministic simulation), CockroachDB and TiKV (range sharding, Raft per range), Materialize and RethinkDB (live queries), Firebase (client sync, security rules), Neo4j (graph model). Order: a solid single node (M5, M13, M7b), then realtime (M7 subscribe, M11), then fault tolerance (M12, M8, M9), then scale (M10), then more models (M6, M15).
+
 ## M0 — Storage (done)
 Pager, freelist, page format, key encoding, B+ tree insert/seek/next, rollback journal.
 - [x] 12 bins green debug + release, 0 warnings (commit afae010).
@@ -97,3 +99,33 @@ Layer 10.
 - [ ] Single-shard reads and writes have the same semantics as M2.
 - [ ] Cross-shard reads (scatter-gather) are correct; cross-shard writes use two-phase commit, and a coordinator crash resolves every in-doubt txn.
 - [ ] Rebalancing moves a range between groups while it serves traffic.
+
+## M11 — Live queries
+Layer 6b. Consumers: raize_web, mistplot dashboards. Copies Materialize / RethinkDB changefeeds.
+- [ ] A client subscribes to a typed SELECT and gets the initial result, then only inserts, updates and removals of result rows, in commit order.
+- [ ] Results are maintained incrementally from the change feed; a subscription never re-runs its query on every commit.
+- [ ] Remote subscribe over TCP; a slow subscriber is resynced, never blocks the writer.
+
+## M12 — Server on alph
+Layer 8b. Each connection is an alph session actor; the storage engine is one bound actor under a static supervisor; blocking I/O goes through an alph pool.
+- [ ] Same wire behaviour and test results as the thread server (`srv_*` tests pass unchanged).
+- [ ] A crashed session is restarted or cleaned up by its supervisor without touching other sessions.
+
+## M13 — Documents and relational integrity
+Layers 3 and 5. Consumers: raize_auth (users and credentials), flux_orm apps. Copies PostgreSQL.
+- [ ] A JSON document column type with path reads and indexes on paths, in the same rows and transactions as relational columns.
+- [ ] Foreign keys (with ON DELETE actions), CHECK constraints, column defaults.
+- [ ] Inner and left joins, GROUP BY with COUNT/SUM/MIN/MAX/AVG.
+- [ ] Composite indexes.
+
+## M14 — Deterministic simulation and fuzzing
+Shared with alph. Copies FoundationDB and TigerBeetle.
+- [ ] The engine runs against a simulated disk, clock and network; any failing seed replays exactly.
+- [ ] Fuzzers for the wire codec, page, record and catalog decoders.
+- [ ] Thousands of simulated crash and partition runs per day with no lost committed write.
+
+## M15 — More models
+Layer 7. Each model is a layer over the same tables and transactions.
+- [ ] Key-value with expiry (sessions, rate limits).
+- [ ] Time series retention and downsampling.
+- [ ] Full-text search (inverted index, BM25) and vector search (HNSW).
