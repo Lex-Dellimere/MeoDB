@@ -1,0 +1,177 @@
+// query/spec: the description of one query, filled by the meo_q_* builders and
+// read by query/plan. Exported because Mettle exports are global; not part of
+// the documented API.
+//
+// Every name is an owned copy and every array a growable buffer owned by the
+// spec (meo_qspec_free). Values are not stored here: terms, assignments and
+// INSERT cells name value slots of the query by index.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../format/bytes.mettle";
+import "../record/value.mettle";
+
+// Query kinds (MeoQSpec.kind).
+export const MEO_Q_K_CREATE: int32 = 1;
+export const MEO_Q_K_INSERT: int32 = 2;
+export const MEO_Q_K_SELECT: int32 = 3;
+export const MEO_Q_K_UPDATE: int32 = 4;
+export const MEO_Q_K_DELETE: int32 = 5;
+
+// Filter kinds (MeoQTerm.kind).
+export const MEO_Q_EQ: int32 = 1;
+export const MEO_Q_IN: int32 = 2;
+export const MEO_Q_IS_NULL: int32 = 3;
+export const MEO_Q_NOT_NULL: int32 = 4;
+export const MEO_Q_LT: int32 = 5;
+export const MEO_Q_LE: int32 = 6;
+export const MEO_Q_GT: int32 = 7;
+export const MEO_Q_GE: int32 = 8;
+export const MEO_Q_NE: int32 = 9;
+
+export struct MeoQName {
+  p: uint8*;             // owned, NUL-terminated
+  n: int32;
+}
+
+export struct MeoQColDef {
+  name: MeoQName;
+  affinity: int32;       // MEO_T_INT | REAL | TEXT | BLOB
+  cflags: int32;         // MEO_COL_PK | NOT_NULL | UNIQUE
+}
+
+export struct MeoQTerm {
+  kind: int32;           // MEO_Q_EQ..NE
+  col: MeoQName;
+  v0: int32;             // value slots [v0, v0 + n_v)
+  n_v: int32;
+}
+
+export struct MeoQOrder {
+  col: MeoQName;
+  desc: bool;
+}
+
+export struct MeoQAssign {
+  col: MeoQName;
+  v: int32;              // value slot
+}
+
+export struct MeoQSpec {
+  kind: int32;           // MEO_Q_K_*
+  table: MeoQName;
+  if_not_exists: bool;
+  cols: MeoQColDef*;     // CREATE
+  n_cols: int32;
+  cap_cols: int32;
+  names: MeoQName*;      // INSERT column list / SELECT pick; 0 = every column
+  n_names: int32;
+  cap_names: int32;
+  cells_v0: int32;       // INSERT cells are slots [cells_v0, cells_v0 + n_cells)
+  n_cells: int32;
+  sets: MeoQAssign*;
+  n_sets: int32;
+  cap_sets: int32;
+  terms: MeoQTerm*;
+  n_terms: int32;
+  cap_terms: int32;
+  order: MeoQOrder*;
+  n_order: int32;
+  cap_order: int32;
+  limit: int64;          // -1 = none
+  offset: int64;
+}
+
+export fn meo_qspec_init(s: MeoQSpec*, kind: int32) {
+  s->kind = kind;
+  s->table.p = 0;
+  s->table.n = 0;
+  s->if_not_exists = false;
+  s->cols = 0;
+  s->n_cols = 0;
+  s->cap_cols = 0;
+  s->names = 0;
+  s->n_names = 0;
+  s->cap_names = 0;
+  s->cells_v0 = 0;
+  s->n_cells = 0;
+  s->sets = 0;
+  s->n_sets = 0;
+  s->cap_sets = 0;
+  s->terms = 0;
+  s->n_terms = 0;
+  s->cap_terms = 0;
+  s->order = 0;
+  s->n_order = 0;
+  s->cap_order = 0;
+  s->limit = -1;
+  s->offset = 0;
+}
+
+fn qspec_name_free(nm: MeoQName*) {
+  if (nm->p != 0) { free(nm->p); }
+  nm->p = 0;
+  nm->n = 0;
+}
+
+export fn meo_qspec_free(s: MeoQSpec*) {
+  qspec_name_free(&s->table);
+  var i: int32 = 0;
+  while (i < s->n_cols) {
+    qspec_name_free(&s->cols[i].name);
+    i += 1;
+  }
+  i = 0;
+  while (i < s->n_names) {
+    qspec_name_free(&s->names[i]);
+    i += 1;
+  }
+  i = 0;
+  while (i < s->n_sets) {
+    qspec_name_free(&s->sets[i].col);
+    i += 1;
+  }
+  i = 0;
+  while (i < s->n_terms) {
+    qspec_name_free(&s->terms[i].col);
+    i += 1;
+  }
+  i = 0;
+  while (i < s->n_order) {
+    qspec_name_free(&s->order[i].col);
+    i += 1;
+  }
+  if (s->cols != 0) { free(s->cols); }
+  if (s->names != 0) { free(s->names); }
+  if (s->sets != 0) { free(s->sets); }
+  if (s->terms != 0) { free(s->terms); }
+  if (s->order != 0) { free(s->order); }
+  meo_qspec_init(s, s->kind);
+}
+
+// Copy `src` into an owned name. MEO_OK, -MEO_ERR_TOOBIG, -MEO_ERR_NOMEM.
+export fn meo_qspec_name(nm: MeoQName*, src: string) -> int32 {
+  nm->p = 0;
+  nm->n = 0;
+  var n: int64 = (int64)src.length;
+  if (n > (int64)2147483646) { return -MEO_ERR_TOOBIG; }
+  var p: uint8* = malloc(n + 1);
+  if (p == 0) { return -MEO_ERR_NOMEM; }
+  meo_bytes_copy(p, src.chars, n);
+  p[n] = 0;
+  nm->p = p;
+  nm->n = (int32)n;
+  return MEO_OK;
+}
+
+// Room for element `n` of an array of `elem`-byte items with capacity *cap:
+// the same or a moved block, or 0 (the old block is kept).
+export fn meo_qspec_grow(p: rawptr, n: int32, cap: int32*, elem: int64) -> rawptr {
+  if (n < cap[0]) { return p; }
+  var nc: int32 = cap[0] * 2;
+  if (nc < 4) { nc = 4; }
+  var np: rawptr = realloc(p, (int64)nc * elem);
+  if (np == 0) { return 0; }
+  cap[0] = nc;
+  return np;
+}

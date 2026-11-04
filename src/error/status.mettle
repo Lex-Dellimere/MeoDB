@@ -1,7 +1,7 @@
 // error/status: the single status-code contract.
 //
 // Codes 1..12 are fixed by PHASE1.md section 2; 13..18 were appended for the
-// SQL layer (.apex/DECISIONS.md D8). The set is APPEND-ONLY: a new code takes
+// tables and queries (.apex/DECISIONS.md D8). The set is APPEND-ONLY: a new code takes
 // the next free number, and no existing code is ever removed, renumbered or
 // reordered, because on-disk/API compatibility and the flux_orm RC mapping
 // depend on the numbers. Every meo_* function returns MEO_OK (0) or a positive count on
@@ -26,7 +26,7 @@ export const MEO_ERR_READONLY: int32 = 12;
 export const MEO_ERR_CONFLICT: int32 = 13;    // duplicate PRIMARY KEY / UNIQUE
 export const MEO_ERR_CONSTRAINT: int32 = 14;  // NOT NULL violation
 export const MEO_ERR_TX: int32 = 15;          // nested begin, none open, wrong thread
-export const MEO_ERR_SQL: int32 = 16;         // bad SQL, unknown table or column
+export const MEO_ERR_SCHEMA: int32 = 16;      // unknown or duplicate table or column
 export const MEO_ERR_TOOBIG: int32 = 17;      // row or key over the size limit
 export const MEO_ERR_MISMATCH: int32 = 18;    // value type does not fit the request
 
@@ -79,7 +79,7 @@ export fn meo_status_name(code: int32) -> string {
     case 13: { return "CONFLICT"; }
     case 14: { return "CONSTRAINT"; }
     case 15: { return "TX"; }
-    case 16: { return "SQL"; }
+    case 16: { return "SCHEMA"; }
     case 17: { return "TOOBIG"; }
     case 18: { return "MISMATCH"; }
   }
@@ -125,7 +125,7 @@ fn meo_status_lname(code: int32) -> string {
     case 13: { return "conflict"; }
     case 14: { return "constraint"; }
     case 15: { return "tx"; }
-    case 16: { return "sql"; }
+    case 16: { return "schema"; }
     case 17: { return "toobig"; }
     case 18: { return "mismatch"; }
   }

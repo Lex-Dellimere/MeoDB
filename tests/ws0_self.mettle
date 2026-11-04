@@ -10,9 +10,9 @@
 //                  max finite, min subnormal, +inf, two NaNs with payloads;
 //                  compared as uint64, plus the little-endian byte layout
 //   w_consts       MEO_T_*, MEO_OPEN_*, MEO_TX_*, MEO_ROW/DONE, MEO_COL_*,
-//                  MEO_MAX_COLS, MEO_REC_MAX, MEO_AST_* values
+//                  MEO_MAX_COLS, MEO_REC_MAX, MEO_Q_* values
 //   w_value        MeoValue setters write every field; meo_value_check
-//   w_ast          meo_ast_init defaults; a hand-built INSERT AST
+//   w_spec         meo_qspec_init defaults; names are owned copies
 //
 // Run: mbuild run ws0_self. Every case prints PASS; a failure prints
 // FAIL <label> and the exit status is non-zero.
@@ -24,7 +24,7 @@ import "../src/format/bytes.mettle";
 import "../src/record/value.mettle";
 import "../src/db/flags.mettle";
 import "../src/catalog/schema.mettle";
-import "../src/sql/ast.mettle";
+import "../src/query/spec.mettle";
 
 var w_failures: int32 = 0;
 
@@ -95,13 +95,13 @@ fn w_status_new() {
   w_i32(MEO_ERR_CONFLICT, 13, "CONFLICT");
   w_i32(MEO_ERR_CONSTRAINT, 14, "CONSTRAINT");
   w_i32(MEO_ERR_TX, 15, "TX");
-  w_i32(MEO_ERR_SQL, 16, "SQL");
+  w_i32(MEO_ERR_SCHEMA, 16, "SCHEMA");
   w_i32(MEO_ERR_TOOBIG, 17, "TOOBIG");
   w_i32(MEO_ERR_MISMATCH, 18, "MISMATCH");
   w_str(meo_status_name(13), "CONFLICT", "name 13");
   w_str(meo_status_name(-14), "CONSTRAINT", "name -14");
   w_str(meo_status_name(15), "TX", "name 15");
-  w_str(meo_status_name(-16), "SQL", "name -16");
+  w_str(meo_status_name(-16), "SCHEMA", "name -16");
   w_str(meo_status_name(17), "TOOBIG", "name 17");
   w_str(meo_status_name(-18), "MISMATCH", "name -18");
   w_str(meo_status_name(19), "UNKNOWN", "name 19 unknown");
@@ -183,12 +183,12 @@ fn w_consts() {
   w_i32(MEO_COL_PK, 1, "COL_PK"); w_i32(MEO_COL_NOT_NULL, 2, "COL_NOT_NULL");
   w_i32(MEO_COL_UNIQUE, 4, "COL_UNIQUE"); w_i32(MEO_COL_ROWID_ALIAS, 8, "COL_ROWID_ALIAS");
   w_i32(MEO_MAX_COLS, 64, "MAX_COLS"); w_i32(MEO_REC_MAX, 1280, "REC_MAX");
-  w_i32(MEO_AST_C_PK, MEO_COL_PK, "AST_C_PK");
-  w_i32(MEO_AST_C_NOT_NULL, MEO_COL_NOT_NULL, "AST_C_NOT_NULL");
-  w_i32(MEO_AST_C_UNIQUE, MEO_COL_UNIQUE, "AST_C_UNIQUE");
-  w_i32(MEO_AST_CREATE, 1, "AST_CREATE"); w_i32(MEO_AST_INSERT, 2, "AST_INSERT");
-  w_i32(MEO_AST_SELECT, 3, "AST_SELECT"); w_i32(MEO_AST_UPDATE, 4, "AST_UPDATE");
-  w_i32(MEO_AST_DELETE, 5, "AST_DELETE");
+  w_i32(MEO_Q_K_CREATE, 1, "Q_K_CREATE"); w_i32(MEO_Q_K_INSERT, 2, "Q_K_INSERT");
+  w_i32(MEO_Q_K_SELECT, 3, "Q_K_SELECT"); w_i32(MEO_Q_K_UPDATE, 4, "Q_K_UPDATE");
+  w_i32(MEO_Q_K_DELETE, 5, "Q_K_DELETE");
+  w_i32(MEO_Q_EQ, 1, "Q_EQ"); w_i32(MEO_Q_IN, 2, "Q_IN"); w_i32(MEO_Q_IS_NULL, 3, "Q_IS_NULL");
+  w_i32(MEO_Q_NOT_NULL, 4, "Q_NOT_NULL"); w_i32(MEO_Q_LT, 5, "Q_LT"); w_i32(MEO_Q_LE, 6, "Q_LE");
+  w_i32(MEO_Q_GT, 7, "Q_GT"); w_i32(MEO_Q_GE, 8, "Q_GE"); w_i32(MEO_Q_NE, 9, "Q_NE");
   w_ok(meo_schema_affinity_ok(MEO_T_BLOB) && !meo_schema_affinity_ok(MEO_T_NULL)
        && !meo_schema_affinity_ok(5), "affinity_ok");
   w_case("w_consts", f0);
@@ -219,34 +219,22 @@ fn w_value() {
   w_case("w_value", f0);
 }
 
-fn w_ast() {
+fn w_spec() {
   var f0: int32 = w_failures;
-  var a: MeoAst;
-  a.limit = 99;
-  a.n_where = 3;
-  meo_ast_init(&a);
-  w_ok(a.limit == -1 && a.offset == 0 && a.n_where == 0 && a.where_terms == 0
-       && !a.select_star && !a.if_not_exists && a.kind == 0, "ast_init");
-  // INSERT INTO "t" VALUES (?, 'x'), (NULL, 2): 2 rows x 2, row-major.
-  var sql: string = "INSERT INTO \"t\" VALUES (?, 'x'), (NULL, 2)";
-  var ops: MeoAstOperand[4];
-  ops[0].kind = MEO_AST_OPND_PARAM; ops[0].param = 1;
-  ops[1].kind = MEO_AST_OPND_LITERAL;
-  meo_value_set_text(&ops[1].val, (uint8*)sql.chars + 28, 1);
-  ops[2].kind = MEO_AST_OPND_LITERAL; meo_value_set_null(&ops[2].val);
-  ops[3].kind = MEO_AST_OPND_LITERAL; meo_value_set_int(&ops[3].val, 2);
-  a.kind = MEO_AST_INSERT;
-  a.table.p = (uint8*)sql.chars + 13;
-  a.table.n = 1;
-  a.values = &ops[0];
-  a.n_rows = 2;
-  a.row_width = 2;
-  a.n_params = 1;
-  w_ok(a.table.p[0] == 't', "table view");
-  var c: MeoAstOperand* = &a.values[1 * a.row_width + 1];
-  w_ok(c->kind == MEO_AST_OPND_LITERAL && c->val.type == MEO_T_INT && c->val.i == 2, "row 1 col 1");
-  w_ok(a.values[1].val.p[0] == 'x', "text view");
-  w_case("w_ast", f0);
+  var sp: MeoQSpec;
+  sp.limit = 99;
+  sp.n_terms = 3;
+  meo_qspec_init(&sp, MEO_Q_K_INSERT);
+  w_ok(sp.kind == MEO_Q_K_INSERT && sp.limit == -1 && sp.offset == 0 && sp.n_terms == 0
+       && sp.terms == 0 && sp.n_names == 0 && sp.n_cells == 0 && !sp.if_not_exists, "qspec_init");
+  // The name is a copy, NUL-terminated, not the caller's buffer.
+  var nm: string = "t";
+  w_i32(meo_qspec_name(&sp.table, nm), MEO_OK, "qspec_name");
+  w_ok(sp.table.n == 1 && sp.table.p[0] == 't' && sp.table.p[1] == 0
+       && sp.table.p != nm.chars, "name copied");
+  meo_qspec_free(&sp);
+  w_ok(sp.table.p == 0 && sp.kind == MEO_Q_K_INSERT && sp.limit == -1, "qspec_free");
+  w_case("w_spec", f0);
 }
 
 fn main() -> int32 {
@@ -255,7 +243,7 @@ fn main() -> int32 {
   w_f64();
   w_consts();
   w_value();
-  w_ast();
+  w_spec();
   if (w_failures != 0) {
     println("FAIL ws0_self: {w_failures} failure(s)");
     return 1;

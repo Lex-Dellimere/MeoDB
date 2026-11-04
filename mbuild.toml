@@ -83,6 +83,11 @@ main = "tests/phase3_child.mettle"
 [bin.draft]
 main = "tests/draft.mettle"
 
+# B-tree delete, byte-balanced splits and float/blob keys, checked against a
+# sorted-array oracle.
+[bin.btdel_self]
+main = "tests/btdel_self.mettle"
+
 # Record codec round trips and corrupt-input checks.
 [bin.record_self]
 main = "tests/record_self.mettle"
@@ -90,15 +95,6 @@ main = "tests/record_self.mettle"
 # The db lock under 64 threads.
 [bin.lock_self]
 main = "tests/lock_self.mettle"
-
-# Lexer and parser for the whole SQL subset, including error offsets.
-[bin.parse_self]
-main = "tests/parse_self.mettle"
-
-# B-tree delete, byte-balanced splits and float/blob keys, checked against a
-# sorted-array oracle.
-[bin.btdel_self]
-main = "tests/btdel_self.mettle"
 
 # Catalog persistence, rollback reload and the db transaction API.
 [bin.catalog_self]

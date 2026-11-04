@@ -1,6 +1,6 @@
 // catalog/schema: the in-memory shape of a table, and nothing else.
 //
-// Types and constants only, no functions that touch the pager: sql/plan reads
+// Types and constants only, no functions that touch the pager: query/plan reads
 // schemas without depending on storage (DECISIONS.md D1), while
 // catalog/catalog loads and saves them. The fields mirror the catalog row of
 // D4 one to one:
@@ -12,7 +12,7 @@
 // case-insensitively. The catalog owns every name buffer and the columns
 // array. A MeoTable is never freed while the db is open (D4): after a
 // rollback the catalog reloads in place and a table that vanished gets
-// live = false, so a statement holding its id fails with -MEO_ERR_SQL instead
+// live = false, so a query holding its id fails with -MEO_ERR_SCHEMA instead
 // of reading freed memory.
 
 import "../record/value.mettle";

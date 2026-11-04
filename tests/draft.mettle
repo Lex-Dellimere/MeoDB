@@ -1,5 +1,6 @@
-// draft: the D10 draft slice. CREATE TABLE, 3000 bound INSERTs in one
-// transaction, commit, reopen, SELECT *: rows, order, text, the root split
+// draft: one thin path through every layer with the typed query API. CREATE,
+// 3000 INSERTs in one transaction through one reused query (reset +
+// set_value), commit, reopen, select all: rows, order, text, the root split
 // (8-byte separators) and the root read back from the catalog. Then table "u":
 // NULL ids in one multi-row INSERT get distinct rowids, and a multi-row INSERT
 // that fails Phase A writes nothing and leaves the transaction committable.
@@ -62,36 +63,58 @@ fn dr_root_keys_ok(db: MeoDb*, root: uint32) -> int32 {
   return rc;
 }
 
+// CREATE "name" (id INTEGER PRIMARY KEY, <col> TEXT).
+fn dr_create(db: MeoDb*, name: string, col: string) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, col, MEO_T_TEXT, 0);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
 fn dr_write(path: string, root_out: uint32*) -> int32 {
   var db: MeoDb* = 0;
   var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
   if (rc != MEO_OK) { return dr_fail("open rc={rc}"); }
-  rc = meo_sql_exec(db, "CREATE TABLE \"t\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT)");
-  if (rc != MEO_OK) { return dr_fail("create rc={rc}"); }
+  rc = dr_create(db, "t", "name");
+  if (rc != MEO_DONE) { return dr_fail("create rc={rc}"); }
   var t: MeoTable* = dr_table(db);
   if (t == 0) { return dr_fail("table not in the catalog after CREATE"); }
   if (meo_pager_root(db->pager, MEO_ROOT_CATALOG) == 0) { return dr_fail("catalog root 0"); }
   rc = meo_db_begin(db, MEO_TX_DEFAULT);
   if (rc != MEO_OK) { return dr_fail("begin rc={rc}"); }
   if (meo_db_begin(db, MEO_TX_DEFAULT) != -MEO_ERR_TX) { return dr_fail("nested begin not TX"); }
-  var st: MeoStmt* = 0;
-  var off: int32 = 0;
-  rc = meo_sql_prepare(db, "INSERT INTO \"t\" (\"id\",\"name\") VALUES (?, ?)", &st, &off);
-  if (rc != MEO_OK) { return dr_fail("prepare insert rc={rc} off={off}"); }
-  if (meo_sql_bind_count(st) != 2) { return dr_fail("bind_count != 2"); }
+  var q: MeoQuery* = 0;
+  rc = meo_q_insert(db, "t", &q);
+  if (rc != MEO_OK) { return dr_fail("insert query rc={rc}"); }
+  var v: MeoValue;
+  meo_value_set_int(&v, 0);
+  var b1: int32 = meo_q_into(q, "id");
+  var b2: int32 = meo_q_into(q, "name");
+  var b3: int32 = meo_q_value(q, &v);
+  var b4: int32 = meo_q_value(q, &v);
+  if (b1 != MEO_OK || b2 != MEO_OK || b3 != MEO_OK || b4 != MEO_OK) {
+    return dr_fail("insert builders {b1} {b2} {b3} {b4}");
+  }
+  if (meo_q_n_values(q) != 2) { return dr_fail("n_values != 2"); }
   var first_root: uint32 = 0;
   var i: int32 = 1;
   while (i <= DR_ROWS) {
     var txt: string = "row-{i}";
-    var b1: int32 = meo_sql_bind_int64(st, 1, (int64)i);
-    var b2: int32 = meo_sql_bind_text(st, 2, txt);
+    meo_value_set_int(&v, (int64)i);
+    b1 = meo_q_set_value(q, 0, &v);
+    meo_value_set_text(&v, txt.chars, (int32)txt.length);
+    b2 = meo_q_set_value(q, 1, &v);
     free(txt.chars);
-    if (b1 != MEO_OK || b2 != MEO_OK) { return dr_fail("bind row {i}: {b1} {b2}"); }
-    rc = meo_sql_step(st);
+    if (b1 != MEO_OK || b2 != MEO_OK) { return dr_fail("set_value row {i}: {b1} {b2}"); }
+    rc = meo_q_step(q);
     if (rc != MEO_DONE) { return dr_fail("insert step row {i} rc={rc}"); }
-    if (meo_sql_changes(st) != 1) { return dr_fail("changes != 1 at row {i}"); }
-    if (meo_sql_last_insert_rowid(st) != (int64)i) { return dr_fail("last rowid at row {i}"); }
-    rc = meo_sql_reset(st);
+    if (meo_q_changes(q) != 1) { return dr_fail("changes != 1 at row {i}"); }
+    if (meo_q_last_insert_rowid(q) != (int64)i) { return dr_fail("last rowid at row {i}"); }
+    rc = meo_q_reset(q);
     if (rc != MEO_OK) { return dr_fail("reset rc={rc}"); }
     if (i == 1) { first_root = t->root; }
     i += 1;
@@ -105,8 +128,8 @@ fn dr_write(path: string, root_out: uint32*) -> int32 {
   if (kc != 0) { return dr_fail("inner root separators not truncated to 8 ({kc})"); }
   root_out[0] = t->root;
   println("  root split {first_root} -> {t->root}, separators 8 bytes");
-  rc = meo_sql_finalize(st);
-  if (rc != MEO_OK) { return dr_fail("finalize rc={rc}"); }
+  rc = meo_q_free(q);
+  if (rc != MEO_OK) { return dr_fail("free rc={rc}"); }
   rc = meo_db_close(db);
   if (rc != MEO_OK) { return dr_fail("close rc={rc}"); }
   return 0;
@@ -122,78 +145,96 @@ fn dr_read(path: string, want_root: uint32) -> int32 {
   if (t->n_cols != 2 || t->columns[0].cflags != (MEO_COL_PK | MEO_COL_ROWID_ALIAS)) {
     return dr_fail("reopened schema differs");
   }
-  var st: MeoStmt* = 0;
-  var off: int32 = 0;
-  rc = meo_sql_prepare(db, "SELECT * FROM \"t\"", &st, &off);
-  if (rc != MEO_OK) { return dr_fail("prepare select rc={rc} off={off}"); }
-  if (meo_sql_column_count(st) != 2) { return dr_fail("column_count != 2"); }
+  var q: MeoQuery* = 0;
+  rc = meo_q_select(db, "t", &q);
+  if (rc != MEO_OK) { return dr_fail("select query rc={rc}"); }
   var want_rows: int32 = DR_ROWS + DR_RED;
   var i: int32 = 1;
   while (i <= want_rows) {
-    rc = meo_sql_step(st);
+    rc = meo_q_step(q);
     if (rc != MEO_ROW) { return dr_fail("select step {i}: rc={rc}, want MEO_ROW"); }
-    if (meo_sql_column_type(st, 0) != MEO_T_INT) { return dr_fail("col 0 type at {i}"); }
-    var id: int64 = meo_sql_column_int64(st, 0);
+    if (i == 1 && meo_q_column_count(q) != 2) { return dr_fail("column_count != 2"); }
+    if (meo_q_column_type(q, 0) != MEO_T_INT) { return dr_fail("col 0 type at {i}"); }
+    var id: int64 = meo_q_column_int64(q, 0);
     if (id != (int64)i) { return dr_fail("row {i}: id {id}"); }
     var want: string = "row-{i}";
-    var got: uint8* = meo_sql_column_text(st, 1);
-    var n: int32 = meo_sql_column_bytes(st, 1);
+    var got: uint8* = meo_q_column_text(q, 1);
+    var n: int32 = meo_q_column_bytes(q, 1);
     var same: bool = got != 0 && (int64)n == (int64)want.length
       && meo_bytes_equal(got, want.chars, (int64)n) && got[n] == (uint8)0;
     free(want.chars);
     if (!same) { return dr_fail("row {i}: text differs"); }
     i += 1;
   }
-  rc = meo_sql_step(st);
+  rc = meo_q_step(q);
   if (rc != MEO_DONE) { return dr_fail("after {want_rows} rows: rc={rc}, want MEO_DONE"); }
-  if (meo_sql_step(st) != MEO_DONE) { return dr_fail("step after DONE"); }
-  meo_sql_finalize(st);
+  if (meo_q_step(q) != MEO_DONE) { return dr_fail("step after DONE"); }
+  if (meo_q_row_count(q) != DR_ROWS) { return dr_fail("row_count {meo_q_row_count(q)}"); }
+  // Whole-result access after the last step.
+  var c: MeoValue;
+  rc = meo_q_cell(q, DR_ROWS - 1, 1, &c);
+  if (rc != MEO_OK || c.type != MEO_T_TEXT || c.n != 8 || c.p[4] != '3') {
+    return dr_fail("cell of the last row rc={rc}");
+  }
+  meo_q_free(q);
+  // A column subset, in the order picked.
+  var pq: MeoQuery* = 0;
+  rc = meo_q_select(db, "t", &pq);
+  if (rc != MEO_OK) { return dr_fail("pick query rc={rc}"); }
+  meo_q_pick(pq, "NAME");
+  meo_q_pick(pq, "id");
+  rc = meo_q_step(pq);
+  if (rc != MEO_ROW || meo_q_column_count(pq) != 2 || meo_q_column_type(pq, 0) != MEO_T_TEXT
+      || meo_q_column_int64(pq, 1) != 1) {
+    return dr_fail("pick name, id: rc={rc}");
+  }
+  meo_q_free(pq);
   rc = meo_db_close(db);
   if (rc != MEO_OK) { return dr_fail("close 2 rc={rc}"); }
   return 0;
 }
 
-// Ids of SELECT * FROM "u" into ids[0..cap); the row count, or -1.
+// Ids of every "u" row into ids[0..cap); the row count, or -1.
 fn dr_u_ids(db: MeoDb*, ids: int64*, cap: int32) -> int32 {
-  var st: MeoStmt* = 0;
-  var off: int32 = 0;
-  if (meo_sql_prepare(db, "SELECT * FROM \"u\"", &st, &off) != MEO_OK) { return -1; }
+  var q: MeoQuery* = 0;
+  if (meo_q_select(db, "u", &q) != MEO_OK) { return -1; }
   var n: int32 = 0;
   while (true) {
-    var rc: int32 = meo_sql_step(st);
+    var rc: int32 = meo_q_step(q);
     if (rc == MEO_DONE) { break; }
     if (rc != MEO_ROW || n == cap) {
-      meo_sql_finalize(st);
+      meo_q_free(q);
       return -1;
     }
-    ids[n] = meo_sql_column_int64(st, 0);
+    ids[n] = meo_q_column_int64(q, 0);
     n += 1;
   }
-  meo_sql_finalize(st);
+  meo_q_free(q);
   return n;
 }
 
-// One multi-row INSERT into "u": ids[i] < 0 binds NULL.
-fn dr_u_insert(db: MeoDb*, sql: string, ids: int64*, n: int32, with_id: bool,
-    changes: int32*) -> int32 {
-  var st: MeoStmt* = 0;
-  var off: int32 = 0;
-  var rc: int32 = meo_sql_prepare(db, sql, &st, &off);
+// One multi-row INSERT into "u": with_id lists (id, v), else only v.
+fn dr_u_insert(db: MeoDb*, ids: int64*, n: int32, with_id: bool, changes: int32*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "u", &q);
   if (rc != MEO_OK) { return rc; }
-  var k: int32 = 1;
+  if (with_id) { meo_q_into(q, "id"); }
+  meo_q_into(q, "v");
+  var v: MeoValue;
   var i: int32 = 0;
   while (i < n) {
     if (with_id) {
-      meo_sql_bind_int64(st, k, ids[i]);
-      k += 1;
+      meo_value_set_int(&v, ids[i]);
+      meo_q_value(q, &v);
     }
-    meo_sql_bind_text(st, k, "v");
-    k += 1;
+    var s: string = "v";
+    meo_value_set_text(&v, s.chars, 1);
+    meo_q_value(q, &v);
     i += 1;
   }
-  rc = meo_sql_step(st);
-  changes[0] = meo_sql_changes(st);
-  meo_sql_finalize(st);
+  rc = meo_q_step(q);
+  changes[0] = meo_q_changes(q);
+  meo_q_free(q);
   return rc;
 }
 
@@ -201,11 +242,12 @@ fn dr_multi(path: string) -> int32 {
   var db: MeoDb* = 0;
   var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
   if (rc != MEO_OK) { return dr_fail("open u rc={rc}"); }
-  rc = meo_sql_exec(db, "CREATE TABLE \"u\" (\"id\" INTEGER PRIMARY KEY, \"v\" TEXT)");
-  if (rc != MEO_OK) { return dr_fail("create u rc={rc}"); }
+  rc = dr_create(db, "u", "v");
+  if (rc != MEO_DONE) { return dr_fail("create u rc={rc}"); }
+  if (dr_create(db, "U", "v") != -MEO_ERR_SCHEMA) { return dr_fail("second create not SCHEMA"); }
   var ids: int64[8];
   var ch: int32 = 0;
-  rc = dr_u_insert(db, "INSERT INTO \"u\" (\"v\") VALUES (?), (?), (?)", &ids[0], 3, false, &ch);
+  rc = dr_u_insert(db, &ids[0], 3, false, &ch);
   if (rc != MEO_DONE || ch != 3) { return dr_fail("NULL-id insert rc={rc} changes={ch}"); }
   var n: int32 = dr_u_ids(db, &ids[0], 8);
   if (n != 3 + DR_RED_U) { return dr_fail("u has {n} rows after the NULL-id insert, want 3"); }
@@ -217,16 +259,14 @@ fn dr_multi(path: string) -> int32 {
   ids[0] = 10;
   ids[1] = 11;
   ids[2] = 2;   // already present
-  rc = dr_u_insert(db, "INSERT INTO \"u\" (\"id\", \"v\") VALUES (?, ?), (?, ?), (?, ?)",
-    &ids[0], 3, true, &ch);
+  rc = dr_u_insert(db, &ids[0], 3, true, &ch);
   if (rc != -MEO_ERR_CONFLICT) { return dr_fail("dup-id insert rc={rc}, want CONFLICT"); }
   rc = meo_db_commit(db);
   if (rc != MEO_OK) { return dr_fail("commit after a Phase-A failure rc={rc}"); }
   ids[0] = 20;
-  ids[1] = 20;  // duplicate inside the statement (autocommit)
-  rc = dr_u_insert(db, "INSERT INTO \"u\" (\"id\", \"v\") VALUES (?, ?), (?, ?)",
-    &ids[0], 2, true, &ch);
-  if (rc != -MEO_ERR_CONFLICT) { return dr_fail("in-statement dup rc={rc}, want CONFLICT"); }
+  ids[1] = 20;  // duplicate inside the query (autocommit)
+  rc = dr_u_insert(db, &ids[0], 2, true, &ch);
+  if (rc != -MEO_ERR_CONFLICT) { return dr_fail("in-query dup rc={rc}, want CONFLICT"); }
   n = dr_u_ids(db, &ids[0], 8);
   if (n != 3 + DR_RED_U) { return dr_fail("u has {n} rows after the failed inserts, want 3"); }
   rc = meo_db_close(db);

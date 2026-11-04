@@ -163,7 +163,7 @@ fn cs_split(path: string) -> int32 {
   var nm0: string = cs_tbl_name(3);
   rc = cs_create(db, nm0, 2, false, &dup);
   free(nm0.chars);
-  if (rc != -MEO_ERR_SQL) { return cs_fail("duplicate name rc={rc}"); }
+  if (rc != -MEO_ERR_SCHEMA) { return cs_fail("duplicate name rc={rc}"); }
   rc = meo_db_close(db);
   if (rc != MEO_OK) { return cs_fail("close rc={rc}"); }
   var db2: MeoDb* = 0;

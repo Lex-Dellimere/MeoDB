@@ -405,12 +405,12 @@ fn cat_put_table(p: MeoPager*, root: uint32*, t: MeoTable*) -> int32 {
 
 // Persist t's current row (name, table root, every column's index root) in
 // the caller's pager transaction: delete the old row, insert the new one.
-// Creates the catalog tree with its header row on first use. -MEO_ERR_SQL for
+// Creates the catalog tree with its header row on first use. -MEO_ERR_SCHEMA for
 // a dead table, -MEO_ERR_CORRUPT once a reload has failed.
 export fn meo_cat_save_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
   if (cat == 0 || t == 0) { return -MEO_ERR_USAGE; }
   if (cat->broken) { return -MEO_ERR_CORRUPT; }
-  if (!t->live) { return -MEO_ERR_SQL; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
   var p: MeoPager* = cat->pager;
   var start: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
   var root: uint32 = start;
@@ -436,7 +436,7 @@ export fn meo_cat_save_table(cat: MeoCatalog*, t: MeoTable*) -> int32 {
 
 // Create a table: validate, copy name and columns, give it the next id and
 // root 0 (its tree is created by the first insert), and save it. MEO_OK and
-// *out set; -MEO_ERR_SQL when a live table has the name or two columns share
+// *out set; -MEO_ERR_SCHEMA when a live table has the name or two columns share
 // one; -MEO_ERR_USAGE for 0 or more than MEO_MAX_COLS columns or a bad
 // affinity; -MEO_ERR_TOOBIG when the catalog row would exceed MEO_REC_MAX;
 // -MEO_ERR_CORRUPT once a reload has failed. Nothing is written on any of
@@ -448,7 +448,7 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
   }
   if (n_cols < 1 || n_cols > MEO_MAX_COLS) { return -MEO_ERR_USAGE; }
   if (cat->broken) { return -MEO_ERR_CORRUPT; }
-  if (meo_cat_find(cat, name, name_len) != 0) { return -MEO_ERR_SQL; }
+  if (meo_cat_find(cat, name, name_len) != 0) { return -MEO_ERR_SCHEMA; }
   var i: int32 = 0;
   while (i < n_cols) {
     if (!meo_schema_affinity_ok(cols[i].affinity) || cols[i].name_len <= 0) {
@@ -457,7 +457,7 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
     var j: int32 = 0;
     while (j < i) {
       if (meo_cat_name_eq(cols[i].name, cols[i].name_len, cols[j].name, cols[j].name_len)) {
-        return -MEO_ERR_SQL;
+        return -MEO_ERR_SCHEMA;
       }
       j += 1;
     }

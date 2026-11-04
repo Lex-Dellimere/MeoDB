@@ -1,6 +1,6 @@
 // db/flags: the public flag and step-result constants (DECISIONS.md D8).
 //
-// They sit in their own module so that db/, sql/ and every consumer can name
+// They sit in their own module so that db/, query/ and every consumer can name
 // them without pulling in the engine. The open and transaction values equal
 // flux_orm's RC_MEOSQL_* and RC_TX_*, so an adapter passes them through
 // unchanged; never renumber them.
@@ -20,7 +20,7 @@ export const MEO_TX_DEFAULT: int32 = 0;
 export const MEO_TX_DEFERRED: int32 = 1;
 export const MEO_TX_IMMEDIATE: int32 = 2;
 
-// meo_sql_step results. Positive, so they read as success under the
+// meo_q_step results. Positive, so they read as success under the
 // negative-on-failure convention, and far above any status code.
 export const MEO_ROW: int32 = 100;
 export const MEO_DONE: int32 = 101;

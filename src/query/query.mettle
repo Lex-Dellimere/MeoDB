@@ -1,0 +1,429 @@
+// query/query: the public meo_q_* interface. A query is built by calls, run by
+// meo_q_step, and reused with meo_q_reset + meo_q_set_value.
+//
+// Builders copy every name and every text/blob byte, take no lock and read no
+// catalog; names resolve at the first step. Every value a builder takes gets
+// the next slot, 0-based, in call order. A builder used on the wrong kind,
+// with a bad argument, or outside READY returns -MEO_ERR_USAGE and the error
+// sticks: every later step returns it. A failed builder never half-adds.
+// Column pointers are borrowed until the next step, reset or free; meo_q_cell
+// pointers until reset or free.
+
+import "std/mem";
+import "std/thread";
+import "../error/status.mettle";
+import "../record/value.mettle";
+import "../mem/arena.mettle";
+import "../catalog/schema.mettle";
+import "../db/db.mettle";
+import "../db/flags.mettle";
+import "spec.mettle";
+import "plan.mettle";
+import "exec.mettle";
+
+fn q_release(q: MeoQuery*) {
+  var i: int32 = 0;
+  while (i < q->cap_vals) {
+    if (q->val_buf[i] != 0) { free(q->val_buf[i]); }
+    i += 1;
+  }
+  if (q->val_buf != 0) { free(q->val_buf); }
+  if (q->val_cap != 0) { free(q->val_cap); }
+  if (q->vals != 0) { free(q->vals); }
+  if (q->res != 0) { free(q->res); }
+  if (q->res_arena != 0) { meo_arena_free(q->res_arena); }
+  if (q->plan_arena != 0) { meo_arena_free(q->plan_arena); }
+  meo_qspec_free(&q->spec);
+  free(q);
+}
+
+fn q_new(db: MeoDb*, kind: int32, table: string, out: MeoQuery**) -> int32 {
+  if (db == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  out[0] = 0;
+  var q: MeoQuery* = new MeoQuery;
+  if (q == 0) { return -MEO_ERR_NOMEM; }
+  q->db = db;
+  meo_qspec_init(&q->spec, kind);
+  meo_plan_init(&q->plan);
+  q->plan_arena = 0;
+  q->vals = 0;
+  q->val_buf = 0;
+  q->val_cap = 0;
+  q->n_vals = 0;
+  q->cap_vals = 0;
+  q->state = MEO_Q_READY;
+  q->err = MEO_OK;
+  q->sticky = MEO_OK;
+  q->res = 0;
+  q->res_cap = 0;
+  q->res_arena = 0;
+  q->n_rows = 0;
+  q->n_cols = 0;
+  q->cur = 0;
+  q->changes = 0;
+  q->last_rowid = 0;
+  var rc: int32 = meo_qspec_name(&q->spec.table, table);
+  if (rc == MEO_OK) {
+    q->plan_arena = meo_arena_new(4096);
+    q->res_arena = meo_arena_new(65536);
+    if (q->plan_arena == 0 || q->res_arena == 0) { rc = -MEO_ERR_NOMEM; }
+  }
+  if (rc != MEO_OK) {
+    q_release(q);
+    return rc;
+  }
+  // Atomic, not under the lock: builders never take it.
+  atomic_inc_i32(&db->n_stmts);
+  out[0] = q;
+  return MEO_OK;
+}
+
+export fn meo_q_create(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_CREATE, table, out);
+}
+
+export fn meo_q_insert(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_INSERT, table, out);
+}
+
+export fn meo_q_select(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_SELECT, table, out);
+}
+
+export fn meo_q_update(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_UPDATE, table, out);
+}
+
+export fn meo_q_delete(db: MeoDb*, table: string, out: MeoQuery**) -> int32 {
+  return q_new(db, MEO_Q_K_DELETE, table, out);
+}
+
+// --- builders ---------------------------------------------------------------
+
+// Record a builder failure so the next step reports it.
+fn q_fail(q: MeoQuery*, rc: int32) -> int32 {
+  if (q->sticky == MEO_OK) { q->sticky = rc; }
+  return rc;
+}
+
+// MEO_OK when a builder may run on q for one of the kinds a..b.
+fn q_check(q: MeoQuery*, a: int32, b: int32) -> int32 {
+  if (q->state != MEO_Q_READY) { return q_fail(q, -MEO_ERR_USAGE); }
+  if (q->spec.kind < a || q->spec.kind > b) { return q_fail(q, -MEO_ERR_USAGE); }
+  return MEO_OK;
+}
+
+// Filters apply to SELECT, UPDATE and DELETE (kinds 3..5).
+fn q_check_filter(q: MeoQuery*) -> int32 {
+  return q_check(q, MEO_Q_K_SELECT, MEO_Q_K_DELETE);
+}
+
+fn q_check_value(q: MeoQuery*, v: MeoValue*) -> int32 {
+  if (meo_value_check(v) != MEO_OK) { return q_fail(q, -MEO_ERR_USAGE); }
+  return MEO_OK;
+}
+
+export fn meo_q_column_def(q: MeoQuery*, name: string, affinity: int32, cflags: int32) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
+  if (rc != MEO_OK) { return rc; }
+  var known: int32 = MEO_COL_PK | MEO_COL_NOT_NULL | MEO_COL_UNIQUE;
+  if (!meo_schema_affinity_ok(affinity) || (cflags & ~known) != 0) {
+    return q_fail(q, -MEO_ERR_USAGE);
+  }
+  var s: MeoQSpec* = &q->spec;
+  var np: MeoQColDef* = meo_qspec_grow(s->cols, s->n_cols, &s->cap_cols, (int64)sizeof(MeoQColDef));
+  if (np == 0) { return q_fail(q, -MEO_ERR_NOMEM); }
+  s->cols = np;
+  var cd: MeoQColDef* = &s->cols[s->n_cols];
+  rc = meo_qspec_name(&cd->name, name);
+  if (rc != MEO_OK) { return q_fail(q, rc); }
+  cd->affinity = affinity;
+  cd->cflags = cflags;
+  s->n_cols += 1;
+  return MEO_OK;
+}
+
+export fn meo_q_if_not_exists(q: MeoQuery*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
+  if (rc != MEO_OK) { return rc; }
+  q->spec.if_not_exists = true;
+  return MEO_OK;
+}
+
+// One more INSERT column / SELECT result column.
+fn q_add_name(q: MeoQuery*, name: string) -> int32 {
+  var s: MeoQSpec* = &q->spec;
+  var np: MeoQName* = meo_qspec_grow(s->names, s->n_names, &s->cap_names, (int64)sizeof(MeoQName));
+  if (np == 0) { return q_fail(q, -MEO_ERR_NOMEM); }
+  s->names = np;
+  var rc: int32 = meo_qspec_name(&s->names[s->n_names], name);
+  if (rc != MEO_OK) { return q_fail(q, rc); }
+  s->n_names += 1;
+  return MEO_OK;
+}
+
+export fn meo_q_into(q: MeoQuery*, name: string) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_INSERT, MEO_Q_K_INSERT);
+  if (rc != MEO_OK) { return rc; }
+  return q_add_name(q, name);
+}
+
+export fn meo_q_value(q: MeoQuery*, v: MeoValue*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_INSERT, MEO_Q_K_INSERT);
+  if (rc == MEO_OK) { rc = q_check_value(q, v); }
+  if (rc != MEO_OK) { return rc; }
+  var k: int32 = meo_exec_slots_add(q, v, 1);
+  if (k < 0) { return q_fail(q, k); }
+  // Only meo_q_value adds slots to an INSERT, so the cells stay contiguous.
+  if (q->spec.n_cells == 0) { q->spec.cells_v0 = k; }
+  q->spec.n_cells += 1;
+  return MEO_OK;
+}
+
+export fn meo_q_pick(q: MeoQuery*, name: string) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_SELECT, MEO_Q_K_SELECT);
+  if (rc != MEO_OK) { return rc; }
+  return q_add_name(q, name);
+}
+
+export fn meo_q_assign(q: MeoQuery*, name: string, v: MeoValue*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_UPDATE, MEO_Q_K_UPDATE);
+  if (rc == MEO_OK) { rc = q_check_value(q, v); }
+  if (rc != MEO_OK) { return rc; }
+  var s: MeoQSpec* = &q->spec;
+  var np: MeoQAssign* = meo_qspec_grow(s->sets, s->n_sets, &s->cap_sets, (int64)sizeof(MeoQAssign));
+  if (np == 0) { return q_fail(q, -MEO_ERR_NOMEM); }
+  s->sets = np;
+  var a: MeoQAssign* = &s->sets[s->n_sets];
+  rc = meo_qspec_name(&a->col, name);
+  if (rc != MEO_OK) { return q_fail(q, rc); }
+  var k: int32 = meo_exec_slots_add(q, v, 1);
+  if (k < 0) {
+    free(a->col.p);
+    return q_fail(q, k);
+  }
+  a->v = k;
+  s->n_sets += 1;
+  return MEO_OK;
+}
+
+// Append one filter term with n values (vals may be 0 when n == 0).
+fn q_add_term(q: MeoQuery*, name: string, kind: int32, vals: MeoValue*, n: int32) -> int32 {
+  var s: MeoQSpec* = &q->spec;
+  var np: MeoQTerm* = meo_qspec_grow(s->terms, s->n_terms, &s->cap_terms, (int64)sizeof(MeoQTerm));
+  if (np == 0) { return q_fail(q, -MEO_ERR_NOMEM); }
+  s->terms = np;
+  var tm: MeoQTerm* = &s->terms[s->n_terms];
+  var rc: int32 = meo_qspec_name(&tm->col, name);
+  if (rc != MEO_OK) { return q_fail(q, rc); }
+  tm->kind = kind;
+  tm->v0 = q->n_vals;
+  tm->n_v = n;
+  if (n > 0) {
+    var k: int32 = meo_exec_slots_add(q, vals, n);
+    if (k < 0) {
+      free(tm->col.p);
+      return q_fail(q, k);
+    }
+    tm->v0 = k;
+  }
+  s->n_terms += 1;
+  return MEO_OK;
+}
+
+export fn meo_q_where(q: MeoQuery*, name: string, op: int32, v: MeoValue*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check_filter(q);
+  if (rc == MEO_OK) { rc = q_check_value(q, v); }
+  if (rc != MEO_OK) { return rc; }
+  if (op != MEO_Q_EQ && op != MEO_Q_NE && (op < MEO_Q_LT || op > MEO_Q_GE)) {
+    return q_fail(q, -MEO_ERR_USAGE);
+  }
+  return q_add_term(q, name, op, v, 1);
+}
+
+export fn meo_q_where_in(q: MeoQuery*, name: string, vals: MeoValue*, n: int32) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check_filter(q);
+  if (rc != MEO_OK) { return rc; }
+  if (n < 1 || vals == 0) { return q_fail(q, -MEO_ERR_USAGE); }
+  var i: int32 = 0;
+  while (i < n) {
+    rc = q_check_value(q, &vals[i]);
+    if (rc != MEO_OK) { return rc; }
+    i += 1;
+  }
+  return q_add_term(q, name, MEO_Q_IN, vals, n);
+}
+
+export fn meo_q_where_null(q: MeoQuery*, name: string) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check_filter(q);
+  if (rc != MEO_OK) { return rc; }
+  return q_add_term(q, name, MEO_Q_IS_NULL, 0, 0);
+}
+
+export fn meo_q_where_not_null(q: MeoQuery*, name: string) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check_filter(q);
+  if (rc != MEO_OK) { return rc; }
+  return q_add_term(q, name, MEO_Q_NOT_NULL, 0, 0);
+}
+
+export fn meo_q_order(q: MeoQuery*, name: string, desc: bool) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_SELECT, MEO_Q_K_SELECT);
+  if (rc != MEO_OK) { return rc; }
+  var s: MeoQSpec* = &q->spec;
+  var np: MeoQOrder* = meo_qspec_grow(s->order, s->n_order, &s->cap_order, (int64)sizeof(MeoQOrder));
+  if (np == 0) { return q_fail(q, -MEO_ERR_NOMEM); }
+  s->order = np;
+  rc = meo_qspec_name(&s->order[s->n_order].col, name);
+  if (rc != MEO_OK) { return q_fail(q, rc); }
+  s->order[s->n_order].desc = desc;
+  s->n_order += 1;
+  return MEO_OK;
+}
+
+export fn meo_q_limit(q: MeoQuery*, n: int64) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_SELECT, MEO_Q_K_SELECT);
+  if (rc != MEO_OK) { return rc; }
+  if (n < 0) { return q_fail(q, -MEO_ERR_USAGE); }
+  q->spec.limit = n;
+  return MEO_OK;
+}
+
+export fn meo_q_offset(q: MeoQuery*, n: int64) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_SELECT, MEO_Q_K_SELECT);
+  if (rc != MEO_OK) { return rc; }
+  if (n < 0) { return q_fail(q, -MEO_ERR_USAGE); }
+  q->spec.offset = n;
+  return MEO_OK;
+}
+
+// --- values -----------------------------------------------------------------
+
+export fn meo_q_n_values(q: MeoQuery*) -> int32 {
+  if (q == 0) { return 0; }
+  return q->n_vals;
+}
+
+// Replace slot `slot` with a copy of *v. Not while rows are being read.
+export fn meo_q_set_value(q: MeoQuery*, slot: int32, v: MeoValue*) -> int32 {
+  if (q == 0 || slot < 0 || slot >= q->n_vals) { return -MEO_ERR_USAGE; }
+  if (q->state == MEO_Q_ROWS) { return -MEO_ERR_USAGE; }
+  if (meo_value_check(v) != MEO_OK) { return -MEO_ERR_USAGE; }
+  return meo_exec_slot_put(q, slot, v);
+}
+
+// --- run --------------------------------------------------------------------
+
+export fn meo_q_step(q: MeoQuery*) -> int32 {
+  return meo_exec_step(q);
+}
+
+export fn meo_q_changes(q: MeoQuery*) -> int32 {
+  if (q == 0) { return 0; }
+  return q->changes;
+}
+
+export fn meo_q_last_insert_rowid(q: MeoQuery*) -> int64 {
+  if (q == 0) { return 0; }
+  return q->last_rowid;
+}
+
+export fn meo_q_reset(q: MeoQuery*) -> int32 {
+  return meo_exec_reset(q);
+}
+
+export fn meo_q_free(q: MeoQuery*) -> int32 {
+  if (q == 0) { return MEO_OK; }
+  // Atomic, not under the lock: free must never fail or block.
+  atomic_dec_i32(&q->db->n_stmts);
+  q_release(q);
+  return MEO_OK;
+}
+
+// --- results ----------------------------------------------------------------
+
+// Result columns of the last run (a SELECT), 0 before the first step.
+export fn meo_q_column_count(q: MeoQuery*) -> int32 {
+  if (q == 0) { return 0; }
+  return q->n_cols;
+}
+
+// MEO_T_* of the current row's column i; MEO_T_NULL when there is none.
+export fn meo_q_column_type(q: MeoQuery*, i: int32) -> int32 {
+  var v: MeoValue* = meo_exec_cell(q, i);
+  if (v == 0) { return MEO_T_NULL; }
+  return v->type;
+}
+
+export fn meo_q_column_int64(q: MeoQuery*, i: int32) -> int64 {
+  var v: MeoValue* = meo_exec_cell(q, i);
+  if (v == 0) { return 0; }
+  if (v->type == MEO_T_INT) { return v->i; }
+  if (v->type == MEO_T_REAL) { return (int64)v->f; }
+  return 0;
+}
+
+export fn meo_q_column_double(q: MeoQuery*, i: int32) -> float64 {
+  var v: MeoValue* = meo_exec_cell(q, i);
+  if (v == 0) { return 0.0; }
+  if (v->type == MEO_T_REAL) { return v->f; }
+  if (v->type == MEO_T_INT) { return (float64)v->i; }
+  return 0.0;
+}
+
+// NUL-terminated bytes of a TEXT (or BLOB) cell, borrowed; 0 otherwise.
+export fn meo_q_column_text(q: MeoQuery*, i: int32) -> uint8* {
+  var v: MeoValue* = meo_exec_cell(q, i);
+  if (v == 0) { return 0; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) { return v->p; }
+  return 0;
+}
+
+export fn meo_q_column_blob(q: MeoQuery*, i: int32) -> uint8* {
+  return meo_q_column_text(q, i);
+}
+
+export fn meo_q_column_bytes(q: MeoQuery*, i: int32) -> int32 {
+  var v: MeoValue* = meo_exec_cell(q, i);
+  if (v == 0) { return 0; }
+  if (v->type == MEO_T_TEXT || v->type == MEO_T_BLOB) { return v->n; }
+  return 0;
+}
+
+// Copy the current row's cell into *out (out.p borrowed). -MEO_ERR_USAGE when
+// not on a row.
+export fn meo_q_column(q: MeoQuery*, i: int32, out: MeoValue*) -> int32 {
+  if (out == 0) { return -MEO_ERR_USAGE; }
+  var v: MeoValue* = meo_exec_cell(q, i);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  out[0] = v[0];
+  return MEO_OK;
+}
+
+// Rows in the whole result, valid after the first step until reset or free.
+export fn meo_q_row_count(q: MeoQuery*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  if (q->state != MEO_Q_ROWS && q->state != MEO_Q_DONE) { return -MEO_ERR_USAGE; }
+  return q->n_rows;
+}
+
+// Any cell of the result (out.p borrowed until reset or free).
+export fn meo_q_cell(q: MeoQuery*, row: int32, col: int32, out: MeoValue*) -> int32 {
+  if (out == 0) { return -MEO_ERR_USAGE; }
+  var v: MeoValue* = meo_exec_cell_at(q, row, col);
+  if (v == 0) { return -MEO_ERR_USAGE; }
+  out[0] = v[0];
+  return MEO_OK;
+}

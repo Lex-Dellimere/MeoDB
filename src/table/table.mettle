@@ -300,7 +300,7 @@ fn tbl_check_indexes(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n: int32, n_cols
 // size, and every unique index against the tree and within the statement.
 // rowids_out[r] gets row r's rowid: the alias value, or for a NULL/omitted
 // alias the next of max+1, max+2, ... as if inserted in order.
-// MEO_OK, or SQL, MISMATCH, CONSTRAINT, CONFLICT, TOOBIG, FULL, or a storage
+// MEO_OK, or SCHEMA, MISMATCH, CONSTRAINT, CONFLICT, TOOBIG, FULL, or a storage
 // error.
 export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: int32,
     n_cols: int32, arena: MeoArena*, rowids_out: int64*) -> int32 {
@@ -309,8 +309,8 @@ export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: 
   }
   if (n_rows == 0) { return MEO_OK; }
   if (rows == 0) { return -MEO_ERR_USAGE; }
-  if (!t->live) { return -MEO_ERR_SQL; }
-  if (n_cols != t->n_cols) { return -MEO_ERR_SQL; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  if (n_cols != t->n_cols) { return -MEO_ERR_SCHEMA; }
   var alias: int32 = meo_tbl_alias_col(t);
   var int64_max: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
   var hi: int64 = 0;
@@ -360,8 +360,8 @@ export fn meo_tbl_check_update(db: MeoDb*, t: MeoTable*, rowids: int64*, n: int3
   if (db == 0 || t == 0 || arena == 0 || n < 0) { return -MEO_ERR_USAGE; }
   if (n == 0) { return MEO_OK; }
   if (rowids == 0 || new_vals == 0) { return -MEO_ERR_USAGE; }
-  if (!t->live) { return -MEO_ERR_SQL; }
-  if (n_cols != t->n_cols) { return -MEO_ERR_SQL; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  if (n_cols != t->n_cols) { return -MEO_ERR_SCHEMA; }
   var alias: int32 = meo_tbl_alias_col(t);
   var new_ids: int64* = (int64*)meo_arena_alloc(arena, (int64)n * 8);
   if (new_ids == 0) { return -MEO_ERR_NOMEM; }
@@ -632,7 +632,7 @@ export fn meo_tbl_lookup_rowid(db: MeoDb*, t: MeoTable*, rowid: int64, buf: uint
 // meo_tbl_scan_next.
 export fn meo_tbl_scan_open(db: MeoDb*, t: MeoTable*, sc: MeoTblScan*) -> int32 {
   if (db == 0 || t == 0 || sc == 0) { return -MEO_ERR_USAGE; }
-  if (!t->live) { return -MEO_ERR_SQL; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
   sc->db = db;
   sc->t = t;
   sc->started = false;
