@@ -1,6 +1,6 @@
 # Mettle: release-only miscompile of a loop that advances a pointer field
 
-Status: open, reported here only. Compiler: `/home/nox/Projects/mettle/Mettle/bin/mettle` (reports v0.17.0).
+Status: open, filed as Mettle report 038 (`../Mettle/reports/038-release-loop-pointer-field-hang.md`). Compiler: `/home/nox/Projects/mettle/Mettle/bin/mettle` (reports v0.17.0).
 
 An outer `while` that reads a field through a pointer (`lx->pos`) hangs under `--release` when one branch has an inner `while` advancing the same field and another branch leaves the loop. Debug builds are correct. `--release --verify` reports OK.
 

@@ -4,7 +4,7 @@
 
 | Id | Area | What happens | Why it matters | Where | Status |
 |---|---|---|---|---|---|
-| B1 | conc | A waiter can wait longer than `busy_ms`: the runtime mutex restarts the full timeout after every wake-up. | Under heavy contention a client may see BUSY late. | `src/conc/lock.mettle` | open |
+| B1 | conc | A waiter can wait longer than `busy_ms`: the runtime mutex restarts the full timeout after every wake-up. | Under heavy contention a client may see BUSY late. | `src/conc/lock.mettle`; runtime bug filed as Mettle report 039 | open |
 | B2 | conc | A thread that exits while holding the db lock leaves it held forever; thread ids can be reused. | Only reachable by an embedded caller that exits mid-transaction; the server always rolls back first. | `src/conc/lock.mettle` | open |
 | B3 | query | A DROP TABLE that fails partway inside an explicit transaction marks the table dead from the first freed page and poisons the transaction until rollback. Not tested. | The table looks gone until rollback reloads it. | `src/catalog/catalog.mettle` (`meo_cat_drop_table`) | open |
 | B4 | catalog | Dropping a table can grow the file by one page when the freelist needs a new trunk page. | Minor; the test allows it. | `src/pager/freelist.mettle` | open |
