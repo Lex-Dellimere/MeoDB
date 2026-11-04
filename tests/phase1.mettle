@@ -860,7 +860,7 @@ fn p1_t1_crc_varint() -> int32 {
 
   // Zigzag: 0 -> 0, -1 -> 1, 1 -> 2, and the extremes survive.
   var signs: int64[5] = [(int64)0, (int64)-1, (int64)1,
-    9223372036854775807, (int64)(0 - 9223372036854775807 - 1)];
+    9223372036854775807, (int64)0 - 9223372036854775807 - 1];
   i = 0;
   while (i < 5) {
     var v: int64 = signs[i];
