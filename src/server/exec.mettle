@@ -17,7 +17,7 @@ import "../wire/stmt.mettle";
 import "../wire/msg.mettle";
 
 // caps this server advertises in HELLO_OK.
-export const MEO_SRV_CAPS: uint32 = 3;   // COUNT | ASSIGN_ADD
+export const MEO_SRV_CAPS: uint32 = 15;   // COUNT | ASSIGN_ADD | SUBSCRIBE | SCAN
 
 // RC_W_* (index) -> MEO_Q_*; IN, NULL and NOT_NULL have their own builders.
 fn srv_term_op(op: int32) -> int32 {

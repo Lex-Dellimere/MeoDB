@@ -1,0 +1,116 @@
+// server/scan: the streaming SCAN request.
+//
+// The query layer calls back once per point; points are buffered and sent as
+// SCAN_ROWS frames of `chunk` points (fewer when the client's frame limit is
+// smaller). A full buffer is held until the next point arrives, because only
+// then is it known not to be the last frame. In WAL mode the scan reads one
+// snapshot and holds no db lock; inside a transaction it reads the session's
+// own writes.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../db/db.mettle";
+import "../query/query.mettle";
+import "../wire/frame.mettle";
+import "../wire/msg.mettle";
+import "../wire/sub.mettle";
+import "conn.mettle";
+
+struct SrvScan {
+  s: MeoSrvSession*;
+  rid: uint32;
+  grouped: bool;
+  per: int32;             // points per frame
+  pts: MeoWPoint*;
+  n: int32;
+  cap: int32;
+  seq: uint64;            // the commit the scan reads, set by the query layer
+  failed: bool;           // a send failed: the connection is gone
+  sent: int32;            // frames sent
+}
+
+// Send the buffered points as one frame.
+fn scan_flush(sc: SrvScan*, last: bool) -> int32 {
+  var s: MeoSrvSession* = sc->s;
+  s->w.max = meo_srv_frame_max(s);
+  meo_wbuf_begin(&s->w);
+  meo_wire_scan_rows_put(&s->w, last, sc->grouped, sc->seq, sc->n, sc->pts);
+  var n: int32 = meo_wbuf_finish(&s->w, MEO_WIRE_K_SCAN_ROWS, sc->rid);
+  s->w.max = s->srv->cfg.max_frame;
+  var rc: int32 = meo_srv_send(s, n);
+  if (rc < 0) { sc->failed = true; }
+  sc->n = 0;
+  sc->sent += 1;
+  return rc;
+}
+
+fn scan_add(sc: SrvScan*, g: int64, x: float64, y: float64) -> int32 {
+  if (sc->n == sc->per) {
+    var rc: int32 = scan_flush(sc, false);
+    if (rc < 0) { return rc; }
+  }
+  if (sc->n == sc->cap) {
+    var want: int32 = sc->cap * 2;
+    if (want < 1024) { want = 1024; }
+    if (want > sc->per) { want = sc->per; }
+    var p: rawptr = realloc((rawptr)sc->pts, (int64)want * (int64)sizeof(MeoWPoint));
+    if (p == 0) { return -MEO_ERR_NOMEM; }
+    sc->pts = (MeoWPoint*)p;
+    sc->cap = want;
+  }
+  sc->pts[sc->n].g = g;
+  sc->pts[sc->n].x = x;
+  sc->pts[sc->n].y = y;
+  sc->n += 1;
+  return 0;
+}
+
+fn scan_cb_xy(ctx: rawptr, x: float64, y: float64) -> int32 {
+  return scan_add((SrvScan*)ctx, 0, x, y);
+}
+
+fn scan_cb_xyg(ctx: rawptr, g: int64, x: float64, y: float64) -> int32 {
+  return scan_add((SrvScan*)ctx, g, x, y);
+}
+
+// SCAN in READY or TX: SCAN_ROWS frames up to the one with last = 1, or an
+// ERROR in place of the rest (after the first frame too, with the same rid).
+export fn meo_srv_on_scan(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  var req: MeoWScan;
+  if (meo_wire_scan_get(r, &req) < 0) {
+    return meo_srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+  }
+  if (s->state != MEO_SRV_S_READY && s->state != MEO_SRV_S_TX) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+  }
+  if (req.chunk < 1 || req.chunk > MEO_WIRE_CHUNK_MAX) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_USAGE, false));
+  }
+  var sc: SrvScan;
+  sc.s = s;
+  sc.rid = h->rid;
+  sc.grouped = req.group.length > 0;
+  sc.pts = 0;
+  sc.n = 0;
+  sc.cap = 0;
+  sc.seq = 0;
+  sc.failed = false;
+  sc.sent = 0;
+  sc.per = (int32)req.chunk;
+  var fit: int32 = (meo_srv_frame_max(s) - MEO_WIRE_SCAN_ROWS_HDR) / meo_wire_scan_point_size(sc.grouped);
+  if (fit < sc.per) { sc.per = fit; }
+  var db: MeoDb* = s->srv->db;
+  var rc: int32 = MEO_OK;
+  if (sc.grouped) {
+    rc = meo_q_scan_xyg_seq(db, req.table, req.x, req.y, req.group, req.lo, req.hi,
+      &scan_cb_xyg, (rawptr)&sc, &sc.seq);
+  } else {
+    rc = meo_q_scan_xy_seq(db, req.table, req.x, req.y, req.lo, req.hi, &scan_cb_xy,
+      (rawptr)&sc, &sc.seq);
+  }
+  if (rc == MEO_OK && !sc.failed) { scan_flush(&sc, true); }
+  if (sc.pts != 0) { free((rawptr)sc.pts); }
+  if (sc.failed) { return meo_srv_after(s, -MEO_ERR_IO); }
+  if (rc < 0) { return meo_srv_after(s, meo_srv_reply_error(s, h->rid, -rc, false)); }
+  return MEO_SRV_CONTINUE;
+}

@@ -1,0 +1,232 @@
+// server/conn: the server and session types and the helpers every server
+// module shares: the clock, the frame senders, the error replies and the
+// rollback that keeps ERROR.tx honest. session, sub and scan build on it.
+
+import "std/mem";
+import "std/thread";
+import "../error/status.mettle";
+import "../mem/arena.mettle";
+import "../record/value.mettle";
+import "../db/db.mettle";
+import "../feed/feed.mettle";
+import "../net/sock.mettle";
+import "../wire/frame.mettle";
+import "../wire/msg.mettle";
+import "../wire/sub.mettle";
+
+export const MEO_SRV_S_HELLO: int32 = 0;
+export const MEO_SRV_S_READY: int32 = 1;
+export const MEO_SRV_S_TX: int32 = 2;
+export const MEO_SRV_S_ABORTED: int32 = 3;
+export const MEO_SRV_S_SUBSCRIBED: int32 = 4;
+
+// Exit reasons, numbered like alph's so a session can become an actor.
+export const MEO_SRV_EXIT_NORMAL: int64 = 0;     // BYE, or EOF while READY or SUBSCRIBED
+export const MEO_SRV_EXIT_KILLED: int64 = 2;     // cut off by a timeout
+export const MEO_SRV_EXIT_CRASHED: int64 = 4;    // protocol violation, bad token
+export const MEO_SRV_EXIT_SHUTDOWN: int64 = 5;   // server stop
+export const MEO_SRV_EXIT_LOST: int64 = 100;     // peer EOF or socket error
+
+// What a frame handler answers: keep serving, or end with s->reason set.
+export const MEO_SRV_CONTINUE: int32 = 0;
+export const MEO_SRV_STOP: int32 = 1;
+
+export const MEO_SRV_BUF_KEEP: int32 = 1048576;   // buffers above this are dropped after a frame
+const SRV_HELLO_SEND_MS: int32 = 1000;
+const SRV_READY_SEND_MS: int32 = 30000;
+
+export struct MeoSrvConfig {
+  ip: string;
+  port: int32;            // 0 = ephemeral; meo_srv_port reads it back
+  max_conns: int32;
+  max_frame: int32;
+  token: uint8*;          // copied by meo_srv_start
+  token_n: int32;         // 0 = no token
+  busy_ms: int32;
+  tx_idle_ms: int32;
+  tx_max_ms: int32;
+  idle_ms: int32;         // 0 = none
+  hello_ms: int32;
+  stop_ms: int32;
+  sub_hb_ms: int32;       // a subscription idle this long gets an empty EVENTS frame
+}
+
+export struct MeoSrvSlot {
+  s: MeoSrvSession*;
+  thread: int64;
+  done: int32;            // set by the session thread as its last act
+}
+
+export struct MeoSrv {
+  db: MeoDb*;
+  cfg: MeoSrvConfig;
+  lfd: int64;
+  port: int32;
+  acceptor: int64;
+  stop: int32;
+  mtx: int64;             // guards slots and session fds
+  slots: MeoSrvSlot*;
+  next_id: int64;
+  feed: MeoFeed*;         // every subscription reads this one
+  feed_base: uint64;      // the db's commit_seq when the feed was attached
+}
+
+// A covered table in a subscription's schema map. n_cols is what the client
+// was last told; -1 until its SCHEMA event went out.
+export struct MeoSrvSubTab {
+  id: int64;
+  covered: bool;
+  n_cols: int32;
+}
+
+export struct MeoSrvSubName {
+  p: uint8*;
+  n: int32;
+}
+
+// One subscription: the cursor, the events read but not yet sent, the window
+// and the schema map. Owned by its session thread.
+export struct MeoSrvSub {
+  cur: MeoFeedCursor;
+  all: bool;                   // every table
+  names: MeoSrvSubName*;       // the covered names when not all
+  n_names: int32;
+  tabs: MeoSrvSubTab*;
+  n_tabs: int32;
+  cap_tabs: int32;
+  skip_commit: uint64;         // from_commit: drop events at or below it
+  window: int32;
+  fifo: uint64*;               // seqs sent and not ACKed, oldest first
+  f_head: int32;
+  f_n: int32;
+  last_sent: uint64;           // highest seq in any frame sent
+  last_send_ms: int64;
+  bat: MeoChange*;             // events read from the feed
+  bat_n: int32;
+  bat_at: int32;               // next one to send
+  keybuf: uint8*;
+  vals: MeoValue*;             // decode scratch, MEO_MAX_COLS each
+  old: MeoValue*;
+  cols: MeoWSchemaCol*;
+}
+
+export struct MeoSrvSession {
+  id: int64;
+  srv: MeoSrv*;
+  slot: int32;
+  fd: int64;
+  state: int32;
+  minor: int32;           // negotiated; the minor-1 kinds need 1
+  tx_start_ms: int64;
+  peer_max: int32;        // largest frame the client accepts
+  rbuf: uint8*;
+  rcap: int32;
+  w: MeoWBuf;
+  arena: MeoArena*;
+  sub: MeoSrvSub*;        // while SUBSCRIBED
+  reason: int64;
+}
+
+export fn meo_srv_now_ms() -> int64 {
+  // clock_gettime(CLOCK_MONOTONIC)
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  syscall((int64)228, (int64)1, (int64)&ts[0]);
+  return ts[0] * (int64)1000 + ts[1] / (int64)1000000;
+}
+
+export fn meo_srv_stopping(srv: MeoSrv*) -> bool {
+  return atomic_compare_exchange_i32(&srv->stop, 0, 0) != 0;
+}
+
+// One ERROR frame into w; the frame size or the codec's error.
+export fn meo_srv_error_frame(w: MeoWBuf*, rid: uint32, code: int32, fatal: bool, tx: int32) -> int32 {
+  var e: MeoWError;
+  e.code = code;
+  e.fatal = fatal;
+  e.tx = tx;
+  e.msg = meo_status_name(code);
+  meo_wbuf_begin(w);
+  meo_wire_error_put(w, &e);
+  return meo_wbuf_finish(w, MEO_WIRE_K_ERROR, rid);
+}
+
+export fn meo_srv_tx_byte(s: MeoSrvSession*) -> int32 {
+  if (s->state == MEO_SRV_S_TX) { return MEO_WIRE_TX_OPEN; }
+  if (s->state == MEO_SRV_S_ABORTED) { return MEO_WIRE_TX_ABORTED; }
+  return MEO_WIRE_TX_NONE;
+}
+
+export fn meo_srv_set_state(s: MeoSrvSession*, state: int32) {
+  s->state = state;
+  var c: MeoSrvConfig* = &s->srv->cfg;
+  if (state == MEO_SRV_S_HELLO) {
+    meo_sock_set_recv_timeout(s->fd, c->hello_ms);
+    meo_sock_set_send_timeout(s->fd, SRV_HELLO_SEND_MS);
+  } else if (state == MEO_SRV_S_READY) {
+    meo_sock_set_recv_timeout(s->fd, c->idle_ms);
+    meo_sock_set_send_timeout(s->fd, SRV_READY_SEND_MS);
+  } else if (state == MEO_SRV_S_SUBSCRIBED) {
+    // Only a frame cut in half waits on this: the loop polls before it reads.
+    meo_sock_set_recv_timeout(s->fd, c->tx_idle_ms);
+    meo_sock_set_send_timeout(s->fd, SRV_READY_SEND_MS);
+  } else {
+    meo_sock_set_recv_timeout(s->fd, c->tx_idle_ms);
+    meo_sock_set_send_timeout(s->fd, c->tx_idle_ms);
+  }
+}
+
+// Undo an open transaction on this thread, which releases the db lock.
+export fn meo_srv_rollback(s: MeoSrvSession*) {
+  if (s->state == MEO_SRV_S_TX) {
+    meo_db_rollback(s->srv->db);
+    meo_srv_set_state(s, MEO_SRV_S_ABORTED);
+  }
+}
+
+// The first n bytes of s->w, which is shrunk again if a big frame grew it.
+export fn meo_srv_send(s: MeoSrvSession*, n: int32) -> int32 {
+  if (n < 0) { return n; }
+  var rc: int32 = meo_sock_send_all(s->fd, s->w.p, n);
+  if (s->w.cap > MEO_SRV_BUF_KEEP) {
+    meo_wbuf_free(&s->w);
+    meo_wbuf_init(&s->w, s->srv->cfg.max_frame);
+  }
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+export fn meo_srv_reply_empty(s: MeoSrvSession*, kind: int32, rid: uint32) -> int32 {
+  meo_wbuf_begin(&s->w);
+  return meo_srv_send(s, meo_wbuf_finish(&s->w, kind, rid));
+}
+
+export fn meo_srv_reply_error(s: MeoSrvSession*, rid: uint32, code: int32, fatal: bool) -> int32 {
+  return meo_srv_send(s, meo_srv_error_frame(&s->w, rid, code, fatal, meo_srv_tx_byte(s)));
+}
+
+// A fatal error: roll back first so ERROR.tx tells the truth, answer, stop.
+export fn meo_srv_fatal(s: MeoSrvSession*, rid: uint32, code: int32, reason: int64) -> int32 {
+  meo_srv_rollback(s);
+  if (s->state == MEO_SRV_S_ABORTED) { s->state = MEO_SRV_S_READY; }
+  meo_srv_reply_error(s, rid, code, true);
+  s->reason = reason;
+  return MEO_SRV_STOP;
+}
+
+// After a reply: a failed send ends the session.
+export fn meo_srv_after(s: MeoSrvSession*, rc: int32) -> int32 {
+  if (rc < 0) {
+    s->reason = MEO_SRV_EXIT_LOST;
+    return MEO_SRV_STOP;
+  }
+  return MEO_SRV_CONTINUE;
+}
+
+// The frame size limit for what this session sends: its own and the client's.
+export fn meo_srv_frame_max(s: MeoSrvSession*) -> int32 {
+  var max: int32 = s->srv->cfg.max_frame;
+  if (s->peer_max < max) { max = s->peer_max; }
+  return max;
+}

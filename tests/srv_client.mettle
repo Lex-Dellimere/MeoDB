@@ -1,0 +1,325 @@
+// srv_client: a raw-frame client for the subscribe and scan tests, with the
+// few statements they run. Not a program of its own; srv_sub and srv_scan
+// import it. Each decoded frame lives until the next ss_recv.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/mem/arena.mettle";
+import "../src/wire/sub.mettle";
+import "../src/meo_server.mettle";
+
+export const SS_FRAME: int32 = 1048576;
+
+// Statement columns: types 1 INT 2 REAL 3 TEXT 4 BLOB, flags MEO_WIRE_CF_*.
+export struct SsC {
+  fd: int64;
+  rid: uint32;
+  w: MeoWBuf;
+  buf: uint8*;
+  hdr: MeoWHdr;
+  rd: MeoWRd;
+  arena: MeoArena*;
+  err: MeoWError;
+  res: MeoWResult;
+  ok: MeoWSubOk;       // the last SUB_OK
+  evs: MeoWEvents;     // the last EVENTS frame
+  head: MeoWScanRows;  // the last SCAN_ROWS header
+  pts: MeoWPoint*;     // its points
+  caps: uint32;
+  minor: int32;
+}
+
+export fn ss_init(c: SsC*) {
+  c->fd = -1;
+  c->rid = 0;
+  meo_wbuf_init(&c->w, SS_FRAME);
+  c->buf = (uint8*)malloc((int64)SS_FRAME + 64);
+  c->arena = meo_arena_new(65536);
+  c->pts = 0;
+  c->caps = 0;
+  c->minor = 0;
+}
+
+export fn ss_close(c: SsC*) {
+  if (c->fd >= 0) { meo_sock_close(c->fd); }
+  c->fd = -1;
+}
+
+export fn ss_free(c: SsC*) {
+  ss_close(c);
+  meo_wbuf_free(&c->w);
+  free((rawptr)c->buf);
+  meo_arena_free(c->arena);
+}
+
+export fn ss_send(c: SsC*, kind: int32) -> int32 {
+  c->rid += 1;
+  var n: int32 = meo_wbuf_finish(&c->w, kind, c->rid);
+  if (n < 0) { return n; }
+  var rc: int32 = meo_sock_send_all(c->fd, c->w.p, n);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// The next frame decoded by kind: its kind, 0 on EOF, or -MEO_ERR_* (TIMEOUT
+// when nothing came within the socket's receive timeout).
+export fn ss_recv(c: SsC*) -> int32 {
+  var rc: int32 = meo_sock_recv_exact(c->fd, c->buf, MEO_WIRE_HDR);
+  if (rc <= 0) { return rc; }
+  rc = meo_wire_hdr_get(c->buf, SS_FRAME, &c->hdr);
+  if (rc < 0) { return rc; }
+  if (c->hdr.len > 0) {
+    rc = meo_sock_recv_exact(c->fd, c->buf + MEO_WIRE_HDR, c->hdr.len);
+    if (rc != c->hdr.len) { return -MEO_ERR_IO; }
+  }
+  meo_wrd_init(&c->rd, c->buf + MEO_WIRE_HDR, c->hdr.len);
+  meo_arena_reset(c->arena);
+  var k: int32 = c->hdr.kind;
+  rc = MEO_OK;
+  if (k == MEO_WIRE_K_ERROR) {
+    rc = meo_wire_error_get(&c->rd, &c->err);
+  } else if (k == MEO_WIRE_K_RESULT) {
+    rc = meo_wire_result_get(&c->rd, c->arena, &c->res);
+  } else if (k == MEO_WIRE_K_SUB_OK) {
+    rc = meo_wire_sub_ok_get(&c->rd, c->arena, &c->ok);
+  } else if (k == MEO_WIRE_K_EVENTS) {
+    rc = meo_wire_events_get(&c->rd, c->arena, &c->evs);
+  } else if (k == MEO_WIRE_K_SCAN_ROWS) {
+    rc = meo_wire_scan_rows_get(&c->rd, c->arena, &c->head, &c->pts);
+  }
+  if (rc < 0) { return -MEO_ERR_PROTO; }
+  return k;
+}
+
+// Connected and past HELLO as a client of the given minor.
+export fn ss_open(c: SsC*, port: int32, minor: int32) -> int32 {
+  c->fd = meo_sock_connect("127.0.0.1", port);
+  if (c->fd < 0) { return (int32)c->fd; }
+  meo_sock_set_recv_timeout(c->fd, 5000);
+  var h: MeoWHello;
+  h.major = MEO_WIRE_MAJOR;
+  h.minor = minor;
+  h.max_frame = SS_FRAME;
+  h.token = "";
+  h.name = "srv_client";
+  meo_wbuf_begin(&c->w);
+  meo_wire_hello_put(&c->w, &h);
+  var rc: int32 = ss_send(c, MEO_WIRE_K_HELLO);
+  if (rc < 0) { return rc; }
+  if (ss_recv(c) != MEO_WIRE_K_HELLO_OK) { return -MEO_ERR_PROTO; }
+  var ok: MeoWHelloOk;
+  var r2: MeoWRd;
+  meo_wrd_init(&r2, c->buf + MEO_WIRE_HDR, c->hdr.len);
+  if (meo_wire_hello_ok_get(&r2, &ok) < 0) { return -MEO_ERR_PROTO; }
+  c->caps = ok.caps;
+  c->minor = ok.minor;
+  return MEO_OK;
+}
+
+// An empty request; the response kind.
+export fn ss_call(c: SsC*, kind: int32) -> int32 {
+  meo_wbuf_begin(&c->w);
+  var rc: int32 = ss_send(c, kind);
+  if (rc < 0) { return rc; }
+  return ss_recv(c);
+}
+
+// Skip pushed frames (rid 0) until the answer to the last request.
+export fn ss_answer(c: SsC*) -> int32 {
+  while (true) {
+    var k: int32 = ss_recv(c);
+    if (k <= 0) { return k; }
+    if (c->hdr.rid == c->rid) { return k; }
+    if (c->hdr.rid != 0) { return -MEO_ERR_PROTO; }
+  }
+  return -MEO_ERR_PROTO;
+}
+
+export fn ss_query(c: SsC*, st: MeoWStmt*) -> int32 {
+  meo_wbuf_begin(&c->w);
+  var rc: int32 = meo_wire_stmt_put(&c->w, st);
+  if (rc < 0) { return rc; }
+  rc = ss_send(c, MEO_WIRE_K_QUERY);
+  if (rc < 0) { return rc; }
+  return ss_recv(c);
+}
+
+export fn ss_col(col: MeoWCol*, name: string, ty: int32, flags: int32) {
+  col->name = name;
+  col->ty = ty;
+  col->flags = flags;
+}
+
+// CREATE TABLE t(id INTEGER PRIMARY KEY, a <ta>, b <tb>): true on RESULT.
+export fn ss_create(c: SsC*, table: string, a: string, ta: int32, b: string, tb: int32) -> bool {
+  var cols: MeoWCol[3];
+  ss_col(&cols[0], "id", MEO_T_INT, MEO_WIRE_CF_PK);
+  ss_col(&cols[1], a, ta, 0);
+  ss_col(&cols[2], b, tb, 0);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_CREATE;
+  st.table = table;
+  st.cols = &cols[0];
+  st.n_cols = 3;
+  return ss_query(c, &st) == MEO_WIRE_K_RESULT;
+}
+
+// INSERT INTO t(id, <a>, <b>) VALUES (id, v, name): true on RESULT.
+export fn ss_insert(c: SsC*, table: string, a: string, b: string, id: int64, v: float64, name: string) -> bool {
+  var cols: MeoWCol[3];
+  ss_col(&cols[0], "id", 0, 0);
+  ss_col(&cols[1], a, 0, 0);
+  ss_col(&cols[2], b, 0, 0);
+  var args: MeoValue[3];
+  meo_value_set_int(&args[0], id);
+  meo_value_set_real(&args[1], v);
+  meo_value_set_text(&args[2], name.chars, (int32)name.length);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = table;
+  st.cols = &cols[0];
+  st.n_cols = 3;
+  st.n_rows = 1;
+  st.args = &args[0];
+  st.n_args = 3;
+  return ss_query(c, &st) == MEO_WIRE_K_RESULT;
+}
+
+// UPDATE t SET <a> = v WHERE id = id.
+export fn ss_update(c: SsC*, table: string, a: string, v: float64, id: int64) -> bool {
+  var cols: MeoWCol[1];
+  ss_col(&cols[0], a, 0, 0);
+  var terms: MeoWTerm[1];
+  terms[0].col = "id";
+  terms[0].op = MEO_WIRE_W_EQ;
+  terms[0].arg0 = 1;
+  terms[0].n_args = 1;
+  var args: MeoValue[2];
+  meo_value_set_real(&args[0], v);
+  meo_value_set_int(&args[1], id);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_UPDATE;
+  st.table = table;
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  st.args = &args[0];
+  st.n_args = 2;
+  return ss_query(c, &st) == MEO_WIRE_K_RESULT;
+}
+
+// DELETE FROM t WHERE id = id.
+export fn ss_delete(c: SsC*, table: string, id: int64) -> bool {
+  var terms: MeoWTerm[1];
+  terms[0].col = "id";
+  terms[0].op = MEO_WIRE_W_EQ;
+  terms[0].arg0 = 0;
+  terms[0].n_args = 1;
+  var args: MeoValue[1];
+  meo_value_set_int(&args[0], id);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DELETE;
+  st.table = table;
+  st.terms = &terms[0];
+  st.n_terms = 1;
+  st.args = &args[0];
+  st.n_args = 1;
+  return ss_query(c, &st) == MEO_WIRE_K_RESULT;
+}
+
+// ALTER TABLE t ADD COLUMN name <ty>.
+export fn ss_add_column(c: SsC*, table: string, name: string, ty: int32) -> bool {
+  var cols: MeoWCol[1];
+  ss_col(&cols[0], name, ty, 0);
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_ADD_COLUMN;
+  st.table = table;
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  return ss_query(c, &st) == MEO_WIRE_K_RESULT;
+}
+
+// COUNT(*) of t, or -1.
+export fn ss_count(c: SsC*, table: string) -> int64 {
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_COUNT;
+  st.table = table;
+  if (ss_query(c, &st) != MEO_WIRE_K_RESULT || c->res.n_rows != 1) { return -1; }
+  return c->res.cells[0].i;
+}
+
+// Rows (id, v, g) in one autocommit INSERT: id = first .. first + n - 1,
+// v = id / 2 (NaN-free), g = id % 3. true on RESULT.
+export fn ss_insert_bulk(c: SsC*, table: string, first: int64, n: int32) -> bool {
+  var cols: MeoWCol[3];
+  ss_col(&cols[0], "id", 0, 0);
+  ss_col(&cols[1], "v", 0, 0);
+  ss_col(&cols[2], "g", 0, 0);
+  var args: MeoValue* = (MeoValue*)malloc((int64)n * (int64)3 * (int64)sizeof(MeoValue));
+  var i: int32 = 0;
+  while (i < n) {
+    var id: int64 = first + (int64)i;
+    meo_value_set_int(&args[i * 3], id);
+    meo_value_set_real(&args[i * 3 + 1], (float64)id / 2.0);
+    meo_value_set_int(&args[i * 3 + 2], id % 3);
+    i += 1;
+  }
+  var st: MeoWStmt;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_INSERT;
+  st.table = table;
+  st.cols = &cols[0];
+  st.n_cols = 3;
+  st.n_rows = n;
+  st.args = args;
+  st.n_args = n * 3;
+  var k: int32 = ss_query(c, &st);
+  free((rawptr)args);
+  return k == MEO_WIRE_K_RESULT;
+}
+
+// SUBSCRIBE: the answering kind (SUB_OK decoded into c->ok). names: n tables.
+export fn ss_subscribe(c: SsC*, n: int32, names: string*, from_seq: uint64, from_commit: uint64,
+    window: uint32) -> int32 {
+  var s: MeoWSub;
+  s.n_tables = n;
+  s.tables = names;
+  s.from_seq = from_seq;
+  s.from_commit = from_commit;
+  s.window = window;
+  meo_wbuf_begin(&c->w);
+  meo_wire_sub_put(&c->w, &s);
+  var rc: int32 = ss_send(c, MEO_WIRE_K_SUBSCRIBE);
+  if (rc < 0) { return rc; }
+  return ss_answer(c);
+}
+
+export fn ss_ack(c: SsC*, seq: uint64) -> int32 {
+  meo_wbuf_begin(&c->w);
+  meo_wire_ack_put(&c->w, seq);
+  return ss_send(c, MEO_WIRE_K_ACK);
+}
+
+// SCAN: sends the request; read the frames with ss_recv.
+export fn ss_scan(c: SsC*, table: string, x: string, y: string, group: string, lo: float64,
+    hi: float64, chunk: uint32) -> int32 {
+  var s: MeoWScan;
+  s.table = table;
+  s.x = x;
+  s.y = y;
+  s.group = group;
+  s.lo = lo;
+  s.hi = hi;
+  s.chunk = chunk;
+  meo_wbuf_begin(&c->w);
+  meo_wire_scan_put(&c->w, &s);
+  return ss_send(c, MEO_WIRE_K_SCAN);
+}

@@ -829,3 +829,49 @@ export fn meo_feed_cursor_end(f: MeoFeed*, cur: MeoFeedCursor*) -> int32 {
   spin_unlock(&f->lock);
   return MEO_OK;
 }
+
+// Position a new reader. from_commit != 0: at the first visible event whose
+// commit_seq is above it; else from_seq != 0: at that seq; else past the newest
+// event. *lost is set when events the reader is owed may be gone: they left
+// the ring, or the seq is beyond this feed's newest (a restarted server); the
+// caller then reports a GAP first. *commit_out is the newest published
+// commit, read under the same lock hold as the position.
+export fn meo_feed_seek(f: MeoFeed*, cur: MeoFeedCursor*, from_seq: uint64,
+    from_commit: uint64, lost: bool*, commit_out: uint64*) -> int32 {
+  if (f == 0 || cur == 0 || lost == 0 || commit_out == 0) { return -MEO_ERR_USAGE; }
+  lost[0] = false;
+  spin_lock(&f->lock);
+  commit_out[0] = f->last_commit;
+  if (from_commit != 0) {
+    // Commits only grow along the ring: the first one above from_commit.
+    var lo: uint64 = f->first_seq;
+    var hi: uint64 = f->visible_seq;
+    while (lo < hi) {
+      var mid: uint64 = lo + (hi - lo) / 2;
+      if (f->ring[(int64)((mid - 1) % (uint64)f->cap)].commit_seq > from_commit) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    cur->next_seq = lo;
+    if (f->first_seq > 1) {
+      // Dropped events have commits up to the oldest kept one's.
+      var oldest: uint64 = f->last_commit;
+      if (f->first_seq < f->visible_seq) {
+        oldest = f->ring[(int64)((f->first_seq - 1) % (uint64)f->cap)].commit_seq;
+      }
+      if (oldest > from_commit) { lost[0] = true; }
+    }
+  } else if (from_seq != 0) {
+    cur->next_seq = from_seq;
+    if (from_seq > f->visible_seq) {
+      cur->next_seq = f->visible_seq;
+      lost[0] = true;
+    }
+  } else {
+    cur->next_seq = f->visible_seq;
+  }
+  spin_unlock(&f->lock);
+  return MEO_OK;
+}

@@ -228,7 +228,7 @@ fn smk_handshake() -> int32 {
   if (smk_hello(fd, SMK_TOKEN) != MEO_WIRE_K_HELLO_OK) { return smk_fail("hello"); }
   var ok: MeoWHelloOk;
   if (meo_wire_hello_ok_get(&g_rd, &ok) < 0) { return smk_fail("hello_ok decode"); }
-  if (ok.caps != 3 || ok.major != 1 || ok.max_frame != SMK_FRAME) {
+  if (ok.caps != 15 || ok.major != 1 || ok.max_frame != SMK_FRAME) {
     return smk_fail("hello_ok caps={ok.caps} max={ok.max_frame}");
   }
   if (smk_call(fd, MEO_WIRE_K_PING) != MEO_WIRE_K_OK) { return smk_fail("ping"); }

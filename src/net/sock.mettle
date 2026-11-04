@@ -14,6 +14,7 @@
 import "../error/status.mettle";
 
 const MEO_SYS_CLOSE: int64 = 3;
+const MEO_SYS_POLL: int64 = 7;
 const MEO_SYS_SOCKET: int64 = 41;
 const MEO_SYS_CONNECT: int64 = 42;
 const MEO_SYS_ACCEPT4: int64 = 288;
@@ -36,6 +37,7 @@ const MEO_IPPROTO_TCP: int64 = 6;
 const MEO_TCP_NODELAY: int64 = 1;
 // A dead peer must be an error code, not SIGPIPE killing the process.
 const MEO_MSG_NOSIGNAL: int64 = 16384;
+const MEO_POLLIN: int32 = 1;
 
 const MEO_E_INTR: int64 = 4;
 const MEO_E_BADF: int64 = 9;
@@ -253,4 +255,22 @@ export fn meo_sock_shutdown(fd: int64, how: int32) -> int32 {
   var rc: int64 = syscall(MEO_SYS_SHUTDOWN, fd, (int64)how);
   if (rc < 0) { return meo_sock_err(rc); }
   return MEO_OK;
+}
+
+// Is there something to read? 1 when data is waiting or the peer closed or
+// the socket failed (a recv then says which), 0 when ms passed with nothing
+// (a signal counts as nothing), else a negative code. ms 0 only looks.
+export fn meo_sock_poll_in(fd: int64, ms: int32) -> int32 {
+  if (ms < 0) { return -MEO_ERR_USAGE; }
+  // struct pollfd { int fd; short events; short revents; }
+  var pfd: int32[2];
+  pfd[0] = (int32)fd;
+  pfd[1] = MEO_POLLIN;
+  var rc: int64 = syscall(MEO_SYS_POLL, (int64)&pfd[0], (int64)1, (int64)ms);
+  if (rc < 0) {
+    if (rc == 0 - MEO_E_INTR) { return 0; }
+    return meo_sock_err(rc);
+  }
+  if (rc == 0) { return 0; }
+  return 1;
 }

@@ -1,0 +1,576 @@
+// server/sub: SUBSCRIBE, the push stream and ACK flow control.
+//
+// A subscribed session is a push stream on its own connection, as in logical
+// replication: its thread reads the feed with a cursor of its own, decodes
+// each row against the catalog and sends EVENTS frames while the client's
+// window allows. The writer never waits for a subscriber: a slow one falls
+// behind the feed's ring and is told with a GAP.
+//
+// session.mettle owns the loop (wait, pump, read a frame); this file is what
+// it calls: meo_srv_on_subscribe, meo_srv_sub_pump, meo_srv_sub_wait and
+// meo_srv_sub_frame.
+
+import "std/mem";
+import "std/thread";
+import "../error/status.mettle";
+import "../mem/arena.mettle";
+import "../record/value.mettle";
+import "../catalog/schema.mettle";
+import "../catalog/catalog.mettle";
+import "../db/db.mettle";
+import "../feed/feed.mettle";
+import "../table/table.mettle";
+import "../net/sock.mettle";
+import "../wire/frame.mettle";
+import "../wire/msg.mettle";
+import "../wire/sub.mettle";
+import "conn.mettle";
+
+const SUB_BATCH: int32 = 256;              // events read from the feed at once
+const SUB_KEY_CAP: int32 = 262144;         // keybuf for a batch: 64 * MEO_FEED_MAX_KEY
+const SUB_WAIT_MS: int32 = 50;
+const SUB_BUSY_SLEEP_MS: uint32 = 10;
+const SUB_TABS_INITIAL: int32 = 8;
+
+fn sub_str(p: uint8*, n: int32) -> string {
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn sub_free_names(sb: MeoSrvSub*) {
+  var i: int32 = 0;
+  while (i < sb->n_names) {
+    if (sb->names[i].p != 0) { free((rawptr)sb->names[i].p); }
+    i += 1;
+  }
+  if (sb->names != 0) { free((rawptr)sb->names); }
+}
+
+export fn meo_srv_sub_free(sb: MeoSrvSub*) {
+  if (sb == 0) { return; }
+  sub_free_names(sb);
+  if (sb->tabs != 0) { free((rawptr)sb->tabs); }
+  if (sb->fifo != 0) { free((rawptr)sb->fifo); }
+  if (sb->bat != 0) { free((rawptr)sb->bat); }
+  if (sb->keybuf != 0) { free((rawptr)sb->keybuf); }
+  if (sb->vals != 0) { free((rawptr)sb->vals); }
+  if (sb->old != 0) { free((rawptr)sb->old); }
+  if (sb->cols != 0) { free((rawptr)sb->cols); }
+  free(sb);
+}
+
+fn sub_new(window: int32) -> MeoSrvSub* {
+  var sb: MeoSrvSub* = new MeoSrvSub;
+  if (sb == 0) { return 0; }
+  memset(sb, 0, (int64)sizeof(MeoSrvSub));
+  sb->window = window;
+  sb->cap_tabs = SUB_TABS_INITIAL;
+  sb->tabs = (MeoSrvSubTab*)malloc((int64)SUB_TABS_INITIAL * (int64)sizeof(MeoSrvSubTab));
+  sb->fifo = (uint64*)malloc((int64)window * (int64)8);
+  sb->bat = (MeoChange*)malloc((int64)SUB_BATCH * (int64)sizeof(MeoChange));
+  sb->keybuf = (uint8*)malloc((int64)SUB_KEY_CAP);
+  sb->vals = (MeoValue*)malloc((int64)MEO_MAX_COLS * (int64)sizeof(MeoValue));
+  sb->old = (MeoValue*)malloc((int64)MEO_MAX_COLS * (int64)sizeof(MeoValue));
+  sb->cols = (MeoWSchemaCol*)malloc((int64)MEO_MAX_COLS * (int64)sizeof(MeoWSchemaCol));
+  if (sb->tabs == 0 || sb->fifo == 0 || sb->bat == 0 || sb->keybuf == 0 || sb->vals == 0
+      || sb->old == 0 || sb->cols == 0) {
+    meo_srv_sub_free(sb);
+    return 0;
+  }
+  return sb;
+}
+
+// ---- the catalog a batch is decoded against ----
+
+// WAL mode: a snapshot view's catalog, no db lock. Rollback mode: the base
+// catalog under the db lock, so keep the scope short. 0 when it cannot be had.
+fn sub_cat_open(db: MeoDb*, view: MeoDb**) -> MeoCatalog* {
+  view[0] = 0;
+  if (meo_db_wal_mode(db)) {
+    if (meo_db_snap_begin(db, view) != MEO_OK) { return 0; }
+    return view[0]->cat;
+  }
+  if (meo_db_enter(db) != MEO_OK) { return 0; }
+  return db->cat;
+}
+
+fn sub_cat_close(db: MeoDb*, view: MeoDb*) {
+  if (view != 0) {
+    meo_db_snap_end(view);
+  } else {
+    meo_db_leave(db);
+  }
+}
+
+// ---- the schema map ----
+
+fn sub_tab_find(sb: MeoSrvSub*, id: int64) -> int32 {
+  var i: int32 = 0;
+  while (i < sb->n_tabs) {
+    if (sb->tabs[i].id == id) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+fn sub_tab_add(sb: MeoSrvSub*, id: int64, covered: bool, n_cols: int32) -> int32 {
+  if (sb->n_tabs == sb->cap_tabs) {
+    var want: int32 = sb->cap_tabs * 2;
+    var p: rawptr = realloc((rawptr)sb->tabs, (int64)want * (int64)sizeof(MeoSrvSubTab));
+    if (p == 0) { return -MEO_ERR_NOMEM; }
+    sb->tabs = (MeoSrvSubTab*)p;
+    sb->cap_tabs = want;
+  }
+  var i: int32 = sb->n_tabs;
+  sb->tabs[i].id = id;
+  sb->tabs[i].covered = covered;
+  sb->tabs[i].n_cols = n_cols;
+  sb->n_tabs += 1;
+  return i;
+}
+
+fn sub_covers(sb: MeoSrvSub*, t: MeoTable*) -> bool {
+  if (sb->all) { return true; }
+  var i: int32 = 0;
+  while (i < sb->n_names) {
+    if (meo_cat_name_eq(t->name, t->name_len, sb->names[i].p, sb->names[i].n)) { return true; }
+    i += 1;
+  }
+  return false;
+}
+
+fn sub_fill_cols(t: MeoTable*, cols: MeoWSchemaCol*) {
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    cols[i].name = sub_str(t->columns[i].name, t->columns[i].name_len);
+    cols[i].ty = t->columns[i].affinity;
+    i += 1;
+  }
+}
+
+// ---- SUBSCRIBE ----
+
+// Copy the names a subscription covers; they are matched again when a table
+// id the map has not seen turns up (a table created or recreated later).
+fn sub_keep_names(sb: MeoSrvSub*, req: MeoWSub*) -> int32 {
+  if (req->n_tables == 0) {
+    sb->all = true;
+    return MEO_OK;
+  }
+  sb->names = (MeoSrvSubName*)calloc((int64)req->n_tables, (int64)sizeof(MeoSrvSubName));
+  if (sb->names == 0) { return -MEO_ERR_NOMEM; }
+  sb->n_names = req->n_tables;
+  var i: int32 = 0;
+  while (i < req->n_tables) {
+    var n: int32 = (int32)req->tables[i].length;
+    sb->names[i].p = (uint8*)malloc((int64)n + (int64)1);
+    if (sb->names[i].p == 0) { return -MEO_ERR_NOMEM; }
+    memcpy((rawptr)sb->names[i].p, (rawptr)req->tables[i].chars, (int64)n);
+    sb->names[i].n = n;
+    i += 1;
+  }
+  return MEO_OK;
+}
+
+// The tables SUB_OK lists: every live one, or the named ones (-SCHEMA for an
+// unknown name). Each also enters the schema map. Arrays come from the arena.
+fn sub_pick(s: MeoSrvSession*, sb: MeoSrvSub*, req: MeoWSub*, cat: MeoCatalog*,
+    ok: MeoWSubOk*) -> int32 {
+  var cap: int32 = req->n_tables;
+  if (sb->all) { cap = cat->n_tables; }
+  ok->n_tables = 0;
+  ok->tables = 0;
+  if (cap == 0) { return MEO_OK; }
+  var out: MeoWSubTable* = (MeoWSubTable*)meo_arena_alloc(s->arena,
+    (int64)cap * (int64)sizeof(MeoWSubTable));
+  if (out == 0) { return -MEO_ERR_NOMEM; }
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < cap) {
+    var t: MeoTable* = 0;
+    if (sb->all) {
+      t = cat->tables[i];
+      if (!t->live) { t = 0; }
+    } else {
+      t = meo_cat_find(cat, req->tables[i].chars, (int32)req->tables[i].length);
+      if (t == 0) { return -MEO_ERR_SCHEMA; }
+    }
+    if (t != 0 && sub_tab_find(sb, t->id) < 0) {
+      var cols: MeoWSchemaCol* = (MeoWSchemaCol*)meo_arena_alloc(s->arena,
+        (int64)t->n_cols * (int64)sizeof(MeoWSchemaCol));
+      if (cols == 0) { return -MEO_ERR_NOMEM; }
+      sub_fill_cols(t, cols);
+      out[n].id = (uint32)t->id;
+      out[n].name = sub_str(t->name, t->name_len);
+      out[n].n_cols = t->n_cols;
+      out[n].cols = cols;
+      var rc: int32 = sub_tab_add(sb, t->id, true, t->n_cols);
+      if (rc < 0) { return rc; }
+      n += 1;
+    }
+    i += 1;
+  }
+  ok->n_tables = n;
+  ok->tables = out;
+  return MEO_OK;
+}
+
+// Put a GAP first in the batch: the stream cannot start where the client asked.
+fn sub_gap_first(sb: MeoSrvSub*, seq: uint64, commit: uint64, time_us: int64) {
+  var c: MeoChange* = &sb->bat[0];
+  c->seq = seq;
+  c->commit_seq = commit;
+  c->time_us = time_us;
+  c->table_id = 0;
+  c->kind = MEO_CHANGE_GAP;
+  c->key = 0;
+  c->key_len = 0;
+  c->rowid = 0;
+  c->old_rowid = 0;
+  c->val = 0;
+  c->val_len = 0;
+  c->old_val = 0;
+  c->old_val_len = 0;
+  sb->bat_n = 1;
+  sb->bat_at = 0;
+}
+
+// Position the cursor, read the schema and put the SUB_OK frame in s->w:
+// its size, or -MEO_ERR_*.
+fn sub_open(s: MeoSrvSession*, sb: MeoSrvSub*, req: MeoWSub*, rid: uint32) -> int32 {
+  var srv: MeoSrv* = s->srv;
+  var lost: bool = false;
+  var commit: uint64 = 0;
+  // Position first, schema second: a DDL in between reaches the client as a
+  // SCHEMA event instead of a row that does not match.
+  var rc: int32 = meo_feed_seek(srv->feed, &sb->cur, req->from_seq, req->from_commit, &lost, &commit);
+  if (rc < 0) { return rc; }
+  if (commit < srv->feed_base) { commit = srv->feed_base; }
+  if (req->from_commit != 0) {
+    sb->skip_commit = req->from_commit;
+    // Commits before the feed was attached were never seen.
+    if (req->from_commit < srv->feed_base) { lost = true; }
+  }
+  var start: uint64 = sb->cur.next_seq;
+  if (lost) {
+    var gap_seq: uint64 = 0;
+    if (start > 0) { gap_seq = start - 1; }
+    sub_gap_first(sb, gap_seq, commit, meo_feed_last_time(srv->feed));
+  }
+  rc = sub_keep_names(sb, req);
+  if (rc < 0) { return rc; }
+  var ok: MeoWSubOk;
+  ok.start_seq = start;
+  ok.commit_seq = commit;
+  ok.heartbeat_ms = (uint32)srv->cfg.sub_hb_ms;
+  var view: MeoDb* = 0;
+  var cat: MeoCatalog* = sub_cat_open(srv->db, &view);
+  if (cat == 0) { return -MEO_ERR_BUSY; }
+  rc = sub_pick(s, sb, req, cat, &ok);
+  var n: int32 = rc;
+  if (rc == MEO_OK) {
+    s->w.max = meo_srv_frame_max(s);
+    meo_wbuf_begin(&s->w);
+    meo_wire_sub_ok_put(&s->w, &ok);
+    n = meo_wbuf_finish(&s->w, MEO_WIRE_K_SUB_OK, rid);
+    s->w.max = srv->cfg.max_frame;
+  }
+  sub_cat_close(srv->db, view);
+  return n;
+}
+
+// SUBSCRIBE in READY: SUB_OK and the SUBSCRIBED state, or a non-fatal error.
+export fn meo_srv_on_subscribe(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  meo_arena_reset(s->arena);
+  var req: MeoWSub;
+  var rc: int32 = meo_wire_sub_get(r, s->arena, &req);
+  if (rc == -MEO_ERR_NOMEM) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_NOMEM, false));
+  }
+  if (rc < 0) { return meo_srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED); }
+  if (s->state != MEO_SRV_S_READY) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+  }
+  if (req.window < 1 || req.window > MEO_WIRE_WINDOW_MAX) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_USAGE, false));
+  }
+  var sb: MeoSrvSub* = sub_new((int32)req.window);
+  if (sb == 0) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_NOMEM, false));
+  }
+  var n: int32 = sub_open(s, sb, &req, h->rid);
+  if (n < 0) {
+    meo_srv_sub_free(sb);
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, -n, false));
+  }
+  s->sub = sb;
+  sb->last_send_ms = meo_srv_now_ms();
+  meo_srv_set_state(s, MEO_SRV_S_SUBSCRIBED);
+  return meo_srv_after(s, meo_srv_send(s, n));
+}
+
+// ---- the push stream ----
+
+// Read the next batch from the feed. Events at or below from_commit are the
+// scan the client already holds: dropped here, once.
+fn sub_fill(s: MeoSrvSession*, sb: MeoSrvSub*) {
+  var f: MeoFeed* = s->srv->feed;
+  sb->bat_at = 0;
+  sb->bat_n = 0;
+  var n: int32 = meo_feed_read(f, &sb->cur, sb->bat, SUB_BATCH, sb->keybuf, SUB_KEY_CAP);
+  if (n < 0) {
+    // A cursor the feed will not read: say so and go on from now.
+    meo_feed_cursor_end(f, &sb->cur);
+    sub_gap_first(sb, sb->last_sent, meo_feed_last_commit(f), meo_feed_last_time(f));
+    return;
+  }
+  var j: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (sb->skip_commit != 0 && sb->bat[i].commit_seq <= sb->skip_commit) {
+      i += 1;
+      continue;
+    }
+    sb->skip_commit = 0;
+    if (j != i) { sb->bat[j] = sb->bat[i]; }
+    j += 1;
+    i += 1;
+  }
+  sb->bat_n = j;
+}
+
+// A table's slot in the map, adding an unseen id; -1 when the event is not
+// for this subscription, -MEO_ERR_NOMEM when the map cannot grow. *t is the
+// table in cat, 0 when it is gone.
+fn sub_slot(sb: MeoSrvSub*, cat: MeoCatalog*, id: uint32, t: MeoTable**) -> int32 {
+  t[0] = meo_cat_get(cat, (int64)id);
+  var i: int32 = sub_tab_find(sb, (int64)id);
+  if (i < 0) {
+    if (t[0] == 0) { return -1; }
+    i = sub_tab_add(sb, (int64)id, sub_covers(sb, t[0]), -1);
+    if (i < 0) { return i; }
+  }
+  if (!sb->tabs[i].covered || t[0] == 0) { return -1; }
+  return i;
+}
+
+fn sub_event_init(e: MeoWEvent*, c: MeoChange*) {
+  e->seq = c->seq;
+  e->commit_seq = c->commit_seq;
+  e->time_us = c->time_us;
+  e->kind = c->kind;
+  e->table_id = c->table_id;
+  e->rowid = 0;
+  e->old_rowid = 0;
+  e->n_vals = 0;
+  e->vals = 0;
+  e->n_old = 0;
+  e->old = 0;
+  e->name.chars = 0;
+  e->name.length = 0;
+  e->n_cols = 0;
+  e->cols = 0;
+}
+
+fn sub_event_gap(e: MeoWEvent*) {
+  e->kind = MEO_WIRE_EV_GAP;
+  e->table_id = 0;
+  e->rowid = 0;
+  e->old_rowid = 0;
+  e->n_vals = 0;
+  e->vals = 0;
+  e->n_old = 0;
+  e->old = 0;
+}
+
+// Add the SCHEMA event the client needs before the rows of t. 0, 1 when the
+// frame is full (send it, retry), or a negative code.
+fn sub_add_schema(s: MeoSrvSession*, sb: MeoSrvSub*, c: MeoChange*, t: MeoTable*, slot: int32,
+    count: int32*) -> int32 {
+  var e: MeoWEvent;
+  sub_event_init(&e, c);
+  // Just before the row that needs it, so an ACK of either is in order.
+  e.seq = c->seq - 1;
+  e.kind = MEO_WIRE_EV_SCHEMA;
+  e.name = sub_str(t->name, t->name_len);
+  e.n_cols = t->n_cols;
+  e.cols = sb->cols;
+  sub_fill_cols(t, sb->cols);
+  var rc: int32 = meo_wire_events_add(&s->w, &e);
+  if (rc == -MEO_ERR_TOOBIG && count[0] > 0) { return 1; }
+  if (rc < 0) { return rc; }
+  sb->tabs[slot].n_cols = t->n_cols;
+  count[0] += 1;
+  if (e.seq > sb->last_sent) { sb->last_sent = e.seq; }
+  return MEO_OK;
+}
+
+// Decode the row(s) of c into e. A record that does not decode becomes a GAP:
+// the client reloads rather than trusting a half-read row.
+fn sub_decode(sb: MeoSrvSub*, t: MeoTable*, c: MeoChange*, e: MeoWEvent*) {
+  e->rowid = (int64)c->rowid;
+  var rc: int32 = meo_tbl_row_values(t, e->rowid, c->val, c->val_len, sb->vals, t->n_cols);
+  if (rc == MEO_OK) {
+    e->n_vals = t->n_cols;
+    e->vals = sb->vals;
+  }
+  if (rc == MEO_OK && c->kind == MEO_CHANGE_REPLACE) {
+    e->old_rowid = (int64)c->old_rowid;
+    if (c->old_val_len > 0) {
+      rc = meo_tbl_row_values(t, e->old_rowid, c->old_val, c->old_val_len, sb->old, t->n_cols);
+      if (rc == MEO_OK) {
+        e->n_old = t->n_cols;
+        e->old = sb->old;
+      }
+    }
+  }
+  if (rc != MEO_OK) { sub_event_gap(e); }
+}
+
+// Add event c (after its SCHEMA, when the client needs one) to the frame.
+// 0: added, or not for this subscription. 1: the frame is full. Negative: a
+// codec or allocation error.
+fn sub_add(s: MeoSrvSession*, sb: MeoSrvSub*, cat: MeoCatalog*, c: MeoChange*, count: int32*) -> int32 {
+  var e: MeoWEvent;
+  sub_event_init(&e, c);
+  if (c->kind != MEO_CHANGE_GAP) {
+    if (c->kind != MEO_CHANGE_INSERT && c->kind != MEO_CHANGE_REPLACE && c->kind != MEO_CHANGE_DELETE) {
+      return MEO_OK;
+    }
+    var t: MeoTable* = 0;
+    var slot: int32 = sub_slot(sb, cat, c->table_id, &t);
+    if (slot == -MEO_ERR_NOMEM) { return slot; }
+    if (slot < 0) { return MEO_OK; }
+    if (sb->tabs[slot].n_cols != t->n_cols) {
+      var src: int32 = sub_add_schema(s, sb, c, t, slot, count);
+      if (src != MEO_OK) { return src; }
+    }
+    sub_decode(sb, t, c, &e);
+  }
+  var rc: int32 = meo_wire_events_add(&s->w, &e);
+  if (rc == -MEO_ERR_TOOBIG) {
+    if (count[0] > 0) { return 1; }
+    // One event bigger than a frame: the client reloads instead.
+    sub_event_gap(&e);
+    rc = meo_wire_events_add(&s->w, &e);
+  }
+  if (rc < 0) { return rc; }
+  count[0] += 1;
+  sb->fifo[(sb->f_head + sb->f_n) % sb->window] = c->seq;
+  sb->f_n += 1;
+  sb->last_sent = c->seq;
+  return MEO_OK;
+}
+
+// Send one EVENTS frame from the batch. 0: progress (frame sent, or only
+// events that are not for us consumed). 1: the catalog was not to be had, try
+// later. Negative: the connection or the codec failed.
+fn sub_send(s: MeoSrvSession*, sb: MeoSrvSub*) -> int32 {
+  var srv: MeoSrv* = s->srv;
+  var view: MeoDb* = 0;
+  var cat: MeoCatalog* = sub_cat_open(srv->db, &view);
+  if (cat == 0) {
+    Sleep(SUB_BUSY_SLEEP_MS);
+    return 1;
+  }
+  s->w.max = meo_srv_frame_max(s);
+  meo_wbuf_begin(&s->w);
+  meo_wire_events_begin(&s->w);
+  var count: int32 = 0;
+  var rc: int32 = MEO_OK;
+  while (sb->bat_at < sb->bat_n && sb->f_n < sb->window && rc == MEO_OK) {
+    rc = sub_add(s, sb, cat, &sb->bat[sb->bat_at], &count);
+    if (rc == MEO_OK) { sb->bat_at += 1; }
+  }
+  sub_cat_close(srv->db, view);
+  var n: int32 = meo_wbuf_finish(&s->w, MEO_WIRE_K_EVENTS, 0);
+  s->w.max = srv->cfg.max_frame;
+  if (rc < 0) { return rc; }
+  if (count == 0) { return MEO_OK; }
+  if (n < 0) { return n; }
+  sb->last_send_ms = meo_srv_now_ms();
+  return meo_srv_send(s, n);
+}
+
+fn sub_heartbeat(s: MeoSrvSession*, sb: MeoSrvSub*) -> int32 {
+  var now: int64 = meo_srv_now_ms();
+  if (now - sb->last_send_ms < (int64)s->srv->cfg.sub_hb_ms) { return MEO_OK; }
+  meo_wbuf_begin(&s->w);
+  meo_wire_events_put(&s->w, 0, 0);
+  sb->last_send_ms = now;
+  return meo_srv_send(s, meo_wbuf_finish(&s->w, MEO_WIRE_K_EVENTS, 0));
+}
+
+// Send what the feed holds and the window allows, then the heartbeat if one is
+// due. MEO_SRV_CONTINUE, or MEO_SRV_STOP with the reason set.
+export fn meo_srv_sub_pump(s: MeoSrvSession*) -> int32 {
+  var sb: MeoSrvSub* = s->sub;
+  var f: MeoFeed* = s->srv->feed;
+  var rc: int32 = MEO_OK;
+  while (rc == MEO_OK && sb->f_n < sb->window) {
+    if (sb->bat_at >= sb->bat_n) {
+      if (!meo_feed_pending_for(f, &sb->cur)) { break; }
+      sub_fill(s, sb);
+    } else {
+      rc = sub_send(s, sb);
+      if (rc == 1) { break; }
+    }
+  }
+  if (rc == MEO_OK) { rc = sub_heartbeat(s, sb); }
+  return meo_srv_after(s, rc);
+}
+
+// Sleep until there is something to do: an event when the window is open, an
+// ACK (or anything on the socket) when it is full. At most SUB_WAIT_MS, so the
+// loop keeps checking the socket, the heartbeat and the server stopping.
+export fn meo_srv_sub_wait(s: MeoSrvSession*) {
+  var sb: MeoSrvSub* = s->sub;
+  if (sb->f_n >= sb->window) {
+    meo_sock_poll_in(s->fd, SUB_WAIT_MS);
+    return;
+  }
+  meo_feed_wait(s->srv->feed, &sb->cur, SUB_WAIT_MS);
+}
+
+// ---- requests while SUBSCRIBED ----
+
+fn sub_on_ack(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  var sb: MeoSrvSub* = s->sub;
+  var seq: uint64 = 0;
+  if (meo_wire_ack_get(r, &seq) < 0) {
+    return meo_srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+  }
+  if (seq > sb->last_sent) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_USAGE, false));
+  }
+  while (sb->f_n > 0 && sb->fifo[sb->f_head] <= seq) {
+    sb->f_head = (sb->f_head + 1) % sb->window;
+    sb->f_n -= 1;
+  }
+  return MEO_SRV_CONTINUE;
+}
+
+// One request while SUBSCRIBED: ACK, UNSUBSCRIBE, PING and BYE; the rest is
+// a non-fatal TX error (the client gets its answer, the stream goes on).
+export fn meo_srv_sub_frame(s: MeoSrvSession*, h: MeoWHdr*, r: MeoWRd*) -> int32 {
+  if (h->kind == MEO_WIRE_K_ACK) { return sub_on_ack(s, h, r); }
+  if (h->kind != MEO_WIRE_K_UNSUBSCRIBE && h->kind != MEO_WIRE_K_PING && h->kind != MEO_WIRE_K_BYE) {
+    return meo_srv_after(s, meo_srv_reply_error(s, h->rid, MEO_ERR_TX, false));
+  }
+  if (meo_wire_empty_get(r) < 0) {
+    return meo_srv_fatal(s, h->rid, MEO_ERR_PROTO, MEO_SRV_EXIT_CRASHED);
+  }
+  if (h->kind == MEO_WIRE_K_BYE) {
+    meo_srv_reply_empty(s, MEO_WIRE_K_OK, h->rid);
+    s->reason = MEO_SRV_EXIT_NORMAL;
+    return MEO_SRV_STOP;
+  }
+  if (h->kind == MEO_WIRE_K_UNSUBSCRIBE) {
+    meo_srv_sub_free(s->sub);
+    s->sub = 0;
+    meo_srv_set_state(s, MEO_SRV_S_READY);
+  }
+  return meo_srv_after(s, meo_srv_reply_empty(s, MEO_WIRE_K_OK, h->rid));
+}

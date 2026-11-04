@@ -1,6 +1,302 @@
+// srv_scan: the streaming SCAN over the wire, against the server embedded on
+// 127.0.0.1 port 0, once on a WAL database and once on a rollback-journal one.
+// 100k rows scanned in chunks (x order, one commit_seq, a short last frame, the
+// client's frame limit splitting a big chunk), a grouped scan, bad requests,
+// a scan inside a transaction that sees the transaction's own insert, and (WAL)
+// a writer that neither waits for a scan nor shows up in it.
+
 import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/meo_server.mettle";
+import "srv_client.mettle";
+
+const SCN_DB: string = "build/srv_scan.db";
+const SCN_ROWS: int64 = 100000;
+const SCN_BATCH: int32 = 1000;
+const SCN_WRITER_MS: int64 = 2000;       // a commit beside a scan answers within this
+const SCN_FAR: float64 = 1000000000000.0;
+
+fn scn_fail(msg: string) -> int32 {
+  println("FAIL srv_scan: {msg}");
+  return 1;
+}
+
+fn scn_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  var wpath: string = db + "-wal";
+  meo_file_unlink(wpath);
+  free(wpath.chars);
+  return rc;
+}
+
+// What a scan returned.
+struct ScnOut {
+  n: int64;            // points
+  frames: int32;
+  commit: uint64;
+  ok: bool;            // every frame consistent: same commit, last only at the end
+  ordered: bool;       // x strictly increasing
+  y_ok: bool;          // y == x / 2
+  g_ok: bool;          // grouped: g == x % 3
+  first_x: float64;
+  last_x: float64;
+  max_per: int32;      // most points in one frame
+  last_n: int32;       // points in the final frame
+}
+
+// Read SCAN_ROWS frames up to last = 1. Returns the ERROR code (>0), 0 for a
+// complete scan, or a negative transport code.
+fn scn_read(c: SsC*, o: ScnOut*, grouped: bool) -> int32 {
+  o->n = 0;
+  o->frames = 0;
+  o->commit = 0;
+  o->ok = true;
+  o->ordered = true;
+  o->y_ok = true;
+  o->g_ok = true;
+  o->first_x = 0.0;
+  o->last_x = 0.0;
+  o->max_per = 0;
+  o->last_n = 0;
+  var done: bool = false;
+  while (!done) {
+    var k: int32 = ss_recv(c);
+    if (k == MEO_WIRE_K_ERROR) { return c->err.code; }
+    if (k != MEO_WIRE_K_SCAN_ROWS || c->hdr.rid != c->rid) { return -MEO_ERR_PROTO; }
+    if (c->head.grouped != grouped) { o->ok = false; }
+    if (o->frames == 0) {
+      o->commit = c->head.commit_seq;
+    } else if (c->head.commit_seq != o->commit) {
+      o->ok = false;
+    }
+    var i: int32 = 0;
+    while (i < c->head.n) {
+      var p: MeoWPoint* = &c->pts[i];
+      if (o->n == 0) { o->first_x = p->x; }
+      if (o->n > 0 && !(p->x > o->last_x)) { o->ordered = false; }
+      if (p->y != p->x / 2.0) { o->y_ok = false; }
+      if (grouped && p->g != (int64)p->x % 3) { o->g_ok = false; }
+      o->last_x = p->x;
+      o->n += 1;
+      i += 1;
+    }
+    if (c->head.n > o->max_per) { o->max_per = c->head.n; }
+    o->frames += 1;
+    if (c->head.last) {
+      done = true;
+      o->last_n = c->head.n;
+    }
+  }
+  return 0;
+}
+
+fn scn_check(o: ScnOut*, what: string, n: int64, frames: int32) -> int32 {
+  if (!o->ok) { return scn_fail("{what}: frames disagree on commit_seq or grouped"); }
+  if (o->commit == 0) { return scn_fail("{what}: commit_seq 0"); }
+  if (!o->ordered) { return scn_fail("{what}: x not increasing"); }
+  if (!o->y_ok) { return scn_fail("{what}: y is not x / 2"); }
+  if (o->n != n) { return scn_fail("{what}: {o->n} points, want {n}"); }
+  if (o->frames != frames) { return scn_fail("{what}: {o->frames} frames, want {frames}"); }
+  return 0;
+}
+
+fn scn_load(c: SsC*) -> int32 {
+  if (!ss_create(c, "p", "v", MEO_T_REAL, "g", MEO_T_INT)) { return scn_fail("create p"); }
+  var first: int64 = 1;
+  while (first <= SCN_ROWS) {
+    if (!ss_insert_bulk(c, "p", first, SCN_BATCH)) { return scn_fail("bulk insert at {first}"); }
+    first += (int64)SCN_BATCH;
+  }
+  if (ss_count(c, "p") != SCN_ROWS) { return scn_fail("count after load"); }
+  return 0;
+}
+
+fn scn_chunks(c: SsC*) -> int32 {
+  var o: ScnOut;
+  // A window of 59001 rows in chunks of 7000: eight full frames and a short one.
+  if (ss_scan(c, "p", "id", "v", "", 1000.0, 60000.0, 7000) < 0) { return scn_fail("send scan"); }
+  var rc: int32 = scn_read(c, &o, false);
+  if (rc != 0) { return scn_fail("window scan rc={rc}"); }
+  if (scn_check(&o, "window", 59001, 9) != 0) { return 1; }
+  if (o.first_x != 1000.0 || o.last_x != 60000.0) { return scn_fail("window ends {o.first_x} {o.last_x}"); }
+  if (o.max_per != 7000 || o.last_n != 59001 - 8 * 7000) { return scn_fail("chunking {o.max_per} {o.last_n}"); }
+
+  // Everything, with a chunk bigger than the client's frame holds: the server
+  // splits at the frame limit, not at the chunk.
+  if (ss_scan(c, "p", "id", "v", "", -SCN_FAR, SCN_FAR, 1048576) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != 0) { return scn_fail("full scan rc={rc}"); }
+  if (!o.ok || !o.ordered || !o.y_ok || o.n != SCN_ROWS) { return scn_fail("full scan: {o.n} points"); }
+  if (o.frames != 2 || o.max_per > (SS_FRAME - 14) / 16) { return scn_fail("full scan frames {o.frames} max {o.max_per}"); }
+
+  // A chunk that divides the rows exactly still ends with last = 1 on the
+  // final full frame, not an extra empty one.
+  if (ss_scan(c, "p", "id", "v", "", 1.0, 100000.0, 25000) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != 0 || scn_check(&o, "exact chunks", SCN_ROWS, 4) != 0) { return scn_fail("exact chunks rc={rc}"); }
+
+  // No row in the window: one empty frame.
+  if (ss_scan(c, "p", "id", "v", "", 5.0e9, 6.0e9, 100) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != 0 || o.n != 0 || o.frames != 1 || o.commit == 0) { return scn_fail("empty window rc={rc} n={o.n} frames={o.frames}"); }
+
+  // The same scan on an unindexed REAL x: every row is read, rowid order.
+  if (ss_scan(c, "p", "v", "id", "", 100.0, 110.0, 1000) < 0) { return scn_fail("send scan"); }
+  var k: int32 = ss_recv(c);
+  if (k != MEO_WIRE_K_SCAN_ROWS || c->head.n != 21 || !c->head.last) { return scn_fail("real x: kind {k} n {c->head.n}"); }
+  return 0;
+}
+
+fn scn_grouped(c: SsC*) -> int32 {
+  var o: ScnOut;
+  if (ss_scan(c, "p", "id", "v", "g", 10.0, 30009.0, 10000) < 0) { return scn_fail("send scan"); }
+  var rc: int32 = scn_read(c, &o, true);
+  if (rc != 0) { return scn_fail("grouped scan rc={rc}"); }
+  if (scn_check(&o, "grouped", 30000, 3) != 0) { return 1; }
+  if (!o.g_ok) { return scn_fail("grouped: group is not id % 3"); }
+  return 0;
+}
+
+fn scn_errors(c: SsC*) -> int32 {
+  var o: ScnOut;
+  if (ss_scan(c, "p", "id", "nope", "", 0.0, 10.0, 10) < 0) { return scn_fail("send scan"); }
+  var rc: int32 = scn_read(c, &o, false);
+  if (rc != MEO_ERR_SCHEMA || c->err.fatal) { return scn_fail("unknown column rc={rc}"); }
+  if (ss_scan(c, "nope", "id", "v", "", 0.0, 10.0, 10) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != MEO_ERR_SCHEMA || c->err.fatal) { return scn_fail("unknown table rc={rc}"); }
+  if (ss_scan(c, "p", "id", "v", "nope", 0.0, 10.0, 10) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, true);
+  if (rc != MEO_ERR_SCHEMA || c->err.fatal) { return scn_fail("unknown group rc={rc}"); }
+  if (ss_scan(c, "p", "id", "v", "", 0.0, 10.0, 0) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != MEO_ERR_USAGE || c->err.fatal) { return scn_fail("chunk 0 rc={rc}"); }
+  if (ss_scan(c, "p", "id", "v", "", 0.0, 10.0, 1048577) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != MEO_ERR_USAGE || c->err.fatal) { return scn_fail("chunk too big rc={rc}"); }
+  // The session survived all of it.
+  if (ss_call(c, MEO_WIRE_K_PING) != MEO_WIRE_K_OK) { return scn_fail("ping after errors"); }
+  return 0;
+}
+
+// Inside a transaction the scan reads through it.
+fn scn_in_tx(c: SsC*, other: SsC*, wal: bool) -> int32 {
+  var o: ScnOut;
+  meo_wbuf_begin(&c->w);
+  meo_wire_begin_put(&c->w, 0);
+  ss_send(c, MEO_WIRE_K_BEGIN);
+  if (ss_recv(c) != MEO_WIRE_K_OK) { return scn_fail("begin"); }
+  if (!ss_insert_bulk(c, "p", 2000000, 1)) { return scn_fail("tx insert"); }
+  if (ss_scan(c, "p", "id", "v", "", 1999999.0, 2000001.0, 10) < 0) { return scn_fail("send scan"); }
+  var rc: int32 = scn_read(c, &o, false);
+  if (rc != 0 || o.n != 1 || o.first_x != 2000000.0 || !o.y_ok) {
+    return scn_fail("scan in tx rc={rc} n={o.n}");
+  }
+  if (wal) {
+    // Another connection reads the last commit: not the open transaction.
+    if (ss_scan(other, "p", "id", "v", "", 1999999.0, 2000001.0, 10) < 0) { return scn_fail("send scan"); }
+    rc = scn_read(other, &o, false);
+    if (rc != 0 || o.n != 0) { return scn_fail("uncommitted row visible to another scan: rc={rc} n={o.n}"); }
+  }
+  if (ss_call(c, MEO_WIRE_K_ROLLBACK) != MEO_WIRE_K_OK) { return scn_fail("rollback"); }
+  if (ss_scan(c, "p", "id", "v", "", 1999999.0, 2000001.0, 10) < 0) { return scn_fail("send scan"); }
+  rc = scn_read(c, &o, false);
+  if (rc != 0 || o.n != 0) { return scn_fail("scan after rollback rc={rc} n={o.n}"); }
+  return 0;
+}
+
+// WAL: a scan holds its snapshot and no lock. A commit made after the scan's
+// first frame answers at once and is not in the scan; a later scan has it.
+fn scn_writer(c: SsC*, w: SsC*) -> int32 {
+  var o: ScnOut;
+  if (ss_scan(c, "p", "id", "v", "", 1.0, 100000.0, 10) < 0) { return scn_fail("send scan"); }
+  var k: int32 = ss_recv(c);
+  if (k != MEO_WIRE_K_SCAN_ROWS || c->head.last) { return scn_fail("first frame: kind {k}"); }
+  var seq0: uint64 = c->head.commit_seq;
+  var t0: int64 = meo_clock_monotonic_us();
+  if (!ss_insert_bulk(w, "p", 100001, 1)) { return scn_fail("insert beside a scan"); }
+  var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+  if (ms > SCN_WRITER_MS) { return scn_fail("writer waited {ms} ms for a scan"); }
+  // The rest of the scan, starting with the frame already read.
+  var n: int64 = (int64)c->head.n;
+  var last: bool = c->head.last;
+  var commit_ok: bool = true;
+  while (!last) {
+    k = ss_recv(c);
+    if (k != MEO_WIRE_K_SCAN_ROWS) { return scn_fail("scan frame: kind {k}"); }
+    if (c->head.commit_seq != seq0) { commit_ok = false; }
+    n += (int64)c->head.n;
+    last = c->head.last;
+  }
+  if (!commit_ok) { return scn_fail("commit_seq changed during the scan"); }
+  if (n != SCN_ROWS) { return scn_fail("scan beside a writer: {n} points, want {SCN_ROWS}"); }
+  if (ss_scan(c, "p", "id", "v", "", 100001.0, 100001.0, 10) < 0) { return scn_fail("send scan"); }
+  var rc: int32 = scn_read(c, &o, false);
+  if (rc != 0 || o.n != 1 || o.commit <= seq0) {
+    return scn_fail("scan after the writer: rc={rc} n={o.n} commit {o.commit} vs {seq0}");
+  }
+  println("scan beside a writer: insert took {ms} ms, snapshot commit {seq0}");
+  return 0;
+}
+
+fn scn_run(wal: bool) -> int32 {
+  var mode: string = "rollback";
+  var flag: int32 = MEO_OPEN_NO_WAL;
+  if (wal) {
+    mode = "wal";
+    flag = MEO_OPEN_WAL;
+  }
+  if (scn_reset(SCN_DB) != MEO_OK) { return scn_fail("reset db"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(SCN_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE | flag, 0, &db);
+  if (rc != MEO_OK) { return scn_fail("{mode}: open db rc={rc}"); }
+  var cfg: MeoSrvConfig;
+  meo_srv_config_default(&cfg);
+  cfg.port = 0;
+  cfg.max_frame = SS_FRAME;
+  var srv: MeoSrv* = 0;
+  rc = meo_srv_start(db, &cfg, &srv);
+  if (rc != MEO_OK) { return scn_fail("{mode}: start rc={rc}"); }
+  var port: int32 = meo_srv_port(srv);
+
+  var a: SsC;
+  var b: SsC;
+  ss_init(&a);
+  ss_init(&b);
+  var bad: int32 = 0;
+  if (ss_open(&a, port, MEO_WIRE_MINOR) != MEO_OK || ss_open(&b, port, MEO_WIRE_MINOR) != MEO_OK) {
+    bad = scn_fail("{mode}: connect");
+  }
+  if (bad == 0 && (a.caps & MEO_WIRE_CAP_SCAN) == 0) { bad = scn_fail("{mode}: SCAN cap not set"); }
+  if (bad == 0) { bad = scn_load(&a); }
+  if (bad == 0) { bad = scn_chunks(&a); }
+  if (bad == 0) { bad = scn_grouped(&a); }
+  if (bad == 0) { bad = scn_errors(&a); }
+  if (bad == 0) { bad = scn_in_tx(&a, &b, wal); }
+  if (bad == 0 && wal) { bad = scn_writer(&a, &b); }
+  if (bad != 0) { println("  (in {mode} mode)"); }
+  ss_free(&a);
+  ss_free(&b);
+  meo_srv_stop(srv);
+  if (meo_srv_free(srv) != MEO_OK && bad == 0) { bad = scn_fail("{mode}: free"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK && bad == 0) { bad = scn_fail("{mode}: close rc={rc}"); }
+  return bad;
+}
 
 fn main() -> int32 {
-  println("PASS srv_scan (stub)");
+  if (scn_run(true) != 0) { return 1; }
+  if (scn_run(false) != 0) { return 1; }
+  println("PASS srv_scan");
   return 0;
 }

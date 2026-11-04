@@ -2,14 +2,18 @@
 //
 // One thread per connection. The acceptor reaps finished sessions before it
 // places a new one, so a slot is reused only after its thread was joined.
-// The server never opens or closes the db; its caller does.
+// The server never opens or closes the db; its caller does. It does own the
+// change feed it attaches to the db's pager while it runs: subscriptions read it.
 
 import "std/mem";
 import "std/thread";
 import "../error/status.mettle";
 import "../db/db.mettle";
 import "../net/sock.mettle";
+import "../feed/feed.mettle";
+import "../pager/pager.mettle";
 import "../wire/frame.mettle";
+import "conn.mettle";
 import "session.mettle";
 
 const SRV_BACKLOG: int32 = 128;
@@ -17,6 +21,7 @@ const SRV_BUSY_SEND_MS: int32 = 1000;
 // srv->stop: 0 serving, then these. meo_srv_stopping is true for both.
 const SRV_STOPPING: int32 = 1;   // a meo_srv_stop is running
 const SRV_STOPPED: int32 = 2;
+const SRV_FEED_CAP: int32 = 65536;   // events a subscriber may fall behind before a GAP
 
 export fn meo_srv_config_default(c: MeoSrvConfig*) {
   c->ip = "127.0.0.1";
@@ -31,6 +36,7 @@ export fn meo_srv_config_default(c: MeoSrvConfig*) {
   c->idle_ms = 300000;
   c->hello_ms = 5000;
   c->stop_ms = 10000;
+  c->sub_hb_ms = 15000;
 }
 
 fn srv_config_ok(c: MeoSrvConfig*) -> bool {
@@ -38,7 +44,7 @@ fn srv_config_ok(c: MeoSrvConfig*) -> bool {
   if (c->max_frame < MEO_WIRE_MIN_FRAME || c->max_frame > MEO_WIRE_MAX_FRAME_LIMIT) { return false; }
   if (c->token_n < 0 || c->token_n > 256 || (c->token_n > 0 && c->token == 0)) { return false; }
   if (c->busy_ms < 0 || c->tx_idle_ms < 1 || c->tx_max_ms < 0 || c->idle_ms < 0) { return false; }
-  return c->hello_ms >= 1 && c->stop_ms >= 0;
+  return c->hello_ms >= 1 && c->stop_ms >= 0 && c->sub_hb_ms >= 1;
 }
 
 // Join and free every session whose thread has finished. Acceptor thread, or
@@ -132,6 +138,22 @@ fn srv_spawn_acceptor(srv: MeoSrv*) -> int64 {
   return CreateThread(0, 0, &srv_accept_loop, (cstring)srv, 0, 0);
 }
 
+// The feed that subscriptions read. The db's commit_seq is noted first: a
+// subscriber resuming from an older commit has missed what came before.
+fn srv_feed_attach(srv: MeoSrv*) -> int32 {
+  srv->feed = meo_feed_new(SRV_FEED_CAP);
+  if (srv->feed == 0) { return -MEO_ERR_NOMEM; }
+  srv->feed_base = meo_pager_commit_seq(srv->db->pager);
+  return meo_feed_attach(srv->db->pager, srv->feed);
+}
+
+// Detach and free the feed, once no session can be reading it.
+fn srv_feed_drop(srv: MeoSrv*) {
+  if (srv->feed == 0) { return; }
+  meo_feed_free(srv->feed);
+  srv->feed = 0;
+}
+
 // Bind, listen, start the acceptor and return. c is copied, its token too.
 export fn meo_srv_start(db: MeoDb*, c: MeoSrvConfig*, out: MeoSrv**) -> int32 {
   if (out == 0) { return -MEO_ERR_USAGE; }
@@ -147,6 +169,8 @@ export fn meo_srv_start(db: MeoDb*, c: MeoSrvConfig*, out: MeoSrv**) -> int32 {
   srv->acceptor = 0;
   srv->stop = 0;
   srv->next_id = 0;
+  srv->feed = 0;
+  srv->feed_base = 0;
   srv->mtx = mutex_create();
   srv->slots = (MeoSrvSlot*)calloc((int64)c->max_conns, (int64)sizeof(MeoSrvSlot));
   if (c->token_n > 0) {
@@ -164,6 +188,9 @@ export fn meo_srv_start(db: MeoDb*, c: MeoSrvConfig*, out: MeoSrv**) -> int32 {
   if (rc == MEO_OK) {
     srv->port = meo_sock_port(srv->lfd);
     if (srv->port < 0) { rc = srv->port; }
+  }
+  if (rc == MEO_OK) {
+    rc = srv_feed_attach(srv);
   }
   if (rc == MEO_OK) {
     meo_db_busy_timeout(db, c->busy_ms);
@@ -258,6 +285,7 @@ export fn meo_srv_stop(srv: MeoSrv*) -> int32 {
   }
   var rc: int32 = MEO_OK;
   if (!srv_join_all(srv, meo_srv_now_ms() + (int64)srv->cfg.stop_ms)) { rc = -MEO_ERR_BUSY; }
+  if (rc == MEO_OK) { srv_feed_drop(srv); }
   atomic_exchange_i32(&srv->stop, SRV_STOPPED);
   return rc;
 }
@@ -271,6 +299,7 @@ export fn meo_srv_free(srv: MeoSrv*) -> int32 {
     if (!srv_join_all(srv, meo_srv_now_ms())) { return -MEO_ERR_BUSY; }
     free((rawptr)srv->slots);
   }
+  srv_feed_drop(srv);
   if (srv->cfg.token != 0) { free((rawptr)srv->cfg.token); }
   if (srv->mtx != 0) { mutex_close(srv->mtx); }
   free(srv);
