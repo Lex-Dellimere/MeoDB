@@ -1,6 +1,8 @@
 // platform/clock_linux: the wall clock, for the change feed's commit
-// timestamps. One raw syscall, clock_gettime(228) with CLOCK_REALTIME (0), on
-// Linux x86-64, the same mechanism file_linux.mettle uses for I/O.
+// timestamps, plus a monotonic clock and a sleep for timeouts. Raw syscalls,
+// clock_gettime(228) with CLOCK_REALTIME (0) or CLOCK_MONOTONIC (1) and
+// nanosleep(35), on Linux x86-64, the same mechanism file_linux.mettle uses
+// for I/O.
 //
 // Allocates nothing. Invariant: the answer is microseconds since the Unix
 // epoch, or 0 when the kernel refuses (which it does not for CLOCK_REALTIME
@@ -20,4 +22,35 @@ export fn meo_clock_realtime_us() -> int64 {
     (int64)&ts[0]);
   if (rc < 0) { return 0; }
   return ts[0] * (int64)1000000 + ts[1] / (int64)1000;
+}
+
+const MEO_SYS_NANOSLEEP: int64 = 35;
+const MEO_CLOCK_MONOTONIC: int64 = 1;
+
+// Microseconds on the monotonic clock: never steps back, so it is the one for
+// timeouts and elapsed time. The origin is arbitrary (boot). 0 if the kernel
+// refuses.
+export fn meo_clock_monotonic_us() -> int64 {
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  var rc: int64 = syscall(MEO_SYS_CLOCK_GETTIME, MEO_CLOCK_MONOTONIC,
+    (int64)&ts[0]);
+  if (rc < 0) { return 0; }
+  return ts[0] * (int64)1000000 + ts[1] / (int64)1000;
+}
+
+// Sleep at least us microseconds; us <= 0 returns at once. A signal can cut
+// the sleep short, and the remainder is then slept, so the floor holds.
+export fn meo_sleep_us(us: int64) {
+  if (us <= 0) { return; }
+  var deadline: int64 = meo_clock_monotonic_us() + us;
+  var left: int64 = us;
+  while (left > 0) {
+    var req: int64[2];
+    req[0] = left / (int64)1000000;
+    req[1] = (left % (int64)1000000) * (int64)1000;
+    syscall(MEO_SYS_NANOSLEEP, (int64)&req[0], 0);
+    left = deadline - meo_clock_monotonic_us();
+  }
 }

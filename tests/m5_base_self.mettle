@@ -1,6 +1,242 @@
+// m5_base_self: the futex/atomic/clock helpers and the page-0 fields the WAL
+// work builds on.
+//
+//   mbuild run m5_base_self        (and -r for release)
+//
+// Cases, each with the bug it exists to catch:
+//   b1_wake      a thread blocked in meo_futex_wait wakes within 1 s of the
+//                store and wake. Catches a wait that never returns or a wake
+//                that reaches no one.
+//   b2_mismatch  a wait whose expect differs from the word returns at once.
+//                Catches a wait that sleeps on a stale value (lost wakeup).
+//   b3_timeout   a 50 ms wait returns 1 after 40-500 ms. Catches a timeout in
+//                the wrong unit or one that is ignored.
+//   b4_atomic    atomic store then load round-trips, and the load changes
+//                nothing.
+//   b5_clock     the monotonic clock never steps back; meo_sleep_us(20000)
+//                sleeps at least 15 ms.
+//   b6_meta      flags and a schema_seq above 2^32 round-trip through
+//                meo_meta_write/read; the pad (68..71) and reserved area
+//                (80..127) are zero.
+//   b7_old_file  a page written with flags 0 reads flags 0 and schema_seq 0.
+//   b8_flags     flags bit 1 makes meo_meta_check VERSION; bit 0 is accepted.
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/format/page.mettle";
+import "../src/format/meta.mettle";
+import "../src/platform/futex_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "tinytest.mettle";
+
+var g_word: int32 = 0;      // the futex word
+var g_woken: int32 = 0;     // atomic: the waiter returned
+var g_wait_rc: int32 = -99; // the waiter's result
+
+fn b1_waiter(arg: cstring) -> uint32 {
+  g_wait_rc = meo_futex_wait(&g_word, 0, -1);
+  meo_atomic_store_i32(&g_woken, 1);
+  return 0;
+}
+
+fn b1_wake() -> int32 {
+  g_word = 0;
+  g_woken = 0;
+  var h: int64 = CreateThread(0, 0, &b1_waiter, 0, 0, 0);
+  if (!meo_t_check(h != 0, "b1: thread start")) { return 1; }
+  meo_sleep_us(50000);  // let it block; either order must still wake
+  meo_atomic_store_i32(&g_word, 1);
+  meo_futex_wake(&g_word, 1);
+
+  var t0: int64 = meo_clock_monotonic_us();
+  while (meo_atomic_load_i32(&g_woken) == 0
+      && meo_clock_monotonic_us() - t0 < (int64)1000000) {
+    meo_sleep_us(1000);
+  }
+  var woke: bool = meo_atomic_load_i32(&g_woken) == 1;
+  if (woke) {
+    thread_join_infinite(h);
+    thread_close(h);
+  } else {
+    thread_detach(h);
+  }
+  if (!meo_t_check(woke, "b1: waiter woke within 1 s")) { return 1; }
+  if (!meo_t_check_i64((int64)g_wait_rc, (int64)MEO_OK, "b1: wait result")) {
+    return 1;
+  }
+  println("PASS b1_wake");
+  return 0;
+}
+
+fn b2_mismatch() -> int32 {
+  var w: int32 = 5;
+  var t0: int64 = meo_clock_monotonic_us();
+  var rc: int32 = meo_futex_wait(&w, 0, -1);
+  var dt: int64 = meo_clock_monotonic_us() - t0;
+  if (!meo_t_check_i64((int64)rc, (int64)MEO_OK, "b2: result")) { return 1; }
+  if (!meo_t_check(dt < (int64)500000, "b2: returned at once")) { return 1; }
+  println("PASS b2_mismatch");
+  return 0;
+}
+
+fn b3_timeout() -> int32 {
+  var w: int32 = 0;
+  var t0: int64 = meo_clock_monotonic_us();
+  var rc: int32 = meo_futex_wait(&w, 0, 50);
+  var dt: int64 = meo_clock_monotonic_us() - t0;
+  if (!meo_t_check_i64((int64)rc, 1, "b3: timed out")) { return 1; }
+  if (!meo_t_check(dt >= (int64)40000, "b3: waited at least 40 ms")) { return 1; }
+  if (!meo_t_check(dt <= (int64)500000, "b3: waited at most 500 ms")) { return 1; }
+  println("PASS b3_timeout");
+  return 0;
+}
+
+fn b4_atomic() -> int32 {
+  var w: int32 = 0;
+  meo_atomic_store_i32(&w, 41);
+  if (!meo_t_check_i64((int64)meo_atomic_load_i32(&w), 41, "b4: load 41")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_atomic_load_i32(&w), 41, "b4: load is pure")) {
+    return 1;
+  }
+  meo_atomic_store_i32(&w, -7);
+  if (!meo_t_check_i64((int64)meo_atomic_load_i32(&w), -7, "b4: load -7")) {
+    return 1;
+  }
+  println("PASS b4_atomic");
+  return 0;
+}
+
+fn b5_clock() -> int32 {
+  var prev: int64 = meo_clock_monotonic_us();
+  if (!meo_t_check(prev > 0, "b5: clock answers")) { return 1; }
+  var i: int32 = 0;
+  while (i < 1000) {
+    var now: int64 = meo_clock_monotonic_us();
+    if (!meo_t_check(now >= prev, "b5: nondecreasing")) { return 1; }
+    prev = now;
+    i += 1;
+  }
+  var t0: int64 = meo_clock_monotonic_us();
+  meo_sleep_us(20000);
+  var dt: int64 = meo_clock_monotonic_us() - t0;
+  if (!meo_t_check(dt >= (int64)15000, "b5: slept at least 15 ms")) { return 1; }
+  var t1: int64 = meo_clock_monotonic_us();
+  meo_sleep_us(0);
+  meo_sleep_us(-5);
+  if (!meo_t_check(meo_clock_monotonic_us() - t1 < (int64)100000,
+      "b5: non-positive sleep returns")) { return 1; }
+  println("PASS b5_clock");
+  return 0;
+}
+
+fn b_meta_base() -> MeoMeta {
+  var m: MeoMeta;
+  m.valid = true;
+  m.magic = MEO_MAGIC;
+  m.version = MEO_FORMAT_VERSION;
+  m.page_size = MEO_PAGE_SIZE;
+  m.page_count = (uint32)3;
+  m.freelist_root = (uint32)0;
+  m.catalog_root = (uint32)1;
+  m.btree_root = (uint32)2;
+  m.txn_id = (uint64)9;
+  m.write_version = (uint64)1;
+  m.commit_seq = (uint64)77;
+  return m;
+}
+
+fn b6_meta() -> int32 {
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (!meo_t_check(p != 0, "b6: malloc")) { return 1; }
+  defer free(p);
+  // Dirty bytes where the pad and reserved area live, to prove the write
+  // zeroes them.
+  var i: int32 = 0;
+  while (i < MEO_PAGE_SIZE) { p[i] = (uint8)0xAA; i += 1; }
+  if (!meo_t_check_i64((int64)meo_page_init(p, MEO_PAGE_META), 0, "b6: init")) {
+    return 1;
+  }
+  var big: uint64 = ((uint64)1 << 40) + (uint64)5;
+  var m: MeoMeta = b_meta_base();
+  m.flags = MEO_META_F_WAL;
+  m.schema_seq = big;
+  meo_meta_write(p, m);
+  var r: MeoMeta = meo_meta_read(p);
+  if (!meo_t_check(r.valid, "b6: valid")) { return 1; }
+  if (!meo_t_check_i64((int64)r.flags, 1, "b6: flags")) { return 1; }
+  if (!meo_t_check(r.schema_seq == big, "b6: schema_seq")) { return 1; }
+  if (!meo_t_check_i64((int64)r.commit_seq, 77, "b6: commit_seq kept")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_meta_check(p), (int64)MEO_OK, "b6: check")) {
+    return 1;
+  }
+  i = 68;
+  while (i < 72) {
+    if (!meo_t_check_i64((int64)p[i], 0, "b6: pad byte")) { return 1; }
+    i += 1;
+  }
+  i = 80;
+  while (i < 128) {
+    if (!meo_t_check_i64((int64)p[i], 0, "b6: reserved byte")) { return 1; }
+    i += 1;
+  }
+  println("PASS b6_meta");
+  return 0;
+}
+
+fn b7_old_file() -> int32 {
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (!meo_t_check(p != 0, "b7: malloc")) { return 1; }
+  defer free(p);
+  meo_page_init(p, MEO_PAGE_META);
+  // The fields a pre-WAL writer never set stay at their zero default.
+  var m: MeoMeta = b_meta_base();
+  meo_meta_write(p, m);
+  var r: MeoMeta = meo_meta_read(p);
+  if (!meo_t_check(r.valid, "b7: valid")) { return 1; }
+  if (!meo_t_check_i64((int64)r.flags, 0, "b7: flags")) { return 1; }
+  if (!meo_t_check(r.schema_seq == (uint64)0, "b7: schema_seq")) { return 1; }
+  println("PASS b7_old_file");
+  return 0;
+}
+
+fn b8_flags() -> int32 {
+  var p: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  if (!meo_t_check(p != 0, "b8: malloc")) { return 1; }
+  defer free(p);
+  meo_page_init(p, MEO_PAGE_META);
+  var m: MeoMeta = b_meta_base();
+  m.flags = MEO_META_F_WAL;
+  meo_meta_write(p, m);
+  if (!meo_t_check_i64((int64)meo_meta_check(p), (int64)MEO_OK, "b8: bit 0 ok")) {
+    return 1;
+  }
+  m.flags = (uint32)2;
+  meo_meta_write(p, m);
+  if (!meo_t_check_i64((int64)meo_meta_check(p), (int64)(-MEO_ERR_VERSION),
+      "b8: bit 1 is VERSION")) { return 1; }
+  m.flags = (uint32)3;
+  meo_meta_write(p, m);
+  if (!meo_t_check_i64((int64)meo_meta_check(p), (int64)(-MEO_ERR_VERSION),
+      "b8: bits 0+1 are VERSION")) { return 1; }
+  println("PASS b8_flags");
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS m5_base_self (stub)");
-  return 0;
+  if (b1_wake() != 0) { return 1; }
+  if (b2_mismatch() != 0) { return 1; }
+  if (b3_timeout() != 0) { return 1; }
+  if (b4_atomic() != 0) { return 1; }
+  if (b5_clock() != 0) { return 1; }
+  if (b6_meta() != 0) { return 1; }
+  if (b7_old_file() != 0) { return 1; }
+  if (b8_flags() != 0) { return 1; }
+  println("PASS m5_base_self");
+  return meo_t_report();
 }

@@ -12,7 +12,9 @@
 // commit_seq (offset 56, u64) is such a field: the change feed's persisted
 // commit counter. Files written before it existed carry zeros there and
 // therefore read commit_seq = 0, which is a valid starting value, so adding it
-// needed no format-version bump. The reserved area now starts at 64.
+// needed no format-version bump. flags (offset 64, bit 0 = WAL mode) and
+// schema_seq (offset 72) were carved out the same way; the reserved area now
+// starts at 80.
 
 import "../error/status.mettle";
 import "bytes.mettle";
@@ -22,6 +24,10 @@ export const MEO_ROOT_FREELIST: int32 = 0;
 export const MEO_ROOT_CATALOG: int32 = 1;
 export const MEO_ROOT_BTREE: int32 = 2;
 export const MEO_ROOT_COUNT: int32 = 3;
+
+// meta.flags bit 0: the file is in WAL mode. Any other bit is a feature this
+// build does not know, which meo_meta_check refuses.
+export const MEO_META_F_WAL: uint32 = 1;
 
 // Meta body offsets, in absolute page bytes.
 const META_OFF_MAGIC: int64 = 16;
@@ -34,7 +40,10 @@ const META_OFF_BTREE_ROOT: int64 = 36;
 const META_OFF_TXN_ID: int64 = 40;
 const META_OFF_WRITE_VERSION: int64 = 48;
 const META_OFF_COMMIT_SEQ: int64 = 56;
-const META_OFF_RESERVED: int64 = 64;
+const META_OFF_FLAGS: int64 = 64;
+const META_OFF_PAD: int64 = 68;
+const META_OFF_SCHEMA_SEQ: int64 = 72;
+const META_OFF_RESERVED: int64 = 80;
 const META_RESERVED_BYTES: int64 = (int64)MEO_META_BODY - META_OFF_RESERVED;
 
 export struct MeoMeta {
@@ -49,6 +58,8 @@ export struct MeoMeta {
   txn_id: uint64;
   write_version: uint64;
   commit_seq: uint64;  // successful commits (and counted autocommit flushes)
+  flags: uint32;       // MEO_META_F_*
+  schema_seq: uint64;  // transactions that wrote the catalog tree
 }
 
 // Decode the meta body. A bad magic, version or page size returns a zeroed
@@ -75,6 +86,8 @@ export fn meo_meta_read(p: uint8*) -> MeoMeta {
   m.txn_id = meo_get_u64le(p, META_OFF_TXN_ID);
   m.write_version = meo_get_u64le(p, META_OFF_WRITE_VERSION);
   m.commit_seq = meo_get_u64le(p, META_OFF_COMMIT_SEQ);
+  m.flags = meo_get_u32le(p, META_OFF_FLAGS);
+  m.schema_seq = meo_get_u64le(p, META_OFF_SCHEMA_SEQ);
   return m;
 }
 
@@ -90,6 +103,10 @@ export fn meo_meta_check(p: uint8*) -> int32 {
     return -MEO_ERR_VERSION;
   }
   if ((int32)meo_get_u16le(p, META_OFF_PAGE_SIZE) != MEO_PAGE_SIZE) {
+    return -MEO_ERR_VERSION;
+  }
+  // A flag this build does not know may change how the file must be read.
+  if ((meo_get_u32le(p, META_OFF_FLAGS) & ~MEO_META_F_WAL) != 0) {
     return -MEO_ERR_VERSION;
   }
   if (meo_page_type(p) != MEO_PAGE_META) { return -MEO_ERR_CORRUPT; }
@@ -111,8 +128,11 @@ export fn meo_meta_write(p: uint8*, m: MeoMeta) -> int32 {
   meo_put_u64le(p, META_OFF_TXN_ID, m.txn_id);
   meo_put_u64le(p, META_OFF_WRITE_VERSION, m.write_version);
   meo_put_u64le(p, META_OFF_COMMIT_SEQ, m.commit_seq);
-  // Only the bytes after commit_seq are reserved now; zeroing from 56 would
-  // erase the counter on every write.
+  meo_put_u32le(p, META_OFF_FLAGS, m.flags);
+  meo_put_u32le(p, META_OFF_PAD, 0);
+  meo_put_u64le(p, META_OFF_SCHEMA_SEQ, m.schema_seq);
+  // Only the bytes after schema_seq are reserved now; zeroing from 56 would
+  // erase the counters on every write.
   meo_bytes_zero(p + META_OFF_RESERVED, META_RESERVED_BYTES);
   meo_page_seal(p);
   return MEO_OK;

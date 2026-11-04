@@ -1,0 +1,54 @@
+// platform/futex_linux: futex wait/wake and the two atomic word accessors the
+// shared-word rule needs. Raw futex(202) on Linux x86-64, the private-futex
+// variants (the words never cross a process boundary).
+//
+// Allocates nothing. Invariant: a wait returns only MEO_OK (woken, or the word
+// no longer held `expect`, or a signal), 1 (timed out) or -MEO_ERR_USAGE, so a
+// caller re-checks its word and loops; a wake never blocks.
+
+import "std/thread";
+import "../error/status.mettle";
+
+const MEO_SYS_FUTEX: int64 = 202;
+const MEO_FUTEX_WAIT_PRIVATE: int64 = 128;
+const MEO_FUTEX_WAKE_PRIVATE: int64 = 129;
+const MEO_FUTEX_EAGAIN: int64 = 11;
+const MEO_FUTEX_EINTR: int64 = 4;
+const MEO_FUTEX_ETIMEDOUT: int64 = 110;
+
+// Sleep while *addr == expect. timeout_ms < 0 waits forever. Spurious wakeups
+// are normal, so the caller loops on its own condition.
+export fn meo_futex_wait(addr: int32*, expect: int32, timeout_ms: int32) -> int32 {
+  // struct timespec, a relative timeout for FUTEX_WAIT.
+  var ts: int64[2];
+  var tsp: int64 = 0;
+  if (timeout_ms >= 0) {
+    ts[0] = (int64)(timeout_ms / 1000);
+    ts[1] = (int64)(timeout_ms % 1000) * (int64)1000000;
+    tsp = (int64)&ts[0];
+  }
+  var rc: int64 = syscall(MEO_SYS_FUTEX, (int64)addr, MEO_FUTEX_WAIT_PRIVATE,
+    (int64)expect, tsp, 0, 0);
+  if (rc >= 0) { return MEO_OK; }
+  var e: int64 = 0 - rc;
+  if (e == MEO_FUTEX_EAGAIN || e == MEO_FUTEX_EINTR) { return MEO_OK; }
+  if (e == MEO_FUTEX_ETIMEDOUT) { return 1; }
+  return -MEO_ERR_USAGE;
+}
+
+// Wake up to n waiters on addr. The woken count, or -MEO_ERR_IO.
+export fn meo_futex_wake(addr: int32*, n: int32) -> int32 {
+  var rc: int64 = syscall(MEO_SYS_FUTEX, (int64)addr, MEO_FUTEX_WAKE_PRIVATE,
+    (int64)n, 0, 0, 0);
+  if (rc < 0) { return -MEO_ERR_IO; }
+  return (int32)rc;
+}
+
+// A CAS of 0 for 0 returns the current value and never changes it.
+export fn meo_atomic_load_i32(p: int32*) -> int32 {
+  return atomic_compare_exchange_i32(p, 0, 0);
+}
+
+export fn meo_atomic_store_i32(p: int32*, v: int32) {
+  atomic_exchange_i32(p, v);
+}
