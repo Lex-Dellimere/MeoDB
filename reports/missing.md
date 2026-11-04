@@ -1,11 +1,9 @@
 # Missing features
-
 Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
-
 | Id | Feature | Who needs it | Milestone | Status |
 |---|---|---|---|---|
 | M1 | CREATE INDEX / DROP INDEX: named, non-unique, on existing tables (`b1afd59`). Composite indexes are still missing. | flux_orm migrations, example_sass (listing entries by user) | M3 | partly done |
-| M2 | Rows larger than 1280 encoded bytes (overflow pages). | example_sass entries, any long text | M3 | open |
+| M2 | Rows larger than 1280 encoded bytes (overflow pages). | example_sass entries, any long text | M3 | done (`f087ae3`) |
 | M3 | Range scans on an ordered key for time windows. | mistplot | M3 | done (`c3acf7f`) |
 | M4 | Change feed for typed-API writes, with row payloads, GAP times and transient-error reporting. | mistplot live charts, raize notifications | M4 | done (`611dc90`, `802a1a1`) |
 | M5 | Readers that don't wait for the writer (WAL + MVCC). | raize_web, any multi-user app | M5 | open |
@@ -28,5 +26,5 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 | M22 | Group commit: concurrent commits share one fsync. | write-heavy apps (example_sass F02.7) | M5 | open |
 | M23 | Catalog changes (create/drop table, add column) in the change feed. | mistplot, raize (schema-aware consumers) | M4 | open |
 | M24 | Feed callbacks on a feed thread outside the db lock, and a per-subscriber `meo_feed_subscribe`. | mistplot live push | M4 | open |
-
 | M25 | Error detail on the wire: a CONFLICT can't name its column, so flux can't attach it to a field. | flux_orm | not scheduled | open |
+| M26 | Feed events for rows over about 4 KB: the change feed reports them as a GAP instead of carrying the row. | mistplot, raize | M4 | open |

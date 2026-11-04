@@ -23,9 +23,9 @@ Layers 3, 4a, 5. Consumer: flux_orm.
 - [x] README has a create/insert/select example with `meo_q_*` that compiles.
 
 ## M3 — Storage v2 + mistplot range scan
-- [ ] Overflow pages: rows up to 16 MiB round-trip; `MEO_REC_MAX` is lifted.
+- [x] Overflow pages: rows up to 16 MiB round-trip; `MEO_REC_MAX` now only limits in-leaf records and index keys (`ovf_self`, `rowbig_self`). Over TCP a row is also bounded by the frame limit (16 MiB by default).
 - [ ] B-tree merge/rebalance; emptied pages go back to the freelist (file size is stable under insert/delete churn).
-- [ ] Index creation on an existing table, composite and non-unique indexes; inner and left joins for flux_orm's join builder.
+- [ ] Index creation on an existing table, composite and non-unique indexes; inner and left joins for flux_orm's join builder. Named, non-unique, single-column indexes on existing tables are done (`index_self`); composite indexes and joins are not.
 - [x] Range predicates (`<`, `<=`, `>`, `>=`, BETWEEN) use the rowid or a unique index (`range_self`).
 - [x] `meo_q_scan_xy` / `meo_q_scan_xyg` stream (x, y) float64 pairs over an x window without materializing the table (`range_self`). Filling an `MpSeries` from 1M rows is mistplot's to check.
 - [ ] Opt-in streaming select: memory stays constant while reading all of a 1M-row table.
