@@ -156,3 +156,13 @@ export fn meo_key_int_decode(buf: uint8*, n: int32, out: int64*) -> int32 {
   out[0] = (int64)(x ^ ((uint64)1 << 63));
   return 9;
 }
+
+// Decode the meo_key_rowid field at the front of buf into out[0]. Returns 8, or
+// -MEO_ERR_CORRUPT when n < 8.
+export fn meo_key_rowid_decode(buf: uint8*, n: int32, out: int64*) -> int32 {
+  if (buf == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  if (n < 8) { return -MEO_ERR_CORRUPT; }
+  var x: uint64 = key_bswap64(meo_get_u64le(buf, 0));
+  out[0] = (int64)(x ^ ((uint64)1 << 63));
+  return 8;
+}

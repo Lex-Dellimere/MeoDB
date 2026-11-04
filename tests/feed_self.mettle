@@ -33,13 +33,17 @@
 //                    GAP instead of partial data.
 //   f8_two_readers   two cursors read the same events independently.
 //   f9_persist_peek  commit_seq survives close/reopen, is readable from disk by
-//                    meo_peek_commit_seq while the pager is open, peek answers 1
-//                    while a journal exists, and autocommit flushes count
+//                    meo_peek_commit_seq while the pager is open, peek answers
+//                    MEO_PEEK_HOT while a journal exists, and autocommit flushes count
 //                    (empty ones do not) and publish their events.
 //   f10_crash        a process killed between the commit's fsync and the journal
 //                    unlink: peek sees the uncommitted value with status 1;
 //                    recovery restores the pre-transaction commit_seq and data;
 //                    a feed in the new process is empty.
+//   f12_peek_damage  a closed db with a flipped byte in page 0 and no journal is
+//                    -MEO_ERR_CORRUPT (damage does not change between reads);
+//                    the same page 0 with a journal beside it is
+//                    MEO_PEEK_TRANSIENT and leaves out[0] alone.
 //   f11_threads      a writer thread commits N transactions while a reader
 //                    thread polls: every event exactly once, in order, no GAP.
 //
@@ -784,8 +788,8 @@ fn f9_persist_peek() -> int32 {
   }
   // An open transaction leaves a journal: peek says "maybe uncommitted".
   meo_pager_begin(p);
-  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), 1,
-      "f9: peek answers 1 while a journal exists")) {
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), MEO_PEEK_HOT,
+      "f9: peek answers hot while a journal exists")) {
     return 1;
   }
   if (!meo_t_check_i64((int64)seq, 4, "f9: and still reads the value")) {
@@ -906,7 +910,7 @@ fn f10_crash() -> int32 {
   // The child's page 0 reached the disk with commit_seq 2, but it is not
   // committed: peek must say so.
   var seq: uint64 = 0;
-  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), 1,
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), MEO_PEEK_HOT,
       "f10: peek flags the hot journal")) {
     return 1;
   }
@@ -950,6 +954,67 @@ fn f10_crash() -> int32 {
   }
   if (!meo_t_check_i64((int64)seq, 1, "f10: peek reads 1")) { return 1; }
   println("PASS f10_crash");
+  return 0;
+}
+
+// --- f12: damaged page 0 ------------------------------------------------------
+
+// Flip one byte of page 0's body in place.
+fn fd_flip_page0(db: string, off: int64) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var b: uint8[1];
+  var rc: int32 = meo_file_read_at(f, off, &b[0], 1);
+  if (rc == 1) {
+    b[0] = b[0] ^ (uint8)0xFF;
+    rc = meo_file_write_at(f, off, &b[0], 1);
+  } else {
+    rc = -MEO_ERR_IO;
+  }
+  meo_file_close(f);
+  if (rc != MEO_OK) { return -MEO_ERR_IO; }
+  return MEO_OK;
+}
+
+fn f12_peek_damage() -> int32 {
+  if (!meo_t_check_i64(fd_reset(F_DB), MEO_OK, "f12: reset")) { return 1; }
+  var p: MeoPager* = fd_open(F_DB);
+  var root: uint32 = 0;
+  meo_pager_begin(p);
+  var kb: uint8[16];
+  var kn: int32 = meo_key_int(&kb[0], 16, 1);
+  var k: MeoBtKey = { data: &kb[0], len: kn };
+  meo_bt_insert(p, &root, &meo_key_compare, k, 1);
+  meo_pager_set_root(p, MEO_ROOT_BTREE, root);
+  meo_pager_commit(p);
+  if (!meo_t_check_i64(fd_close(p), MEO_OK, "f12: seed")) { return 1; }
+  if (!meo_t_check_i64(fd_flip_page0(F_DB, 2000), MEO_OK, "f12: flip")) {
+    return 1;
+  }
+  var seq: uint64 = 12345;
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), -MEO_ERR_CORRUPT,
+      "f12: stable damage with no journal is corrupt")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 12345, "f12: out is untouched")) {
+    return 1;
+  }
+  // A journal beside the same page 0 means a writer is at it: transient.
+  var jpath: string = fd_jpath(F_DB);
+  var jf: MeoFile = meo_file_open(jpath,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!meo_t_check(jf.is_open, "f12: create a journal file")) { return 1; }
+  meo_file_close(jf);
+  if (!meo_t_check_i64(meo_peek_commit_seq(F_DB, &seq), MEO_PEEK_TRANSIENT,
+      "f12: damage with a journal is transient")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)seq, 12345, "f12: out is untouched again")) {
+    return 1;
+  }
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  println("PASS f12_peek_damage");
   return 0;
 }
 
@@ -1102,6 +1167,7 @@ fn main() -> int32 {
   if (rc == 0) { rc = f9_persist_peek(); }
   if (rc == 0) { rc = f10_crash(); }
   if (rc == 0) { rc = f11_threads(); }
+  if (rc == 0) { rc = f12_peek_damage(); }
   free(outs.data);
   free(kbs.data);
   if (rc == 0) { println("PASS feed_self"); }

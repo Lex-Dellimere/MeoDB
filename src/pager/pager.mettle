@@ -1610,62 +1610,95 @@ export fn meo_pager_commit_seq(p: MeoPager*) -> uint64 {
   return p->meta.commit_seq;
 }
 
+// Peek answers: the value was read, and a journal sits beside the database.
+export const MEO_PEEK_HOT: int32 = 1;
+// Peek answers: page 0 failed its checks but is being written; retry.
+export const MEO_PEEK_TRANSIENT: int32 = 2;
+
+// Read page 0 into buf and run the open's checks on it. Returns MEO_OK (and
+// the commit counter in seq[0]) or the failing status. *got is the byte count
+// the read returned, so a caller can tell two failing reads apart.
+fn peek_page0(f: MeoFile, buf: uint8*, seq: uint64*, got: int32*) -> int32 {
+  var rc: int32 = meo_file_read_at(f, 0, buf, (int64)MEO_PAGE_SIZE);
+  got[0] = rc;
+  if (rc < 0) { return rc; }
+  if (rc != MEO_PAGE_SIZE) { return -MEO_ERR_CORRUPT; }
+  var status: int32 = meo_meta_check(buf);
+  if (status == MEO_OK && meo_page_verify(buf) != MEO_OK) {
+    return -MEO_ERR_CORRUPT;
+  }
+  if (status != MEO_OK) { return status; }
+  var m: MeoMeta = meo_meta_read(buf);
+  if (!m.valid) { return -MEO_ERR_CORRUPT; }
+  seq[0] = m.commit_seq;
+  return MEO_OK;
+}
+
 // Read commit_seq straight from page 0 on disk, with no pager: the cheap "did
 // anything commit?" probe for another handle or another process. Page 0 is
 // validated exactly as an open validates it (magic, version, page size, page
 // structure, CRC). No recovery is attempted and nothing is written.
 //
-// MEO_OK: out[0] is the committed value. 1: out[0] was read, but a journal
-// sits beside the database (a transaction is open, is committing, or died
-// hot), so the value may belong to a state that is not committed yet and may
-// still be rolled back; poll again. Page 0 is read BEFORE the journal is
-// looked for: a commit writes page 0, fsyncs, then removes the journal, so a
-// new value seen with no journal after it is committed.
+// Positive answers mean "retry later", negative ones mean real damage:
+//   MEO_OK              out[0] is the committed value, no journal.
+//   MEO_PEEK_HOT (1)    out[0] was read, but a journal sits beside the
+//                       database (a transaction is open, is committing, or
+//                       died hot), so the value may still be rolled back.
+//   MEO_PEEK_TRANSIENT  page 0 failed its checks but a writer is at it; out[0]
+//   (2)                 is untouched. Either a journal is present, or there is
+//                       none and page 0 changed between back-to-back reads (an
+//                       autocommit flush has no journal).
+// Page 0 is read BEFORE the journal is looked for: a commit writes page 0,
+// fsyncs, then removes the journal, so a new value seen with no journal after
+// it is committed.
 //
-// Failures: the open's codes for a missing file, -MEO_ERR_NOT_A_DB /
-// -MEO_ERR_VERSION for a foreign file, -MEO_ERR_CORRUPT for a page 0 that fails
-// its checks. A page 0 that fails its checks while a journal is present is
-// -MEO_ERR_BUSY instead: that is a writer caught mid-write (retry), not damage.
-// An autocommit flush has no journal, so a reader racing one can see a
-// transient -MEO_ERR_CORRUPT; retry before believing it.
+// A page 0 that fails its checks with no journal is re-read up to three times:
+// one that passes is used, bytes that changed are transient, and bytes that
+// stay identical and failing are -MEO_ERR_CORRUPT, because a torn write in
+// progress changes the bytes and damage does not. Other failures are the
+// open's codes for a missing file and -MEO_ERR_NOT_A_DB / -MEO_ERR_VERSION for
+// a foreign file.
 export fn meo_peek_commit_seq(path: string, out: uint64*) -> int32 {
   if (out == 0) { return -MEO_ERR_USAGE; }
   var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
   if (!f.is_open) { return (int32)f.handle; }
-  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE);
+  var buf: uint8* = malloc((int64)MEO_PAGE_SIZE * 2);
   if (buf == 0) {
     meo_file_close(f);
     return -MEO_ERR_NOMEM;
   }
-  var rc: int32 = meo_file_read_at(f, 0, buf, (int64)MEO_PAGE_SIZE);
-  meo_file_close(f);
-  var status: int32 = MEO_OK;
-  if (rc < 0) {
-    status = rc;
-  } else if (rc != MEO_PAGE_SIZE) {
-    status = -MEO_ERR_CORRUPT;
-  } else {
-    status = meo_meta_check(buf);
-    if (status == MEO_OK && meo_page_verify(buf) != MEO_OK) {
-      status = -MEO_ERR_CORRUPT;
-    }
-  }
+  var again: uint8* = buf + (int64)MEO_PAGE_SIZE;
   var seq: uint64 = 0;
-  if (status == MEO_OK) {
-    var m: MeoMeta = meo_meta_read(buf);
-    if (!m.valid) {
-      status = -MEO_ERR_CORRUPT;
-    } else {
-      seq = m.commit_seq;
+  var got: int32 = 0;
+  var got2: int32 = 0;
+  var status: int32 = peek_page0(f, buf, &seq, &got);
+  var changed: bool = false;
+  if (status == -MEO_ERR_CORRUPT) {
+    var hot0: int32 = meo_jrn_present(path);
+    if (hot0 == 1) {
+      meo_file_close(f);
+      free(buf);
+      return MEO_PEEK_TRANSIENT;
+    }
+    var tries: int32 = 0;
+    while (tries < 3 && status == -MEO_ERR_CORRUPT && !changed) {
+      status = peek_page0(f, again, &seq, &got2);
+      if (status == -MEO_ERR_CORRUPT
+          && (got2 != got
+            || !meo_bytes_equal(buf, again, (int64)MEO_PAGE_SIZE))) {
+        changed = true;
+      }
+      tries += 1;
     }
   }
+  meo_file_close(f);
   free(buf);
+  if (changed) { return MEO_PEEK_TRANSIENT; }
+  if (status != MEO_OK) { return status; }
   var hot: int32 = meo_jrn_present(path);
   if (hot < 0) { return hot; }
-  if (status == -MEO_ERR_CORRUPT && hot == 1) { return -MEO_ERR_BUSY; }
-  if (status != MEO_OK) { return status; }
   out[0] = seq;
-  if (hot == 1) { return 1; }
+  if (hot == 1) { return MEO_PEEK_HOT; }
   return MEO_OK;
 }
 

@@ -17,6 +17,9 @@
 //                  which starts with its payload.
 //   k_composite    fields concatenate in index order: (1,5) < (1,6) < (2,0)
 //                  and (1, max) < (2, min). No separators are involved.
+//   k_decode       meo_key_int_decode and meo_key_rowid_decode invert their
+//                  encoders at the extremes, a composite key is walked field by
+//                  field, and a wrong tag or a short buffer is negative.
 //   k_cap_full     a cap one byte short is -MEO_ERR_FULL and writes nothing: an
 //                  encoder that writes the tag before checking capacity, or
 //                  that accepts an exact-fit buffer and overwrites, is caught.
@@ -383,6 +386,94 @@ fn k_cap_full() -> int32 {
   return 0;
 }
 
+fn k_decode() -> int32 {
+  var vals: int64[5];
+  vals[0] = (int64)((uint64)1 << 63);
+  vals[1] = (int64)-1;
+  vals[2] = (int64)0;
+  vals[3] = (int64)1;
+  vals[4] = (int64)(((uint64)1 << 63) - (uint64)1);
+  var buf: uint8[K_BUFSZ];
+  var out: int64 = 5;
+  var i: int32 = 0;
+  while (i < 5) {
+    var n: int32 = meo_key_int(&buf[0], K_BUFSZ, vals[i]);
+    if (!k_i32(meo_key_int_decode(&buf[0], n, &out), 9, "decode: int reads 9")) {
+      return 1;
+    }
+    if (!k_ok(out == vals[i], "decode: int round trip")) { return 1; }
+
+    out = 5;
+    var m: int32 = meo_key_rowid(&buf[0], K_BUFSZ, vals[i]);
+    if (!k_i32(meo_key_rowid_decode(&buf[0], m, &out), 8,
+        "decode: rowid reads 8")) {
+      return 1;
+    }
+    if (!k_ok(out == vals[i], "decode: rowid round trip")) { return 1; }
+    i += 1;
+  }
+
+  // A composite key is walked by the bytes each decode reports.
+  var j: int32 = 0;
+  while (j < 5) {
+    var a: int64 = vals[j];
+    var b: int64 = vals[4 - j];
+    var total: int32 = k_pair(&buf[0], K_BUFSZ, a, b);
+    if (!k_i32(total, 18, "decode: composite is 18 bytes")) { return 1; }
+    var x: int64 = 5;
+    var y: int64 = 5;
+    var used: int32 = meo_key_int_decode(&buf[0], total, &x);
+    if (!k_i32(used, 9, "decode: first field")) { return 1; }
+    var used2: int32 = meo_key_int_decode(&buf[0] + (int64)used, total - used,
+      &y);
+    if (!k_i32(used2, 9, "decode: second field")) { return 1; }
+    if (!k_ok(x == a && y == b, "decode: composite round trip")) { return 1; }
+    j += 1;
+  }
+
+  // An int field followed by a rowid, the shape of an index key.
+  var tn: int32 = k_int_rowid(&buf[0], K_BUFSZ, (int64)-1, (int64)7);
+  var f1: int64 = 0;
+  var f2: int64 = 0;
+  var u1: int32 = meo_key_int_decode(&buf[0], tn, &f1);
+  if (!k_i32(u1, 9, "decode: index key int")) { return 1; }
+  if (!k_i32(meo_key_rowid_decode(&buf[0] + (int64)u1, tn - u1, &f2), 8,
+      "decode: index key rowid")) {
+    return 1;
+  }
+  if (!k_ok(f1 == (int64)-1 && f2 == 7, "decode: index key values")) {
+    return 1;
+  }
+
+  // Refusals: wrong tag, short buffer, null arguments.
+  var tn2: int32 = meo_key_text(&buf[0], K_BUFSZ, "abcdefghij");
+  if (!k_ok(meo_key_int_decode(&buf[0], tn2, &out) < 0,
+      "decode: a text tag is not an int")) {
+    return 1;
+  }
+  var ni: int32 = meo_key_int(&buf[0], K_BUFSZ, (int64)3);
+  if (!k_ok(meo_key_int_decode(&buf[0], ni - 1, &out) < 0,
+      "decode: a short int is refused")) {
+    return 1;
+  }
+  var nr: int32 = meo_key_rowid(&buf[0], K_BUFSZ, (int64)3);
+  if (!k_ok(meo_key_rowid_decode(&buf[0], nr - 1, &out) < 0,
+      "decode: a short rowid is refused")) {
+    return 1;
+  }
+  if (!k_ok(meo_key_rowid_decode(&buf[0], 0, &out) < 0,
+      "decode: an empty rowid is refused")) {
+    return 1;
+  }
+  if (!k_ok(meo_key_rowid_decode(&buf[0], nr, 0) < 0,
+      "decode: a null out is refused")) {
+    return 1;
+  }
+
+  println("PASS k_decode");
+  return 0;
+}
+
 // --- interpreter @test -----------------------------------------------------
 //
 // main() proves the byte layout; these run under `mettle test` so the shared
@@ -441,6 +532,7 @@ fn main() -> int32 {
   if (k_text_order() != 0) { return 1; }
   if (k_tags() != 0) { return 1; }
   if (k_composite() != 0) { return 1; }
+  if (k_decode() != 0) { return 1; }
   if (k_cap_full() != 0) { return 1; }
   if (k_failures != 0) {
     println("FAIL key_self: {k_failures} check(s) failed");
