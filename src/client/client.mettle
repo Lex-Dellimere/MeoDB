@@ -1,0 +1,530 @@
+// client/client: the reference client for protocol v1, over wire/ and
+// net/sock only. One MeoCli is one connection, used by one thread at a time.
+//
+// A lost connection (EOF, socket error, local timeout, a reply with the wrong
+// rid or kind, a malformed payload) closes the socket at once, so a late reply
+// is never read as the answer to a later request. Inside a transaction that
+// call and every later one return -MEO_ERR_TX until meo_cli_rollback, which
+// returns OK locally: the server rolled back when the socket closed. Outside a
+// transaction the call returns -MEO_ERR_IO and the next call reconnects once
+// before sending. A request is never sent twice.
+
+import "std/mem";
+import "../error/status.mettle";
+import "../mem/arena.mettle";
+import "../record/value.mettle";
+import "../wire/frame.mettle";
+import "../wire/stmt.mettle";
+import "../wire/msg.mettle";
+import "../net/sock.mettle";
+
+export const MEO_CLI_TX_NONE: int32 = 0;
+export const MEO_CLI_TX_OPEN: int32 = 1;
+export const MEO_CLI_TX_LOST: int32 = 2;   // went with the connection; only rollback clears it
+
+export const MEO_CLI_TIMEOUT_MS: int32 = 30000;
+
+const MEO_CLI_TOKEN_MAX: int32 = 256;
+
+export struct MeoCliOpts {
+  recv_ms: int32;      // SO_RCVTIMEO per wait; 0 = none
+  send_ms: int32;      // SO_SNDTIMEO; 0 = none
+  max_frame: int32;    // largest reply payload accepted
+  name: string;        // client name sent in HELLO, <= 64 bytes
+}
+
+export struct MeoCli {
+  ip: uint8*;
+  ip_n: int32;
+  port: int32;
+  token: uint8*;
+  token_n: int32;
+  name: uint8*;
+  name_n: int32;
+  recv_ms: int32;
+  send_ms: int32;
+  max_frame: int32;
+  fd: int64;           // -1 when not connected
+  rid: uint32;         // last rid sent on this connection
+  tx: int32;           // MEO_CLI_TX_*
+  srv_max: int32;
+  caps: uint32;
+  session: uint64;
+  minor: int32;
+  w: MeoWBuf;
+  rbuf: uint8*;
+  rcap: int32;
+  e_code: int32;
+  e_fatal: bool;
+  e_tx: int32;
+  e_msg: uint8*;
+  e_n: int32;
+}
+
+// Cells are views into buf; valid until meo_cli_result_free.
+export struct MeoCliResult {
+  res: MeoWResult;
+  buf: uint8*;
+  a: MeoArena*;
+}
+
+export fn meo_cli_opts_init(o: MeoCliOpts*) {
+  o->recv_ms = MEO_CLI_TIMEOUT_MS;
+  o->send_ms = MEO_CLI_TIMEOUT_MS;
+  o->max_frame = MEO_WIRE_MAX_FRAME;
+  o->name = "meosql-cli";
+}
+
+fn meo_cli_str(p: uint8*, n: int32) -> string {
+  var s: string = "";
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn meo_cli_dup(p: uint8*, n: int32) -> uint8* {
+  var q: uint8* = (uint8*)malloc((int64)n + 1);
+  if (q == 0) { return 0; }
+  if (n > 0) { memcpy((rawptr)q, (rawptr)p, (int64)n); }
+  q[n] = 0;
+  return q;
+}
+
+fn meo_cli_code(rc: int32) -> int32 {
+  if (rc < 0) { return -rc; }
+  return MEO_ERR_IO;
+}
+
+fn meo_cli_clear_err(c: MeoCli*) {
+  c->e_code = MEO_OK;
+  c->e_fatal = false;
+  c->e_tx = MEO_WIRE_TX_NONE;
+  c->e_n = 0;
+}
+
+fn meo_cli_set_err(c: MeoCli*, code: int32, fatal: bool, tx: int32, msg: string) {
+  c->e_code = code;
+  c->e_fatal = fatal;
+  c->e_tx = tx;
+  var n: int32 = MEO_WIRE_MSG_MAX;
+  if (msg.length < (uint64)n) { n = (int32)msg.length; }
+  if (n > 0) { memcpy((rawptr)c->e_msg, (rawptr)msg.chars, (int64)n); }
+  c->e_n = n;
+}
+
+fn meo_cli_drop(c: MeoCli*) {
+  if (c->fd >= 0) { meo_sock_close(c->fd); }
+  c->fd = -1;
+}
+
+// The connection is gone: rc is the local cause.
+fn meo_cli_lost(c: MeoCli*, rc: int32, kind: int32) -> int32 {
+  meo_cli_drop(c);
+  if (c->tx == MEO_CLI_TX_OPEN) {
+    if (kind == MEO_WIRE_K_ROLLBACK) {
+      c->tx = MEO_CLI_TX_NONE;
+      return MEO_OK;
+    }
+    c->tx = MEO_CLI_TX_LOST;
+    meo_cli_set_err(c, meo_cli_code(rc), true, MEO_WIRE_TX_NONE, "connection lost in a transaction");
+    return -MEO_ERR_TX;
+  }
+  meo_cli_set_err(c, meo_cli_code(rc), true, MEO_WIRE_TX_NONE, "connection lost");
+  return -MEO_ERR_IO;
+}
+
+fn meo_cli_on_error(c: MeoCli*, e: MeoWError*, kind: int32) -> int32 {
+  meo_cli_set_err(c, e->code, e->fatal, e->tx, e->msg);
+  if (e->fatal) {
+    meo_cli_drop(c);
+    if (c->tx == MEO_CLI_TX_OPEN) {
+      if (kind == MEO_WIRE_K_ROLLBACK) {
+        c->tx = MEO_CLI_TX_NONE;
+        return MEO_OK;
+      }
+      c->tx = MEO_CLI_TX_LOST;
+      return -MEO_ERR_TX;
+    }
+    return -e->code;
+  }
+  if (e->tx == MEO_WIRE_TX_NONE) {
+    c->tx = MEO_CLI_TX_NONE;
+  } else {
+    c->tx = MEO_CLI_TX_OPEN;
+  }
+  return -e->code;
+}
+
+fn meo_cli_next_rid(c: MeoCli*) -> uint32 {
+  c->rid = c->rid + 1;
+  if (c->rid == 0) { c->rid = 1; }
+  return c->rid;
+}
+
+// Room in the reusable reply buffer for n bytes.
+fn meo_cli_room(c: MeoCli*, n: int32) -> bool {
+  if (n <= c->rcap) { return true; }
+  var q: rawptr = realloc((rawptr)c->rbuf, (int64)n);
+  if (q == 0) { return false; }
+  c->rbuf = (uint8*)q;
+  c->rcap = n;
+  return true;
+}
+
+// Send the n-byte frame in c->w and read its reply. A RESULT goes to out, which
+// then owns the payload buffer.
+fn meo_cli_exchange(c: MeoCli*, kind: int32, rid: uint32, n: int32, out: MeoCliResult*) -> int32 {
+  var rc: int32 = meo_sock_send_all(c->fd, c->w.p, n);
+  if (rc != n) { return meo_cli_lost(c, rc, kind); }
+  var hb: uint8[12];
+  rc = meo_sock_recv_exact(c->fd, &hb[0], MEO_WIRE_HDR);
+  if (rc != MEO_WIRE_HDR) { return meo_cli_lost(c, rc, kind); }
+  var h: MeoWHdr;
+  rc = meo_wire_hdr_get(&hb[0], c->max_frame, &h);
+  if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+  var want: int32 = MEO_WIRE_K_OK;
+  if (kind == MEO_WIRE_K_HELLO) { want = MEO_WIRE_K_HELLO_OK; }
+  if (kind == MEO_WIRE_K_QUERY) { want = MEO_WIRE_K_RESULT; }
+  // A server-initiated ERROR (BUSY at accept, hello timeout) carries rid 0.
+  var rid_ok: bool = h.rid == rid || (h.kind == MEO_WIRE_K_ERROR && h.rid == 0);
+  if (!rid_ok || (h.kind != want && h.kind != MEO_WIRE_K_ERROR)) {
+    return meo_cli_lost(c, -MEO_ERR_PROTO, kind);
+  }
+  var p: uint8* = 0;
+  var own: bool = h.kind == MEO_WIRE_K_RESULT;
+  if (own) {
+    p = (uint8*)malloc((int64)h.len + 1);
+    if (p == 0) { return meo_cli_lost(c, -MEO_ERR_NOMEM, kind); }
+  } else {
+    if (!meo_cli_room(c, h.len + 1)) { return meo_cli_lost(c, -MEO_ERR_NOMEM, kind); }
+    p = c->rbuf;
+  }
+  if (h.len > 0) {
+    rc = meo_sock_recv_exact(c->fd, p, h.len);
+    if (rc != h.len) {
+      if (own) { free((rawptr)p); }
+      return meo_cli_lost(c, rc, kind);
+    }
+  }
+  var r: MeoWRd;
+  meo_wrd_init(&r, p, h.len);
+  if (h.kind == MEO_WIRE_K_ERROR) {
+    var e: MeoWError;
+    rc = meo_wire_error_get(&r, &e);
+    if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+    return meo_cli_on_error(c, &e, kind);
+  }
+  if (h.kind == MEO_WIRE_K_RESULT) {
+    var a: MeoArena* = meo_arena_new(4096);
+    if (a == 0) {
+      free((rawptr)p);
+      return meo_cli_lost(c, -MEO_ERR_NOMEM, kind);
+    }
+    rc = meo_wire_result_get(&r, a, &out->res);
+    if (rc < 0) {
+      meo_arena_free(a);
+      free((rawptr)p);
+      meo_cli_result_init(out);
+      return meo_cli_lost(c, rc, kind);
+    }
+    out->buf = p;
+    out->a = a;
+    return MEO_OK;
+  }
+  if (h.kind == MEO_WIRE_K_HELLO_OK) {
+    var ok: MeoWHelloOk;
+    rc = meo_wire_hello_ok_get(&r, &ok);
+    if (rc >= 0 && ok.major != MEO_WIRE_MAJOR) { rc = -MEO_ERR_VERSION; }
+    if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+    c->minor = ok.minor;
+    c->srv_max = ok.max_frame;
+    c->session = ok.session;
+    c->caps = ok.caps;
+    return MEO_OK;
+  }
+  rc = meo_wire_empty_get(&r);
+  if (rc < 0) { return meo_cli_lost(c, rc, kind); }
+  if (kind == MEO_WIRE_K_BEGIN) { c->tx = MEO_CLI_TX_OPEN; }
+  if (kind == MEO_WIRE_K_COMMIT || kind == MEO_WIRE_K_ROLLBACK) { c->tx = MEO_CLI_TX_NONE; }
+  return MEO_OK;
+}
+
+// connect + HELLO; a failure leaves the client disconnected.
+fn meo_cli_dial(c: MeoCli*) -> int32 {
+  var fd: int64 = meo_sock_connect(meo_cli_str(c->ip, c->ip_n), c->port);
+  if (fd < 0) {
+    meo_cli_set_err(c, meo_cli_code((int32)fd), true, MEO_WIRE_TX_NONE, "connect failed");
+    return (int32)fd;
+  }
+  var rc: int32 = meo_sock_set_nodelay(fd, true);
+  if (rc >= 0) { rc = meo_sock_set_recv_timeout(fd, c->recv_ms); }
+  if (rc >= 0) { rc = meo_sock_set_send_timeout(fd, c->send_ms); }
+  if (rc < 0) {
+    meo_sock_close(fd);
+    meo_cli_set_err(c, meo_cli_code(rc), true, MEO_WIRE_TX_NONE, "socket options failed");
+    return rc;
+  }
+  c->fd = fd;
+  c->rid = 0;
+  c->caps = 0;
+  c->srv_max = MEO_WIRE_MIN_FRAME;
+  var h: MeoWHello;
+  h.major = MEO_WIRE_MAJOR;
+  h.minor = MEO_WIRE_MINOR;
+  h.max_frame = c->max_frame;
+  h.token = meo_cli_str(c->token, c->token_n);
+  h.name = meo_cli_str(c->name, c->name_n);
+  c->w.max = MEO_WIRE_MIN_FRAME;
+  meo_wbuf_begin(&c->w);
+  meo_wire_hello_put(&c->w, &h);
+  var rid: uint32 = meo_cli_next_rid(c);
+  var n: int32 = meo_wbuf_finish(&c->w, MEO_WIRE_K_HELLO, rid);
+  if (n < 0) {
+    meo_cli_drop(c);
+    meo_cli_set_err(c, -n, false, MEO_WIRE_TX_NONE, "hello not encoded");
+    return n;
+  }
+  rc = meo_cli_exchange(c, MEO_WIRE_K_HELLO, rid, n, 0);
+  if (rc < 0) { meo_cli_drop(c); }
+  return rc;
+}
+
+fn meo_cli_call(c: MeoCli*, kind: int32, mode: int32, st: MeoWStmt*, out: MeoCliResult*) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  meo_cli_clear_err(c);
+  if (c->tx == MEO_CLI_TX_LOST) {
+    if (kind == MEO_WIRE_K_ROLLBACK) {
+      c->tx = MEO_CLI_TX_NONE;
+      return MEO_OK;
+    }
+    meo_cli_set_err(c, MEO_ERR_TX, false, MEO_WIRE_TX_NONE, "transaction lost; roll back");
+    return -MEO_ERR_TX;
+  }
+  if (c->fd < 0) {
+    if (meo_cli_dial(c) < 0) { return -MEO_ERR_IO; }
+  }
+  if (kind == MEO_WIRE_K_QUERY && st->op == MEO_WIRE_OP_COUNT
+      && (c->caps & MEO_WIRE_CAP_COUNT) == 0) {
+    meo_cli_set_err(c, MEO_ERR_UNSUPPORTED, false, MEO_WIRE_TX_NONE, "server lacks COUNT");
+    return -MEO_ERR_UNSUPPORTED;
+  }
+  c->w.max = c->srv_max;
+  meo_wbuf_begin(&c->w);
+  if (kind == MEO_WIRE_K_BEGIN) { meo_wire_begin_put(&c->w, mode); }
+  if (kind == MEO_WIRE_K_QUERY) { meo_wire_stmt_put(&c->w, st); }
+  if (c->w.err < 0) {
+    meo_cli_set_err(c, -c->w.err, false, MEO_WIRE_TX_NONE, "request not encoded");
+    return c->w.err;
+  }
+  var rid: uint32 = meo_cli_next_rid(c);
+  var n: int32 = meo_wbuf_finish(&c->w, kind, rid);
+  return meo_cli_exchange(c, kind, rid, n, out);
+}
+
+// token may be 0 with token_n 0; opts 0 = defaults.
+export fn meo_cli_connect(ip: string, port: int32, token: uint8*, token_n: int32,
+                          opts: MeoCliOpts*, out: MeoCli**) -> int32 {
+  if (out == 0) { return -MEO_ERR_USAGE; }
+  *out = 0;
+  if (token_n < 0 || token_n > MEO_CLI_TOKEN_MAX || (token_n > 0 && token == 0)
+      || ip.length > 64) {
+    return -MEO_ERR_USAGE;
+  }
+  var o: MeoCliOpts;
+  meo_cli_opts_init(&o);
+  if (opts != 0) {
+    o.recv_ms = opts->recv_ms;
+    o.send_ms = opts->send_ms;
+    o.max_frame = opts->max_frame;
+    o.name = opts->name;
+  }
+  if (o.recv_ms < 0 || o.send_ms < 0 || o.max_frame < MEO_WIRE_MIN_FRAME
+      || o.name.length > (uint64)MEO_WIRE_NAME_MAX) {
+    return -MEO_ERR_USAGE;
+  }
+  var c: MeoCli* = new MeoCli;
+  if (c == 0) { return -MEO_ERR_NOMEM; }
+  c->ip_n = (int32)ip.length;
+  c->ip = meo_cli_dup(ip.chars, c->ip_n);
+  c->port = port;
+  c->token_n = token_n;
+  c->token = meo_cli_dup(token, token_n);
+  c->name_n = (int32)o.name.length;
+  c->name = meo_cli_dup(o.name.chars, c->name_n);
+  c->recv_ms = o.recv_ms;
+  c->send_ms = o.send_ms;
+  c->max_frame = o.max_frame;
+  c->fd = -1;
+  c->rid = 0;
+  c->tx = MEO_CLI_TX_NONE;
+  c->srv_max = MEO_WIRE_MIN_FRAME;
+  c->caps = 0;
+  c->session = 0;
+  c->minor = 0;
+  meo_wbuf_init(&c->w, MEO_WIRE_MIN_FRAME);
+  c->rbuf = 0;
+  c->rcap = 0;
+  c->e_msg = (uint8*)malloc((int64)MEO_WIRE_MSG_MAX);
+  meo_cli_clear_err(c);
+  if (c->ip == 0 || c->token == 0 || c->name == 0 || c->e_msg == 0) {
+    meo_cli_free(c);
+    return -MEO_ERR_NOMEM;
+  }
+  var rc: int32 = meo_cli_dial(c);
+  if (rc < 0) {
+    meo_cli_free(c);
+    return rc;
+  }
+  *out = c;
+  return MEO_OK;
+}
+
+fn meo_cli_free(c: MeoCli*) {
+  meo_cli_drop(c);
+  meo_wbuf_free(&c->w);
+  if (c->rbuf != 0) { free((rawptr)c->rbuf); }
+  if (c->ip != 0) { free((rawptr)c->ip); }
+  if (c->token != 0) { free((rawptr)c->token); }
+  if (c->name != 0) { free((rawptr)c->name); }
+  if (c->e_msg != 0) { free((rawptr)c->e_msg); }
+  free(c);
+}
+
+// BYE if connected (best effort, never reconnects), then frees c.
+export fn meo_cli_close(c: MeoCli*) -> int32 {
+  if (c == 0) { return -MEO_ERR_USAGE; }
+  if (c->fd >= 0) {
+    c->w.max = c->srv_max;
+    meo_wbuf_begin(&c->w);
+    var rid: uint32 = meo_cli_next_rid(c);
+    var n: int32 = meo_wbuf_finish(&c->w, MEO_WIRE_K_BYE, rid);
+    if (n > 0) { meo_cli_exchange(c, MEO_WIRE_K_BYE, rid, n, 0); }
+  }
+  meo_cli_free(c);
+  return MEO_OK;
+}
+
+export fn meo_cli_ping(c: MeoCli*) -> int32 {
+  return meo_cli_call(c, MEO_WIRE_K_PING, 0, 0, 0);
+}
+
+// mode: 0 DEFAULT, 1 DEFERRED, 2 IMMEDIATE.
+export fn meo_cli_begin(c: MeoCli*, mode: int32) -> int32 {
+  if (mode < 0 || mode > 255) { return -MEO_ERR_USAGE; }
+  return meo_cli_call(c, MEO_WIRE_K_BEGIN, mode, 0, 0);
+}
+
+export fn meo_cli_commit(c: MeoCli*) -> int32 {
+  return meo_cli_call(c, MEO_WIRE_K_COMMIT, 0, 0, 0);
+}
+
+export fn meo_cli_rollback(c: MeoCli*) -> int32 {
+  return meo_cli_call(c, MEO_WIRE_K_ROLLBACK, 0, 0, 0);
+}
+
+// out must be empty or freed; on success free it with meo_cli_result_free.
+export fn meo_cli_query(c: MeoCli*, st: MeoWStmt*, out: MeoCliResult*) -> int32 {
+  if (st == 0 || out == 0) { return -MEO_ERR_USAGE; }
+  meo_cli_result_init(out);
+  return meo_cli_call(c, MEO_WIRE_K_QUERY, 0, st, out);
+}
+
+// ---- state and last error ----
+
+export fn meo_cli_tx_state(c: MeoCli*) -> int32 {
+  return c->tx;
+}
+
+export fn meo_cli_connected(c: MeoCli*) -> bool {
+  return c->fd >= 0;
+}
+
+export fn meo_cli_last_rid(c: MeoCli*) -> uint32 {
+  return c->rid;
+}
+
+export fn meo_cli_caps(c: MeoCli*) -> uint32 {
+  return c->caps;
+}
+
+export fn meo_cli_session(c: MeoCli*) -> uint64 {
+  return c->session;
+}
+
+export fn meo_cli_server_max(c: MeoCli*) -> int32 {
+  return c->srv_max;
+}
+
+// Positive MEO_ERR_* of the last failed call (server's or local), 0 if none.
+export fn meo_cli_err_code(c: MeoCli*) -> int32 {
+  return c->e_code;
+}
+
+export fn meo_cli_err_fatal(c: MeoCli*) -> bool {
+  return c->e_fatal;
+}
+
+// Server's txn state after the error: MEO_WIRE_TX_*.
+export fn meo_cli_err_tx(c: MeoCli*) -> int32 {
+  return c->e_tx;
+}
+
+// A view valid until the next call on c.
+export fn meo_cli_err_msg(c: MeoCli*) -> string {
+  return meo_cli_str(c->e_msg, c->e_n);
+}
+
+// ---- results ----
+
+export fn meo_cli_result_init(r: MeoCliResult*) {
+  r->res.affected = 0;
+  r->res.last_id = 0;
+  r->res.n_cols = 0;
+  r->res.hints = 0;
+  r->res.n_rows = 0;
+  r->res.cells = 0;
+  r->buf = 0;
+  r->a = 0;
+}
+
+export fn meo_cli_result_free(r: MeoCliResult*) {
+  if (r->a != 0) { meo_arena_free(r->a); }
+  if (r->buf != 0) { free((rawptr)r->buf); }
+  meo_cli_result_init(r);
+}
+
+export fn meo_cli_row_count(r: MeoCliResult*) -> int32 {
+  return r->res.n_rows;
+}
+
+export fn meo_cli_col_count(r: MeoCliResult*) -> int32 {
+  return r->res.n_cols;
+}
+
+export fn meo_cli_affected(r: MeoCliResult*) -> int32 {
+  return r->res.affected;
+}
+
+export fn meo_cli_last_id(r: MeoCliResult*) -> int64 {
+  return r->res.last_id;
+}
+
+// MEO_T_* of the column's first non-NULL cell, 0 if none or out of range.
+export fn meo_cli_col_hint(r: MeoCliResult*, col: int32) -> int32 {
+  if (col < 0 || col >= r->res.n_cols) { return MEO_T_NULL; }
+  return r->res.hints[col];
+}
+
+// TEXT/BLOB bytes are views into r.
+export fn meo_cli_cell(r: MeoCliResult*, row: int32, col: int32, out: MeoValue*) -> int32 {
+  if (row < 0 || row >= r->res.n_rows || col < 0 || col >= r->res.n_cols || out == 0) {
+    return -MEO_ERR_RANGE;
+  }
+  var v: MeoValue* = &r->res.cells[(int64)row * (int64)r->res.n_cols + (int64)col];
+  out->type = v->type;
+  out->i = v->i;
+  out->f = v->f;
+  out->p = v->p;
+  out->n = v->n;
+  return MEO_OK;
+}

@@ -1,0 +1,384 @@
+// cli_self: client/client against a scripted fake server on a thread.
+// HELLO + caps, PING, BEGIN/COMMIT, a typed RESULT, a non-fatal then a fatal
+// ERROR, a mid-txn disconnect (TX until rollback), a drop outside a txn
+// (IO, then one reconnect), reconnect failure, and BYE. The server checks
+// every frame's kind and rid in order, so a resent request is a FAIL.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/mem/arena.mettle";
+import "../src/record/value.mettle";
+import "../src/meo_client.mettle";
+
+const CS_IP: string = "127.0.0.1";
+const CS_BUF: int32 = 1048576;
+const CS_TOKEN: string = "s3cret";
+
+var g_lfd: int64 = -1;
+var g_fail: string = "";
+var g_failed: bool = false;
+var g_accepts: int32 = 0;
+var g_buf: uint8* = 0;
+var g_len: int32 = 0;
+
+fn cs_fail(msg: string) -> int32 {
+  println("FAIL cli_self: {msg}");
+  return 1;
+}
+
+fn fs_bad(msg: string) -> bool {
+  if (!g_failed) {
+    g_failed = true;
+    g_fail = msg;
+  }
+  return false;
+}
+
+// ---- fake server ----
+
+fn fs_accept() -> int64 {
+  var c: int64 = meo_sock_accept(g_lfd);
+  if (c < 0) { return c; }
+  g_accepts = g_accepts + 1;
+  meo_sock_set_recv_timeout(c, 3000);
+  meo_sock_set_send_timeout(c, 3000);
+  return c;
+}
+
+// Reads one frame into g_buf/g_len and checks its kind and rid.
+fn fs_expect(c: int64, kind: int32, rid: uint32) -> bool {
+  var hb: uint8[12];
+  if (meo_sock_recv_exact(c, &hb[0], MEO_WIRE_HDR) != MEO_WIRE_HDR) {
+    return fs_bad("server: no frame where kind {kind} rid {rid} was due");
+  }
+  var h: MeoWHdr;
+  if (meo_wire_hdr_get(&hb[0], CS_BUF, &h) < 0) { return fs_bad("server: bad header"); }
+  if (h.kind != kind || h.rid != rid) {
+    return fs_bad("server: got kind {h.kind} rid {h.rid}, want kind {kind} rid {rid}");
+  }
+  if (h.len > 0 && meo_sock_recv_exact(c, g_buf, h.len) != h.len) {
+    return fs_bad("server: short payload");
+  }
+  g_len = h.len;
+  return true;
+}
+
+fn fs_send(c: int64, w: MeoWBuf*, kind: int32, rid: uint32) -> bool {
+  var n: int32 = meo_wbuf_finish(w, kind, rid);
+  var ok: bool = n > 0 && meo_sock_send_all(c, w->p, n) == n;
+  meo_wbuf_free(w);
+  if (!ok) { return fs_bad("server: send kind {kind} failed"); }
+  return true;
+}
+
+fn fs_ok(c: int64, rid: uint32) -> bool {
+  var w: MeoWBuf;
+  meo_wbuf_init(&w, CS_BUF);
+  meo_wbuf_begin(&w);
+  return fs_send(c, &w, MEO_WIRE_K_OK, rid);
+}
+
+fn fs_error(c: int64, rid: uint32, code: int32, fatal: bool, msg: string) -> bool {
+  var e: MeoWError;
+  e.code = code;
+  e.fatal = fatal;
+  e.tx = MEO_WIRE_TX_NONE;
+  e.msg = msg;
+  var w: MeoWBuf;
+  meo_wbuf_init(&w, CS_BUF);
+  meo_wbuf_begin(&w);
+  meo_wire_error_put(&w, &e);
+  return fs_send(c, &w, MEO_WIRE_K_ERROR, rid);
+}
+
+fn fs_hello(c: int64, caps: uint32) -> bool {
+  if (!fs_expect(c, MEO_WIRE_K_HELLO, 1)) { return false; }
+  var r: MeoWRd;
+  meo_wrd_init(&r, g_buf, g_len);
+  var h: MeoWHello;
+  if (meo_wire_hello_get(&r, &h) < 0) { return fs_bad("server: hello does not decode"); }
+  if (h.token != CS_TOKEN || h.max_frame != CS_BUF) { return fs_bad("server: hello token/max"); }
+  var ok: MeoWHelloOk;
+  ok.major = 1;
+  ok.minor = 0;
+  ok.max_frame = CS_BUF;
+  ok.session = (uint64)(76 + g_accepts);
+  ok.caps = caps;
+  ok.name = "fake";
+  var w: MeoWBuf;
+  meo_wbuf_init(&w, CS_BUF);
+  meo_wbuf_begin(&w);
+  meo_wire_hello_ok_put(&w, &ok);
+  return fs_send(c, &w, MEO_WIRE_K_HELLO_OK, 1);
+}
+
+fn fs_ping(c: int64, rid: uint32) -> bool {
+  if (!fs_expect(c, MEO_WIRE_K_PING, rid)) { return false; }
+  return fs_ok(c, rid);
+}
+
+fn fs_select(c: int64, rid: uint32) -> bool {
+  if (!fs_expect(c, MEO_WIRE_K_QUERY, rid)) { return false; }
+  var r: MeoWRd;
+  meo_wrd_init(&r, g_buf, g_len);
+  var a: MeoArena* = meo_arena_new(4096);
+  var st: MeoWStmt;
+  var rc: int32 = meo_wire_stmt_get(&r, a, &st);
+  var good: bool = rc == MEO_OK && st.op == MEO_WIRE_OP_SELECT && st.table == "items"
+    && st.n_terms == 1 && st.terms[0].col == "id" && st.terms[0].op == MEO_WIRE_W_EQ
+    && st.n_args == 1 && st.args[0].type == MEO_T_INT && st.args[0].i == 7 && st.limit == 10;
+  meo_arena_free(a);
+  if (!good) { return fs_bad("server: select stmt decoded wrong, rc={rc}"); }
+  var cells: MeoValue* = (MeoValue*)malloc((int64)9 * (int64)sizeof(MeoValue));
+  var blob: uint8[3];
+  blob[0] = 0;
+  blob[1] = 1;
+  blob[2] = 255;
+  var alpha: string = "alpha";
+  meo_value_set_int(&cells[0], 1);
+  meo_value_set_text(&cells[1], alpha.chars, 5);
+  meo_value_set_real(&cells[2], 1.5);
+  meo_value_set_int(&cells[3], -9223372036854775807 - 1);
+  meo_value_set_null(&cells[4]);
+  meo_value_set_real(&cells[5], -0.25);
+  meo_value_set_int(&cells[6], 3);
+  meo_value_set_blob(&cells[7], &blob[0], 3);
+  meo_value_set_null(&cells[8]);
+  var w: MeoWBuf;
+  meo_wbuf_init(&w, CS_BUF);
+  meo_wbuf_begin(&w);
+  meo_wire_result_put(&w, 3, 42, 3, 3, cells);
+  free((rawptr)cells);
+  return fs_send(c, &w, MEO_WIRE_K_RESULT, rid);
+}
+
+fn fs_script() -> bool {
+  // 1: everything that works, a non-fatal and a fatal error.
+  var c: int64 = fs_accept();
+  if (c < 0) { return fs_bad("server: accept 1"); }
+  if (!fs_hello(c, 0)) { return false; }
+  if (!fs_ping(c, 2)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_BEGIN, 3)) { return false; }
+  if (g_len != 1 || g_buf[0] != 2) { return fs_bad("server: begin mode"); }
+  if (!fs_ok(c, 3)) { return false; }
+  if (!fs_select(c, 4)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_COMMIT, 5) || !fs_ok(c, 5)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_QUERY, 6)) { return false; }
+  if (!fs_error(c, 6, MEO_ERR_CONFLICT, false, "dup key")) { return false; }
+  if (!fs_ping(c, 7)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_QUERY, 8)) { return false; }
+  if (!fs_error(c, 8, MEO_ERR_BUSY, true, "too busy")) { return false; }
+  meo_sock_close(c);
+  // 2: reconnect, then the connection dies inside a transaction.
+  c = fs_accept();
+  if (c < 0) { return fs_bad("server: accept 2"); }
+  if (!fs_hello(c, MEO_WIRE_CAP_COUNT)) { return false; }
+  if (!fs_ping(c, 2)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_BEGIN, 3) || !fs_ok(c, 3)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_QUERY, 4)) { return false; }
+  meo_sock_close(c);
+  // 3: reconnect after rollback, then a drop outside a transaction.
+  c = fs_accept();
+  if (c < 0) { return fs_bad("server: accept 3"); }
+  if (!fs_hello(c, 0)) { return false; }
+  if (!fs_ping(c, 2)) { return false; }
+  if (!fs_expect(c, MEO_WIRE_K_QUERY, 3)) { return false; }
+  meo_sock_close(c);
+  // 4 and 5: client A reconnects and later says BYE; client B loses its
+  // connection after the listener is gone, so its reconnect must fail.
+  var a: int64 = fs_accept();
+  if (a < 0) { return fs_bad("server: accept 4"); }
+  if (!fs_hello(a, 0) || !fs_ping(a, 2)) { return false; }
+  var b: int64 = fs_accept();
+  if (b < 0) { return fs_bad("server: accept 5"); }
+  if (!fs_hello(b, 0)) { return false; }
+  if (!fs_expect(b, MEO_WIRE_K_PING, 2)) { return false; }
+  meo_sock_close(g_lfd);
+  g_lfd = -1;
+  meo_sock_close(b);
+  if (!fs_expect(a, MEO_WIRE_K_BYE, 3) || !fs_ok(a, 3)) { return false; }
+  var hb: uint8[12];
+  if (meo_sock_recv_exact(a, &hb[0], MEO_WIRE_HDR) != 0) { return fs_bad("server: frame after BYE"); }
+  meo_sock_close(a);
+  return true;
+}
+
+fn fs_main(arg: cstring) -> uint32 {
+  fs_script();
+  if (g_lfd >= 0) {
+    meo_sock_close(g_lfd);
+    g_lfd = -1;
+  }
+  return 0;
+}
+
+// ---- client side ----
+
+fn cs_select(st: MeoWStmt*, term: MeoWTerm*, arg: MeoValue*) {
+  meo_wire_stmt_init(st);
+  st->op = MEO_WIRE_OP_SELECT;
+  st->table = "items";
+  term->col = "id";
+  term->op = MEO_WIRE_W_EQ;
+  term->arg0 = 0;
+  term->n_args = 1;
+  meo_value_set_int(arg, 7);
+  st->terms = term;
+  st->n_terms = 1;
+  st->args = arg;
+  st->n_args = 1;
+  st->limit = 10;
+}
+
+fn cs_cell_int(r: MeoCliResult*, row: int32, col: int32, want: int64) -> bool {
+  var v: MeoValue;
+  if (meo_cli_cell(r, row, col, &v) != MEO_OK) { return false; }
+  return v.type == MEO_T_INT && v.i == want;
+}
+
+fn cs_cell_real(r: MeoCliResult*, row: int32, col: int32, want: float64) -> bool {
+  var v: MeoValue;
+  if (meo_cli_cell(r, row, col, &v) != MEO_OK) { return false; }
+  return v.type == MEO_T_REAL && v.f == want;
+}
+
+fn cs_cell_type(r: MeoCliResult*, row: int32, col: int32) -> int32 {
+  var v: MeoValue;
+  if (meo_cli_cell(r, row, col, &v) != MEO_OK) { return -1; }
+  return v.type;
+}
+
+fn cs_rows(r: MeoCliResult*) -> int32 {
+  if (meo_cli_row_count(r) != 3 || meo_cli_col_count(r) != 3) { return cs_fail("result shape"); }
+  if (meo_cli_affected(r) != 3 || meo_cli_last_id(r) != 42) { return cs_fail("affected/last_id"); }
+  if (meo_cli_col_hint(r, 0) != MEO_T_INT || meo_cli_col_hint(r, 1) != MEO_T_TEXT
+      || meo_cli_col_hint(r, 2) != MEO_T_REAL) {
+    return cs_fail("column hints");
+  }
+  if (!cs_cell_int(r, 0, 0, 1) || !cs_cell_real(r, 0, 2, 1.5)) { return cs_fail("row 0"); }
+  var v: MeoValue;
+  meo_cli_cell(r, 0, 1, &v);
+  if (v.type != MEO_T_TEXT || v.n != 5 || v.p[0] != 97 || v.p[4] != 97) { return cs_fail("row 0 text"); }
+  if (!cs_cell_int(r, 1, 0, -9223372036854775807 - 1) || cs_cell_type(r, 1, 1) != MEO_T_NULL
+      || !cs_cell_real(r, 1, 2, -0.25)) {
+    return cs_fail("row 1");
+  }
+  meo_cli_cell(r, 2, 1, &v);
+  if (!cs_cell_int(r, 2, 0, 3) || v.type != MEO_T_BLOB || v.n != 3 || v.p[2] != 255
+      || cs_cell_type(r, 2, 2) != MEO_T_NULL) {
+    return cs_fail("row 2");
+  }
+  if (meo_cli_cell(r, 3, 0, &v) != -MEO_ERR_RANGE) { return cs_fail("cell out of range"); }
+  return 0;
+}
+
+fn cs_run(port: int32) -> int32 {
+  var o: MeoCliOpts;
+  meo_cli_opts_init(&o);
+  o.recv_ms = 2000;
+  o.send_ms = 2000;
+  o.max_frame = CS_BUF;
+  o.name = "cli_self";
+  var tok: string = CS_TOKEN;
+  var c: MeoCli* = 0;
+  var rc: int32 = meo_cli_connect(CS_IP, port, tok.chars, (int32)tok.length, &o, &c);
+  if (rc != MEO_OK) { return cs_fail("connect rc={rc}"); }
+  if (meo_cli_session(c) != 77 || meo_cli_server_max(c) != CS_BUF || meo_cli_last_rid(c) != 1) {
+    return cs_fail("hello_ok not kept");
+  }
+  if (meo_cli_ping(c) != MEO_OK || meo_cli_last_rid(c) != 2) { return cs_fail("ping"); }
+
+  // COUNT without caps bit0 is refused locally; the server's next frame must be BEGIN rid 3.
+  var st: MeoWStmt;
+  var term: MeoWTerm;
+  var arg: MeoValue;
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_COUNT;
+  st.table = "items";
+  var res: MeoCliResult;
+  meo_cli_result_init(&res);
+  if (meo_cli_query(c, &st, &res) != -MEO_ERR_UNSUPPORTED || meo_cli_last_rid(c) != 2) {
+    return cs_fail("count without caps");
+  }
+
+  if (meo_cli_begin(c, 2) != MEO_OK || meo_cli_tx_state(c) != MEO_CLI_TX_OPEN) { return cs_fail("begin"); }
+  cs_select(&st, &term, &arg);
+  rc = meo_cli_query(c, &st, &res);
+  if (rc != MEO_OK) { return cs_fail("select rc={rc} err={meo_cli_err_code(c)}"); }
+  if (cs_rows(&res) != 0) { return 1; }
+  meo_cli_result_free(&res);
+  if (meo_cli_commit(c) != MEO_OK || meo_cli_tx_state(c) != MEO_CLI_TX_NONE) { return cs_fail("commit"); }
+
+  rc = meo_cli_query(c, &st, &res);
+  if (rc != -MEO_ERR_CONFLICT || meo_cli_err_code(c) != MEO_ERR_CONFLICT || meo_cli_err_fatal(c)
+      || meo_cli_err_tx(c) != MEO_WIRE_TX_NONE || meo_cli_err_msg(c) != "dup key"
+      || !meo_cli_connected(c)) {
+    return cs_fail("non-fatal error rc={rc}");
+  }
+  if (meo_cli_ping(c) != MEO_OK || meo_cli_err_code(c) != 0) { return cs_fail("ping after error"); }
+  rc = meo_cli_query(c, &st, &res);
+  if (rc != -MEO_ERR_BUSY || !meo_cli_err_fatal(c) || meo_cli_err_msg(c) != "too busy"
+      || meo_cli_connected(c)) {
+    return cs_fail("fatal error rc={rc}");
+  }
+
+  // Reconnects once (connection 2) with fresh rids.
+  if (meo_cli_ping(c) != MEO_OK || meo_cli_last_rid(c) != 2 || meo_cli_session(c) != 78) {
+    return cs_fail("reconnect after fatal");
+  }
+  if (meo_cli_begin(c, 0) != MEO_OK) { return cs_fail("begin 2"); }
+  rc = meo_cli_query(c, &st, &res);
+  if (rc != -MEO_ERR_TX || meo_cli_tx_state(c) != MEO_CLI_TX_LOST || meo_cli_connected(c)) {
+    return cs_fail("mid-txn drop rc={rc}");
+  }
+  if (meo_cli_ping(c) != -MEO_ERR_TX || meo_cli_query(c, &st, &res) != -MEO_ERR_TX
+      || meo_cli_begin(c, 0) != -MEO_ERR_TX || meo_cli_commit(c) != -MEO_ERR_TX) {
+    return cs_fail("TX until rollback");
+  }
+  if (meo_cli_connected(c) || meo_cli_last_rid(c) != 4) { return cs_fail("reconnected inside a lost txn"); }
+  if (meo_cli_rollback(c) != MEO_OK || meo_cli_tx_state(c) != MEO_CLI_TX_NONE || meo_cli_connected(c)) {
+    return cs_fail("local rollback");
+  }
+
+  // Connection 3: drop outside a transaction is IO, the next call reconnects.
+  if (meo_cli_ping(c) != MEO_OK || meo_cli_last_rid(c) != 2) { return cs_fail("reconnect after rollback"); }
+  rc = meo_cli_query(c, &st, &res);
+  if (rc != -MEO_ERR_IO || meo_cli_tx_state(c) != MEO_CLI_TX_NONE || meo_cli_connected(c)
+      || !meo_cli_err_fatal(c)) {
+    return cs_fail("drop outside txn rc={rc}");
+  }
+  if (meo_cli_ping(c) != MEO_OK || meo_cli_last_rid(c) != 2) { return cs_fail("reconnect 4"); }
+
+  var b: MeoCli* = 0;
+  rc = meo_cli_connect(CS_IP, port, tok.chars, (int32)tok.length, &o, &b);
+  if (rc != MEO_OK) { return cs_fail("connect B rc={rc}"); }
+  if (meo_cli_ping(b) != -MEO_ERR_IO) { return cs_fail("B drop"); }
+  // Listener is gone: each call tries one reconnect and fails, nothing loops.
+  if (meo_cli_ping(b) != -MEO_ERR_IO || meo_cli_connected(b)) { return cs_fail("B reconnect should fail"); }
+  if (meo_cli_ping(b) != -MEO_ERR_IO) { return cs_fail("B second reconnect"); }
+  if (meo_cli_close(b) != MEO_OK) { return cs_fail("close B"); }
+  if (meo_cli_close(c) != MEO_OK) { return cs_fail("close A"); }
+  return 0;
+}
+
+fn main() -> int32 {
+  g_buf = (uint8*)malloc((int64)CS_BUF);
+  g_lfd = meo_sock_listen(CS_IP, 0, 16);
+  if (g_lfd < 0) { return cs_fail("listen rc={g_lfd}"); }
+  var port: int32 = meo_sock_port(g_lfd);
+  var h: int64 = CreateThread(0, 0, &fs_main, 0, 0, 0);
+  if (h == 0) { return cs_fail("CreateThread"); }
+  var rc: int32 = cs_run(port);
+  var w: uint32 = thread_join(h, 10000);
+  if (w == WAIT_TIMEOUT()) { return cs_fail("server thread did not finish"); }
+  thread_close(h);
+  if (rc != 0) { return rc; }
+  if (g_failed) { return cs_fail(g_fail); }
+  if (g_accepts != 5) { return cs_fail("accepts {g_accepts}, want 5"); }
+  free((rawptr)g_buf);
+  println("  hello/caps, ping, begin/commit, typed rows, errors, lost txn, reconnect-once, bye");
+  println("PASS cli_self");
+  return 0;
+}

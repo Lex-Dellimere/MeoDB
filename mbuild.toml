@@ -119,3 +119,7 @@ main = "tests/wire_self.mettle"
 # Dropping tables and adding columns, including rollback.
 [bin.schema_self]
 main = "tests/schema_self.mettle"
+
+# The client library against a scripted fake server.
+[bin.cli_self]
+main = "tests/cli_self.mettle"

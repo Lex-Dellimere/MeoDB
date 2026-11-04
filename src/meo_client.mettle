@@ -1,0 +1,8 @@
+// meo_client: import root of the network client, wire + net + client. No engine.
+
+import "wire/frame.mettle";
+import "wire/value.mettle";
+import "wire/stmt.mettle";
+import "wire/msg.mettle";
+import "net/sock.mettle";
+import "client/client.mettle";
