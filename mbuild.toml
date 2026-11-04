@@ -1,15 +1,14 @@
-# MeoSQL — a relational database written in Mettle, the storage backend for
-# flux_orm.
+# MeoSQL: a database written in Mettle, reached by flux_orm over TCP.
 #
-#   mbuild build         debug, target linux -> build/linux/debug/meosql
-#   mbuild build -r      release
-#   mbuild check         type-check every src/ file on its own
-#   mbuild test          @test functions in the compile-time interpreter
-#   mbuild run meosql    build and run the smoke entry
-#   mbuild run b_self    build and run one test program
+#   mbuild build          debug, target linux -> build/linux/debug/
+#   mbuild build -r       release
+#   mbuild check          type-check every bin
+#   mbuild test           @test functions in the compile-time interpreter
+#   mbuild run meosql     the server (see --help)
+#   mbuild run smoke      the whole stack in one run
+#   mbuild run <test>     one test program; each prints PASS or FAIL
 #
-# Compiler: head, not the v0.17.0 release (MeoSQL uses syscall() for
-# pread/pwrite/fsync). Point mbuild at it, or pass --mettle:
+# Needs the head compiler, not the v0.17.0 release (MeoSQL uses syscall()):
 #   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
 
 [package]
@@ -22,75 +21,74 @@ targets = ["linux"]
 [profile.release]
 flags = ["--release"]
 
-[bin.smoke]
-main = "src/main.mettle"
-
-# The MeoSQL server: owns one database file and serves the wire protocol.
+# The server: owns one database file and serves the wire protocol.
 [bin.meosql]
 main = "src/server/main.mettle"
 
+# The whole storage stack in one run.
+[bin.smoke]
+main = "src/main.mettle"
+
+# Status codes, bytes, varints, CRC, page format.
 [bin.s0_self]
 main = "tests/s0_self.mettle"
 
 [bin.a_self]
 main = "tests/a_self.mettle"
 
+# Files and the arena.
 [bin.b_self]
 main = "tests/b_self.mettle"
 
+# The pager: cache, eviction, flush, reopen.
 [bin.c_self]
 main = "tests/c_self.mettle"
 
 [bin.phase1]
 main = "tests/phase1.mettle"
 
-[bin.key_self]
-main = "tests/key_self.mettle"
-
 [bin.freelist_self]
 main = "tests/freelist_self.mettle"
 
-[bin.btree_self]
-main = "tests/btree_self.mettle"
-
-# The phase-2 gate: the whole stack in one run (PHASE2.md I1..I4). Declaring it
-# here is what puts it in tools/check.sh, which derives its bin list from these
-# sections, so it runs in both profiles instead of only by hand.
-[bin.phase2]
-main = "tests/phase2.mettle"
-
+# The rollback journal and recovery.
 [bin.j_self]
 main = "tests/j_self.mettle"
 
 [bin.journal_self]
 main = "tests/journal_self.mettle"
 
-# The change feed and the persisted commit counter (src/feed/, meta.commit_seq).
-[bin.feed_self]
-main = "tests/feed_self.mettle"
+# Order-preserving keys.
+[bin.key_self]
+main = "tests/key_self.mettle"
 
-# Run 1, WS0: shared types and status codes (record/value, db/flags,
-# catalog/schema, sql/ast, the f64 byte helpers, codes 13-18).
-[bin.ws0_self]
-main = "tests/ws0_self.mettle"
+# B-tree insert and scan.
+[bin.btree_self]
+main = "tests/btree_self.mettle"
 
-# The phase-3 gate (K1-K5): b-tree commit / rollback / crash / crash mid-split /
-# journal capacity. phase3_child is the process the crash cases kill.
+# B-tree delete, byte-balanced splits and float/blob keys, checked against a
+# sorted-array oracle.
+[bin.btdel_self]
+main = "tests/btdel_self.mettle"
+
+# Pager, freelist and b-tree together.
+[bin.phase2]
+main = "tests/phase2.mettle"
+
+# B-tree commit, rollback, a killed process, a crash mid-split, journal limit.
+# phase3_child is the process the crash cases kill.
 [bin.phase3]
 main = "tests/phase3.mettle"
 
 [bin.phase3_child]
 main = "tests/phase3_child.mettle"
 
-# Run 1, draft slice: CREATE TABLE + 3000 INSERTs in one transaction, reopen,
-# SELECT * -- one thin path through every new layer (DECISIONS.md D10).
-[bin.draft]
-main = "tests/draft.mettle"
+# The change feed and the persisted commit counter.
+[bin.feed_self]
+main = "tests/feed_self.mettle"
 
-# B-tree delete, byte-balanced splits and float/blob keys, checked against a
-# sorted-array oracle.
-[bin.btdel_self]
-main = "tests/btdel_self.mettle"
+# Shared value types and status codes.
+[bin.ws0_self]
+main = "tests/ws0_self.mettle"
 
 # Record codec round trips and corrupt-input checks.
 [bin.record_self]
@@ -108,29 +106,21 @@ main = "tests/catalog_self.mettle"
 [bin.table_self]
 main = "tests/table_self.mettle"
 
+# Imports only meo_core.mettle, proving tables work without the query layer.
+[bin.core_only]
+main = "tests/core_only.mettle"
+
+# Create, insert and select through the typed query API, with reopen.
+[bin.draft]
+main = "tests/draft.mettle"
+
 # Typed queries: filters, access paths, ordering, limits, update, delete, count.
 [bin.query_self]
 main = "tests/query_self.mettle"
 
-# Sockets: loopback echo, receive timeouts, shutdown wake-ups.
-[bin.sock_self]
-main = "tests/sock_self.mettle"
-
-# Wire codec: every frame kind, truncation and random corruption.
-[bin.wire_self]
-main = "tests/wire_self.mettle"
-
 # Dropping tables and adding columns, including rollback.
 [bin.schema_self]
 main = "tests/schema_self.mettle"
-
-# The client library against a scripted fake server.
-[bin.cli_self]
-main = "tests/cli_self.mettle"
-
-# The server over loopback with raw frames: handshake, queries, errors.
-[bin.srv_smoke]
-main = "tests/srv_smoke.mettle"
 
 # End to end through the typed API: every type, transactions, reopen.
 [bin.query_e2e]
@@ -148,17 +138,21 @@ main = "tests/query_mt.mettle"
 [bin.flux_shapes]
 main = "tests/flux_shapes.mettle"
 
-# Imports only meo_core.mettle, proving tables work without the query layer.
-[bin.core_only]
-main = "tests/core_only.mettle"
+# Wire codec: every frame kind, truncation and random corruption.
+[bin.wire_self]
+main = "tests/wire_self.mettle"
 
-# Protocol limits: sizes, versions, tokens, connection cap.
-[bin.srv_limits]
-main = "tests/srv_limits.mettle"
+# Sockets: loopback echo, receive timeouts, shutdown wake-ups.
+[bin.sock_self]
+main = "tests/sock_self.mettle"
 
-# Stopping the server with open transactions.
-[bin.srv_stop]
-main = "tests/srv_stop.mettle"
+# The client library against a scripted fake server.
+[bin.cli_self]
+main = "tests/cli_self.mettle"
+
+# The server over loopback with raw frames: handshake, queries, errors.
+[bin.srv_smoke]
+main = "tests/srv_smoke.mettle"
 
 # The full query suite through the client, compared with embedded results.
 [bin.srv_e2e]
@@ -171,3 +165,11 @@ main = "tests/srv_mt.mettle"
 # A client killed or hung mid-transaction.
 [bin.srv_kill]
 main = "tests/srv_kill.mettle"
+
+# Protocol limits: sizes, versions, tokens, connection cap.
+[bin.srv_limits]
+main = "tests/srv_limits.mettle"
+
+# Stopping the server with open transactions.
+[bin.srv_stop]
+main = "tests/srv_stop.mettle"
