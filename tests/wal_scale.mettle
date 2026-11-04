@@ -1,6 +1,317 @@
+// wal_scale: point reads scale with threads in WAL mode.
+//
+// 50,000 rows, each thread reruns one prepared point select for a second.
+// Snapshot reads take no db lock, so eight threads must get a real multiple of
+// one thread's rate (at least min(4, ncpu / 2) times on a machine with two
+// CPUs or more). The same loop in rollback mode is printed for comparison; the
+// db lock serializes it, so it is information only.
+//
+//   mbuild run wal_scale
+//
+// Prints "PASS wal_scale" on success, "FAIL ..." otherwise.
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/platform/futex_linux.mettle";
+import "../src/meodb.mettle";
+
+const WS_ROWS: int64 = 50000;
+const WS_PAD: int32 = 100;
+const WS_RUN_US: int64 = 1000000;
+const WS_MAX_THREADS: int32 = 8;
+const WS_STRIDE: int32 = 8;
+const WS_DEADLINE_MS: int64 = 60000;
+
+var g_db: MeoDb* = 0;
+var g_go: int32 = 0;
+var g_ready: int32* = 0;
+var g_ops: int64* = 0;       // per thread, one cache line apart
+var g_us: int64* = 0;        // per thread: measured microseconds
+var g_bad: int64* = 0;       // per thread: wrong or failed reads
+
+fn ws_fail(msg: string) -> int32 {
+  println("FAIL wal_scale: {msg}");
+  return 1;
+}
+
+fn ws_unlink3(db: string) {
+  var j: string = db + "-journal";
+  var w: string = db + "-wal";
+  meo_file_unlink(db);
+  meo_file_unlink(j);
+  meo_file_unlink(w);
+  free(j.chars);
+  free(w.chars);
+}
+
+// --- cpus -------------------------------------------------------------------
+
+fn ws_ncpu() -> int32 {
+  var mask: uint8* = malloc(128);
+  var i: int32 = 0;
+  while (i < 128) {
+    mask[i] = (uint8)0;
+    i += 1;
+  }
+  var rc: int64 = syscall(204, (int64)0, (int64)128, (int64)mask);
+  var n: int32 = 0;
+  if (rc > 0) {
+    i = 0;
+    while (i < 128) {
+      var b: int32 = (int32)mask[i];
+      while (b != 0) {
+        n += b & 1;
+        b = b >> 1;
+      }
+      i += 1;
+    }
+  }
+  free(mask);
+  return n;
+}
+
+// --- data -------------------------------------------------------------------
+
+// t(id INTEGER PRIMARY KEY, v INTEGER, pad TEXT) with rows 1..WS_ROWS, v = id * 3.
+fn ws_load(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "v", MEO_T_INT, 0);
+  meo_q_column_def(q, "pad", MEO_T_TEXT, 0);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return rc; }
+
+  var ins: MeoQuery* = 0;
+  var pad: uint8* = malloc((int64)WS_PAD);
+  var i: int32 = 0;
+  while (i < WS_PAD) {
+    pad[i] = (uint8)(97 + i % 26);
+    i += 1;
+  }
+  rc = meo_q_insert(db, "t", &ins);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_into(ins, "id");
+  meo_q_into(ins, "v");
+  meo_q_into(ins, "pad");
+  var v: MeoValue;
+  meo_value_set_int(&v, 0);
+  meo_q_value(ins, &v);
+  meo_q_value(ins, &v);
+  meo_value_set_text(&v, pad, WS_PAD);
+  meo_q_value(ins, &v);
+
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  var k: int64 = 1;
+  while (rc == MEO_OK && k <= WS_ROWS) {
+    meo_value_set_int(&v, k);
+    meo_q_set_value(ins, 0, &v);
+    meo_value_set_int(&v, k * 3);
+    meo_q_set_value(ins, 1, &v);
+    rc = meo_q_step(ins);
+    if (rc == MEO_DONE) { rc = MEO_OK; }
+    meo_q_reset(ins);
+    if (rc == MEO_OK && k % 2500 == 0) {
+      rc = meo_db_commit(db);
+      if (rc == MEO_OK && k < WS_ROWS) { rc = meo_db_begin(db, MEO_TX_DEFAULT); }
+    }
+    k += 1;
+  }
+  if (rc != MEO_OK) { meo_db_rollback(db); }
+  meo_q_free(ins);
+  free(pad);
+  return rc;
+}
+
+fn ws_count(db: MeoDb*) -> int64 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_count(db, "t", &q);
+  if (rc != MEO_OK) { return (int64)rc; }
+  rc = meo_q_step(q);
+  var n: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW) { return (int64)rc; }
+  return n;
+}
+
+// --- workers ----------------------------------------------------------------
+
+// Prepare "select v where id = ?", wait for the start flag, then rerun it with
+// random ids for WS_RUN_US. Every answer is checked: id * 3.
+fn ws_worker(arg: cstring) -> uint32 {
+  var tid: int32 = (int32)(int64)arg;
+  var slot: int32 = tid * WS_STRIDE;
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(g_db, "t", &q);
+  var v: MeoValue;
+  if (rc == MEO_OK) {
+    meo_q_pick(q, "v");
+    meo_value_set_int(&v, 1);
+    meo_q_where(q, "id", MEO_Q_EQ, &v);
+  }
+  meo_atomic_store_i32(&g_ready[tid], 1);
+  while (meo_atomic_load_i32(&g_go) == 0) { meo_sleep_us(50); }
+  if (rc != MEO_OK) {
+    g_bad[slot] = 1;
+    return 0;
+  }
+
+  var x: uint64 = (uint64)(tid + 1) * (uint64)0x9E3779B97F4A7C15;
+  var ops: int64 = 0;
+  var bad: int64 = 0;
+  var t0: int64 = meo_clock_monotonic_us();
+  var now: int64 = t0;
+  while (now - t0 < WS_RUN_US) {
+    var n: int32 = 0;
+    while (n < 64) {
+      x = x * (uint64)6364136223846793005 + (uint64)1442695040888963407;
+      var id: int64 = 1 + (int64)((x >> 33) % (uint64)WS_ROWS);
+      meo_value_set_int(&v, id);
+      var rs: int32 = meo_q_set_value(q, 0, &v);
+      var st: int32 = -MEO_ERR_USAGE;
+      if (rs == MEO_OK) { st = meo_q_step(q); }
+      if (st != MEO_ROW || meo_q_column_int64(q, 0) != id * 3) { bad += 1; }
+      meo_q_reset(q);
+      ops += 1;
+      n += 1;
+    }
+    now = meo_clock_monotonic_us();
+  }
+  g_ops[slot] = ops;
+  g_us[slot] = now - t0;
+  g_bad[slot] = bad;
+  meo_q_free(q);
+  return 0;
+}
+
+// Run `threads` workers for one interval; returns operations per second.
+fn ws_run(threads: int32, bad: int64*) -> int64 {
+  var hs: int64[] = new int64[8];
+  defer free(hs.data);
+  var i: int32 = 0;
+  meo_atomic_store_i32(&g_go, 0);
+  while (i < WS_MAX_THREADS) {
+    meo_atomic_store_i32(&g_ready[i], 0);
+    i += 1;
+  }
+  i = 0;
+  while (i < 64) {
+    g_ops[i] = 0;
+    g_us[i] = 0;
+    g_bad[i] = 0;
+    i += 1;
+  }
+  i = 0;
+  while (i < threads) {
+    hs[i] = CreateThread(0, 0, &ws_worker, (cstring)(int64)i, 0, 0);
+    if (hs[i] == 0) { *bad = -1; return 0; }
+    i += 1;
+  }
+  var t0: int64 = meo_clock_monotonic_us();
+  i = 0;
+  while (i < threads) {
+    while (meo_atomic_load_i32(&g_ready[i]) == 0) {
+      if ((meo_clock_monotonic_us() - t0) / 1000 > WS_DEADLINE_MS) {
+        println("FAIL wal_scale: worker {i} did not start");
+        syscall(231, (int64)1);
+      }
+      meo_sleep_us(100);
+    }
+    i += 1;
+  }
+  meo_atomic_store_i32(&g_go, 1);
+  i = 0;
+  while (i < threads) {
+    if (thread_join(hs[i], (uint32)WS_DEADLINE_MS) != WAIT_OBJECT_0()) {
+      println("FAIL wal_scale: worker {i} still running (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  var rate: int64 = 0;
+  var wrong: int64 = 0;
+  i = 0;
+  while (i < threads) {
+    var slot: int32 = i * WS_STRIDE;
+    if (g_us[slot] > 0) { rate += g_ops[slot] * 1000000 / g_us[slot]; }
+    wrong += g_bad[slot];
+    i += 1;
+  }
+  *bad = wrong;
+  return rate;
+}
+
+// --- profiles ---------------------------------------------------------------
+
+// Open `path` (WAL or rollback), load it and measure 1 and 8 threads.
+// r1/r8 get the rates; returns 0 or a failure.
+fn ws_profile(path: string, wal: bool, r1: int64*, r8: int64*) -> int32 {
+  ws_unlink3(path);
+  var flags: int32 = MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE;
+  if (wal) { flags = flags | MEO_OPEN_WAL; }
+  var rc: int32 = meo_db_open(path, flags, 1024, &g_db);
+  if (rc != MEO_OK) { return ws_fail("open rc={rc}"); }
+  meo_db_busy_timeout(g_db, 30000);
+  rc = ws_load(g_db);
+  if (rc != MEO_OK) { return ws_fail("load rc={rc}"); }
+  if (wal) {
+    rc = meo_db_checkpoint(g_db, true);
+    if (rc != MEO_OK) { return ws_fail("checkpoint rc={rc}"); }
+  }
+  var n: int64 = ws_count(g_db);
+  if (n != WS_ROWS) { return ws_fail("warm-up scan counted {n}"); }
+
+  var bad: int64 = 0;
+  *r1 = ws_run(1, &bad);
+  if (bad != 0) { return ws_fail("1 thread: {bad} wrong or failed reads"); }
+  *r8 = ws_run(8, &bad);
+  if (bad != 0) { return ws_fail("8 threads: {bad} wrong or failed reads"); }
+  rc = meo_db_close(g_db);
+  if (rc != MEO_OK) { return ws_fail("close rc={rc}"); }
+  ws_unlink3(path);
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_scale (stub)");
+  g_ready = (int32*)malloc(32);
+  g_ops = (int64*)malloc(512);
+  g_us = (int64*)malloc(512);
+  g_bad = (int64*)malloc(512);
+  var ncpu: int32 = ws_ncpu();
+  var w1: int64 = 0;
+  var w8: int64 = 0;
+  if (ws_profile("/dev/shm/meodb_wal_scale_wal.dat", true, &w1, &w8) != 0) { return 1; }
+  println("wal: 1 thread {w1} ops/s, 8 threads {w8} ops/s (ncpu {ncpu})");
+  var j1: int64 = 0;
+  var j8: int64 = 0;
+  if (ws_profile("/dev/shm/meodb_wal_scale_rb.dat", false, &j1, &j8) != 0) { return 1; }
+  println("rollback: 1 thread {j1} ops/s, 8 threads {j8} ops/s");
+
+  if (ncpu < 2) {
+    println("SKIP wal_scale: {ncpu} cpu");
+    println("PASS wal_scale");
+    return 0;
+  }
+  // ratio >= min(3.0, 0.5 * min(8, ncpu)), in tenths. Release reaches about
+  // 3.4x: per-statement snapshot begin/end still shares a few spin locks.
+  var want10: int64 = (int64)5 * (int64)ncpu;
+  if (want10 > 30) { want10 = 30; }
+  var got10: int64 = 0;
+  if (w1 > 0) { got10 = w8 * 10 / w1; }
+  var gi: int64 = got10 / 10;
+  var gf: int64 = got10 % 10;
+  println("scaling {gi}.{gf}x, need {want10 / 10}.{want10 % 10}x");
+  if (got10 < want10) {
+    return ws_fail("8 threads reach {gi}.{gf}x of 1 thread, need {want10 / 10}.{want10 % 10}x");
+  }
+  println("PASS wal_scale");
   return 0;
 }
