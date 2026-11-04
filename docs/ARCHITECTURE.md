@@ -14,7 +14,7 @@ Build order: [ROADMAP.md](ROADMAP.md).
 | 3 | Records, catalog, tables, db handle | `src/record/`, `src/catalog/`, `src/table/`, `src/db/` | `meo_rec_`, `meo_cat_`, `meo_tbl_`, `meo_db_` | 2, 4a | mistplot (data mapping), flux_orm via 5 | M2 |
 | 4a | Concurrency v1: db-wide lock | `src/conc/` | `meo_lock_` | std/thread | raize_web (64 threads) | M2 |
 | 5 | Typed queries (no query language) | `src/query/` | `meo_q_` | 3 | the server (flux_orm), embedded apps | M2 |
-| 4b | Concurrency v2: WAL + MVCC readers | `src/wal/`, `src/conc/` | `meo_wal_`, `meo_snap_` | 1, 2 | raize_web read-heavy load | later (M5) |
+| 4b | Concurrency v2: WAL, snapshot readers, group commit | `src/pager/wal.mettle`, `src/pager/pcache.mettle`, `src/db/` | `meo_wal_`, `meo_pcache_`, `meo_pager_snap_`, `meo_db_snap_` | 1, 2 | raize_web read-heavy load | built (M5) |
 | 6 | Change feed | `src/feed/` | `meo_feed_` | 1 (pager commit hook), 3 | mistplot live push, raize notifications | built for pager-level writes (`meo_feed_insert`); table writes in M4 |
 | 7 | Graph | `src/graph/` | `meo_graph_` | 3 (node/edge tables, adjacency index) | apps that model relations | later (M6) |
 | 8a | Wire protocol (frame codec) | `src/wire/` | `meo_wire_` | 0, record values | server and client | M7 |
@@ -75,3 +75,7 @@ Rules: no circular imports (E0006 fails the build), no lower layer imports a hig
 - All multi-byte reads and writes go through `format/bytes.mettle`. No struct is laid over a page, and no page-sized buffer goes on the stack.
 - Imports are relative and include the extension. Zero warnings, debug and release.
 - No pager frame stays pinned when a public call returns, and no user callback runs under the db lock.
+
+## Lock order
+
+Never take an earlier lock while holding a later one: the db lock, then the WAL sync lock, then the WAL checkpoint lock, then leaf locks (WAL header, page-cache stripes, the feed ring, the db's catalog-snapshot and view-pool locks). No two leaf locks are held at once, and readers only take leaf locks.

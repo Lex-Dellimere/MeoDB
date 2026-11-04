@@ -12,10 +12,10 @@
 | B6 | btree | Nodes are never merged, so space from emptied leaves is not reclaimed. | Files only shrink by dropping tables. | `src/btree/btree.mettle` | open |
 | B7 | btree | Byte-balanced splits keep rows to 1280 encoded bytes; a larger row returns TOOBIG. | Apps must cap text sizes until overflow pages exist. | `src/catalog/schema.mettle` (`MEO_REC_MAX`) | open |
 | B8 | pager | No file locking: two processes on one database file corrupt it. | Run exactly one `meodb` per file until the file lock lands (missing.md M19, roadmap M3). | `src/platform/file_linux.mettle` | fixed, F11 |
-| B9 | perf | Every commit fsyncs, about 5 ms on disk, so roughly 200 committed writes per second. `query_mt` runs on `/dev/shm` to stay fast. | Write-heavy apps must batch writes in transactions. | `src/pager/pager.mettle` | open |
+| B9 | perf | Every commit fsyncs, about 5 ms on disk, so roughly 200 committed writes per second. `query_mt` runs on `/dev/shm` to stay fast. | Write-heavy apps must batch writes in transactions. | `src/pager/pager.mettle` | fixed in WAL mode, F13; open in rollback mode |
 | B10 | perf | COUNT and filters on non-indexed columns are full scans under the db lock. `srv_mt` takes about 2 minutes. | Slow lookups stall every client. | `src/query/exec.mettle` | open |
 | B11 | wire | A decoded result can take about 40 times its frame size in memory (40 bytes per cell, 1 byte for a NULL on the wire). | A client with a large `max_frame` can be made to allocate a lot. | `src/wire/msg.mettle` | open |
-| B12 | server | One open transaction blocks every other connection, reads included, until it ends or `tx_idle_ms` cuts it. | Long transactions stall a whole web app. | `src/server/session.mettle` | open |
+| B12 | server | One open transaction blocks every other connection, reads included, until it ends or `tx_idle_ms` cuts it. | Long transactions stall a whole web app. | `src/server/session.mettle` | fixed in WAL mode, F14; open in rollback mode |
 | B13 | server | A 64-worker raize pool uses every connection slot. | A 65th client gets BUSY. | `src/server/server.mettle` (`max_conns`) | open |
 | B14 | net | EINTR retries and send-timeout expiry are untested. IPv4 only. | Rare signals or slow peers may surface as IO errors. | `src/net/sock.mettle` | open |
 | B15 | pager | Not tested: a crash in the middle of a page write (torn write), and a crash between commit preparation and journal removal. | Recovery in those windows is unproven. | `tests/phase3.mettle` | open |
@@ -26,6 +26,8 @@
 | B20 | feed | `meo_peek_commit_seq` can't tell a transient CORRUPT (an autocommit flush mid-write) from real damage. | mistplot retries up to 8 times. | `src/pager/pager.mettle` | fixed, F9 |
 | B21 | feed | Writes through the typed query API are not reported by the change feed; only `meo_feed_insert` writes are. | mistplot live charts can't follow app tables yet. | `src/feed/feed.mettle`, `src/table/table.mettle` | fixed, F10 |
 | B22 | tests | Some red-check failure messages print the real value as both sides (for example "2500 rows, want 2500"). | Cosmetic. | `tests/table_self.mettle`, `tests/draft.mettle` | open |
+| B23 | perf | WAL readers scale 3.4x from 1 to 8 threads in release, not 4x: every statement takes and releases a snapshot through a few shared spin locks (view pool, catalog snapshot, WAL header). | Reader throughput flattens with more cores. | `src/db/db.mettle`, `src/pager/pager.mettle`, `src/pager/wal.mettle` | open |
+| B24 | perf | An autocommit insert costs about 0.6 ms before its commit even on tmpfs, against about 0.05 ms per insert inside one transaction. | Caps autocommit throughput and how many commits one fsync can share. | `src/query/exec.mettle`, `src/db/db.mettle` (not located yet) | open |
 
 ## Fixed
 
@@ -43,3 +45,5 @@
 | F10 | Typed-API writes were not in the change feed; inserts, updates and deletes now are, with the row as a value. | `611dc90` |
 | F11 | Two processes could open one database file and corrupt it; open now takes a whole-file lock and a conflicting opener gets BUSY. | `16381e3` |
 | F12 | Catalog reload copied stale in-memory index roots over the disk values when a table's column count changed, and could read past the columns array. | `b1afd59` |
+| F13 | Every commit paid its own fsync; in WAL mode concurrent commits now share one (group commit). | `5d37d12` |
+| F14 | One open transaction blocked every reader; in WAL mode readers use snapshots and never wait for the writer. | `5d37d12` |

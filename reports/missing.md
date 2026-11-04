@@ -6,7 +6,7 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 | M2 | Rows larger than 1280 encoded bytes (overflow pages). | example_sass entries, any long text | M3 | done (`f087ae3`) |
 | M3 | Range scans on an ordered key for time windows. | mistplot | M3 | done (`c3acf7f`) |
 | M4 | Change feed for typed-API writes, with row payloads, GAP times and transient-error reporting. | mistplot live charts, raize notifications | M4 | done (`611dc90`, `802a1a1`) |
-| M5 | Readers that don't wait for the writer (WAL + MVCC). | raize_web, any multi-user app | M5 | open |
+| M5 | Readers that don't wait for the writer (WAL + MVCC). | raize_web, any multi-user app | M5 | done in WAL mode (`5d37d12`) |
 | M6 | Graph engine: node and edge tables with an adjacency index. | future apps | M6 | open |
 | M7 | Remote SUBSCRIBE over TCP. | browser dashboards via raize | M7 (after M4) | open |
 | M8 | Users, passwords, per-table permissions, login throttling, encrypted transport; hashing and encryption from a separate security library. | every network client | M7b | open |
@@ -23,7 +23,7 @@ Milestones refer to [docs/ROADMAP.md](../docs/ROADMAP.md).
 | M19 | An exclusive file lock at open, so a second process on the same file gets BUSY instead of corrupting it. | example_sass, any deployment | M3 | done (`16381e3`) |
 | M20 | IPv6 and host names. | non-local deployments | not scheduled | open |
 | M21 | A way to run every test in one command (the old check script was deleted). | developers | not scheduled | open |
-| M22 | Group commit: concurrent commits share one fsync. | write-heavy apps (example_sass F02.7) | M5 | open |
+| M22 | Group commit: concurrent commits share one fsync. | write-heavy apps (example_sass F02.7) | M5 | done in WAL mode (`5d37d12`) |
 | M23 | Catalog changes (create/drop table, add column) in the change feed. | mistplot, raize (schema-aware consumers) | M4 | open |
 | M24 | Feed callbacks on a feed thread outside the db lock, and a per-subscriber `meo_feed_subscribe`. | mistplot live push | M4 | open |
 | M25 | Error detail on the wire: a CONFLICT can't name its column, so flux can't attach it to a field. | flux_orm | not scheduled | open |

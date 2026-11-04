@@ -46,11 +46,11 @@ The pager commit hook, persisted `commit_seq` and `src/feed/feed.mettle` came fi
 
 ## M5 — WAL + MVCC concurrent readers
 Layer 4b. Consumer: raize_web read-heavy load.
-- [ ] A write-ahead log (`<db>-wal`) with checkpointing; the rollback journal stays as a mode.
-- [ ] Readers take snapshots and do not take the writer's lock: 63 readers and 1 writer run with no reader blocking, and every reader sees a consistent snapshot.
-- [ ] The pager frame table is thread-safe (striped locks); reader throughput at 8 threads is at least 4x that at 1 thread.
-- [ ] Crash at every WAL write point (fork test) recovers to the last committed txn.
-- [ ] Group commit: concurrent commits share one fsync, so committed writes per second rise well above the ~200 of one fsync per commit.
+- [x] A write-ahead log (`<db>-wal`) with checkpointing; the rollback journal stays as a mode (`wal_self`, `wal_sync_self`, `wal_pager_self`).
+- [x] Readers take snapshots and do not take the writer's lock: 63 readers and 1 writer run with no reader blocking, and every reader sees a consistent snapshot (`wal_mt`, `wal_snap_self`, `wal_db_self`).
+- [ ] The pager frame table is thread-safe (striped locks); reader throughput at 8 threads is at least 4x that at 1 thread. Readers share a striped page cache (`pcache_self`); release reaches 3.4x (debug 5.4x), about 1.7M point reads/s at 8 threads (`wal_scale`, which requires 3x). The rest is per-statement snapshot overhead (bugs.md B23).
+- [x] Crash at every WAL write point (fork test) recovers to the last committed txn (`wal_crash`, 612 crash runs).
+- [x] Group commit: concurrent commits share one fsync, so committed writes per second rise well above the ~200 of one fsync per commit (`wal_group`, `srv_wal`).
 
 ## M6 — Graph engine
 Layer 7.

@@ -19,16 +19,17 @@ MeoDB has no SQL language. Programs call a typed query API (`meo_q_*`): a
 query is built with function calls and run with `meo_q_step`.
 
 Built: the single-node engine. Tables with INTEGER, REAL, TEXT and BLOB
-columns, PRIMARY KEY, NOT NULL and UNIQUE; insert, select (filters, IN, NULL
-tests, ORDER BY, LIMIT/OFFSET), update, delete and count; unique indexes;
-transactions with a rollback journal and crash recovery; one database shared by
-up to 64 threads through a database-wide lock (one writer at a time). An
-in-process change feed reports committed writes (see
-[Change feed](#change-feed)).
+columns, PRIMARY KEY, NOT NULL and UNIQUE; rows up to 16 MiB; insert, select
+(filters, IN, NULL tests, ranges, ORDER BY, LIMIT/OFFSET), update, delete and
+count; unique and non-unique indexes, also created on existing tables; range
+scans on the rowid or an index; transactions with crash recovery in two journal
+modes (see [Journal modes](#journal-modes)); one writer at a time, and in WAL
+mode readers that never wait for it. An in-process change feed reports
+committed writes (see [Change feed](#change-feed)).
 
 The `meodb` server serves one database over TCP for flux_orm and other
-clients (see [Server](#server)). Not built yet: joins, CREATE INDEX,
-distribution, replication, and concurrent readers.
+clients (see [Server](#server)). Not built yet: joins, composite indexes,
+distribution and replication.
 
 | Module | What it does |
 |---|---|
@@ -89,6 +90,26 @@ slot, so a query can be run again with `meo_q_reset` and `meo_q_set_value`.
 Write queries report `meo_q_changes` and `meo_q_last_insert_rowid`. Explicit
 transactions use `meo_db_begin`, `meo_db_commit` and `meo_db_rollback`.
 
+## Journal modes
+
+A database is in one of two modes, stored in page 0:
+
+- **WAL** (`MEO_OPEN_WAL`, the server's default). Commits append page frames to
+  `<db>-wal`. Readers (SELECT, COUNT, `meo_q_scan_xy`) read a snapshot of the
+  last durable commit and never take the writer's lock. Concurrent commits
+  share one fsync (group commit). Committed frames are copied back into the
+  database file by a checkpoint, automatically every 1000 frames
+  (`meo_db_wal_autocheckpoint`) or on demand (`meo_db_checkpoint`), and the log
+  restarts from the beginning once nothing needs it. Closing the database
+  checkpoints and removes the log.
+- **Rollback** (`MEO_OPEN_NO_WAL`, the embedded default for new files). Each
+  transaction saves the original pages in `<db>-journal`; readers share the
+  database-wide lock with the writer.
+
+Opening without either flag keeps the file's mode; either flag converts it. A
+failed fsync in WAL mode stops writes until the database is reopened; readers
+keep their last snapshot.
+
 ## Server
 
 ```
@@ -97,7 +118,7 @@ build/linux/release/meodb --db data.meo --port 0     # any free port
 build/linux/release/meodb --db data.meo --listen 0.0.0.0:5490 --token-file token
 ```
 
-It prints the port it bound, serves until SIGINT or SIGTERM, and rolls back
+`--journal wal|rollback` picks the mode (default `wal`). It prints the port it bound, serves until SIGINT or SIGTERM, and rolls back
 any open transaction when a client disconnects, goes idle, or the server stops.
 A non-loopback address needs a token. `--help` lists the limits and timeouts.
 The wire format is in [docs/PROTOCOL.md](docs/PROTOCOL.md); `src/client/` is a
@@ -169,16 +190,16 @@ unchanged). It goes up by exactly one per successful commit and is written
 inside the transaction, so a rollback or crash reverts it.
 `meo_pager_commit_seq(p)` reads it from an open pager;
 `meo_peek_commit_seq(path, &seq)` reads it straight from disk with no pager,
-validating page 0 like an open does. It answers `MEO_OK`, or `1` when a journal
-sits beside the database (a transaction is open, committing or died hot, so the
-value may not be committed yet: poll again). A page 0 caught mid-write is
-`-MEO_ERR_BUSY` while a journal exists; without one (an autocommit flush) it can
-be a transient `-MEO_ERR_CORRUPT`, so retry before believing it.
+validating page 0 like an open does, and in WAL mode reading the newest commit
+in the log. It takes no file lock. It answers `MEO_OK`, `MEO_PEEK_HOT` (1) when
+a journal sits beside the database (the value may not be committed yet: poll
+again), or `MEO_PEEK_TRANSIENT` (2) when page 0 was caught mid-write (retry).
+A negative answer means real damage. In WAL mode the feed publishes a commit
+only once it is durable, in commit order.
 
-Limits: values are not included until rows have payloads; `table_id` is assigned
-by the caller until a catalog exists, and must stay the same when the root moves
-(the root page number is not an identity); capture covers `meo_feed_insert`
-only, since the b-tree has no delete yet.
+Limits: table writes carry the row as a value, but an event whose key and row
+exceed `MEO_FEED_MAX_KEY` (4096 bytes) is published as a GAP; catalog changes
+are not reported.
 
 ## Naming
 
