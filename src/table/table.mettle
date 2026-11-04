@@ -13,6 +13,7 @@ import "../btree/btree.mettle";
 import "../types/key.mettle";
 import "../record/value.mettle";
 import "../record/codec.mettle";
+import "../mem/arena.mettle";
 import "../catalog/schema.mettle";
 import "../catalog/catalog.mettle";
 import "../db/db.mettle";
@@ -77,20 +78,14 @@ fn tbl_check_value(t: MeoTable*, i: int32, v: MeoValue*) -> int32 {
   return -MEO_ERR_MISMATCH;
 }
 
-// The next free rowid: max + 1, 1 for an empty table, -MEO_ERR_FULL at
-// INT64_MAX.
-fn tbl_next_rowid(db: MeoDb*, t: MeoTable*, out: int64*) -> int32 {
+// The largest rowid in the tree, or 0 for an empty table (rowids start at 1).
+fn tbl_max_rowid(db: MeoDb*, t: MeoTable*, out: int64*) -> int32 {
+  out[0] = 0;
   var last: uint64 = 0;
   var rc: int32 = meo_bt_last(db->pager, t->root, &last);
   if (rc < 0) { return rc; }
-  if (rc == 1) {
-    out[0] = 1;
-    return MEO_OK;
-  }
-  var mx: int64 = (int64)last;
-  if (mx == (int64)(((uint64)1 << 63) - (uint64)1)) { return -MEO_ERR_FULL; }
-  out[0] = mx + 1;
-  if (out[0] < 1) { out[0] = 1; }
+  if (rc == 1) { return MEO_OK; }
+  out[0] = (int64)last;
   return MEO_OK;
 }
 
@@ -104,50 +99,134 @@ fn tbl_rowid_exists(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   return meo_bt_lookup(db->pager, t->root, meo_tbl_cmp, key, &got);
 }
 
-// Phase A for one row (D5): arity, types, NOT NULL, rowid conflict, record
-// size. Writes nothing. *rowid_out gets the rowid the row will take.
-// WS6: unique-index conflicts.
-export fn meo_tbl_check_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
-    rowid_out: int64*) -> int32 {
-  if (db == 0 || t == 0 || vals == 0 || rowid_out == 0) { return -MEO_ERR_USAGE; }
-  if (!t->live) { return -MEO_ERR_SQL; }
-  if (n != t->n_cols) { return -MEO_ERR_SQL; }
-  var i: int32 = 0;
-  while (i < n) {
-    var rc: int32 = tbl_check_value(t, i, &vals[i]);
-    if (rc != MEO_OK) { return rc; }
-    i += 1;
+fn tbl_sift(a: int64*, root: int32, n: int32) {
+  var r: int32 = root;
+  while (r * 2 + 1 < n) {
+    var c: int32 = r * 2 + 1;
+    if (c + 1 < n && a[c + 1] > a[c]) { c += 1; }
+    if (a[r] >= a[c]) { return; }
+    var x: int64 = a[r];
+    a[r] = a[c];
+    a[c] = x;
+    r = c;
   }
+}
+
+// Heapsort: n can be thousands, so no quadratic sort.
+fn tbl_sort_i64(a: int64*, n: int32) {
+  var i: int32 = n / 2 - 1;
+  while (i >= 0) {
+    tbl_sift(a, i, n);
+    i -= 1;
+  }
+  var end: int32 = n - 1;
+  while (end > 0) {
+    var x: int64 = a[0];
+    a[0] = a[end];
+    a[end] = x;
+    tbl_sift(a, 0, end);
+    end -= 1;
+  }
+}
+
+// Encoded record size of one row with the rowid alias stored NULL.
+fn tbl_row_size(t: MeoTable*, vals: MeoValue*, n: int32) -> int32 {
   var alias: int32 = meo_tbl_alias_col(t);
-  var rowid: int64 = 0;
-  if (alias >= 0 && vals[alias].type == MEO_T_INT) {
-    rowid = vals[alias].i;
-    var ex: int32 = tbl_rowid_exists(db, t, rowid);
-    if (ex < 0) { return ex; }
-    if (ex == MEO_OK) { return -MEO_ERR_CONFLICT; }
-  } else {
-    var nr: int32 = tbl_next_rowid(db, t, &rowid);
-    if (nr != MEO_OK) { return nr; }
+  var saved: MeoValue;
+  if (alias >= 0) {
+    saved = vals[alias];
+    meo_value_set_null(&vals[alias]);
   }
-  rowid_out[0] = rowid;
+  var sz: int32 = meo_rec_size(vals, n);
+  if (alias >= 0) { vals[alias] = saved; }
+  return sz;
+}
+
+// Phase A for a whole INSERT (D5), no writes: `rows` holds n_rows rows of
+// n_cols values, row-major (coerced in place, INTEGER -> REAL). Checks arity,
+// types, NOT NULL, rowid conflicts with the tree and within the statement, and
+// record size. rowids_out[r] gets row r's rowid: the alias value, or for a
+// NULL/omitted alias the next of max+1, max+2, ... as if inserted in order.
+// MEO_OK, or SQL, MISMATCH, CONSTRAINT, CONFLICT, TOOBIG, FULL, UNSUPPORTED
+// (indexed table, WS6), or a storage error.
+export fn meo_tbl_check_rows(db: MeoDb*, t: MeoTable*, rows: MeoValue*, n_rows: int32,
+    n_cols: int32, arena: MeoArena*, rowids_out: int64*) -> int32 {
+  if (db == 0 || t == 0 || arena == 0 || rowids_out == 0 || n_rows < 0) {
+    return -MEO_ERR_USAGE;
+  }
+  if (n_rows == 0) { return MEO_OK; }
+  if (rows == 0) { return -MEO_ERR_USAGE; }
+  if (!t->live) { return -MEO_ERR_SQL; }
+  if (n_cols != t->n_cols) { return -MEO_ERR_SQL; }
+  var c: int32 = 0;
+  while (c < n_cols) {
+    if (meo_tbl_col_indexed(t, c)) { return -MEO_ERR_UNSUPPORTED; }
+    c += 1;
+  }
+  // WS6: unique index checks
+  var alias: int32 = meo_tbl_alias_col(t);
+  var int64_max: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
+  var hi: int64 = 0;
+  var rc: int32 = tbl_max_rowid(db, t, &hi);
+  if (rc != MEO_OK) { return rc; }
+  var r: int32 = 0;
+  while (r < n_rows) {
+    var vals: MeoValue* = rows + (int64)r * (int64)n_cols;
+    c = 0;
+    while (c < n_cols) {
+      rc = tbl_check_value(t, c, &vals[c]);
+      if (rc != MEO_OK) { return rc; }
+      c += 1;
+    }
+    var rowid: int64 = 0;
+    if (alias >= 0 && vals[alias].type == MEO_T_INT) {
+      rowid = vals[alias].i;
+      var ex: int32 = tbl_rowid_exists(db, t, rowid);
+      if (ex < 0) { return ex; }
+      if (ex == MEO_OK) { return -MEO_ERR_CONFLICT; }
+    } else {
+      if (hi == int64_max) { return -MEO_ERR_FULL; }
+      rowid = hi + 1;
+      if (rowid < 1) { rowid = 1; }
+    }
+    if (rowid > hi) { hi = rowid; }
+    var sz: int32 = tbl_row_size(t, vals, n_cols);
+    if (sz < 0) { return sz; }
+    if (sz > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+    rowids_out[r] = rowid;
+    r += 1;
+  }
+  if (n_rows > 1) {
+    var sorted: int64* = (int64*)meo_arena_alloc(arena, (int64)n_rows * 8);
+    if (sorted == 0) { return -MEO_ERR_NOMEM; }
+    r = 0;
+    while (r < n_rows) {
+      sorted[r] = rowids_out[r];
+      r += 1;
+    }
+    tbl_sort_i64(sorted, n_rows);
+    r = 1;
+    while (r < n_rows) {
+      if (sorted[r] == sorted[r - 1]) { return -MEO_ERR_CONFLICT; }
+      r += 1;
+    }
+  }
   return MEO_OK;
 }
 
-// Insert one row: `vals` holds n == t->n_cols values in column order (they may
-// be coerced in place, INTEGER -> REAL). The rowid alias, when NULL, gets
-// max + 1. MEO_OK and *rowid_out; -MEO_ERR_SQL (arity / dead table),
-// MISMATCH, CONSTRAINT, CONFLICT (rowid taken), TOOBIG (record over
-// MEO_REC_MAX), UNSUPPORTED (indexed table, WS6), or a storage error.
-export fn meo_tbl_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
-    rowid_out: int64*) -> int32 {
-  var rowid: int64 = 0;
-  var rc: int32 = meo_tbl_check_insert(db, t, vals, n, &rowid);
-  if (rc != MEO_OK) { return rc; }
-  var i: int32 = 0;
-  while (i < n) {
-    if (meo_tbl_col_indexed(t, i)) { return -MEO_ERR_UNSUPPORTED; }  // WS6
-    i += 1;
-  }
+// Phase A for an UPDATE of n rows (rowids[i] gets new_vals row i, n_cols
+// values each). Same codes as meo_tbl_check_rows. WS6.
+export fn meo_tbl_check_update(db: MeoDb*, t: MeoTable*, rowids: int64*, n: int32,
+    new_vals: MeoValue*, n_cols: int32, arena: MeoArena*) -> int32 {
+  return -MEO_ERR_UNSUPPORTED;  // WS6: types, NOT NULL, unique swaps, size
+}
+
+// Phase B: write one row that meo_tbl_check_rows accepted, under `rowid`. No
+// re-check, so no Phase-A code: any failure here is a storage failure and the
+// caller treats the statement as having written.
+export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
+    rowid: int64) -> int32 {
+  if (db == 0 || t == 0 || vals == 0 || n != t->n_cols) { return -MEO_ERR_USAGE; }
   var alias: int32 = meo_tbl_alias_col(t);
   var saved: MeoValue;
   if (alias >= 0) {
@@ -157,8 +236,7 @@ export fn meo_tbl_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
   var sz: int32 = meo_rec_size(vals, n);
   if (sz < 0 || sz > MEO_REC_MAX) {
     if (alias >= 0) { vals[alias] = saved; }
-    if (sz < 0) { return sz; }
-    return -MEO_ERR_TOOBIG;
+    return -MEO_ERR_USAGE;   // Phase A was skipped
   }
   var buf: uint8* = malloc((int64)sz + 8);
   if (buf == 0) {
@@ -174,7 +252,7 @@ export fn meo_tbl_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
   }
   var key: MeoBtKey = { data: buf, len: w + 8 };
   var root: uint32 = t->root;
-  rc = meo_bt_insert_sep(db->pager, &root, meo_tbl_cmp, key, (uint64)rowid, 8);
+  var rc: int32 = meo_bt_insert_sep(db->pager, &root, meo_tbl_cmp, key, (uint64)rowid, 8);
   free(buf);
   if (rc != MEO_OK) { return rc; }
   if (root != t->root) {
@@ -182,8 +260,8 @@ export fn meo_tbl_insert(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
     rc = meo_cat_save_table(db->cat, t);
     if (rc != MEO_OK) { return rc; }
   }
+  // WS6: index writes
   db->last_rowid = rowid;
-  rowid_out[0] = rowid;
   return MEO_OK;
 }
 

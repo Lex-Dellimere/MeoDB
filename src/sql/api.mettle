@@ -3,6 +3,7 @@
 // WS8 owns it.
 
 import "std/mem";
+import "std/thread";
 import "../error/status.mettle";
 import "../format/bytes.mettle";
 import "../record/value.mettle";
@@ -83,7 +84,7 @@ export fn meo_sql_prepare(db: MeoDb*, sql: string, out: MeoStmt**, err_off: int3
         t = meo_cat_find(db->cat, st->ast.table.p, st->ast.table.n);
       }
       rc = meo_plan_build(&st->ast, t, st->arena, &st->plan, &off);
-      if (rc == MEO_OK) { db->n_stmts += 1; }
+      if (rc == MEO_OK) { atomic_inc_i32(&db->n_stmts); }
       meo_db_leave(db);
     }
   }
@@ -93,9 +94,7 @@ export fn meo_sql_prepare(db: MeoDb*, sql: string, out: MeoStmt**, err_off: int3
     st->bind_buf = (uint8**)malloc((int64)k * (int64)sizeof(uint8*));
     st->bind_cap = (int32*)malloc((int64)k * 4);
     if (st->binds == 0 || st->bind_buf == 0 || st->bind_cap == 0) {
-      meo_db_enter(db);
-      db->n_stmts -= 1;
-      meo_db_leave(db);
+      atomic_dec_i32(&db->n_stmts);
       rc = -MEO_ERR_NOMEM;
     } else {
       st->n_binds = k;
@@ -119,10 +118,8 @@ export fn meo_sql_prepare(db: MeoDb*, sql: string, out: MeoStmt**, err_off: int3
 
 export fn meo_sql_finalize(st: MeoStmt*) -> int32 {
   if (st == 0) { return MEO_OK; }
-  var db: MeoDb* = st->db;
-  meo_db_enter(db);
-  db->n_stmts -= 1;
-  meo_db_leave(db);
+  // Atomic, not under the lock: finalize must never fail or block (D9 BUSY).
+  atomic_dec_i32(&st->db->n_stmts);
   api_free(st);
   return MEO_OK;
 }

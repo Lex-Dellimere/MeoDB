@@ -1,7 +1,7 @@
 // sql/exec: MeoStmt and the run on first step, under the db lock (D7, D5).
 // SELECT is materialized; later steps walk the buffer without the lock.
 // Real: CREATE, INSERT, SELECT over FULL_SCAN.
-// WS8: filters, point/index paths, sort, LIMIT, UPDATE, DELETE, Phase A.
+// WS8: filters, point/index paths, sort, LIMIT, UPDATE, DELETE.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -111,40 +111,58 @@ fn exec_create(st: MeoStmt*) -> int32 {
   var t: MeoTable* = 0;
   rc = meo_cat_create_table(db->cat, a->table.p, a->table.n, st->plan.new_cols,
     st->plan.n_new_cols, &t);
-  return meo_db_stmt_end(db, started, rc);
+  return meo_db_stmt_end(db, started, true, rc);
 }
 
+// Phase A over every row, then Phase B (D5): a check failure writes nothing.
 fn exec_insert(st: MeoStmt*, t: MeoTable*) -> int32 {
   var db: MeoDb* = st->db;
   var a: MeoAst* = &st->ast;
-  var vals: MeoValue* = (MeoValue*)malloc((int64)t->n_cols * (int64)sizeof(MeoValue));
-  if (vals == 0) { return -MEO_ERR_NOMEM; }
-  defer free(vals);
-  var started: bool = false;
-  var rc: int32 = meo_db_stmt_begin(db, &started);
-  if (rc != MEO_OK) { return rc; }
-  // WS8: Phase A over every row and in-statement duplicates before any write.
+  var nc: int32 = t->n_cols;
+  var nr: int32 = a->n_rows;
+  var rows: MeoValue* = (MeoValue*)malloc((int64)nr * (int64)nc * (int64)sizeof(MeoValue) + 1);
+  var rowids: int64* = (int64*)malloc((int64)nr * 8 + 8);
+  var tmp: MeoArena* = meo_arena_new(4096);
+  if (rows == 0 || rowids == 0 || tmp == 0) {
+    if (rows != 0) { free(rows); }
+    if (rowids != 0) { free(rowids); }
+    if (tmp != 0) { meo_arena_free(tmp); }
+    return -MEO_ERR_NOMEM;
+  }
+  defer free(rows);
+  defer free(rowids);
+  defer meo_arena_free(tmp);
   var r: int32 = 0;
-  while (r < a->n_rows && rc == MEO_OK) {
+  while (r < nr) {
     var c: int32 = 0;
-    while (c < t->n_cols) {
+    while (c < nc) {
+      var dst: MeoValue* = &rows[(int64)r * (int64)nc + (int64)c];
       var src: int32 = st->plan.col_src[c];
       if (src < 0) {
-        meo_value_set_null(&vals[c]);
+        meo_value_set_null(dst);
       } else {
-        exec_operand(st, &a->values[r * a->row_width + src], &vals[c]);
+        exec_operand(st, &a->values[r * a->row_width + src], dst);
       }
       c += 1;
     }
-    var rowid: int64 = 0;
-    rc = meo_tbl_insert(db, t, vals, t->n_cols, &rowid);
+    r += 1;
+  }
+  var started: bool = false;
+  var rc: int32 = meo_db_stmt_begin(db, &started);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_tbl_check_rows(db, t, rows, nr, nc, tmp, rowids);
+  var wrote: bool = false;
+  r = 0;
+  while (r < nr && rc == MEO_OK) {
+    wrote = true;
+    rc = meo_tbl_write_row(db, t, &rows[(int64)r * (int64)nc], nc, rowids[r]);
     if (rc == MEO_OK) {
       st->changes += 1;
-      st->last_rowid = rowid;
+      st->last_rowid = rowids[r];
     }
     r += 1;
   }
-  return meo_db_stmt_end(db, started, rc);
+  return meo_db_stmt_end(db, started, wrote, rc);
 }
 
 fn exec_select(st: MeoStmt*, t: MeoTable*) -> int32 {

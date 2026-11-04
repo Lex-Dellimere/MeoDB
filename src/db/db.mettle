@@ -23,7 +23,7 @@ export struct MeoDb {
   tx_owner: int32;       // WS4: thread id that began it
   poisoned: bool;        // a write failed inside the explicit transaction
   last_rowid: int64;     // db-wide last insert rowid (racy by design, D5)
-  n_stmts: int32;        // live prepared statements (sql/api keeps it)
+  n_stmts: int32;        // live prepared statements; sql/api changes it atomically
   read_only: bool;
 }
 
@@ -79,10 +79,16 @@ export fn meo_db_open(path: string, flags: int32, n_frames: int32, out: MeoDb**)
 // while statements are live (nothing is closed then).
 export fn meo_db_close(db: MeoDb*) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
-  if (db->in_tx) { return -MEO_ERR_TX; }
-  if (db->n_stmts > 0) { return -MEO_ERR_BUSY; }
   var rc: int32 = meo_lock_enter(&db->lock, db->busy_ms);
   if (rc != MEO_OK) { return rc; }
+  if (db->in_tx) {
+    meo_lock_leave(&db->lock);
+    return -MEO_ERR_TX;
+  }
+  if (db->n_stmts > 0) {
+    meo_lock_leave(&db->lock);
+    return -MEO_ERR_BUSY;
+  }
   meo_cat_close(db->cat);
   db->cat = 0;
   rc = meo_pager_close(db->pager);
@@ -204,11 +210,12 @@ export fn meo_db_stmt_begin(db: MeoDb*, started: bool*) -> int32 {
   return MEO_OK;
 }
 
-// Finish one write statement with its result `rc`. Autocommit: commit on
-// success, roll back on failure. Explicit transaction: a failure that may have
-// written (anything but the Phase-A codes CONFLICT/CONSTRAINT/MISMATCH/TOOBIG/
-// SQL/USAGE) poisons it. Answers rc, or the commit's failure.
-export fn meo_db_stmt_end(db: MeoDb*, started: bool, rc: int32) -> int32 {
+// Finish one write statement with its result `rc`. `wrote`: a write was
+// attempted, so a failure may have left partial changes. Autocommit: commit on
+// success, roll back on failure. Explicit transaction: a failure after a write
+// poisons it whatever the code; a failure with no write (Phase A) leaves it
+// clean. Answers rc, or the commit's failure.
+export fn meo_db_stmt_end(db: MeoDb*, started: bool, wrote: bool, rc: int32) -> int32 {
   if (db == 0) { return -MEO_ERR_USAGE; }
   if (started) {
     if (rc >= 0) {
@@ -217,15 +224,9 @@ export fn meo_db_stmt_end(db: MeoDb*, started: bool, rc: int32) -> int32 {
       db_rollback_locked(db);
       return c;
     }
-    db_rollback_locked(db);
+    db_rollback_locked(db);   // also ends the pager txn when nothing was written
     return rc;
   }
-  if (rc < 0 && db->in_tx) {
-    var e: int32 = 0 - rc;
-    if (e != MEO_ERR_CONFLICT && e != MEO_ERR_CONSTRAINT && e != MEO_ERR_MISMATCH
-        && e != MEO_ERR_TOOBIG && e != MEO_ERR_SQL && e != MEO_ERR_USAGE) {
-      db->poisoned = true;
-    }
-  }
+  if (rc < 0 && wrote && db->in_tx) { db->poisoned = true; }
   return rc;
 }

@@ -1,6 +1,8 @@
 // draft: the D10 draft slice. CREATE TABLE, 3000 bound INSERTs in one
 // transaction, commit, reopen, SELECT *: rows, order, text, the root split
-// (8-byte separators) and the root read back from the catalog.
+// (8-byte separators) and the root read back from the catalog. Then table "u":
+// NULL ids in one multi-row INSERT get distinct rowids, and a multi-row INSERT
+// that fails Phase A writes nothing and leaves the transaction committable.
 
 import "std/io";
 import "std/mem";
@@ -15,8 +17,10 @@ import "../src/btree/node.mettle";
 import "../src/meosql.mettle";
 
 const DR_ROWS: int32 = 3000;
-// Red-check switch: 1 expects one row too many. Must be 0 when committed.
+// Red-check switches: 1 expects one row too many / one "u" row too many.
+// Must be 0 when committed.
 const DR_RED: int32 = 0;
+const DR_RED_U: int32 = 0;
 
 fn dr_fail(msg: string) -> int32 {
   println("FAIL draft: {msg}");
@@ -149,12 +153,95 @@ fn dr_read(path: string, want_root: uint32) -> int32 {
   return 0;
 }
 
+// Ids of SELECT * FROM "u" into ids[0..cap); the row count, or -1.
+fn dr_u_ids(db: MeoDb*, ids: int64*, cap: int32) -> int32 {
+  var st: MeoStmt* = 0;
+  var off: int32 = 0;
+  if (meo_sql_prepare(db, "SELECT * FROM \"u\"", &st, &off) != MEO_OK) { return -1; }
+  var n: int32 = 0;
+  while (true) {
+    var rc: int32 = meo_sql_step(st);
+    if (rc == MEO_DONE) { break; }
+    if (rc != MEO_ROW || n == cap) {
+      meo_sql_finalize(st);
+      return -1;
+    }
+    ids[n] = meo_sql_column_int64(st, 0);
+    n += 1;
+  }
+  meo_sql_finalize(st);
+  return n;
+}
+
+// One multi-row INSERT into "u": ids[i] < 0 binds NULL.
+fn dr_u_insert(db: MeoDb*, sql: string, ids: int64*, n: int32, with_id: bool,
+    changes: int32*) -> int32 {
+  var st: MeoStmt* = 0;
+  var off: int32 = 0;
+  var rc: int32 = meo_sql_prepare(db, sql, &st, &off);
+  if (rc != MEO_OK) { return rc; }
+  var k: int32 = 1;
+  var i: int32 = 0;
+  while (i < n) {
+    if (with_id) {
+      meo_sql_bind_int64(st, k, ids[i]);
+      k += 1;
+    }
+    meo_sql_bind_text(st, k, "v");
+    k += 1;
+    i += 1;
+  }
+  rc = meo_sql_step(st);
+  changes[0] = meo_sql_changes(st);
+  meo_sql_finalize(st);
+  return rc;
+}
+
+fn dr_multi(path: string) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(path, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return dr_fail("open u rc={rc}"); }
+  rc = meo_sql_exec(db, "CREATE TABLE \"u\" (\"id\" INTEGER PRIMARY KEY, \"v\" TEXT)");
+  if (rc != MEO_OK) { return dr_fail("create u rc={rc}"); }
+  var ids: int64[8];
+  var ch: int32 = 0;
+  rc = dr_u_insert(db, "INSERT INTO \"u\" (\"v\") VALUES (?), (?), (?)", &ids[0], 3, false, &ch);
+  if (rc != MEO_DONE || ch != 3) { return dr_fail("NULL-id insert rc={rc} changes={ch}"); }
+  var n: int32 = dr_u_ids(db, &ids[0], 8);
+  if (n != 3 + DR_RED_U) { return dr_fail("u has {n} rows after the NULL-id insert, want 3"); }
+  if (ids[0] != 1 || ids[1] != 2 || ids[2] != 3) {
+    return dr_fail("NULL ids got {ids[0]},{ids[1]},{ids[2]}, want 1,2,3");
+  }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return dr_fail("begin u rc={rc}"); }
+  ids[0] = 10;
+  ids[1] = 11;
+  ids[2] = 2;   // already present
+  rc = dr_u_insert(db, "INSERT INTO \"u\" (\"id\", \"v\") VALUES (?, ?), (?, ?), (?, ?)",
+    &ids[0], 3, true, &ch);
+  if (rc != -MEO_ERR_CONFLICT) { return dr_fail("dup-id insert rc={rc}, want CONFLICT"); }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return dr_fail("commit after a Phase-A failure rc={rc}"); }
+  ids[0] = 20;
+  ids[1] = 20;  // duplicate inside the statement (autocommit)
+  rc = dr_u_insert(db, "INSERT INTO \"u\" (\"id\", \"v\") VALUES (?, ?), (?, ?)",
+    &ids[0], 2, true, &ch);
+  if (rc != -MEO_ERR_CONFLICT) { return dr_fail("in-statement dup rc={rc}, want CONFLICT"); }
+  n = dr_u_ids(db, &ids[0], 8);
+  if (n != 3 + DR_RED_U) { return dr_fail("u has {n} rows after the failed inserts, want 3"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return dr_fail("close u rc={rc}"); }
+  println("  NULL ids 1,2,3; failed multi-row inserts wrote nothing");
+  return 0;
+}
+
 fn main() -> int32 {
   var path: string = "build/draft.dat";
   if (dr_reset(path) != MEO_OK) { return dr_fail("reset"); }
   var root: uint32 = 0;
   if (dr_write(path, &root) != 0) { return 1; }
   if (dr_read(path, root) != 0) { return 1; }
+  if (dr_multi(path) != 0) { return 1; }
   println("PASS draft");
   return 0;
 }
