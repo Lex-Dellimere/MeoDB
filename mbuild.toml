@@ -107,3 +107,7 @@ main = "tests/table_self.mettle"
 # Typed queries: filters, access paths, ordering, limits, update, delete, count.
 [bin.query_self]
 main = "tests/query_self.mettle"
+
+# Sockets: loopback echo, receive timeouts, shutdown wake-ups.
+[bin.sock_self]
+main = "tests/sock_self.mettle"

@@ -1,0 +1,256 @@
+// net/sock: blocking IPv4 TCP sockets for the server and its tests.
+//
+// Raw Linux x86-64 syscalls, like platform/file_linux.mettle: a failed call
+// hands back -errno directly, which is what tells a timeout (EAGAIN) apart
+// from a dead peer, and std/net's global names (send, recv, accept, ...) stay
+// out of every module that imports this one.
+//
+// Handles are fds as int64; a negative handle is -MEO_ERR_*. Errors map to
+// -MEO_ERR_TIMEOUT (SO_RCVTIMEO/SO_SNDTIMEO expired), -MEO_ERR_USAGE (bad
+// address or argument), -MEO_ERR_NOMEM (out of descriptors), else -MEO_ERR_IO.
+// Peer close: recv returns 0 bytes (recv_exact: 0 only if nothing of the
+// message had arrived; a close mid-message is -MEO_ERR_IO).
+
+import "../error/status.mettle";
+
+const MEO_SYS_CLOSE: int64 = 3;
+const MEO_SYS_SOCKET: int64 = 41;
+const MEO_SYS_CONNECT: int64 = 42;
+const MEO_SYS_ACCEPT4: int64 = 288;
+const MEO_SYS_SENDTO: int64 = 44;
+const MEO_SYS_RECVFROM: int64 = 45;
+const MEO_SYS_SHUTDOWN: int64 = 48;
+const MEO_SYS_BIND: int64 = 49;
+const MEO_SYS_LISTEN: int64 = 50;
+const MEO_SYS_GETSOCKNAME: int64 = 51;
+const MEO_SYS_SETSOCKOPT: int64 = 54;
+
+const MEO_AF_INET: int64 = 2;
+const MEO_SOCK_STREAM: int64 = 1;
+const MEO_SOCK_CLOEXEC: int64 = 524288;
+const MEO_SOL_SOCKET: int64 = 1;
+const MEO_SO_REUSEADDR: int64 = 2;
+const MEO_SO_RCVTIMEO: int64 = 20;
+const MEO_SO_SNDTIMEO: int64 = 21;
+const MEO_IPPROTO_TCP: int64 = 6;
+const MEO_TCP_NODELAY: int64 = 1;
+// A dead peer must be an error code, not SIGPIPE killing the process.
+const MEO_MSG_NOSIGNAL: int64 = 16384;
+
+const MEO_E_INTR: int64 = 4;
+const MEO_E_BADF: int64 = 9;
+const MEO_E_AGAIN: int64 = 11;
+const MEO_E_NOMEM: int64 = 12;
+const MEO_E_FAULT: int64 = 14;
+const MEO_E_NFILE: int64 = 23;
+const MEO_E_MFILE: int64 = 24;
+const MEO_E_NOTSOCK: int64 = 88;
+const MEO_E_NOBUFS: int64 = 105;
+
+export const MEO_SOCK_SHUT_RD: int32 = 0;
+export const MEO_SOCK_SHUT_WR: int32 = 1;
+export const MEO_SOCK_SHUT_BOTH: int32 = 2;
+
+fn meo_sock_err(rc: int64) -> int32 {
+  var e: int64 = 0 - rc;
+  if (e == MEO_E_AGAIN) { return -MEO_ERR_TIMEOUT; }
+  if (e == MEO_E_NOMEM || e == MEO_E_NFILE || e == MEO_E_MFILE || e == MEO_E_NOBUFS) {
+    return -MEO_ERR_NOMEM;
+  }
+  if (e == MEO_E_BADF || e == MEO_E_FAULT || e == MEO_E_NOTSOCK) {
+    return -MEO_ERR_USAGE;
+  }
+  return -MEO_ERR_IO;
+}
+
+// Fill a 16-byte sockaddr_in from a dotted quad; 0 or -MEO_ERR_USAGE.
+fn meo_sock_addr(ip: string, port: int32, sa: uint8*) -> int32 {
+  if (port < 0 || port > 65535) { return -MEO_ERR_USAGE; }
+  var i: int32 = 0;
+  while (i < 16) { sa[i] = 0; i = i + 1; }
+  sa[0] = (uint8)MEO_AF_INET;
+  sa[2] = (uint8)((port >> 8) & 255);
+  sa[3] = (uint8)(port & 255);
+  var n: int64 = (int64)ip.length;
+  var part: int32 = 0;
+  var val: int32 = 0;
+  var digits: int32 = 0;
+  var k: int64 = 0;
+  while (k <= n) {
+    var c: int32 = 46;
+    if (k < n) { c = (int32)ip.chars[k]; }
+    if (c >= 48 && c <= 57) {
+      val = val * 10 + (c - 48);
+      digits = digits + 1;
+      if (digits > 3 || val > 255) { return -MEO_ERR_USAGE; }
+    } else if (c == 46) {
+      if (digits == 0 || part > 3) { return -MEO_ERR_USAGE; }
+      sa[4 + part] = (uint8)val;
+      part = part + 1;
+      val = 0;
+      digits = 0;
+    } else {
+      return -MEO_ERR_USAGE;
+    }
+    k = k + 1;
+  }
+  if (part != 4) { return -MEO_ERR_USAGE; }
+  return MEO_OK;
+}
+
+fn meo_sock_new() -> int64 {
+  var fd: int64 = syscall(MEO_SYS_SOCKET, MEO_AF_INET, MEO_SOCK_STREAM | MEO_SOCK_CLOEXEC,
+    (int64)0);
+  if (fd < 0) { return (int64)meo_sock_err(fd); }
+  return fd;
+}
+
+fn meo_sock_opt_int(fd: int64, level: int64, opt: int64, v: int32) -> int32 {
+  var val: int32 = v;
+  var rc: int64 = syscall(MEO_SYS_SETSOCKOPT, fd, level, opt, (int64)&val, (int64)4);
+  if (rc < 0) { return meo_sock_err(rc); }
+  return MEO_OK;
+}
+
+// ms 0 = no timeout (the kernel's own meaning of a zero timeval).
+fn meo_sock_opt_ms(fd: int64, opt: int64, ms: int32) -> int32 {
+  if (ms < 0) { return -MEO_ERR_USAGE; }
+  var tv: int64[2];
+  tv[0] = (int64)(ms / 1000);
+  tv[1] = (int64)(ms % 1000) * (int64)1000;
+  var rc: int64 = syscall(MEO_SYS_SETSOCKOPT, fd, MEO_SOL_SOCKET, opt, (int64)&tv[0],
+    (int64)16);
+  if (rc < 0) { return meo_sock_err(rc); }
+  return MEO_OK;
+}
+
+export fn meo_sock_set_reuseaddr(fd: int64, on: bool) -> int32 {
+  var v: int32 = 0;
+  if (on) { v = 1; }
+  return meo_sock_opt_int(fd, MEO_SOL_SOCKET, MEO_SO_REUSEADDR, v);
+}
+
+export fn meo_sock_set_nodelay(fd: int64, on: bool) -> int32 {
+  var v: int32 = 0;
+  if (on) { v = 1; }
+  return meo_sock_opt_int(fd, MEO_IPPROTO_TCP, MEO_TCP_NODELAY, v);
+}
+
+export fn meo_sock_set_recv_timeout(fd: int64, ms: int32) -> int32 {
+  return meo_sock_opt_ms(fd, MEO_SO_RCVTIMEO, ms);
+}
+
+export fn meo_sock_set_send_timeout(fd: int64, ms: int32) -> int32 {
+  return meo_sock_opt_ms(fd, MEO_SO_SNDTIMEO, ms);
+}
+
+export fn meo_sock_close(fd: int64) -> int32 {
+  // No retry on EINTR: Linux has already released the fd.
+  var rc: int64 = syscall(MEO_SYS_CLOSE, fd);
+  if (rc < 0 && rc != 0 - MEO_E_INTR) { return meo_sock_err(rc); }
+  return MEO_OK;
+}
+
+// Bound port of a socket (the real one after listening on port 0).
+export fn meo_sock_port(fd: int64) -> int32 {
+  var sa: uint8[16];
+  var len: int32 = 16;
+  var rc: int64 = syscall(MEO_SYS_GETSOCKNAME, fd, (int64)&sa[0], (int64)&len);
+  if (rc < 0) { return meo_sock_err(rc); }
+  return ((int32)sa[2] << 8) | (int32)sa[3];
+}
+
+// SO_REUSEADDR is set before bind so a restarted server can rebind at once.
+export fn meo_sock_listen(ip: string, port: int32, backlog: int32) -> int64 {
+  var sa: uint8[16];
+  var st: int32 = meo_sock_addr(ip, port, &sa[0]);
+  if (st < 0) { return (int64)st; }
+  var fd: int64 = meo_sock_new();
+  if (fd < 0) { return fd; }
+  st = meo_sock_set_reuseaddr(fd, true);
+  if (st < 0) { meo_sock_close(fd); return (int64)st; }
+  var rc: int64 = syscall(MEO_SYS_BIND, fd, (int64)&sa[0], (int64)16);
+  if (rc >= 0) { rc = syscall(MEO_SYS_LISTEN, fd, (int64)backlog); }
+  if (rc < 0) {
+    meo_sock_close(fd);
+    return (int64)meo_sock_err(rc);
+  }
+  return fd;
+}
+
+// After meo_sock_shutdown on the listener, a blocked accept returns -MEO_ERR_IO.
+export fn meo_sock_accept(fd: int64) -> int64 {
+  while (true) {
+    var c: int64 = syscall(MEO_SYS_ACCEPT4, fd, (int64)0, (int64)0, MEO_SOCK_CLOEXEC);
+    if (c >= 0) { return c; }
+    if (c != 0 - MEO_E_INTR) { return (int64)meo_sock_err(c); }
+  }
+  return (int64)(-MEO_ERR_IO);
+}
+
+export fn meo_sock_connect(ip: string, port: int32) -> int64 {
+  var sa: uint8[16];
+  var st: int32 = meo_sock_addr(ip, port, &sa[0]);
+  if (st < 0) { return (int64)st; }
+  var fd: int64 = meo_sock_new();
+  if (fd < 0) { return fd; }
+  var rc: int64 = syscall(MEO_SYS_CONNECT, fd, (int64)&sa[0], (int64)16);
+  if (rc < 0) {
+    meo_sock_close(fd);
+    return (int64)meo_sock_err(rc);
+  }
+  return fd;
+}
+
+// n on success; a timeout or error may leave part of the buffer sent.
+export fn meo_sock_send_all(fd: int64, buf: uint8*, n: int32) -> int32 {
+  if (n < 0) { return -MEO_ERR_USAGE; }
+  var off: int32 = 0;
+  while (off < n) {
+    var rc: int64 = syscall(MEO_SYS_SENDTO, fd, (int64)&buf[off], (int64)(n - off),
+      MEO_MSG_NOSIGNAL, (int64)0, (int64)0);
+    if (rc < 0) {
+      if (rc != 0 - MEO_E_INTR) { return meo_sock_err(rc); }
+    } else {
+      off = off + (int32)rc;
+    }
+  }
+  return n;
+}
+
+// Up to cap bytes; 0 = peer closed (or cap 0).
+export fn meo_sock_recv_some(fd: int64, buf: uint8*, cap: int32) -> int32 {
+  if (cap < 0) { return -MEO_ERR_USAGE; }
+  while (true) {
+    var rc: int64 = syscall(MEO_SYS_RECVFROM, fd, (int64)buf, (int64)cap, (int64)0,
+      (int64)0, (int64)0);
+    if (rc >= 0) { return (int32)rc; }
+    if (rc != 0 - MEO_E_INTR) { return meo_sock_err(rc); }
+  }
+  return -MEO_ERR_IO;
+}
+
+// n, or 0 when the peer closed before the first byte. The receive timeout
+// applies to each wait, not to the whole message.
+export fn meo_sock_recv_exact(fd: int64, buf: uint8*, n: int32) -> int32 {
+  if (n < 0) { return -MEO_ERR_USAGE; }
+  var off: int32 = 0;
+  while (off < n) {
+    var got: int32 = meo_sock_recv_some(fd, &buf[off], n - off);
+    if (got < 0) { return got; }
+    if (got == 0) {
+      if (off == 0) { return 0; }
+      return -MEO_ERR_IO;
+    }
+    off = off + got;
+  }
+  return n;
+}
+
+// how: MEO_SOCK_SHUT_RD / _WR / _BOTH. Wakes a thread blocked on this socket.
+export fn meo_sock_shutdown(fd: int64, how: int32) -> int32 {
+  if (how < MEO_SOCK_SHUT_RD || how > MEO_SOCK_SHUT_BOTH) { return -MEO_ERR_USAGE; }
+  var rc: int64 = syscall(MEO_SYS_SHUTDOWN, fd, (int64)how);
+  if (rc < 0) { return meo_sock_err(rc); }
+  return MEO_OK;
+}

@@ -1,0 +1,238 @@
+// sock_self: loopback checks for net/sock. Echo of 1 MiB through a server
+// thread, the ephemeral port, receive timeout, shutdown waking a blocked
+// accept and a blocked recv, and peer-close detection.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/net/sock.mettle";
+
+const SK_IP: string = "127.0.0.1";
+const SK_TOTAL: int32 = 1048576;
+const SK_CHUNK: int32 = 65536;
+
+var g_fd: int64 = 0;
+var g_rc: int64 = 0;
+var g_ms: int64 = 0;
+var g_echoed: int32 = 0;
+
+fn sk_fail(msg: string) -> int32 {
+  println("FAIL sock_self: {msg}");
+  return 1;
+}
+
+fn sk_now_ms() -> int64 {
+  // clock_gettime(CLOCK_MONOTONIC)
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  syscall((int64)228, (int64)1, (int64)&ts[0]);
+  return ts[0] * (int64)1000 + ts[1] / (int64)1000000;
+}
+
+// Joins with a deadline so a thread that never wakes is a FAIL, not a hang.
+fn sk_join(h: int64, ms: uint32) -> bool {
+  var w: uint32 = thread_join(h, ms);
+  if (w == WAIT_TIMEOUT()) { return false; }
+  thread_close(h);
+  return true;
+}
+
+fn sk_echo_worker(arg: cstring) -> uint32 {
+  var c: int64 = meo_sock_accept(g_fd);
+  if (c < 0) { g_rc = c; return 0; }
+  meo_sock_set_nodelay(c, true);
+  var buf: uint8* = (uint8*)malloc((int64)SK_CHUNK);
+  while (true) {
+    var got: int32 = meo_sock_recv_some(c, buf, SK_CHUNK);
+    if (got <= 0) { g_rc = (int64)got; break; }
+    if (meo_sock_send_all(c, buf, got) != got) { g_rc = -1; break; }
+    g_echoed = g_echoed + got;
+  }
+  free(buf);
+  meo_sock_close(c);
+  return 0;
+}
+
+fn sk_echo() -> int32 {
+  var lfd: int64 = meo_sock_listen(SK_IP, 0, 16);
+  if (lfd < 0) { return sk_fail("listen rc={lfd}"); }
+  var port: int32 = meo_sock_port(lfd);
+  if (port <= 0 || port > 65535) { return sk_fail("ephemeral port {port}"); }
+  g_fd = lfd;
+  g_rc = 99;
+  g_echoed = 0;
+  var h: int64 = CreateThread(0, 0, &sk_echo_worker, 0, 0, 0);
+  var fd: int64 = meo_sock_connect(SK_IP, port);
+  if (fd < 0) { return sk_fail("connect rc={fd}"); }
+  if (meo_sock_set_nodelay(fd, true) != MEO_OK) { return sk_fail("nodelay"); }
+  var out: uint8* = (uint8*)malloc((int64)SK_TOTAL);
+  var back: uint8* = (uint8*)malloc((int64)SK_TOTAL);
+  var i: int32 = 0;
+  while (i < SK_TOTAL) {
+    out[i] = (uint8)((i * 7 + i / 251) & 255);
+    back[i] = 0;
+    i = i + 1;
+  }
+  var t0: int64 = sk_now_ms();
+  var off: int32 = 0;
+  while (off < SK_TOTAL) {
+    var rc: int32 = meo_sock_send_all(fd, &out[off], SK_CHUNK);
+    if (rc != SK_CHUNK) { return sk_fail("send_all rc={rc} at {off}"); }
+    rc = meo_sock_recv_exact(fd, &back[off], SK_CHUNK);
+    if (rc != SK_CHUNK) { return sk_fail("recv_exact rc={rc} at {off}"); }
+    off = off + SK_CHUNK;
+  }
+  var t1: int64 = sk_now_ms();
+  i = 0;
+  while (i < SK_TOTAL) {
+    if (back[i] != out[i]) { return sk_fail("echo byte {i} differs"); }
+    i = i + 1;
+  }
+  // Half-close: the server reads EOF, closes, and the client sees it.
+  if (meo_sock_shutdown(fd, MEO_SOCK_SHUT_WR) != MEO_OK) { return sk_fail("shut wr"); }
+  var tail: int32 = meo_sock_recv_some(fd, back, 16);
+  if (tail != 0) { return sk_fail("peer close not seen, rc={tail}"); }
+  if (!sk_join(h, 5000)) { return sk_fail("echo thread did not finish"); }
+  if (g_rc != 0) { return sk_fail("echo server rc={g_rc}"); }
+  if (g_echoed != SK_TOTAL) { return sk_fail("echoed {g_echoed}"); }
+  free(out);
+  free(back);
+  meo_sock_close(fd);
+  meo_sock_close(lfd);
+  println("  echo 1 MiB in {t1 - t0} ms via ephemeral port {port}, peer close seen");
+  return 0;
+}
+
+// Connects a pair on loopback; the client end is returned, the server end in g_fd.
+fn sk_pair(lfd: int64) -> int64 {
+  var c: int64 = meo_sock_connect(SK_IP, meo_sock_port(lfd));
+  if (c < 0) { return c; }
+  var s: int64 = meo_sock_accept(lfd);
+  if (s < 0) { meo_sock_close(c); return s; }
+  g_fd = s;
+  return c;
+}
+
+fn sk_timeout() -> int32 {
+  var lfd: int64 = meo_sock_listen(SK_IP, 0, 4);
+  if (lfd < 0) { return sk_fail("listen rc={lfd}"); }
+  var c: int64 = sk_pair(lfd);
+  if (c < 0) { return sk_fail("pair rc={c}"); }
+  var s: int64 = g_fd;
+  if (meo_sock_set_recv_timeout(s, 200) != MEO_OK) { return sk_fail("rcvtimeo"); }
+  if (meo_sock_set_send_timeout(s, 200) != MEO_OK) { return sk_fail("sndtimeo"); }
+  var buf: uint8[8];
+  var t0: int64 = sk_now_ms();
+  var rc: int32 = meo_sock_recv_some(s, &buf[0], 8);
+  var dt: int64 = sk_now_ms() - t0;
+  if (rc != -MEO_ERR_TIMEOUT) { return sk_fail("recv timeout rc={rc}"); }
+  if (dt < 180 || dt > 400) { return sk_fail("recv timeout took {dt} ms"); }
+  t0 = sk_now_ms();
+  rc = meo_sock_recv_exact(s, &buf[0], 8);
+  var dt2: int64 = sk_now_ms() - t0;
+  if (rc != -MEO_ERR_TIMEOUT || dt2 > 400) { return sk_fail("recv_exact timeout rc={rc} {dt2} ms"); }
+  // Timeout 0 turns it off again: data sent later is still received.
+  if (meo_sock_set_recv_timeout(s, 0) != MEO_OK) { return sk_fail("rcvtimeo 0"); }
+  buf[0] = 42;
+  if (meo_sock_send_all(c, &buf[0], 1) != 1) { return sk_fail("send 1"); }
+  buf[0] = 0;
+  if (meo_sock_recv_exact(s, &buf[0], 1) != 1 || buf[0] != 42) { return sk_fail("recv after 0"); }
+  meo_sock_close(c);
+  meo_sock_close(s);
+  meo_sock_close(lfd);
+  println("  recv timeout 200 ms -> TIMEOUT after {dt} ms (recv_exact {dt2} ms)");
+  return 0;
+}
+
+fn sk_accept_worker(arg: cstring) -> uint32 {
+  var t0: int64 = sk_now_ms();
+  g_rc = meo_sock_accept(g_fd);
+  g_ms = sk_now_ms() - t0;
+  return 0;
+}
+
+fn sk_recv_worker(arg: cstring) -> uint32 {
+  var buf: uint8[16];
+  var t0: int64 = sk_now_ms();
+  g_rc = (int64)meo_sock_recv_some(g_fd, &buf[0], 16);
+  g_ms = sk_now_ms() - t0;
+  return 0;
+}
+
+fn sk_shutdown() -> int32 {
+  var lfd: int64 = meo_sock_listen(SK_IP, 0, 4);
+  if (lfd < 0) { return sk_fail("listen rc={lfd}"); }
+  g_fd = lfd;
+  g_rc = 99;
+  var h: int64 = CreateThread(0, 0, &sk_accept_worker, 0, 0, 0);
+  thread_sleep_ms(150);
+  if (g_rc != 99) { return sk_fail("accept returned early rc={g_rc}"); }
+  if (meo_sock_shutdown(lfd, MEO_SOCK_SHUT_BOTH) != MEO_OK) { return sk_fail("shut listener"); }
+  if (!sk_join(h, 2000)) { return sk_fail("shutdown did not wake accept"); }
+  if (g_rc >= 0) { return sk_fail("accept after shutdown rc={g_rc}"); }
+  var accept_ms: int64 = g_ms;
+  var accept_rc: int64 = g_rc;
+  meo_sock_close(lfd);
+
+  lfd = meo_sock_listen(SK_IP, 0, 4);
+  if (lfd < 0) { return sk_fail("listen 2 rc={lfd}"); }
+  var c: int64 = sk_pair(lfd);
+  if (c < 0) { return sk_fail("pair rc={c}"); }
+  var s: int64 = g_fd;
+  g_rc = 99;
+  h = CreateThread(0, 0, &sk_recv_worker, 0, 0, 0);
+  thread_sleep_ms(150);
+  if (g_rc != 99) { return sk_fail("recv returned early rc={g_rc}"); }
+  if (meo_sock_shutdown(s, MEO_SOCK_SHUT_RD) != MEO_OK) { return sk_fail("shut rd"); }
+  if (!sk_join(h, 2000)) { return sk_fail("shutdown did not wake recv"); }
+  if (g_rc != 0) { return sk_fail("recv after SHUT_RD rc={g_rc}"); }
+  println("  shutdown woke accept (rc {accept_rc}, {accept_ms} ms) and recv (rc 0, {g_ms} ms)");
+  meo_sock_close(c);
+  meo_sock_close(s);
+  meo_sock_close(lfd);
+  return 0;
+}
+
+fn sk_peer_close() -> int32 {
+  var lfd: int64 = meo_sock_listen(SK_IP, 0, 4);
+  if (lfd < 0) { return sk_fail("listen rc={lfd}"); }
+  var c: int64 = sk_pair(lfd);
+  if (c < 0) { return sk_fail("pair rc={c}"); }
+  var s: int64 = g_fd;
+  var buf: uint8[8];
+  buf[0] = 1; buf[1] = 2; buf[2] = 3;
+  if (meo_sock_send_all(c, &buf[0], 3) != 3) { return sk_fail("send 3"); }
+  meo_sock_close(c);
+  var rc: int32 = meo_sock_recv_exact(s, &buf[0], 8);
+  if (rc != -MEO_ERR_IO) { return sk_fail("close mid-message rc={rc}"); }
+  rc = meo_sock_recv_exact(s, &buf[0], 8);
+  if (rc != 0) { return sk_fail("close at boundary rc={rc}"); }
+  // Writing to the dead peer is an error code, not SIGPIPE.
+  var k: int32 = 0;
+  rc = 1;
+  while (k < 50 && rc > 0) {
+    rc = meo_sock_send_all(s, &buf[0], 8);
+    k = k + 1;
+  }
+  if (rc != -MEO_ERR_IO) { return sk_fail("send to closed peer rc={rc}"); }
+  meo_sock_close(s);
+  if (meo_sock_connect("127.0.0.256", 1) != (int64)(-MEO_ERR_USAGE)) { return sk_fail("bad ip"); }
+  if (meo_sock_connect("1.2.3", 1) != (int64)(-MEO_ERR_USAGE)) { return sk_fail("short ip"); }
+  // The listener is closed now, so its port refuses.
+  var port: int32 = meo_sock_port(lfd);
+  meo_sock_close(lfd);
+  if (meo_sock_connect(SK_IP, port) != (int64)(-MEO_ERR_IO)) { return sk_fail("refused"); }
+  println("  peer close: mid-message IO, at boundary 0, send after close IO");
+  return 0;
+}
+
+fn main() -> int32 {
+  if (sk_echo() != 0) { return 1; }
+  if (sk_timeout() != 0) { return 1; }
+  if (sk_shutdown() != 0) { return 1; }
+  if (sk_peer_close() != 0) { return 1; }
+  println("PASS sock_self");
+  return 0;
+}
