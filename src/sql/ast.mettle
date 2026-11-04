@@ -7,7 +7,8 @@
 //   UPDATE name SET name = operand {, name = operand} [where]
 //   DELETE FROM name [where]
 //   where   := WHERE term {AND term}
-//   term    := name = operand | name IN ( operand {, operand} ) | name IS [NOT] NULL
+//   term    := name (= | < | <= | > | >= | <> | !=) operand
+//            | name IN ( operand {, operand} ) | name IS [NOT] NULL
 //   operand := ? | int | real | 'string' | NULL
 //
 // sql/parser builds one MeoAst per statement; sql/plan resolves its names. The
@@ -51,6 +52,11 @@ export const MEO_AST_T_EQ: int32 = 1;          // col = rhs
 export const MEO_AST_T_IN: int32 = 2;          // col IN (list[0..n_list))
 export const MEO_AST_T_IS_NULL: int32 = 3;     // col IS NULL
 export const MEO_AST_T_NOT_NULL: int32 = 4;    // col IS NOT NULL
+export const MEO_AST_T_LT: int32 = 5;          // col < rhs
+export const MEO_AST_T_LE: int32 = 6;          // col <= rhs
+export const MEO_AST_T_GT: int32 = 7;          // col > rhs
+export const MEO_AST_T_GE: int32 = 8;          // col >= rhs
+export const MEO_AST_T_NE: int32 = 9;          // col <> rhs (also !=)
 
 // An identifier as written, quotes removed (see the header for lifetime).
 export struct MeoAstName {
@@ -79,7 +85,7 @@ export struct MeoAstOperand {
 export struct MeoAstTerm {
   kind: int32;           // MEO_AST_T_*
   col: MeoAstName;
-  rhs: MeoAstOperand;    // EQ only
+  rhs: MeoAstOperand;    // EQ and the comparisons
   list: MeoAstOperand*;  // IN only, n_list >= 1
   n_list: int32;
 }

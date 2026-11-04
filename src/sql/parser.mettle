@@ -400,7 +400,22 @@ fn prs_in_list(ps: PrsState*, t: MeoAstTerm*) -> int32 {
   return prs_expect(ps, MEO_TK_RPAREN);
 }
 
-// term := name = operand | name IN ( ... ) | name IS [NOT] NULL
+// The term kind of the current CMP token (< <= > >= <> !=).
+fn prs_cmp_kind(ps: PrsState*) -> int32 {
+  var c0: uint8 = ps->lx.src[ps->tok.off];
+  if (ps->tok.len == 1) {
+    if (c0 == (uint8)60) { return MEO_AST_T_LT; }
+    return MEO_AST_T_GT;
+  }
+  var c1: uint8 = ps->lx.src[ps->tok.off + 1];
+  if (c1 == (uint8)62) { return MEO_AST_T_NE; }  // <>
+  if (c0 == (uint8)60) { return MEO_AST_T_LE; }
+  if (c0 == (uint8)62) { return MEO_AST_T_GE; }
+  return MEO_AST_T_NE;                           // !=
+}
+
+// term := name (= | < | <= | > | >= | <> | !=) operand | name IN ( ... )
+//   | name IS [NOT] NULL
 fn prs_term(ps: PrsState*, t: MeoAstTerm*) -> int32 {
   var rc: int32 = prs_name(ps, &t->col);
   if (rc != MEO_OK) { return rc; }
@@ -427,8 +442,14 @@ fn prs_term(ps: PrsState*, t: MeoAstTerm*) -> int32 {
     }
     return prs_expect_kw(ps, "NULL");
   }
+  if (ps->tok.kind == MEO_TK_CMP) {
+    t->kind = prs_cmp_kind(ps);
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+    return prs_operand(ps, &t->rhs);
+  }
   // Valid SQL the term kinds cannot hold yet.
-  if (ps->tok.kind == MEO_TK_CMP || prs_is(ps, "LIKE") || prs_is(ps, "BETWEEN")) {
+  if (prs_is(ps, "LIKE") || prs_is(ps, "BETWEEN")) {
     return prs_fail(ps, -MEO_ERR_UNSUPPORTED);
   }
   return prs_fail(ps, -MEO_ERR_SQL);

@@ -3,7 +3,7 @@
 //   p_create      CREATE TABLE [IF NOT EXISTS], every type and constraint
 //   p_insert      column list, multi-row, every literal kind, ? numbering
 //   p_select      SELECT * and the full clause set: WHERE (=, IN, IS [NOT]
-//                 NULL), ORDER BY ASC/DESC, LIMIT, OFFSET
+//                 NULL; comparisons in p_flux), ORDER BY ASC/DESC, LIMIT, OFFSET
 //   p_update      SET list then WHERE; ? numbered SET first
 //   p_delete      with and without WHERE
 //   p_escapes     "a""b" and 'it''s' unescaped; plain quoted names are views
@@ -296,6 +296,16 @@ fn p_case() {
   println("PASS p_case");
 }
 
+// One comparison term `"age" <op> ?` with the expected kind.
+fn p_cmp(sql: string, kind: int32, label: string) {
+  var a: MeoAst;
+  if (!p_good(sql, &a, label)) { return; }
+  if (!p_i32(a.n_where, 1, label + " n_where")) { return; }
+  p_i32(a.where_terms[0].kind, kind, label + " kind");
+  p_name(a.where_terms[0].col, "age", label + " col");
+  p_param(a.where_terms[0].rhs, 1, label + " rhs");
+}
+
 // Statement text exactly as flux_orm builds it (migration/ddl, migration/version,
 // core/persist, query/builder).
 fn p_flux() {
@@ -330,12 +340,23 @@ fn p_flux() {
   p_i32(a.n_where, 3, "p_flux query n_where");
   p_good("SELECT \"id\", \"user_id\" FROM \"posts\" WHERE \"user_id\" IN (?, ?, ?)", &a,
     "p_flux preload");
-  // Comparisons and joins are valid SQL the AST cannot hold yet.
-  p_bad("SELECT \"id\" FROM \"users\" WHERE \"age\" < ?", -MEO_ERR_UNSUPPORTED, 37, "p_flux lt");
-  p_bad("SELECT \"id\" FROM \"users\" WHERE \"age\" <= ?", -MEO_ERR_UNSUPPORTED, 37, "p_flux le");
-  p_bad("SELECT \"id\" FROM \"users\" WHERE \"age\" <> ?", -MEO_ERR_UNSUPPORTED, 37, "p_flux ne");
-  p_bad("SELECT \"id\" FROM \"users\" WHERE \"a\" = ? AND \"age\" >= ?", -MEO_ERR_UNSUPPORTED, 49,
-    "p_flux ge");
+  // rc_query_where_cmp: `"col" <op> ?` for each operator, first term and AND-ed.
+  p_cmp("SELECT \"id\" FROM \"users\" WHERE \"age\" < ?", MEO_AST_T_LT, "p_flux lt");
+  p_cmp("SELECT \"id\" FROM \"users\" WHERE \"age\" <= ?", MEO_AST_T_LE, "p_flux le");
+  p_cmp("SELECT \"id\" FROM \"users\" WHERE \"age\" > ?", MEO_AST_T_GT, "p_flux gt");
+  p_cmp("SELECT \"id\" FROM \"users\" WHERE \"age\" >= ?", MEO_AST_T_GE, "p_flux ge");
+  p_cmp("SELECT \"id\" FROM \"users\" WHERE \"age\" <> ?", MEO_AST_T_NE, "p_flux ne");
+  p_cmp("SELECT \"id\" FROM \"users\" WHERE \"age\" != ?", MEO_AST_T_NE, "p_flux ne bang");
+  p_good("SELECT \"id\" FROM \"users\" WHERE \"a\" = ? AND \"age\" >= ? AND \"b\" < ? "
+    + "ORDER BY \"age\" DESC LIMIT 10", &a, "p_flux cmp and");
+  if (p_i32(a.n_where, 3, "p_flux cmp and n_where")) {
+    p_i32(a.where_terms[1].kind, MEO_AST_T_GE, "p_flux cmp and w1");
+    p_param(a.where_terms[2].rhs, 3, "p_flux cmp and w2 rhs");
+  }
+  // Valid SQL the AST cannot hold yet.
+  p_bad("SELECT \"id\" FROM \"users\" WHERE \"n\" LIKE ?", -MEO_ERR_UNSUPPORTED, 35,
+    "p_flux like");
+  p_bad("SELECT * FROM t WHERE a BETWEEN 1 AND 2", -MEO_ERR_UNSUPPORTED, 24, "p_flux between");
   p_bad("SELECT \"id\" FROM \"users\" JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\"",
     -MEO_ERR_UNSUPPORTED, 25, "p_flux join");
   p_bad("SELECT \"id\" FROM \"users\" LEFT JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\"",
@@ -367,6 +388,8 @@ fn p_errors() {
   p_bad("SELECT * FROM t WHERE a IN ()", -MEO_ERR_SQL, 28, "p_errors empty IN");
   p_bad("SELECT * FROM t WHERE a = @", -MEO_ERR_SQL, 26, "p_errors bad byte");
   p_bad("SELECT * FROM t WHERE a IS 1", -MEO_ERR_SQL, 27, "p_errors IS 1");
+  p_bad("SELECT * FROM t WHERE a < ", -MEO_ERR_SQL, 26, "p_errors cmp no operand");
+  p_bad("SELECT * FROM t WHERE a ! 1", -MEO_ERR_SQL, 24, "p_errors lone bang");
   p_bad("UPDATE t a = 1", -MEO_ERR_SQL, 9, "p_errors missing SET");
   p_bad("DELETE t", -MEO_ERR_SQL, 7, "p_errors missing FROM in DELETE");
   p_bad("DROP TABLE t", -MEO_ERR_SQL, 0, "p_errors DROP");
