@@ -42,3 +42,4 @@
 | F9 | `meo_peek_commit_seq` reported a page 0 caught mid-write as damage; it now answers `MEO_PEEK_TRANSIENT` (2). | `802a1a1` |
 | F10 | Typed-API writes were not in the change feed; inserts, updates and deletes now are, with the row as a value. | `611dc90` |
 | F11 | Two processes could open one database file and corrupt it; open now takes a whole-file lock and a conflicting opener gets BUSY. | `16381e3` |
+| F12 | Catalog reload copied stale in-memory index roots over the disk values when a table's column count changed, and could read past the columns array. | `b1afd59` |
