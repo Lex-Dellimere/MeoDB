@@ -202,3 +202,7 @@ $MB run phase2 -r     # one test program, release build
 Apart from `meosql` and `smoke`, every `mb_bin` in `mbuild.mettle` is a test
 program, and each should print `PASS` in both debug and release with zero
 compiler warnings.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
