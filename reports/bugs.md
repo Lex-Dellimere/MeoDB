@@ -4,7 +4,6 @@
 
 | Id | Area | What happens | Why it matters | Where | Status |
 |---|---|---|---|---|---|
-| B1 | conc | A waiter can wait longer than `busy_ms`: the runtime mutex restarts the full timeout after every wake-up. | Under heavy contention a client may see BUSY late. | `src/conc/lock.mettle`; runtime bug filed as Mettle report 039 | open |
 | B2 | conc | A thread that exits while holding the db lock leaves it held forever; thread ids can be reused. | Only reachable by an embedded caller that exits mid-transaction; the server always rolls back first. | `src/conc/lock.mettle` | open |
 | B3 | query | A DROP TABLE that fails partway inside an explicit transaction marks the table dead from the first freed page and poisons the transaction until rollback. Not tested. | The table looks gone until rollback reloads it. | `src/catalog/catalog.mettle` (`meo_cat_drop_table`) | open |
 | B4 | catalog | Dropping a table can grow the file by one page when the freelist needs a new trunk page. | Minor; the test allows it. | `src/pager/freelist.mettle` | open |
@@ -47,3 +46,4 @@
 | F12 | Catalog reload copied stale in-memory index roots over the disk values when a table's column count changed, and could read past the columns array. | `b1afd59` |
 | F13 | Every commit paid its own fsync; in WAL mode concurrent commits now share one (group commit). | `5d37d12` |
 | F14 | One open transaction blocked every reader; in WAL mode readers use snapshots and never wait for the writer. | `5d37d12` |
+| F15 | B1: a waiter could wait longer than `busy_ms` because the runtime mutex restarted the full timeout after every wake-up (Mettle report 039, fixed in the compiler runtime). | Mettle runtime |
