@@ -160,7 +160,7 @@ fn r_rec_max() {
 
 fn r_cols() {
   var txt: uint8[3] = [(uint8)'a', (uint8)'b', (uint8)'c'];
-  var v: MeoValue[261];
+  var v: MeoValue[325];
   var i: int32 = 0;
   while (i < MEO_REC_MAX_VALS + 1) {
     var k: int32 = i % 5;

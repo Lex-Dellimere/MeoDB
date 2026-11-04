@@ -1,6 +1,7 @@
 // srv_smoke: the server embedded on 127.0.0.1 port 0, driven with raw frames.
 // Handshake errors (PROTO before HELLO, wrong token), a CREATE/INSERT/SELECT
-// round trip, COUNT and UPDATE, DROP and ADD COLUMN, refused ops, a client
+// round trip, COUNT and UPDATE, DROP, ADD COLUMN and the index ops, refused
+// ops, a client
 // that drops its socket mid-transaction, an oversize result, and a stop with
 // a transaction still open.
 
@@ -347,10 +348,19 @@ fn smk_schema(fd: int64) -> int32 {
   st.op = MEO_WIRE_OP_CREATE_INDEX;
   st.table = "t";
   st.name = "ix";
-  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_UNSUPPORTED, false, "create index") != 0) {
+  smk_col(&cols[0], "extra", 0, 0);
+  st.cols = &cols[0];
+  st.n_cols = 1;
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("create index"); }
+  if (smk_expect_error(smk_query(fd, &st), MEO_ERR_SCHEMA, false, "create index twice") != 0) {
     return 1;
   }
   if (g_err.tx != MEO_WIRE_TX_NONE) { return smk_fail("create index tx"); }
+  meo_wire_stmt_init(&st);
+  st.op = MEO_WIRE_OP_DROP_INDEX;
+  st.table = "t";
+  st.name = "ix";
+  if (smk_query(fd, &st) != MEO_WIRE_K_RESULT) { return smk_fail("drop index"); }
   st.op = 11;
   if (smk_expect_error(smk_query(fd, &st), MEO_ERR_USAGE, false, "op 11") != 0) { return 1; }
   var terms: MeoWTerm[1];

@@ -2,9 +2,10 @@
 // path. Sees schemas and the values of range bounds only, never storage; the
 // caller looks the table up under the db lock.
 // Access path: an EQ on the rowid alias, else an EQ on a unique column, else
-// an IN on the rowid alias, else an IN on a unique column, else a range on the
-// rowid alias, else a range on a unique column, else a full scan. Every term
-// is still re-checked on every row the path yields.
+// an IN on the rowid alias, else an IN on a unique column, else an EQ on a
+// column with a non-unique index (an index range with lo = hi), else a range
+// on the rowid alias, else a range on an indexed column, else a full scan.
+// Every term is still re-checked on every row the path yields.
 
 import "../error/status.mettle";
 import "../record/value.mettle";
@@ -54,6 +55,9 @@ export struct MeoPlan {
   range_col: int32;
   lo_term: int32;
   hi_term: int32;
+
+  // CREATE INDEX: the indexed column, -1 when the table or column is unknown.
+  index_col: int32;
 }
 
 export fn meo_plan_init(pl: MeoPlan*) {
@@ -75,6 +79,7 @@ export fn meo_plan_init(pl: MeoPlan*) {
   pl->range_col = -1;
   pl->lo_term = -1;
   pl->hi_term = -1;
+  pl->index_col = -1;
 }
 
 fn plan_name_eq(a: uint8*, an: int32, b: uint8*, bn: int32) -> bool {
@@ -206,11 +211,32 @@ fn plan_bound_ok(t: MeoTable*, c: int32, v: MeoValue*) -> bool {
   return false;
 }
 
-// Column c has a unique index (the rowid alias is the table tree itself).
+// Column c has an index tree, unique or not (the rowid alias is the table
+// tree itself).
 fn plan_has_index(t: MeoTable*, c: int32) -> bool {
   var f: int32 = t->columns[c].cflags;
   if ((f & MEO_COL_ROWID_ALIAS) != 0) { return false; }
-  return (f & (MEO_COL_UNIQUE | MEO_COL_PK)) != 0;
+  return (f & (MEO_COL_UNIQUE | MEO_COL_PK | MEO_COL_INDEXED)) != 0;
+}
+
+// No point path applies: an EQ on a column with a non-unique index scans
+// that index from the value to the value.
+fn plan_index_eq(s: MeoQSpec*, t: MeoTable*, pl: MeoPlan*, vals: MeoValue*) -> bool {
+  if (vals == 0) { return false; }
+  var k: int32 = 0;
+  while (k < s->n_terms) {
+    var c: int32 = pl->term_cols[k];
+    if (s->terms[k].kind == MEO_Q_EQ && (t->columns[c].cflags & MEO_COL_INDEXED) != 0
+        && plan_bound_ok(t, c, &vals[s->terms[k].v0])) {
+      pl->range_col = c;
+      pl->lo_term = k;
+      pl->hi_term = k;
+      pl->access = MEO_PATH_INDEX_RANGE;
+      return true;
+    }
+    k += 1;
+  }
+  return false;
 }
 
 // Term k is a range term whose value can bound its column.
@@ -289,7 +315,9 @@ fn plan_terms(s: MeoQSpec*, t: MeoTable*, vals: MeoValue*, arena: MeoArena*, pl:
     }
     k += 1;
   }
-  if (pl->access == MEO_PATH_FULL_SCAN) { plan_range(s, t, pl, vals); }
+  if (pl->access == MEO_PATH_FULL_SCAN && !plan_index_eq(s, t, pl, vals)) {
+    plan_range(s, t, pl, vals);
+  }
   return MEO_OK;
 }
 
@@ -353,10 +381,19 @@ fn plan_update(s: MeoQSpec*, t: MeoTable*, vals: MeoValue*, arena: MeoArena*, pl
   return plan_terms(s, t, vals, arena, pl);
 }
 
-// Build the plan for `s` against table `t` (0 only for CREATE, or DROP of a
-// missing table, which exec answers). `vals` are the query's value slots; 0
-// rules out range paths. MEO_OK,
-// -MEO_ERR_SCHEMA (unknown table or column, bad definition), -MEO_ERR_USAGE
+// CREATE INDEX: exactly one column (more is a composite index, not in v1) and
+// a name. The column resolves when the table exists; exec answers the rest.
+fn plan_create_index(s: MeoQSpec*, t: MeoTable*, pl: MeoPlan*) -> int32 {
+  if (s->n_names > 1) { return -MEO_ERR_UNSUPPORTED; }
+  if (s->n_names == 0 || s->index.n == 0) { return -MEO_ERR_USAGE; }
+  if (t != 0) { pl->index_col = meo_plan_col(t, &s->names[0]); }
+  return MEO_OK;
+}
+
+// Build the plan for `s` against table `t` (0 only for CREATE, or DROP, CREATE
+// INDEX or DROP INDEX naming a missing table, which exec answers). `vals` are
+// the query's value slots; 0 rules out range paths. MEO_OK,
+// -MEO_ERR_UNSUPPORTED (a composite index), -MEO_ERR_SCHEMA (unknown table or column, bad definition), -MEO_ERR_USAGE
 // (shape), -MEO_ERR_NOMEM.
 export fn meo_plan_build(s: MeoQSpec*, t: MeoTable*, vals: MeoValue*, arena: MeoArena*,
     pl: MeoPlan*) -> int32 {
@@ -367,6 +404,15 @@ export fn meo_plan_build(s: MeoQSpec*, t: MeoTable*, vals: MeoValue*, arena: Meo
   if (s->kind == MEO_Q_K_UPDATE && s->n_sets == 0) { return -MEO_ERR_USAGE; }
   if (s->kind == MEO_Q_K_DROP) {
     pl->t = t;
+    return MEO_OK;
+  }
+  if (s->kind == MEO_Q_K_CREATE_INDEX) {
+    pl->t = t;
+    return plan_create_index(s, t, pl);
+  }
+  if (s->kind == MEO_Q_K_DROP_INDEX) {
+    pl->t = t;
+    if (s->index.n == 0) { return -MEO_ERR_USAGE; }
     return MEO_OK;
   }
   if (t == 0) { return -MEO_ERR_SCHEMA; }   // no such table

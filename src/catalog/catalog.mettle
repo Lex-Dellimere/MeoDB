@@ -1,8 +1,9 @@
 // catalog/catalog: the persisted table list, a table tree at
 // meta.catalog_root. Rowid 0 = header ["meocat", 1]; rowid k = table id k:
 // [name, root, n_cols, tflags, then per column: name, affinity, cflags,
-// index_root]. MeoTable pointers stay valid while open; reload updates them
-// in place and marks vanished tables live = false.
+// index_root, then per column: index name or NULL] (see catalog/schema).
+// MeoTable pointers stay valid while open; reload updates them in place and
+// marks vanished tables live = false.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -66,6 +67,7 @@ fn cat_free_table(t: MeoTable*) {
   var i: int32 = 0;
   while (i < t->n_cols) {
     if (t->columns[i].name != 0) { free(t->columns[i].name); }
+    if (t->columns[i].idx_name != 0) { free(t->columns[i].idx_name); }
     i += 1;
   }
   if (t->columns != 0) { free(t->columns); }
@@ -151,6 +153,8 @@ fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int3
   var i: int32 = 0;
   while (i < (int32)ncols) {
     t->columns[i].name = 0;
+    t->columns[i].idx_name = 0;
+    t->columns[i].idx_name_len = 0;
     i += 1;
   }
   t->n_cols = (int32)ncols;
@@ -167,6 +171,12 @@ fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int3
     if (rc == MEO_OK) { rc = cat_get_int(rec, len, base + 2, &cfl); }
     if (rc == MEO_OK) { rc = cat_get_int(rec, len, base + 3, &iroot); }
     if (rc == MEO_OK && !meo_schema_affinity_ok((int32)aff)) { rc = -MEO_ERR_CORRUPT; }
+    // The index name trails every column group; an older row has none (NULL).
+    var nv: MeoValue;
+    if (rc == MEO_OK) { rc = meo_rec_get(rec, len, 4 + (int32)ncols * 4 + i, &nv); }
+    if (rc == MEO_OK && nv.type != MEO_T_NULL && (nv.type != MEO_T_TEXT || nv.n <= 0)) {
+      rc = -MEO_ERR_CORRUPT;
+    }
     if (rc != MEO_OK) {
       cat_free_table(t);
       return rc;
@@ -180,6 +190,14 @@ fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int3
     t->columns[i].affinity = (int32)aff;
     t->columns[i].cflags = (int32)cfl;
     t->columns[i].index_root = (uint32)iroot;
+    if (nv.type == MEO_T_TEXT) {
+      t->columns[i].idx_name = cat_dup(nv.p, nv.n);
+      if (t->columns[i].idx_name == 0) {
+        cat_free_table(t);
+        return -MEO_ERR_NOMEM;
+      }
+      t->columns[i].idx_name_len = nv.n;
+    }
     i += 1;
   }
   out[0] = t;
@@ -188,7 +206,8 @@ fn cat_decode_table(id: int64, rec: uint8*, len: int32, out: MeoTable**) -> int3
 
 // Same id and name, and one column list is a prefix of the other: the decoded
 // row describes this object (a longer or shorter list is an ADD COLUMN that
-// was committed or rolled back).
+// was committed or rolled back). The index flags may differ: CREATE / DROP
+// INDEX changes them on the same object.
 fn cat_same(old: MeoTable*, t: MeoTable*) -> bool {
   if (old->id != t->id) { return false; }
   if (!meo_cat_name_eq(old->name, old->name_len, t->name, t->name_len)) { return false; }
@@ -199,7 +218,8 @@ fn cat_same(old: MeoTable*, t: MeoTable*) -> bool {
     var a: MeoColumn* = &old->columns[k];
     var b: MeoColumn* = &t->columns[k];
     if (!meo_cat_name_eq(a->name, a->name_len, b->name, b->name_len)) { return false; }
-    if (a->affinity != b->affinity || a->cflags != b->cflags) { return false; }
+    var keep: int32 = ~(MEO_COL_UNIQUE | MEO_COL_INDEXED);
+    if (a->affinity != b->affinity || (a->cflags & keep) != (b->cflags & keep)) { return false; }
     k += 1;
   }
   return true;
@@ -225,11 +245,22 @@ fn cat_merge(cat: MeoCatalog*, t: MeoTable*) -> int32 {
         old->n_cols = t->n_cols;
         t->columns = oc;
         t->n_cols = on;
-      }
-      var k: int32 = 0;
-      while (k < old->n_cols) {
-        old->columns[k].index_root = t->columns[k].index_root;
-        k += 1;
+      } else {
+        var k: int32 = 0;
+        while (k < old->n_cols) {
+          var oc2: MeoColumn* = &old->columns[k];
+          var tc: MeoColumn* = &t->columns[k];
+          oc2->index_root = tc->index_root;
+          oc2->cflags = tc->cflags;
+          // Swap the index names: the stale one is freed with t.
+          var nm: uint8* = oc2->idx_name;
+          var nn: int32 = oc2->idx_name_len;
+          oc2->idx_name = tc->idx_name;
+          oc2->idx_name_len = tc->idx_name_len;
+          tc->idx_name = nm;
+          tc->idx_name_len = nn;
+          k += 1;
+        }
       }
       cat_free_table(t);
       return MEO_OK;
@@ -373,7 +404,7 @@ fn cat_put_row(p: MeoPager*, root: uint32*, rowid: int64, vals: MeoValue*, n: in
   return meo_bt_insert_sep(p, root, meo_cat_cmp, key, (uint64)rowid, 8);
 }
 
-// Fill vals (4 + 4 * n_cols entries) with t's catalog row. Borrows t's names.
+// Fill vals (4 + 5 * n_cols entries) with t's catalog row. Borrows t's names.
 fn cat_row_vals(t: MeoTable*, vals: MeoValue*) {
   meo_value_set_text(&vals[0], t->name, t->name_len);
   meo_value_set_int(&vals[1], (int64)t->root);
@@ -386,6 +417,12 @@ fn cat_row_vals(t: MeoTable*, vals: MeoValue*) {
     meo_value_set_int(&vals[b + 1], (int64)t->columns[i].affinity);
     meo_value_set_int(&vals[b + 2], (int64)t->columns[i].cflags);
     meo_value_set_int(&vals[b + 3], (int64)t->columns[i].index_root);
+    var nv: MeoValue* = &vals[4 + t->n_cols * 4 + i];
+    if (t->columns[i].idx_name != 0) {
+      meo_value_set_text(nv, t->columns[i].idx_name, t->columns[i].idx_name_len);
+    } else {
+      meo_value_set_null(nv);
+    }
     i += 1;
   }
 }
@@ -393,7 +430,7 @@ fn cat_row_vals(t: MeoTable*, vals: MeoValue*) {
 // Encoded size of t's catalog row. Roots are sized at their widest so a row
 // that fits now still fits after any root change.
 fn cat_row_size(t: MeoTable*) -> int32 {
-  var n: int32 = 4 + 4 * t->n_cols;
+  var n: int32 = 4 + 5 * t->n_cols;
   var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
   if (vals == 0) { return -MEO_ERR_NOMEM; }
   defer free(vals);
@@ -408,7 +445,7 @@ fn cat_row_size(t: MeoTable*) -> int32 {
 }
 
 fn cat_put_table(p: MeoPager*, root: uint32*, t: MeoTable*) -> int32 {
-  var n: int32 = 4 + 4 * t->n_cols;
+  var n: int32 = 4 + 5 * t->n_cols;
   var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
   if (vals == 0) { return -MEO_ERR_NOMEM; }
   defer free(vals);
@@ -497,6 +534,8 @@ export fn meo_cat_create_table(cat: MeoCatalog*, name: uint8*, name_len: int32,
     t->columns[i].affinity = cols[i].affinity;
     t->columns[i].cflags = cols[i].cflags;
     t->columns[i].index_root = 0;
+    t->columns[i].idx_name = 0;
+    t->columns[i].idx_name_len = 0;
     t->n_cols = i + 1;
     if (t->columns[i].name == 0) {
       cat_free_table(t);
@@ -653,6 +692,8 @@ export fn meo_cat_add_column(cat: MeoCatalog*, t: MeoTable*, col: MeoColumn*) ->
   nc[i].affinity = col->affinity;
   nc[i].cflags = 0;
   nc[i].index_root = 0;
+  nc[i].idx_name = 0;
+  nc[i].idx_name_len = 0;
   var oc: MeoColumn* = t->columns;
   t->columns = nc;
   t->n_cols = n;
@@ -669,4 +710,101 @@ export fn meo_cat_add_column(cat: MeoCatalog*, t: MeoTable*, col: MeoColumn*) ->
   }
   free(oc);
   return MEO_OK;
+}
+
+// --- named indexes ---------------------------------------------------------
+
+// The live table holding the index named `name` (ASCII case-insensitive), and
+// its column in *col; 0 when no index has that name.
+export fn meo_cat_find_index(cat: MeoCatalog*, name: uint8*, n: int32, col: int32*) -> MeoTable* {
+  if (cat == 0 || name == 0 || col == 0) { return 0; }
+  var i: int32 = 0;
+  while (i < cat->n_tables) {
+    var t: MeoTable* = cat->tables[i];
+    var k: int32 = 0;
+    while (t->live && k < t->n_cols) {
+      var c: MeoColumn* = &t->columns[k];
+      if (c->idx_name != 0 && meo_cat_name_eq(c->idx_name, c->idx_name_len, name, n)) {
+        col[0] = k;
+        return t;
+      }
+      k += 1;
+    }
+    i += 1;
+  }
+  return 0;
+}
+
+// Whether column `col` of t can take an index named `name`, without writing:
+// MEO_OK; -MEO_ERR_SCHEMA for a dead table, a name already used, the rowid
+// alias or a column that already has an index; -MEO_ERR_USAGE for a bad
+// column or name; -MEO_ERR_TOOBIG when the catalog row would exceed
+// MEO_REC_MAX; -MEO_ERR_CORRUPT once a reload has failed.
+export fn meo_cat_index_check(cat: MeoCatalog*, t: MeoTable*, col: int32, name: uint8*,
+    name_len: int32) -> int32 {
+  if (cat == 0 || t == 0 || name == 0 || name_len <= 0) { return -MEO_ERR_USAGE; }
+  if (cat->broken) { return -MEO_ERR_CORRUPT; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  if (col < 0 || col >= t->n_cols) { return -MEO_ERR_USAGE; }
+  var other: int32 = 0;
+  if (meo_cat_find_index(cat, name, name_len, &other) != 0) { return -MEO_ERR_SCHEMA; }
+  var c: MeoColumn* = &t->columns[col];
+  var any: int32 = MEO_COL_ROWID_ALIAS | MEO_COL_PK | MEO_COL_UNIQUE | MEO_COL_INDEXED;
+  if ((c->cflags & any) != 0) { return -MEO_ERR_SCHEMA; }
+  // Size the row with the name in place, borrowed for the call.
+  c->idx_name = name;
+  c->idx_name_len = name_len;
+  var sz: int32 = cat_row_size(t);
+  c->idx_name = 0;
+  c->idx_name_len = 0;
+  if (sz < 0) { return sz; }
+  if (sz > MEO_REC_MAX) { return -MEO_ERR_TOOBIG; }
+  return MEO_OK;
+}
+
+// Record a built index tree at `root` as index `name` on column `col` of t
+// and save the row: UNIQUE when `unique` (a real constraint from now on),
+// else MEO_COL_INDEXED. meo_cat_index_check's codes, nothing changed on any
+// of them. The caller holds the db lock and a pager transaction and rolls it
+// back on failure.
+export fn meo_cat_create_index(cat: MeoCatalog*, t: MeoTable*, col: int32, name: uint8*,
+    name_len: int32, unique: bool, root: uint32) -> int32 {
+  var rc: int32 = meo_cat_index_check(cat, t, col, name, name_len);
+  if (rc != MEO_OK) { return rc; }
+  var nm: uint8* = cat_dup(name, name_len);
+  if (nm == 0) { return -MEO_ERR_NOMEM; }
+  var c: MeoColumn* = &t->columns[col];
+  c->idx_name = nm;
+  c->idx_name_len = name_len;
+  c->index_root = root;
+  if (unique) {
+    c->cflags = c->cflags | MEO_COL_UNIQUE;
+  } else {
+    c->cflags = c->cflags | MEO_COL_INDEXED;
+  }
+  return meo_cat_save_table(cat, t);
+}
+
+// Drop the named index on column `col` of t: free its tree, clear the flag
+// CREATE INDEX set and the name, save the row. -MEO_ERR_SCHEMA for a dead
+// table or a column with no named index (constraint indexes have no name).
+// The caller holds the db lock and a pager transaction and rolls it back on
+// failure (the reload brings the index back).
+export fn meo_cat_drop_index(cat: MeoCatalog*, t: MeoTable*, col: int32) -> int32 {
+  if (cat == 0 || t == 0) { return -MEO_ERR_USAGE; }
+  if (cat->broken) { return -MEO_ERR_CORRUPT; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  if (col < 0 || col >= t->n_cols) { return -MEO_ERR_USAGE; }
+  var c: MeoColumn* = &t->columns[col];
+  if (c->idx_name == 0) { return -MEO_ERR_SCHEMA; }
+  var root: uint32 = c->index_root;
+  // Unindexed from the first freed page on, so nothing reads a half-freed tree.
+  c->index_root = 0;
+  c->cflags = c->cflags & ~(MEO_COL_UNIQUE | MEO_COL_INDEXED);
+  free(c->idx_name);
+  c->idx_name = 0;
+  c->idx_name_len = 0;
+  var rc: int32 = meo_cat_free_tree(cat->pager, root);
+  if (rc != MEO_OK) { return rc; }
+  return meo_cat_save_table(cat, t);
 }

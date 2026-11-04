@@ -15,8 +15,8 @@ import "../format/bytes.mettle";
 import "../format/varint.mettle";
 import "value.mettle";
 
-// A catalog row holds 4 table fields plus 4 per column.
-export const MEO_REC_MAX_VALS: int32 = 4 + 4 * MEO_MAX_COLS;
+// A catalog row holds 4 table fields plus 5 per column.
+export const MEO_REC_MAX_VALS: int32 = 4 + 5 * MEO_MAX_COLS;
 
 // Bytes one value's body takes (the tag byte is counted by the caller).
 fn rec_body_size(v: MeoValue*) -> int32 {

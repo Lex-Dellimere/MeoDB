@@ -1,4 +1,4 @@
-// srv_e2e: every flux_shapes statement, plus DROP, ADD_COLUMN, bit-exact
+// srv_e2e: every flux_shapes statement, plus DROP, ADD_COLUMN, the index ops, bit-exact
 // values, error codes and transactions, sent through meo_cli_query to a server
 // running in this process, and run through meo_q_* on a second, embedded db.
 // Both dbs start empty and get the same statements, so every result must match:
@@ -228,14 +228,17 @@ fn e_kind(db: MeoDb*, st: MeoWStmt*, q: MeoQuery**) -> int32 {
   if (st->op == OP_DELETE) { return meo_q_delete(db, st->table, q); }
   if (st->op == OP_COUNT) { return meo_q_count(db, st->table, q); }
   if (st->op == OP_DROP) { return meo_q_drop(db, st->table, q); }
+  if (st->op == OP_CREATE_INDEX) { return meo_q_create_index(db, st->table, st->name, q); }
+  if (st->op == OP_DROP_INDEX) { return meo_q_drop_index(db, st->table, st->name, q); }
   return meo_q_add_column(db, st->table, q);
 }
 
 fn e_build(st: MeoWStmt*, q: MeoQuery*) -> int32 {
   var rc: int32 = MEO_OK;
-  if ((st->op == OP_CREATE || st->op == OP_DROP) && st->if_not_exists) {
+  if (st->op != OP_INSERT && st->op != OP_SELECT && st->if_not_exists) {
     rc = meo_q_if_not_exists(q);
   }
+  if (rc == MEO_OK && st->op == OP_CREATE_INDEX && st->unique) { rc = meo_q_unique(q); }
   var i: int32 = 0;
   while (i < st->n_cols && rc == MEO_OK) {
     var c: MeoWCol* = &st->cols[i];
@@ -245,6 +248,7 @@ fn e_build(st: MeoWStmt*, q: MeoQuery*) -> int32 {
     if (st->op == OP_INSERT) { rc = meo_q_into(q, c->name); }
     if (st->op == OP_SELECT) { rc = meo_q_pick(q, c->name); }
     if (st->op == OP_UPDATE) { rc = meo_q_assign(q, c->name, &st->args[i]); }
+    if (st->op == OP_CREATE_INDEX) { rc = meo_q_index_column(q, c->name); }
     i += 1;
   }
   if (st->op == OP_INSERT) {
@@ -893,27 +897,83 @@ fn c_errors(cx: SeCtx*) -> int32 {
   se_term(&uc, "nope", W_NULL, 0);
   if (se_ck(cx, "unknown column", &uc, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
   if (se_ping(cx, "schema") != 0) { return 1; }
-
-  // Index ops are wire-only: refused, connection kept.
-  var op: int32 = OP_CREATE_INDEX;
-  while (op <= OP_DROP_INDEX) {
-    var ix: MeoWStmt;
-    se_new(&ix, op, "users");
-    ix.name = "users_age";
-    if (op == OP_CREATE_INDEX) { se_col(&ix, "age", 0, 0); }
-    var w: MeoCliResult;
-    var rc: int32 = meo_cli_query(cx->cli, &ix, &w);
-    se_free(&ix);
-    if (rc == MEO_OK) { meo_cli_result_free(&w); }
-    if (rc != -MEO_ERR_UNSUPPORTED || !meo_cli_connected(cx->cli)) {
-      return se_fail("index op {op}: rc={rc}");
-    }
-    if (se_ping(cx, "index op") != 0) { return 1; }
-    op += 1;
-  }
   var cnt: MeoWStmt;
   se_new(&cnt, OP_COUNT, "users");
   return se_ck(cx, "nothing written", &cnt, 0, MEO_OK, 1, 0, 0, "1");
+}
+
+fn se_index(st: MeoWStmt*, op: int32, name: string, col: string, unique: bool, ifx: bool) {
+  se_new(st, op, "users");
+  st->name = name;
+  st->unique = unique;
+  st->if_not_exists = ifx;
+  if (col.length > 0) { se_col(st, col, 0, 0); }
+}
+
+fn c_index(cx: SeCtx*) -> int32 {
+  // Only dora (id 4, role 3, created_at 9) is left; add three more.
+  var more: MeoWStmt;
+  se_new(&more, OP_INSERT, "users");
+  se_user_cols(&more, false);
+  se_user_args(&more, "f@x", vt("fay"), 40, 1, vn(), 20, 2);
+  se_user_args(&more, "g@x", vt("gus"), 41, 1, vn(), 21, 5);
+  se_user_args(&more, "h@x", vt("hal"), 42, 1, vn(), 22, 2);
+  if (se_ck(cx, "index rows", &more, 0, MEO_OK, 0, 3, 7, "") != 0) { return 1; }
+  var a: MeoWStmt;
+  se_index(&a, OP_CREATE_INDEX, "users_role", "role", false, false);
+  if (se_ck(cx, "create index", &a, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var a2: MeoWStmt;
+  se_index(&a2, OP_CREATE_INDEX, "users_role", "age", false, false);
+  if (se_ck(cx, "create index taken", &a2, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
+  var a3: MeoWStmt;
+  se_index(&a3, OP_CREATE_INDEX, "USERS_ROLE", "age", false, true);
+  if (se_ck(cx, "create index if not exists", &a3, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var e: MeoWStmt;
+  se_index(&e, OP_CREATE_INDEX, "users_email", "email", false, false);
+  if (se_ck(cx, "index on unique column", &e, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
+  var pk: MeoWStmt;
+  se_index(&pk, OP_CREATE_INDEX, "users_id", "id", false, false);
+  if (se_ck(cx, "index on rowid alias", &pk, 0, -MEO_ERR_SCHEMA, 0, 0, 0, "") != 0) { return 1; }
+  var two: MeoWStmt;
+  se_index(&two, OP_CREATE_INDEX, "users_two", "age", false, false);
+  se_col(&two, "role", 0, 0);
+  if (se_ck(cx, "composite index", &two, 0, -MEO_ERR_UNSUPPORTED, 0, 0, 0, "") != 0) { return 1; }
+  var sel: MeoWStmt;
+  se_new(&sel, OP_SELECT, "users");
+  se_col(&sel, "id", 0, 0);
+  se_arg(&sel, vi(2));
+  se_term(&sel, "role", W_EQ, 1);
+  if (se_ck(cx, "select by index", &sel, 0, MEO_OK, 2, 0, 0, "5,7") != 0) { return 1; }
+  var dupu: MeoWStmt;
+  se_index(&dupu, OP_CREATE_INDEX, "users_active_u", "active", true, false);
+  if (se_ck(cx, "unique over duplicates", &dupu, 0, -MEO_ERR_CONFLICT, 0, 0, 0, "") != 0) { return 1; }
+  var u: MeoWStmt;
+  se_index(&u, OP_CREATE_INDEX, "users_created", "created_at", true, false);
+  if (se_ck(cx, "unique index", &u, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var ins: MeoWStmt;
+  se_new(&ins, OP_INSERT, "users");
+  se_user_cols(&ins, false);
+  se_user_args(&ins, "e@x", vt("eve"), 50, 1, vn(), 9, 1);
+  if (se_ck(cx, "unique index insert", &ins, 0, -MEO_ERR_CONFLICT, 0, 0, 0, "") != 0) { return 1; }
+  var k: int32 = 0;
+  while (k < 3) {
+    // drop, drop again (SCHEMA), drop if exists (no-op).
+    var dr: MeoWStmt;
+    se_index(&dr, OP_DROP_INDEX, "users_role", "", false, k == 2);
+    var want: int32 = MEO_OK;
+    if (k == 1) { want = -MEO_ERR_SCHEMA; }
+    if (se_ck(cx, "drop index {k}", &dr, 0, want, 0, 0, 0, "") != 0) { return 1; }
+    k += 1;
+  }
+  var du: MeoWStmt;
+  se_index(&du, OP_DROP_INDEX, "users_created", "", false, false);
+  if (se_ck(cx, "drop unique index", &du, 0, MEO_OK, 0, 0, 0, "") != 0) { return 1; }
+  var sel2: MeoWStmt;
+  se_new(&sel2, OP_SELECT, "users");
+  se_col(&sel2, "id", 0, 0);
+  se_arg(&sel2, vi(2));
+  se_term(&sel2, "role", W_EQ, 1);
+  return se_ck(cx, "select after drop", &sel2, 0, MEO_OK, 2, 0, 0, "5,7");
 }
 
 fn se_post(st: MeoWStmt*, title: string) {
@@ -962,6 +1022,7 @@ fn se_cases(cx: SeCtx*, other: SeCtx*) -> int32 {
   if (c_values(cx) != 0) { return 1; }
   if (c_ddl(cx) != 0) { return 1; }
   if (c_errors(cx) != 0) { return 1; }
+  if (c_index(cx) != 0) { return 1; }
   return c_tx(cx, other);
 }
 

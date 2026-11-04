@@ -125,6 +125,34 @@ export fn meo_q_add_column(db: MeoDb*, table: string, out: MeoQuery**) -> int32 
   return q_new(db, MEO_Q_K_ADD_COLUMN, table, out);
 }
 
+fn q_new_index(db: MeoDb*, kind: int32, table: string, name: string, out: MeoQuery**) -> int32 {
+  var rc: int32 = q_new(db, kind, table, out);
+  if (rc != MEO_OK) { return rc; }
+  rc = meo_qspec_name(&out[0]->spec.index, name);
+  if (rc != MEO_OK) {
+    meo_q_free(out[0]);
+    out[0] = 0;
+  }
+  return rc;
+}
+
+// Create index `name` on one column of `table`, given by meo_q_index_column;
+// meo_q_unique makes it a UNIQUE index, meo_q_if_not_exists a no-op when the
+// name is taken. Existing rows are indexed in the same statement. Unknown
+// table or column, a taken name, the rowid alias or a column that already has
+// an index -> -MEO_ERR_SCHEMA; duplicate values under UNIQUE ->
+// -MEO_ERR_CONFLICT; more than one column -> -MEO_ERR_UNSUPPORTED.
+export fn meo_q_create_index(db: MeoDb*, table: string, name: string, out: MeoQuery**) -> int32 {
+  return q_new_index(db, MEO_Q_K_CREATE_INDEX, table, name, out);
+}
+
+// Drop index `name` of `table`. Missing (or on another table) ->
+// -MEO_ERR_SCHEMA, or MEO_DONE after meo_q_if_not_exists (here: "if
+// exists"). Indexes from PRIMARY KEY / UNIQUE in CREATE TABLE have no name.
+export fn meo_q_drop_index(db: MeoDb*, table: string, name: string, out: MeoQuery**) -> int32 {
+  return q_new_index(db, MEO_Q_K_DROP_INDEX, table, name, out);
+}
+
 // --- builders ---------------------------------------------------------------
 
 // Record a builder failure so the next step reports it.
@@ -176,17 +204,36 @@ export fn meo_q_column_def(q: MeoQuery*, name: string, affinity: int32, cflags: 
   return MEO_OK;
 }
 
-// CREATE: if not exists. DROP: if exists.
+// CREATE, CREATE INDEX: if not exists. DROP, DROP INDEX: if exists.
 export fn meo_q_if_not_exists(q: MeoQuery*) -> int32 {
   if (q == 0) { return -MEO_ERR_USAGE; }
+  var k: int32 = q->spec.kind;
   var rc: int32 = MEO_OK;
-  if (q->spec.kind == MEO_Q_K_DROP) {
-    rc = q_check(q, MEO_Q_K_DROP, MEO_Q_K_DROP);
+  if (k == MEO_Q_K_DROP || k == MEO_Q_K_CREATE_INDEX || k == MEO_Q_K_DROP_INDEX) {
+    rc = q_check(q, k, k);
   } else {
     rc = q_check(q, MEO_Q_K_CREATE, MEO_Q_K_CREATE);
   }
   if (rc != MEO_OK) { return rc; }
   q->spec.if_not_exists = true;
+  return MEO_OK;
+}
+
+// CREATE INDEX: the indexed column. Indexes are single-column: a second call
+// makes the step answer -MEO_ERR_UNSUPPORTED.
+export fn meo_q_index_column(q: MeoQuery*, name: string) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_CREATE_INDEX, MEO_Q_K_CREATE_INDEX);
+  if (rc != MEO_OK) { return rc; }
+  return q_add_name(q, name);
+}
+
+// CREATE INDEX: a UNIQUE index, a constraint on later writes too.
+export fn meo_q_unique(q: MeoQuery*) -> int32 {
+  if (q == 0) { return -MEO_ERR_USAGE; }
+  var rc: int32 = q_check(q, MEO_Q_K_CREATE_INDEX, MEO_Q_K_CREATE_INDEX);
+  if (rc != MEO_OK) { return rc; }
+  q->spec.unique = true;
   return MEO_OK;
 }
 
@@ -641,7 +688,7 @@ fn q_scan_locked(db: MeoDb*, table: string, x: string, y: string, group: string,
   var aff: int32 = t->columns[sc->xc].affinity;
   if (aff != MEO_T_INT && aff != MEO_T_REAL) { return MEO_OK; }   // no numeric x
   if ((f & MEO_COL_ROWID_ALIAS) != 0) { return q_scan_rowids(db, t, sc); }
-  if (meo_tbl_col_indexed(t, sc->xc)) { return q_scan_index(db, t, sc); }
+  if (meo_tbl_col_has_index(t, sc->xc)) { return q_scan_index(db, t, sc); }
   return q_scan_full(db, t, sc);
 }
 

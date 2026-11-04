@@ -44,7 +44,7 @@ Rules: no circular imports (E0006 fails the build), no lower layer imports a hig
 
 - **Records.** A row is a varint column count, one type tag per column, then the bodies. Ints are zigzag varints, reals are 8 IEEE bytes, and text/blob are a length plus bytes.
 - **Tables.** One b-tree per table. The leaf key is the 8-byte rowid followed by the row bytes. Parents keep only the 8-byte rowid. Max encoded row is 1280 bytes until overflow pages (M3).
-- **Indexes.** Each UNIQUE column and each non-integer PRIMARY KEY gets one b-tree, value -> rowid.
+- **Indexes.** Each UNIQUE column and each non-integer PRIMARY KEY gets one b-tree, value -> rowid. CREATE INDEX adds a named single-column index to an existing table: UNIQUE uses the same layout, non-unique keys are value ++ rowid. NULLs are not indexed. The catalog row stores each column's index name after the per-column fields.
 - **Catalog.** Schemas live in a table tree at `meta.catalog_root`. They are loaded at open.
 - **Queries.** There is no query language. A caller builds a query with function calls (`meo_q_select`, `meo_q_where`, `meo_q_order`, ...) and passes values as `MeoValue`. A planner picks a rowid lookup, an index lookup or a full scan. A select result is built at the first `meo_q_step` and then read row by row or as a whole. flux_orm translates its own query struct into these calls.
 - **Concurrency v1.** One lock per db handle, built on the runtime's futex mutex and re-entrant for its owner. One thread works inside the engine at a time. An explicit transaction holds the lock until it ends.

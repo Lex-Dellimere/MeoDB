@@ -162,6 +162,22 @@ fn srv_build(q: MeoQuery*, st: MeoWStmt*) -> int32 {
       if (st->if_not_exists) { rc = meo_q_if_not_exists(q); }
     }
     case 8: { rc = srv_add_defs(q, st); }
+    case 9: {
+      if (st->if_not_exists) { rc = meo_q_if_not_exists(q); }
+      if (rc == MEO_OK && st->unique) { rc = meo_q_unique(q); }
+      while (i < st->n_cols && rc == MEO_OK) {
+        var c: MeoWCol* = &st->cols[i];
+        if (c->ty != 0 || c->flags != 0) {
+          rc = -MEO_ERR_USAGE;
+        } else {
+          rc = meo_q_index_column(q, c->name);
+        }
+        i += 1;
+      }
+    }
+    case 10: {
+      if (st->if_not_exists) { rc = meo_q_if_not_exists(q); }
+    }
   }
   return rc;
 }
@@ -176,6 +192,8 @@ fn srv_new_query(db: MeoDb*, st: MeoWStmt*, out: MeoQuery**) -> int32 {
     case 6: { return meo_q_count(db, st->table, out); }
     case 7: { return meo_q_drop(db, st->table, out); }
     case 8: { return meo_q_add_column(db, st->table, out); }
+    case 9: { return meo_q_create_index(db, st->table, st->name, out); }
+    case 10: { return meo_q_drop_index(db, st->table, st->name, out); }
   }
   return -MEO_ERR_UNSUPPORTED;
 }
@@ -215,9 +233,6 @@ fn srv_put_result(q: MeoQuery*, w: MeoWBuf*) -> int32 {
 export fn meo_srv_exec(db: MeoDb*, st: MeoWStmt*, caps: uint32, w: MeoWBuf*) -> int32 {
   var rc: int32 = srv_check(st, caps);
   if (rc != MEO_OK) { return rc; }
-  if (st->op == MEO_WIRE_OP_CREATE_INDEX || st->op == MEO_WIRE_OP_DROP_INDEX) {
-    return -MEO_ERR_UNSUPPORTED;
-  }
   var q: MeoQuery* = 0;
   rc = srv_new_query(db, st, &q);
   if (rc != MEO_OK) { return rc; }

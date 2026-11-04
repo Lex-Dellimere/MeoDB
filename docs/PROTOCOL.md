@@ -164,10 +164,10 @@ Bits 0..2 are used by CREATE and ADD_COLUMN only. Bit 3 is accepted only when HE
 | 6 | COUNT | table, terms, args; no cols, no order, limit -1, offset 0 | `meo_q_count` |
 | 7 | DROP | table, if_not_exists = IF EXISTS | `meo_q_drop` |
 | 8 | ADD_COLUMN | table, cols = exactly one definition | `meo_q_add_column` |
-| 9 | CREATE_INDEX | table, name, unique, if_not_exists, cols = indexed columns in order | none: `ERROR UNSUPPORTED` in v1 |
-| 10 | DROP_INDEX | table, name, if_not_exists = IF EXISTS | none: `ERROR UNSUPPORTED` in v1 |
+| 9 | CREATE_INDEX | table, name, unique, if_not_exists, cols = indexed columns (type 0, cflags 0) | `meo_q_create_index`, `index_column` per col, `unique` |
+| 10 | DROP_INDEX | table, name, if_not_exists = IF EXISTS | `meo_q_drop_index` |
 
-Ops 9 and 10 decode as valid frames and are refused with `ERROR UNSUPPORTED` (11), non-fatal. Nothing runs, and the transaction state does not change. COUNT needs caps bit0. Without it the client must not send COUNT (RC_ERR_UNSUPPORTED, nothing sent).
+Ops 9 and 10 reply RESULT with affected 0. CREATE_INDEX indexes the existing rows in the same statement. It takes exactly one column: more is `ERROR UNSUPPORTED` (11), and a column type or cflags other than 0 is USAGE. An index name is unique across the database, compared ASCII case-insensitively. A taken name is SCHEMA, or a no-op with if_not_exists. An unknown table or column, the rowid alias, or a column that already has an index (PRIMARY KEY, UNIQUE or a named one) is SCHEMA. With unique set, duplicate values are CONFLICT and nothing is created. A UNIQUE index is a constraint on later writes too. DROP_INDEX of a missing name, or of a name on another table, is SCHEMA, or a no-op with if_not_exists. Indexes from PRIMARY KEY or UNIQUE in CREATE have no name and cannot be dropped. COUNT needs caps bit0. Without it the client must not send COUNT (RC_ERR_UNSUPPORTED, nothing sent).
 
 ### Term ops (RC_W_*)
 
@@ -221,7 +221,7 @@ Append-only: numbers never change.
 | 8 | FULL | page/array has no room |
 | 9 | RANGE | page number out of range |
 | 10 | USAGE | bad argument or bad state |
-| 11 | UNSUPPORTED | not in this version (index ops, COUNT before it lands) |
+| 11 | UNSUPPORTED | not in this version (composite indexes, COUNT before it lands) |
 | 12 | READONLY | write on a read-only db |
 | 13 | CONFLICT | duplicate PRIMARY KEY / UNIQUE |
 | 14 | CONSTRAINT | NOT NULL violated |

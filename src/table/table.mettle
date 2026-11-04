@@ -1,14 +1,16 @@
-// table/table: unlocked row primitives over one table b-tree plus one unique
-// index b-tree per UNIQUE column and per non-INTEGER PRIMARY KEY.
+// table/table: unlocked row primitives over one table b-tree plus one index
+// b-tree per indexed column: unique for UNIQUE columns and non-INTEGER
+// PRIMARY KEYs, non-unique for CREATE INDEX (MEO_COL_INDEXED).
 //
 // Table key = 8-byte rowid ++ record, separators truncated to 8; the rowid
-// alias is stored NULL and filled from the key. Index key = types/key
-// encoding of the value, u64 = rowid, whole-key separators; NULLs are not
-// indexed. Writes are two-phase: meo_tbl_check_rows / meo_tbl_check_update
-// find every constraint failure without writing, then write_row / update /
-// delete only write. The caller holds the db lock and a pager transaction; a
-// root change of the table or an index is saved through meo_cat_save_table in
-// that transaction.
+// alias is stored NULL and filled from the key. Unique index key = types/key
+// encoding of the value (meo_key_compare); non-unique index key = that
+// encoding ++ meo_key_rowid(rowid) (meo_idx_cmp). Both store u64 = rowid, use
+// whole-key separators, and leave NULLs out. Writes are two-phase:
+// meo_tbl_check_rows / meo_tbl_check_update find every constraint failure
+// without writing, then write_row / update / delete only write. The caller
+// holds the db lock and a pager transaction; a root change of the table or an
+// index is saved through meo_cat_save_table in that transaction.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -43,8 +45,8 @@ export struct MeoTblScan {
   start: int64;           // the first rowid the scan seeks to
 }
 
-// A range cursor over one unique index, in key order. Holds one pinned leaf
-// and a key buffer while open.
+// A range cursor over one index, in key order. Holds one pinned leaf and a
+// key buffer while open.
 export struct MeoTblIdxScan {
   db: MeoDb*;
   t: MeoTable*;
@@ -52,15 +54,30 @@ export struct MeoTblIdxScan {
   cur: MeoBtCursor;
   started: bool;
   done: bool;
-  keys: uint8*;           // lo key, then hi key, MEO_REC_MAX bytes each (malloc)
+  keys: uint8*;           // lo key, then hi key, TBL_KBUF bytes each (malloc)
   lo_n: int32;            // lo key length; the lone type tag when unbounded
   hi_n: int32;            // hi key length; 0 when unbounded
   tag: int32;             // MEO_KEY_* of the column's keys
+  multi: bool;            // non-unique: keys end in the rowid, lo key included
 }
+
+// Room for one index key: a value key (at most MEO_REC_MAX) plus the rowid.
+const TBL_KBUF: int32 = MEO_REC_MAX + 8;
 
 // The table-tree comparator: the 8-byte rowid prefix decides.
 export fn meo_tbl_cmp(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
   return meo_cat_cmp(a, an, b, bn);
+}
+
+// The non-unique index comparator: the value parts (all but the trailing 8
+// rowid bytes) by meo_key_compare, then the rowids. Byte order of the whole
+// key would be wrong: a TEXT value key is not self-delimiting, so "ab" ++
+// rowid could sort after "abc" ++ rowid.
+export fn meo_idx_cmp(a: uint8*, an: int32, b: uint8*, bn: int32) -> int32 {
+  if (an < 8 || bn < 8) { return meo_key_compare(a, an, b, bn); }
+  var c: int32 = meo_key_compare(a, an - 8, b, bn - 8);
+  if (c != 0) { return c; }
+  return meo_key_compare(a + an - 8, 8, b + bn - 8, 8);
 }
 
 // Index of the rowid-alias column, or -1.
@@ -79,6 +96,16 @@ export fn meo_tbl_col_indexed(t: MeoTable*, i: int32) -> bool {
   var f: int32 = t->columns[i].cflags;
   if ((f & MEO_COL_ROWID_ALIAS) != 0) { return false; }
   return (f & (MEO_COL_UNIQUE | MEO_COL_PK)) != 0;
+}
+
+// True when column `i` has an index tree, unique or not.
+export fn meo_tbl_col_has_index(t: MeoTable*, i: int32) -> bool {
+  if (meo_tbl_col_indexed(t, i)) { return true; }
+  return (t->columns[i].cflags & MEO_COL_INDEXED) != 0;
+}
+
+fn tbl_col_multi(t: MeoTable*, i: int32) -> bool {
+  return !meo_tbl_col_indexed(t, i) && (t->columns[i].cflags & MEO_COL_INDEXED) != 0;
 }
 
 // Coerce / check one value against column `i` (strict typing): NULL or the
@@ -468,30 +495,35 @@ fn tbl_del_row(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   return meo_bt_delete(db->pager, &root, meo_tbl_cmp, key);
 }
 
-// Add (put) or remove every index entry of one record. kbuf holds
-// MEO_REC_MAX bytes. Values come from the record, so they stay valid while
-// the trees change.
+// Add (put) or remove every index entry of one record. kbuf holds TBL_KBUF
+// bytes. Values come from the record, so they stay valid while the trees
+// change.
 fn tbl_index_rec(db: MeoDb*, t: MeoTable*, rec: uint8*, rec_len: int32, rowid: int64,
     put: bool, kbuf: uint8*, dirty: bool*) -> int32 {
   var c: int32 = 0;
   while (c < t->n_cols) {
-    if (meo_tbl_col_indexed(t, c)) {
+    if (meo_tbl_col_has_index(t, c)) {
       var v: MeoValue;
       var rc: int32 = meo_rec_get(rec, rec_len, c, &v);
       if (rc != MEO_OK) { return rc; }
       var kn: int32 = tbl_key_encode(&v, kbuf, MEO_REC_MAX);
       if (kn < 0) { return kn; }
       if (kn > 0) {
+        var cmp: fn(uint8*, int32, uint8*, int32) -> int32 = meo_key_compare;
+        if (tbl_col_multi(t, c)) {
+          kn += meo_key_rowid(kbuf + kn, 8, rowid);
+          cmp = meo_idx_cmp;
+        }
         var key: MeoBtKey = { data: kbuf, len: kn };
         var root: uint32 = t->columns[c].index_root;
         if (put) {
-          rc = meo_bt_insert(db->pager, &root, meo_key_compare, key, (uint64)rowid);
+          rc = meo_bt_insert(db->pager, &root, cmp, key, (uint64)rowid);
           if (root != t->columns[c].index_root) {
             t->columns[c].index_root = root;
             dirty[0] = true;
           }
         } else {
-          rc = meo_bt_delete(db->pager, &root, meo_key_compare, key);
+          rc = meo_bt_delete(db->pager, &root, cmp, key);
           if (rc == 1) { rc = -MEO_ERR_CORRUPT; }   // index lost the row's entry
         }
         if (rc != MEO_OK) { return rc; }
@@ -530,7 +562,7 @@ export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
   var len: int32 = 0;
   var rc: int32 = tbl_encode_row(t, vals, n, rowid, &buf, &len);
   if (rc != MEO_OK) { return rc; }
-  var kbuf: uint8* = malloc((int64)MEO_REC_MAX);
+  var kbuf: uint8* = malloc((int64)TBL_KBUF);
   if (kbuf == 0) {
     free(buf);
     return -MEO_ERR_NOMEM;
@@ -550,7 +582,7 @@ export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
 // Delete the row with this rowid and its index entries. MEO_OK, 1 absent.
 export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   if (db == 0 || t == 0) { return -MEO_ERR_USAGE; }
-  var old: uint8* = malloc((int64)MEO_REC_MAX * 2);
+  var old: uint8* = malloc((int64)MEO_REC_MAX + (int64)TBL_KBUF);
   if (old == 0) { return -MEO_ERR_NOMEM; }
   defer free(old);
   var row: MeoTblRow;
@@ -573,7 +605,7 @@ export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
 export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*,
     n: int32) -> int32 {
   if (db == 0 || t == 0 || vals == 0 || n != t->n_cols) { return -MEO_ERR_USAGE; }
-  var old: uint8* = malloc((int64)MEO_REC_MAX * 2);
+  var old: uint8* = malloc((int64)MEO_REC_MAX + (int64)TBL_KBUF);
   if (old == 0) { return -MEO_ERR_NOMEM; }
   defer free(old);
   var kbuf: uint8* = old + MEO_REC_MAX;
@@ -804,9 +836,9 @@ fn tbl_tag_of(aff: int32) -> int32 {
   return MEO_KEY_BLOB;
 }
 
-// Open a scan of the unique index on `col` over [lo, hi], both inclusive; 0
-// leaves a side unbounded. An INTEGER column takes REAL bounds, a REAL column
-// INTEGER ones, TEXT and BLOB their own type; anything else is
+// Open a scan of the index on `col` (unique or not) over [lo, hi], both
+// inclusive; 0 leaves a side unbounded. An INTEGER column takes REAL bounds, a
+// REAL column INTEGER ones, TEXT and BLOB their own type; anything else is
 // -MEO_ERR_MISMATCH, a text/blob bound past MEO_REC_MAX -MEO_ERR_TOOBIG,
 // -MEO_ERR_USAGE for a column with no index. Bounds are rounded outward, so
 // the caller still filters. Nothing is pinned until the first
@@ -814,7 +846,7 @@ fn tbl_tag_of(aff: int32) -> int32 {
 export fn meo_tbl_idx_scan_open(db: MeoDb*, t: MeoTable*, col: int32, lo: MeoValue*,
     hi: MeoValue*, sc: MeoTblIdxScan*) -> int32 {
   if (db == 0 || t == 0 || sc == 0 || col < 0 || col >= t->n_cols) { return -MEO_ERR_USAGE; }
-  if (!meo_tbl_col_indexed(t, col)) { return -MEO_ERR_USAGE; }
+  if (!meo_tbl_col_has_index(t, col)) { return -MEO_ERR_USAGE; }
   if (!t->live) { return -MEO_ERR_SCHEMA; }
   sc->db = db;
   sc->t = t;
@@ -827,6 +859,7 @@ export fn meo_tbl_idx_scan_open(db: MeoDb*, t: MeoTable*, col: int32, lo: MeoVal
   meo_bt_cursor_init(&sc->cur);
   var aff: int32 = t->columns[col].affinity;
   sc->tag = tbl_tag_of(aff);
+  sc->multi = tbl_col_multi(t, col);
   var b: MeoValue;
   var empty: bool = false;
   var rc: int32 = MEO_OK;
@@ -842,18 +875,21 @@ export fn meo_tbl_idx_scan_open(db: MeoDb*, t: MeoTable*, col: int32, lo: MeoVal
     if (rc == 1) { empty = true; }
   }
   if (empty) { return MEO_OK; }
-  var keys: uint8* = malloc((int64)MEO_REC_MAX * 2);
+  var keys: uint8* = malloc((int64)TBL_KBUF * 2);
   if (keys == 0) { return -MEO_ERR_NOMEM; }
   keys[0] = (uint8)sc->tag;
   var n: int32 = 1;
   if (lo != 0) { n = tbl_key_encode(&b, keys, MEO_REC_MAX); }
   var hn: int32 = 0;
-  if (n >= 0 && hi != 0) { hn = tbl_key_encode(&b2, keys + MEO_REC_MAX, MEO_REC_MAX); }
+  if (n >= 0 && hi != 0) { hn = tbl_key_encode(&b2, keys + TBL_KBUF, MEO_REC_MAX); }
   if (n < 0 || hn < 0) {
     free(keys);
     if (n < 0) { return n; }
     return hn;
   }
+  // The smallest rowid (INT64_MIN encodes as 8 zero bytes): the seek lands on
+  // the first entry whose value is not below lo.
+  if (sc->multi) { n += meo_key_rowid(keys + n, 8, (int64)((uint64)1 << 63)); }
   sc->lo_n = n;
   sc->hi_n = hn;
   sc->keys = keys;
@@ -876,7 +912,11 @@ export fn meo_tbl_idx_scan_next(sc: MeoTblIdxScan*, rowid_out: int64*) -> int32 
       return 1;
     }
     var key: MeoBtKey = { data: sc->keys, len: sc->lo_n };
-    rc = meo_bt_seek(p, &sc->cur, root, meo_key_compare, key);
+    if (sc->multi) {
+      rc = meo_bt_seek(p, &sc->cur, root, meo_idx_cmp, key);
+    } else {
+      rc = meo_bt_seek(p, &sc->cur, root, meo_key_compare, key);
+    }
   } else {
     rc = meo_bt_next(p, &sc->cur);
   }
@@ -889,10 +929,18 @@ export fn meo_tbl_idx_scan_next(sc: MeoTblIdxScan*, rowid_out: int64*) -> int32 
   var at: int32 = sc->cur.slot_in_leaf;
   var kp: uint8* = meo_btn_leaf_key_ptr(lf, at);
   var kl: int32 = meo_btn_leaf_key_len(lf, at);
+  if (sc->multi) {
+    if (kl < 9) {
+      sc->done = true;
+      meo_bt_close(p, &sc->cur);
+      return -MEO_ERR_CORRUPT;
+    }
+    kl -= 8;   // compare the value part only
+  }
   // Past the column's keys, or past the upper bound.
   var past: bool = kl < 1 || (int32)kp[0] != sc->tag;
   if (!past && sc->hi_n > 0) {
-    past = meo_key_compare(kp, kl, sc->keys + MEO_REC_MAX, sc->hi_n) > 0;
+    past = meo_key_compare(kp, kl, sc->keys + TBL_KBUF, sc->hi_n) > 0;
   }
   if (past) {
     sc->done = true;
@@ -923,4 +971,72 @@ export fn meo_tbl_row_get(t: MeoTable*, row: MeoTblRow*, col: int32, out: MeoVal
     return MEO_OK;
   }
   return meo_rec_get(row->rec, row->rec_len, col, out);
+}
+
+// Build an index tree over every row of t for column `col` into *root (0 on
+// entry). A unique build answers -MEO_ERR_CONFLICT at the first value two rows
+// share; the pages built so far stay in *root.
+fn tbl_index_build(db: MeoDb*, t: MeoTable*, col: int32, unique: bool, root: uint32*) -> int32 {
+  var p: MeoPager* = db->pager;
+  var kbuf: uint8* = malloc((int64)TBL_KBUF);
+  if (kbuf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(kbuf);
+  var sc: MeoTblScan;
+  var rc: int32 = meo_tbl_scan_open(db, t, &sc);
+  if (rc != MEO_OK) { return rc; }
+  var row: MeoTblRow;
+  while (true) {
+    rc = meo_tbl_scan_next(&sc, &row);
+    if (rc != 0) { break; }
+    var v: MeoValue;
+    rc = meo_tbl_row_get(t, &row, col, &v);
+    var kn: int32 = 0;
+    if (rc == MEO_OK) { kn = tbl_key_encode(&v, kbuf, MEO_REC_MAX); }
+    if (kn < 0) { rc = kn; }
+    if (rc == MEO_OK && kn > 0) {
+      if (unique) {
+        var key: MeoBtKey = { data: kbuf, len: kn };
+        var hit: uint64 = 0;
+        rc = meo_bt_lookup(p, root[0], meo_key_compare, key, &hit);
+        if (rc == MEO_OK) {
+          rc = -MEO_ERR_CONFLICT;
+        } else if (rc == 1) {
+          rc = meo_bt_insert(p, root, meo_key_compare, key, (uint64)row.rowid);
+        }
+      } else {
+        kn += meo_key_rowid(kbuf + kn, 8, row.rowid);
+        var mkey: MeoBtKey = { data: kbuf, len: kn };
+        rc = meo_bt_insert(p, root, meo_idx_cmp, mkey, (uint64)row.rowid);
+      }
+    }
+    if (rc != MEO_OK) { break; }
+  }
+  meo_tbl_scan_close(&sc);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// CREATE INDEX: index `name` on column `col` of t, built from the existing
+// rows, then recorded in the catalog (meo_cat_create_index). UNIQUE makes the
+// column a real UNIQUE constraint. meo_cat_index_check's codes before
+// anything is written; -MEO_ERR_CONFLICT when a UNIQUE build meets a value
+// twice. *wrote is set when a failure may have left changes behind; a
+// conflict frees its partial tree first. The caller holds the db lock and a
+// pager transaction and rolls it back on failure.
+export fn meo_tbl_create_index(db: MeoDb*, t: MeoTable*, col: int32, name: uint8*,
+    name_len: int32, unique: bool, wrote: bool*) -> int32 {
+  if (db == 0 || t == 0 || wrote == 0) { return -MEO_ERR_USAGE; }
+  wrote[0] = false;
+  var rc: int32 = meo_cat_index_check(db->cat, t, col, name, name_len);
+  if (rc != MEO_OK) { return rc; }
+  wrote[0] = true;
+  var root: uint32 = 0;
+  rc = tbl_index_build(db, t, col, unique, &root);
+  if (rc == -MEO_ERR_CONFLICT) {
+    // Nothing else changed: with the pages back the statement wrote nothing.
+    if (meo_cat_free_tree(db->pager, root) == MEO_OK) { wrote[0] = false; }
+    return rc;
+  }
+  if (rc != MEO_OK) { return rc; }
+  return meo_cat_create_index(db->cat, t, col, name, name_len, unique, root);
 }

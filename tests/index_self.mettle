@@ -1,0 +1,801 @@
+// index_self: CREATE INDEX / DROP INDEX on existing tables, driven through
+// the typed query API.
+//
+// A program, not @test functions: every case needs a real db file. Prints
+// "PASS <case>" per case and "FAIL <case>: <detail>" per failing check.
+//
+// t1(id INTEGER PRIMARY KEY, tag TEXT, tag2 TEXT, n INTEGER): tag2 is a copy
+// of tag that is never indexed, so every query on tag is checked against the
+// same query on tag2 (a full scan). Tags collide on prefixes ("a", "ab" twice,
+// "abc", "abd") and include NULLs.
+//
+//   c1_build      CREATE INDEX over existing rows: the index holds one entry
+//                 per non-NULL value, EQ and ranges take the index range path
+//                 and match the full scan, an INTEGER index, the x/y scan.
+//   c2_writes     INSERT / UPDATE / DELETE keep the non-unique index exact.
+//   c3_unique     CREATE UNIQUE INDEX over duplicates is CONFLICT and leaves
+//                 the catalog and the file as they were; over clean data it
+//                 becomes a constraint and a point path.
+//   c4_errors     taken names, IF NOT EXISTS, columns that already have an
+//                 index, the rowid alias, unknown names, two columns, drops.
+//   c5_drop       DROP INDEX clears the flag and the name; queries fall back
+//                 to a full scan; a dropped UNIQUE index stops constraining.
+//   c6_tx         CREATE / DROP INDEX rolled back in an explicit transaction;
+//                 a UNIQUE conflict there does not poison it.
+//   c7_reopen     indexes and names survive close and reopen.
+//   c8_old_row    a catalog row in the layout without index names loads, and
+//                 the next save writes the names.
+//   c9_drop_table DROP TABLE frees named index trees and their names.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meosql.mettle";
+import "tinytest.mettle";
+
+const IX_DB: string = "/dev/shm/meosql_index_self.dat";
+const IX_N: int32 = 200;
+
+// The values every query is run with: prefix collisions, a miss, the ends.
+const IX_NV: int32 = 9;
+
+fn ix_remove(db: string) {
+  meo_file_unlink(db);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+}
+
+fn vi(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn vt(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn vn() -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_null(&v);
+  return v;
+}
+
+fn ix_probe(i: int32) -> string {
+  if (i == 0) { return "a"; }
+  if (i == 1) { return "ab"; }
+  if (i == 2) { return "abc"; }
+  if (i == 3) { return "abd"; }
+  if (i == 4) { return "abcd"; }
+  if (i == 5) { return "k07"; }
+  if (i == 6) { return "k1"; }
+  if (i == 7) { return ""; }
+  return "zz";
+}
+
+// Row id's tag: the colliding six first, then "k" + two digits of id % 20,
+// NULL when id % 13 == 0.
+fn ix_tag(id: int32) -> string {
+  if (id == 1) { return "ab"; }
+  if (id == 2) { return "abc"; }
+  if (id == 3) { return "ab"; }
+  if (id == 5) { return "abd"; }
+  if (id == 6) { return "a"; }
+  var k: int32 = id % 20;
+  return "k{k / 10}{k % 10}";
+}
+
+fn ix_tag_null(id: int32) -> bool {
+  return id == 4 || id % 13 == 0;
+}
+
+fn ix_run(q: MeoQuery*) -> int32 {
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+fn ix_create(db: MeoDb*, tbl: string, name: string, col: string, unique: bool,
+    ifx: bool) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create_index(db, tbl, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  if (col.length > 0) { meo_q_index_column(q, col); }
+  if (unique) { meo_q_unique(q); }
+  if (ifx) { meo_q_if_not_exists(q); }
+  return ix_run(q);
+}
+
+fn ix_drop(db: MeoDb*, tbl: string, name: string, ifx: bool) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_drop_index(db, tbl, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  if (ifx) { meo_q_if_not_exists(q); }
+  return ix_run(q);
+}
+
+// Rows matching `col op v` (and `col op2 v2` when op2 != 0); *access gets the
+// plan's access path. -1 on failure.
+fn ix_count2(db: MeoDb*, tbl: string, col: string, op: int32, v: MeoValue, op2: int32,
+    v2: MeoValue, access: int32*) -> int64 {
+  var q: MeoQuery* = 0;
+  if (meo_q_select(db, tbl, &q) != MEO_OK) { return -1; }
+  meo_q_pick(q, "id");
+  meo_q_where(q, col, op, &v);
+  if (op2 != 0) { meo_q_where(q, col, op2, &v2); }
+  var n: int64 = 0;
+  var rc: int32 = meo_q_step(q);
+  access[0] = q->plan.access;
+  while (rc == MEO_ROW) {
+    n += 1;
+    rc = meo_q_step(q);
+  }
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return -1; }
+  return n;
+}
+
+fn ix_count(db: MeoDb*, tbl: string, col: string, op: int32, v: MeoValue, access: int32*) -> int64 {
+  return ix_count2(db, tbl, col, op, v, 0, vn(), access);
+}
+
+fn ix_table(db: MeoDb*, name: string) -> MeoTable* {
+  return meo_cat_find(db->cat, name.chars, (int32)name.length);
+}
+
+fn ix_col(t: MeoTable*, name: string) -> int32 {
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    if (t->columns[i].name_len == (int32)name.length
+        && meo_bytes_equal(t->columns[i].name, name.chars, (int64)name.length)) {
+      return i;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// Walk the whole index of tbl.col: every entry's row exists and is not NULL
+// there, entries come in value order. The entry count, or -1.
+fn ix_entries(db: MeoDb*, tbl: string, col: string) -> int64 {
+  if (meo_db_enter(db) != MEO_OK) { return -1; }
+  var t: MeoTable* = ix_table(db, tbl);
+  var c: int32 = -1;
+  if (t != 0) { c = ix_col(t, col); }
+  var n: int64 = -1;
+  var sc: MeoTblIdxScan;
+  if (c >= 0 && meo_tbl_idx_scan_open(db, t, c, 0, 0, &sc) == MEO_OK) {
+    var buf: uint8* = malloc((int64)MEO_REC_MAX);
+    var prev: MeoValue = vn();
+    var pbuf: uint8* = malloc((int64)MEO_REC_MAX);
+    n = 0;
+    while (n >= 0) {
+      var id: int64 = 0;
+      var rc: int32 = meo_tbl_idx_scan_next(&sc, &id);
+      if (rc != 0) {
+        if (rc < 0) { n = -1; }
+        break;
+      }
+      var row: MeoTblRow;
+      var v: MeoValue;
+      rc = meo_tbl_lookup_rowid(db, t, id, buf, MEO_REC_MAX, &row);
+      if (rc == MEO_OK) { rc = meo_tbl_row_get(t, &row, c, &v); }
+      if (rc != MEO_OK || v.type == MEO_T_NULL) {
+        n = -1;
+      } else {
+        // Value order: TEXT bytewise, INTEGER numerically.
+        if (prev.type == MEO_T_INT && v.i < prev.i) { n = -1; }
+        if (prev.type == MEO_T_TEXT) {
+          var m: int32 = prev.n;
+          if (v.n < m) { m = v.n; }
+          var cmp: int32 = meo_bytes_compare(prev.p, v.p, (int64)m);
+          if (cmp > 0 || (cmp == 0 && prev.n > v.n)) { n = -1; }
+        }
+        prev = v;
+        if (v.type == MEO_T_TEXT) {
+          meo_bytes_copy(pbuf, v.p, (int64)v.n);
+          prev.p = pbuf;
+        }
+        if (n >= 0) { n += 1; }
+      }
+    }
+    meo_tbl_idx_scan_close(&sc);
+    free(buf);
+    free(pbuf);
+  }
+  meo_db_leave(db);
+  return n;
+}
+
+// Every probe value under every operator on tag gives what tag2 gives, and
+// EQ / ranges take the index range path. The index holds exactly the non-NULL
+// tags.
+fn ix_agree(db: MeoDb*, label: string) -> bool {
+  var a: int32 = 0;
+  var b: int32 = 0;
+  var i: int32 = 0;
+  while (i < IX_NV) {
+    var p: string = ix_probe(i);
+    var op: int32 = MEO_Q_EQ;
+    while (op <= MEO_Q_GE) {
+      if (op != MEO_Q_IN && op != MEO_Q_IS_NULL && op != MEO_Q_NOT_NULL) {
+        var x: int64 = ix_count(db, "t1", "tag", op, vt(p), &a);
+        var y: int64 = ix_count(db, "t1", "tag2", op, vt(p), &b);
+        if (!meo_t_check_i64(x, y, "{label} tag op {op} [{p}]")) { return false; }
+        if (op == MEO_Q_EQ || op >= MEO_Q_LT) {
+          if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "{label} access op {op} [{p}]")) {
+            return false;
+          }
+        }
+      }
+      op += 1;
+    }
+    var j: int32 = i;
+    while (j < IX_NV) {
+      var x2: int64 = ix_count2(db, "t1", "tag", MEO_Q_GE, vt(p), MEO_Q_LT, vt(ix_probe(j)), &a);
+      var y2: int64 = ix_count2(db, "t1", "tag2", MEO_Q_GE, vt(p), MEO_Q_LT, vt(ix_probe(j)), &b);
+      if (!meo_t_check_i64(x2, y2, "{label} [{p}, {ix_probe(j)})")) { return false; }
+      j += 1;
+    }
+    i += 1;
+  }
+  var nn: int64 = ix_count(db, "t1", "tag2", MEO_Q_GE, vt(""), &b);
+  return meo_t_check_i64(ix_entries(db, "t1", "tag"), nn, "{label} entries");
+}
+
+fn ix_insert(db: MeoDb*, id: MeoValue, tag: MeoValue, n: MeoValue) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, "t1", &q);
+  meo_q_value(q, &id);
+  meo_q_value(q, &tag);
+  meo_q_value(q, &tag);
+  meo_q_value(q, &n);
+  return ix_run(q);
+}
+
+fn ix_open(db: MeoDb**) -> bool {
+  var rc: int32 = meo_db_open(IX_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, db);
+  return meo_t_check_i64(rc, MEO_OK, "open");
+}
+
+fn ix_setup(db: MeoDb*) -> bool {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "t1", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "tag", MEO_T_TEXT, 0);
+  meo_q_column_def(q, "tag2", MEO_T_TEXT, 0);
+  meo_q_column_def(q, "n", MEO_T_INT, 0);
+  if (!meo_t_check_i64(ix_run(q), MEO_DONE, "create t1")) { return false; }
+  var id: int32 = 1;
+  while (id <= IX_N) {
+    var tag: MeoValue = vn();
+    var s: string = "";
+    if (!ix_tag_null(id)) {
+      s = ix_tag(id);
+      tag = vt(s);
+    }
+    var n: MeoValue = vi(id % 7);
+    if (id % 11 == 0) { n = vn(); }
+    if (!meo_t_check_i64(ix_insert(db, vi(id), tag, n), MEO_DONE, "insert {id}")) { return false; }
+    id += 1;
+  }
+  return true;
+}
+
+// Rows with lo <= id % 7 <= hi and id % 11 != 0.
+fn ix_n_expect(lo: int32, hi: int32) -> int64 {
+  var c: int64 = 0;
+  var id: int32 = 1;
+  while (id <= IX_N) {
+    if (id % 11 != 0 && id % 7 >= lo && id % 7 <= hi) { c += 1; }
+    id += 1;
+  }
+  return c;
+}
+
+fn ix_xy_cb(ctx: rawptr, x: float64, y: float64) -> int32 {
+  var st: float64* = (float64*)ctx;
+  if (x < st[1]) { st[2] = 1.0; }
+  st[1] = x;
+  st[0] = st[0] + 1.0;
+  return 0;
+}
+
+// --- c1 ----------------------------------------------------------------------
+
+fn c1_build(db: MeoDb*) -> int32 {
+  if (!meo_t_check_i64(ix_create(db, "t1", "t1_tag", "tag", false, false), MEO_DONE, "c1 create")) {
+    return 1;
+  }
+  var t: MeoTable* = ix_table(db, "t1");
+  var c: MeoColumn* = &t->columns[1];
+  if (!meo_t_check_i64(c->cflags, MEO_COL_INDEXED, "c1 cflags")) { return 1; }
+  if (!meo_t_check(c->index_root != 0, "c1 root")) { return 1; }
+  if (!meo_t_check(c->idx_name_len == 6 && meo_bytes_equal(c->idx_name, "t1_tag".chars, 6),
+      "c1 name")) { return 1; }
+  var a: int32 = 0;
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("ab"), &a), 2, "c1 ab")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c1 ab access")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("abc"), &a), 1, "c1 abc")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("a"), &a), 1, "c1 a")) { return 1; }
+  if (!meo_t_check_i64(ix_count2(db, "t1", "tag", MEO_Q_GE, vt("ab"), MEO_Q_LT, vt("abd"), &a), 3,
+      "c1 [ab, abd)")) { return 1; }
+  // A value of another type matches nothing, by a full scan.
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vi(3), &a), 0, "c1 int probe")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_FULL_SCAN, "c1 int probe access")) { return 1; }
+  if (!ix_agree(db, "c1")) { return 1; }
+
+  if (!meo_t_check_i64(ix_create(db, "t1", "t1_n", "n", false, false), MEO_DONE, "c1 create n")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(ix_count(db, "t1", "n", MEO_Q_EQ, vi(3), &a), ix_n_expect(3, 3), "c1 n = 3")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c1 n access")) { return 1; }
+  if (!meo_t_check_i64(ix_count2(db, "t1", "n", MEO_Q_GT, vi(1), MEO_Q_LE, vi(4), &a),
+      ix_n_expect(2, 4), "c1 n in (1, 4]")) { return 1; }
+  if (!meo_t_check_i64(ix_entries(db, "t1", "n"), ix_n_expect(0, 6), "c1 n entries")) { return 1; }
+  // The x/y scan walks the non-unique index in x order.
+  var st: float64[3];
+  st[0] = 0.0;
+  st[1] = -1.0;
+  st[2] = 0.0;
+  var rc: int32 = meo_q_scan_xy(db, "t1", "n", "id", 2.0, 5.0, ix_xy_cb, (rawptr)&st[0]);
+  if (!meo_t_check_i64(rc, MEO_OK, "c1 scan_xy")) { return 1; }
+  if (!meo_t_check_i64((int64)st[0], ix_n_expect(2, 5), "c1 scan_xy rows")) { return 1; }
+  if (!meo_t_check(st[2] == 0.0, "c1 scan_xy order")) { return 1; }
+  println("PASS c1_build");
+  return 0;
+}
+
+// --- c2 ----------------------------------------------------------------------
+
+fn ix_set_tag(db: MeoDb*, id: int64, tag: MeoValue) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "t1", &q);
+  meo_q_assign(q, "tag", &tag);
+  meo_q_assign(q, "tag2", &tag);
+  var k: MeoValue = vi(id);
+  meo_q_where(q, "id", MEO_Q_EQ, &k);
+  return ix_run(q);
+}
+
+fn c2_writes(db: MeoDb*) -> int32 {
+  if (!meo_t_check_i64(ix_insert(db, vn(), vt("ab"), vi(3)), MEO_DONE, "c2 insert ab")) { return 1; }
+  if (!meo_t_check_i64(ix_insert(db, vn(), vn(), vi(3)), MEO_DONE, "c2 insert null")) { return 1; }
+  if (!meo_t_check_i64(ix_insert(db, vn(), vt("abcd"), vn()), MEO_DONE, "c2 insert abcd")) {
+    return 1;
+  }
+  if (!ix_agree(db, "c2 inserts")) { return 1; }
+  var a: int32 = 0;
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("ab"), &a), 3, "c2 ab")) { return 1; }
+  if (!meo_t_check_i64(ix_set_tag(db, 2, vt("ab")), MEO_DONE, "c2 abc -> ab")) { return 1; }
+  if (!meo_t_check_i64(ix_set_tag(db, 4, vt("abc")), MEO_DONE, "c2 NULL -> abc")) { return 1; }
+  if (!meo_t_check_i64(ix_set_tag(db, 6, vn()), MEO_DONE, "c2 a -> NULL")) { return 1; }
+  if (!meo_t_check_i64(ix_set_tag(db, 1, vt("ab")), MEO_DONE, "c2 ab -> ab")) { return 1; }
+  if (!ix_agree(db, "c2 updates")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("ab"), &a), 4, "c2 ab after")) { return 1; }
+  // An update through the index path itself, every "k07" row to "k08".
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "t1", &q);
+  var k8: MeoValue = vt("k08");
+  var k7: MeoValue = vt("k07");
+  meo_q_assign(q, "tag", &k8);
+  meo_q_assign(q, "tag2", &k8);
+  meo_q_where(q, "tag", MEO_Q_EQ, &k7);
+  if (!meo_t_check_i64(ix_run(q), MEO_DONE, "c2 k07 -> k08")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("k07"), &a), 0, "c2 k07 gone")) {
+    return 1;
+  }
+  // Deletes through the index path and by rowid.
+  var d: MeoQuery* = 0;
+  meo_q_delete(db, "t1", &d);
+  var ab: MeoValue = vt("ab");
+  meo_q_where(d, "tag", MEO_Q_EQ, &ab);
+  var rc: int32 = meo_q_step(d);
+  var ch: int32 = meo_q_changes(d);
+  meo_q_free(d);
+  if (!meo_t_check_i64(rc, MEO_DONE, "c2 delete ab") || !meo_t_check_i64(ch, 4, "c2 delete ab changes")) {
+    return 1;
+  }
+  var d2: MeoQuery* = 0;
+  meo_q_delete(db, "t1", &d2);
+  var lim: MeoValue = vi(30);
+  meo_q_where(d2, "id", MEO_Q_LE, &lim);
+  if (!meo_t_check_i64(ix_run(d2), MEO_DONE, "c2 delete id <= 30")) { return 1; }
+  if (!ix_agree(db, "c2 deletes")) { return 1; }
+  println("PASS c2_writes");
+  return 0;
+}
+
+// --- c3 ----------------------------------------------------------------------
+
+fn c3_unique(db: MeoDb*) -> int32 {
+  var t: MeoTable* = ix_table(db, "t1");
+  var pages: uint32 = meo_pager_page_count(db->pager);
+  var free0: int64 = meo_free_count(db->pager);
+  var rc: int32 = ix_create(db, "t1", "t1_tag2_u", "tag2", true, false);
+  if (!meo_t_check_i64(rc, -MEO_ERR_CONFLICT, "c3 unique over duplicates")) { return 1; }
+  var c: MeoColumn* = &t->columns[2];
+  if (!meo_t_check(c->cflags == 0 && c->index_root == 0 && c->idx_name == 0, "c3 catalog unchanged")) {
+    return 1;
+  }
+  var col: int32 = 0;
+  if (!meo_t_check(meo_cat_find_index(db->cat, "t1_tag2_u".chars, 9, &col) == 0, "c3 no name")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_page_count(db->pager), pages, "c3 pages")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(db->pager), free0, "c3 free pages")) { return 1; }
+
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "u1", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "code", MEO_T_TEXT, 0);
+  if (!meo_t_check_i64(ix_run(q), MEO_DONE, "c3 create u1")) { return 1; }
+  var i: int32 = 0;
+  while (i < 50) {
+    var ins: MeoQuery* = 0;
+    meo_q_insert(db, "u1", &ins);
+    meo_q_into(ins, "code");
+    var s: string = "c{i}";
+    var v: MeoValue = vt(s);
+    if (i % 10 == 0) { v = vn(); }
+    meo_q_value(ins, &v);
+    if (!meo_t_check_i64(ix_run(ins), MEO_DONE, "c3 insert u1 {i}")) { return 1; }
+    i += 1;
+  }
+  if (!meo_t_check_i64(ix_create(db, "u1", "u1_code", "code", true, false), MEO_DONE, "c3 unique")) {
+    return 1;
+  }
+  var u: MeoTable* = ix_table(db, "u1");
+  if (!meo_t_check_i64(u->columns[1].cflags, MEO_COL_UNIQUE, "c3 unique flag")) { return 1; }
+  var a: int32 = 0;
+  if (!meo_t_check_i64(ix_count(db, "u1", "code", MEO_Q_EQ, vt("c7"), &a), 1, "c3 c7")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_UNIQUE_EQ, "c3 c7 access")) { return 1; }
+  if (!meo_t_check_i64(ix_entries(db, "u1", "code"), 45, "c3 entries")) { return 1; }
+  var dup: MeoQuery* = 0;
+  meo_q_insert(db, "u1", &dup);
+  meo_q_into(dup, "code");
+  var c7: MeoValue = vt("c7");
+  meo_q_value(dup, &c7);
+  if (!meo_t_check_i64(ix_run(dup), -MEO_ERR_CONFLICT, "c3 duplicate insert")) { return 1; }
+  var nul: MeoQuery* = 0;
+  meo_q_insert(db, "u1", &nul);
+  meo_q_into(nul, "code");
+  var n0: MeoValue = vn();
+  meo_q_value(nul, &n0);
+  meo_q_value(nul, &n0);
+  if (!meo_t_check_i64(ix_run(nul), MEO_DONE, "c3 NULLs stay allowed")) { return 1; }
+  println("PASS c3_unique");
+  return 0;
+}
+
+// --- c4 ----------------------------------------------------------------------
+
+fn c4_errors(db: MeoDb*) -> int32 {
+  var t: MeoTable* = ix_table(db, "t1");
+  var r: int32 = ix_create(db, "t1", "t1_tag", "tag2", false, true);
+  if (!meo_t_check_i64(r, MEO_DONE, "c4 if not exists, other column")) { return 1; }
+  if (!meo_t_check(t->columns[2].cflags == 0 && t->columns[2].index_root == 0, "c4 no-op")) {
+    return 1;
+  }
+  r = ix_create(db, "t1", "t1_tag", "tag2", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 taken name")) { return 1; }
+  r = ix_create(db, "u1", "T1_TAG", "code", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 taken name, case")) { return 1; }
+  r = ix_create(db, "t1", "t1_tag_b", "tag", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 column already indexed")) { return 1; }
+  r = ix_create(db, "u1", "u1_code_b", "code", true, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 column already unique")) { return 1; }
+  r = ix_create(db, "t1", "t1_id", "id", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 rowid alias")) { return 1; }
+  r = ix_create(db, "nope", "nope_x", "x", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 unknown table")) { return 1; }
+  r = ix_create(db, "t1", "t1_x", "x", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_SCHEMA, "c4 unknown column")) { return 1; }
+  r = ix_create(db, "t1", "t1_none", "", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_USAGE, "c4 no column")) { return 1; }
+  r = ix_create(db, "t1", "", "tag2", false, false);
+  if (!meo_t_check_i64(r, -MEO_ERR_USAGE, "c4 empty name")) { return 1; }
+  var q: MeoQuery* = 0;
+  meo_q_create_index(db, "t1", "t1_two", &q);
+  meo_q_index_column(q, "tag2");
+  meo_q_index_column(q, "n");
+  if (!meo_t_check_i64(ix_run(q), -MEO_ERR_UNSUPPORTED, "c4 two columns")) { return 1; }
+  var s: MeoQuery* = 0;
+  meo_q_select(db, "t1", &s);
+  if (!meo_t_check_i64(meo_q_unique(s), -MEO_ERR_USAGE, "c4 unique on select")) { return 1; }
+  if (!meo_t_check_i64(meo_q_index_column(s, "tag"), -MEO_ERR_USAGE, "c4 column on select")) {
+    return 1;
+  }
+  meo_q_free(s);
+  if (!meo_t_check_i64(ix_drop(db, "t1", "t1_missing", false), -MEO_ERR_SCHEMA, "c4 drop missing")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(ix_drop(db, "t1", "t1_missing", true), MEO_DONE, "c4 drop if exists")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(ix_drop(db, "u1", "t1_tag", false), -MEO_ERR_SCHEMA, "c4 drop other table")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(ix_drop(db, "nope", "t1_tag", true), MEO_DONE, "c4 drop unknown table")) {
+    return 1;
+  }
+  if (!meo_t_check(t->columns[1].idx_name != 0, "c4 t1_tag kept")) { return 1; }
+  println("PASS c4_errors");
+  return 0;
+}
+
+// --- c5 ----------------------------------------------------------------------
+
+fn c5_drop(db: MeoDb*) -> int32 {
+  var free0: int64 = meo_free_count(db->pager);
+  if (!meo_t_check_i64(ix_drop(db, "t1", "T1_N", false), MEO_DONE, "c5 drop t1_n")) { return 1; }
+  var t: MeoTable* = ix_table(db, "t1");
+  var c: MeoColumn* = &t->columns[3];
+  if (!meo_t_check(c->cflags == 0 && c->index_root == 0 && c->idx_name == 0, "c5 cleared")) {
+    return 1;
+  }
+  if (!meo_t_check(meo_free_count(db->pager) > free0, "c5 pages freed")) { return 1; }
+  var a: int32 = 0;
+  var want: int64 = ix_n_expect(3, 3);
+  // Rows 1..30 are gone since c2; count the survivors with n = 3.
+  var id: int32 = 1;
+  while (id <= 30) {
+    if (id % 11 != 0 && id % 7 == 3) { want -= 1; }
+    id += 1;
+  }
+  want += 1;   // c2's ("ab", 3) row was deleted with the "ab" rows, the NULL one stays
+  if (!meo_t_check_i64(ix_count(db, "t1", "n", MEO_Q_EQ, vi(3), &a), want, "c5 n = 3")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_FULL_SCAN, "c5 full scan")) { return 1; }
+  if (!meo_t_check_i64(ix_drop(db, "u1", "u1_code", false), MEO_DONE, "c5 drop unique")) { return 1; }
+  var u: MeoTable* = ix_table(db, "u1");
+  if (!meo_t_check_i64(u->columns[1].cflags, 0, "c5 unique cleared")) { return 1; }
+  var dup: MeoQuery* = 0;
+  meo_q_insert(db, "u1", &dup);
+  meo_q_into(dup, "code");
+  var c7: MeoValue = vt("c7");
+  meo_q_value(dup, &c7);
+  if (!meo_t_check_i64(ix_run(dup), MEO_DONE, "c5 duplicate allowed")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "u1", "code", MEO_Q_EQ, vt("c7"), &a), 2, "c5 c7 twice")) {
+    return 1;
+  }
+  // The names are free again.
+  if (!meo_t_check_i64(ix_create(db, "u1", "t1_n", "code", false, false), MEO_DONE, "c5 reuse name")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(ix_count(db, "u1", "code", MEO_Q_EQ, vt("c7"), &a), 2, "c5 c7 by index")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c5 c7 access")) { return 1; }
+  println("PASS c5_drop");
+  return 0;
+}
+
+// --- c6 ----------------------------------------------------------------------
+
+fn c6_tx(db: MeoDb*) -> int32 {
+  var t: MeoTable* = ix_table(db, "t1");
+  var pages: uint32 = meo_pager_page_count(db->pager);
+  var free0: int64 = meo_free_count(db->pager);
+  if (!meo_t_check_i64(meo_db_begin(db, MEO_TX_DEFAULT), MEO_OK, "c6 begin")) { return 1; }
+  if (!meo_t_check_i64(ix_create(db, "t1", "t1_n2", "n", false, false), MEO_DONE, "c6 create")) {
+    return 1;
+  }
+  var a: int32 = 0;
+  var n3: int64 = ix_count(db, "t1", "n", MEO_Q_EQ, vi(3), &a);
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c6 index in tx")) { return 1; }
+  if (!meo_t_check_i64(ix_drop(db, "t1", "t1_tag", false), MEO_DONE, "c6 drop in tx")) { return 1; }
+  if (!meo_t_check_i64(meo_db_rollback(db), MEO_OK, "c6 rollback")) { return 1; }
+  if (!meo_t_check(ix_table(db, "t1") == t, "c6 same table object")) { return 1; }
+  var cn: MeoColumn* = &t->columns[3];
+  if (!meo_t_check(cn->cflags == 0 && cn->index_root == 0 && cn->idx_name == 0, "c6 n unindexed")) {
+    return 1;
+  }
+  var ct: MeoColumn* = &t->columns[1];
+  if (!meo_t_check(ct->cflags == MEO_COL_INDEXED && ct->index_root != 0 && ct->idx_name_len == 6
+      && meo_bytes_equal(ct->idx_name, "t1_tag".chars, 6), "c6 tag index back")) { return 1; }
+  if (!meo_t_check_i64(meo_pager_page_count(db->pager), pages, "c6 pages")) { return 1; }
+  if (!meo_t_check_i64(meo_free_count(db->pager), free0, "c6 free pages")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "n", MEO_Q_EQ, vi(3), &a), n3, "c6 n = 3")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_FULL_SCAN, "c6 n full scan")) { return 1; }
+  if (!ix_agree(db, "c6 after rollback")) { return 1; }
+  var col: int32 = 0;
+  if (!meo_t_check(meo_cat_find_index(db->cat, "t1_n2".chars, 5, &col) == 0, "c6 t1_n2 gone")) {
+    return 1;
+  }
+
+  // A UNIQUE conflict inside a transaction leaves it usable.
+  if (!meo_t_check_i64(meo_db_begin(db, MEO_TX_DEFAULT), MEO_OK, "c6 begin 2")) { return 1; }
+  var rc: int32 = ix_create(db, "t1", "t1_tag2_u", "tag2", true, false);
+  if (!meo_t_check_i64(rc, -MEO_ERR_CONFLICT, "c6 unique conflict in tx")) { return 1; }
+  if (!meo_t_check_i64(ix_insert(db, vn(), vt("tx"), vi(1)), MEO_DONE, "c6 insert after")) { return 1; }
+  if (!meo_t_check_i64(ix_create(db, "t1", "t1_n2", "n", false, false), MEO_DONE, "c6 create 2")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_db_commit(db), MEO_OK, "c6 commit")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "tag", MEO_Q_EQ, vt("tx"), &a), 1, "c6 tx row")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db, "t1", "n", MEO_Q_EQ, vi(3), &a), n3, "c6 n = 3 indexed")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c6 n index committed")) { return 1; }
+  println("PASS c6_tx");
+  return 0;
+}
+
+// --- c7 ----------------------------------------------------------------------
+
+fn c7_reopen(db: MeoDb**) -> int32 {
+  var a: int32 = 0;
+  var n3: int64 = ix_count(db[0], "t1", "n", MEO_Q_EQ, vi(3), &a);
+  if (!meo_t_check_i64(meo_db_close(db[0]), MEO_OK, "c7 close")) { return 1; }
+  db[0] = 0;
+  if (!ix_open(db)) { return 1; }
+  var t: MeoTable* = ix_table(db[0], "t1");
+  if (!meo_t_check(t != 0, "c7 t1")) { return 1; }
+  var col: int32 = 0;
+  if (!meo_t_check(meo_cat_find_index(db[0]->cat, "t1_tag".chars, 6, &col) == t && col == 1,
+      "c7 t1_tag")) { return 1; }
+  if (!meo_t_check(meo_cat_find_index(db[0]->cat, "T1_N2".chars, 5, &col) == t && col == 3,
+      "c7 t1_n2")) { return 1; }
+  if (!meo_t_check(meo_cat_find_index(db[0]->cat, "t1_n".chars, 4, &col) == ix_table(db[0], "u1"),
+      "c7 t1_n on u1")) { return 1; }
+  if (!meo_t_check_i64(t->columns[1].cflags, MEO_COL_INDEXED, "c7 tag flag")) { return 1; }
+  if (!ix_agree(db[0], "c7")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db[0], "t1", "n", MEO_Q_EQ, vi(3), &a), n3, "c7 n = 3")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c7 n access")) { return 1; }
+  println("PASS c7_reopen");
+  return 0;
+}
+
+// --- c8 ----------------------------------------------------------------------
+
+// Rewrite table `name`'s catalog row in the layout written before index names
+// existed: 4 + 4 * n_cols fields.
+fn ix_write_old_row(db: MeoDb*, name: string) -> int32 {
+  var rc: int32 = meo_db_enter(db);
+  if (rc != MEO_OK) { return rc; }
+  var t: MeoTable* = ix_table(db, name);
+  var started: bool = false;
+  rc = meo_db_stmt_begin(db, &started);
+  if (rc == MEO_OK) {
+    var p: MeoPager* = db->pager;
+    var n: int32 = 4 + 4 * t->n_cols;
+    var vals: MeoValue* = (MeoValue*)malloc((int64)n * (int64)sizeof(MeoValue));
+    meo_value_set_text(&vals[0], t->name, t->name_len);
+    meo_value_set_int(&vals[1], (int64)t->root);
+    meo_value_set_int(&vals[2], (int64)t->n_cols);
+    meo_value_set_int(&vals[3], (int64)t->tflags);
+    var i: int32 = 0;
+    while (i < t->n_cols) {
+      meo_value_set_text(&vals[4 + i * 4], t->columns[i].name, t->columns[i].name_len);
+      meo_value_set_int(&vals[5 + i * 4], (int64)t->columns[i].affinity);
+      meo_value_set_int(&vals[6 + i * 4], (int64)t->columns[i].cflags);
+      meo_value_set_int(&vals[7 + i * 4], (int64)t->columns[i].index_root);
+      i += 1;
+    }
+    var sz: int32 = meo_rec_size(vals, n);
+    var buf: uint8* = malloc((int64)sz + 8);
+    meo_key_rowid(buf, 8, t->id);
+    meo_rec_encode(buf + 8, sz, vals, n);
+    var root: uint32 = meo_pager_root(p, MEO_ROOT_CATALOG);
+    var start: uint32 = root;
+    var key: MeoBtKey = { data: buf, len: 8 };
+    rc = meo_bt_delete(p, &root, meo_cat_cmp, key);
+    if (rc == MEO_OK) {
+      var full: MeoBtKey = { data: buf, len: sz + 8 };
+      rc = meo_bt_insert_sep(p, &root, meo_cat_cmp, full, (uint64)t->id, 8);
+    }
+    if (rc == MEO_OK && root != start) { rc = meo_pager_set_root(p, MEO_ROOT_CATALOG, root); }
+    free(buf);
+    free(vals);
+    rc = meo_db_stmt_end(db, started, true, rc);
+  }
+  meo_db_leave(db);
+  return rc;
+}
+
+fn c8_old_row(db: MeoDb**) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db[0], "old", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "k", MEO_T_TEXT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "v", MEO_T_INT, 0);
+  if (!meo_t_check_i64(ix_run(q), MEO_DONE, "c8 create")) { return 1; }
+  var ins: MeoQuery* = 0;
+  meo_q_insert(db[0], "old", &ins);
+  var r: MeoValue[6];
+  r[0] = vi(1);
+  r[1] = vt("x");
+  r[2] = vi(5);
+  r[3] = vi(2);
+  r[4] = vt("y");
+  r[5] = vi(5);
+  var i: int32 = 0;
+  while (i < 6) {
+    meo_q_value(ins, &r[i]);
+    i += 1;
+  }
+  if (!meo_t_check_i64(ix_run(ins), MEO_DONE, "c8 insert")) { return 1; }
+  if (!meo_t_check_i64(ix_write_old_row(db[0], "old"), MEO_OK, "c8 old row")) { return 1; }
+  meo_db_close(db[0]);
+  db[0] = 0;
+  if (!ix_open(db)) { return 1; }
+  var t: MeoTable* = ix_table(db[0], "old");
+  if (!meo_t_check(t != 0 && t->n_cols == 3, "c8 loads")) { return 1; }
+  if (!meo_t_check(t->columns[0].idx_name == 0 && t->columns[1].idx_name == 0
+      && t->columns[2].idx_name == 0, "c8 no names")) { return 1; }
+  if (!meo_t_check_i64(t->columns[1].cflags, MEO_COL_UNIQUE, "c8 unique kept")) { return 1; }
+  var a: int32 = 0;
+  if (!meo_t_check_i64(ix_count(db[0], "old", "k", MEO_Q_EQ, vt("y"), &a), 1, "c8 k = y")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(a, MEO_PATH_UNIQUE_EQ, "c8 k access")) { return 1; }
+  // The next save writes the names.
+  if (!meo_t_check_i64(ix_create(db[0], "old", "old_v", "v", false, false), MEO_DONE, "c8 index")) {
+    return 1;
+  }
+  meo_db_close(db[0]);
+  db[0] = 0;
+  if (!ix_open(db)) { return 1; }
+  var col: int32 = 0;
+  t = ix_table(db[0], "old");
+  if (!meo_t_check(meo_cat_find_index(db[0]->cat, "old_v".chars, 5, &col) == t && col == 2,
+      "c8 name saved")) { return 1; }
+  if (!meo_t_check_i64(ix_count(db[0], "old", "v", MEO_Q_EQ, vi(5), &a), 2, "c8 v = 5")) { return 1; }
+  if (!meo_t_check_i64(a, MEO_PATH_INDEX_RANGE, "c8 v access")) { return 1; }
+  println("PASS c8_old_row");
+  return 0;
+}
+
+// --- c9 ----------------------------------------------------------------------
+
+fn c9_drop_table(db: MeoDb*) -> int32 {
+  var free0: int64 = meo_free_count(db->pager);
+  var q: MeoQuery* = 0;
+  meo_q_drop(db, "t1", &q);
+  if (!meo_t_check_i64(ix_run(q), MEO_DONE, "c9 drop t1")) { return 1; }
+  var col: int32 = 0;
+  if (!meo_t_check(meo_cat_find_index(db->cat, "t1_tag".chars, 6, &col) == 0, "c9 t1_tag gone")) {
+    return 1;
+  }
+  if (!meo_t_check(meo_cat_find_index(db->cat, "t1_n2".chars, 5, &col) == 0, "c9 t1_n2 gone")) {
+    return 1;
+  }
+  // The table tree and both index trees: several pages each.
+  if (!meo_t_check(meo_free_count(db->pager) >= free0 + 3, "c9 pages freed")) { return 1; }
+  if (!meo_t_check_i64(ix_create(db, "u1", "t1_tag", "id", false, false), -MEO_ERR_SCHEMA,
+      "c9 still no alias index")) { return 1; }
+  if (!meo_t_check_i64(ix_drop(db, "u1", "t1_n", false), MEO_DONE, "c9 drop t1_n")) { return 1; }
+  if (!meo_t_check_i64(ix_create(db, "u1", "t1_tag", "code", false, false), MEO_DONE,
+      "c9 name reused")) { return 1; }
+  println("PASS c9_drop_table");
+  return 0;
+}
+
+fn main() -> int32 {
+  ix_remove(IX_DB);
+  var db: MeoDb* = 0;
+  var rc: int32 = 1;
+  if (ix_open(&db) && ix_setup(db)) {
+    rc = c1_build(db);
+    if (rc == 0) { rc = c2_writes(db); }
+    if (rc == 0) { rc = c3_unique(db); }
+    if (rc == 0) { rc = c4_errors(db); }
+    if (rc == 0) { rc = c5_drop(db); }
+    if (rc == 0) { rc = c6_tx(db); }
+    if (rc == 0) { rc = c7_reopen(&db); }
+    if (rc == 0) { rc = c8_old_row(&db); }
+    if (rc == 0) { rc = c9_drop_table(db); }
+  }
+  if (db != 0) { meo_db_close(db); }
+  ix_remove(IX_DB);
+  if (rc == 0) { println("PASS index_self"); }
+  return meo_t_report();
+}

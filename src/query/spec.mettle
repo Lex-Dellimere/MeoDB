@@ -20,6 +20,8 @@ export const MEO_Q_K_DELETE: int32 = 5;
 export const MEO_Q_K_COUNT: int32 = 6;
 export const MEO_Q_K_DROP: int32 = 7;
 export const MEO_Q_K_ADD_COLUMN: int32 = 8;
+export const MEO_Q_K_CREATE_INDEX: int32 = 9;
+export const MEO_Q_K_DROP_INDEX: int32 = 10;
 
 // Filter kinds (MeoQTerm.kind).
 export const MEO_Q_EQ: int32 = 1;
@@ -65,12 +67,14 @@ export struct MeoQAssign {
 export struct MeoQSpec {
   kind: int32;           // MEO_Q_K_*
   table: MeoQName;
-  if_not_exists: bool;   // DROP: if exists
+  if_not_exists: bool;   // DROP, DROP INDEX: if exists
+  index: MeoQName;       // CREATE INDEX, DROP INDEX: the index name
+  unique: bool;          // CREATE INDEX: UNIQUE
   cols: MeoQColDef*;     // CREATE, ADD COLUMN
   n_cols: int32;
   cap_cols: int32;
-  names: MeoQName*;      // INSERT column list / SELECT pick; 0 = every column
-  n_names: int32;
+  names: MeoQName*;      // INSERT column list / SELECT pick, 0 = every column;
+  n_names: int32;        // CREATE INDEX: the indexed column
   cap_names: int32;
   cells_v0: int32;       // INSERT cells are slots [cells_v0, cells_v0 + n_cells)
   n_cells: int32;
@@ -92,6 +96,9 @@ export fn meo_qspec_init(s: MeoQSpec*, kind: int32) {
   s->table.p = 0;
   s->table.n = 0;
   s->if_not_exists = false;
+  s->index.p = 0;
+  s->index.n = 0;
+  s->unique = false;
   s->cols = 0;
   s->n_cols = 0;
   s->cap_cols = 0;
@@ -121,6 +128,7 @@ fn qspec_name_free(nm: MeoQName*) {
 
 export fn meo_qspec_free(s: MeoQSpec*) {
   qspec_name_free(&s->table);
+  qspec_name_free(&s->index);
   var i: int32 = 0;
   while (i < s->n_cols) {
     qspec_name_free(&s->cols[i].name);

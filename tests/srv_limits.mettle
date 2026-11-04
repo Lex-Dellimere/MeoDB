@@ -415,15 +415,21 @@ fn lim_big_result() -> int32 {
   return 0;
 }
 
-// Index ops: UNSUPPORTED, non-fatal, the transaction untouched. Term op 9: USAGE.
+// A composite index: UNSUPPORTED, non-fatal, the transaction untouched; a
+// missing index: SCHEMA, the same. Term op 9: USAGE.
 fn lim_refused_ops() -> int32 {
   var fd: int64 = lim_open(LIM_TOKEN);
   if (fd < 0) { return lim_fail("open for refused ops"); }
+  var cols: MeoWCol[2];
+  lim_col(&cols[0], "id", 0, 0);
+  lim_col(&cols[1], "name", 0, 0);
   var st: MeoWStmt;
   meo_wire_stmt_init(&st);
   st.op = MEO_WIRE_OP_CREATE_INDEX;
   st.table = "t";
   st.name = "ix";
+  st.cols = &cols[0];
+  st.n_cols = 2;
   if (lim_expect_error(lim_query(fd, &st), MEO_ERR_UNSUPPORTED, false, "create index") != 0) { return 1; }
   if (g_err.tx != MEO_WIRE_TX_NONE) { return lim_fail("create index outside tx: tx {g_err.tx}"); }
 
@@ -433,8 +439,11 @@ fn lim_refused_ops() -> int32 {
     return 1;
   }
   if (g_err.tx != MEO_WIRE_TX_OPEN) { return lim_fail("create index in tx: tx {g_err.tx}"); }
+  meo_wire_stmt_init(&st);
   st.op = MEO_WIRE_OP_DROP_INDEX;
-  if (lim_expect_error(lim_query(fd, &st), MEO_ERR_UNSUPPORTED, false, "drop index in tx") != 0) {
+  st.table = "t";
+  st.name = "ix";
+  if (lim_expect_error(lim_query(fd, &st), MEO_ERR_SCHEMA, false, "drop index in tx") != 0) {
     return 1;
   }
   if (g_err.tx != MEO_WIRE_TX_OPEN) { return lim_fail("drop index in tx: tx {g_err.tx}"); }

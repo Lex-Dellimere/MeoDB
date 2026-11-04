@@ -5,7 +5,11 @@
 // saves them. The fields mirror the catalog row one to one:
 //
 //   [name TEXT, root INT, n_cols INT, tflags INT,
-//    then per column: name TEXT, affinity INT, cflags INT, index_root INT]
+//    then per column: name TEXT, affinity INT, cflags INT, index_root INT,
+//    then per column: index name TEXT or NULL]
+//
+// Rows written before index names existed end after the index roots; the
+// missing names read as NULL.
 //
 // Names are (pointer, byte length), stored as written and compared ASCII
 // case-insensitively. The catalog owns every name buffer and the columns
@@ -21,6 +25,7 @@ export const MEO_COL_PK: int32 = 1;
 export const MEO_COL_NOT_NULL: int32 = 2;
 export const MEO_COL_UNIQUE: int32 = 4;
 export const MEO_COL_ROWID_ALIAS: int32 = 8;   // INTEGER PRIMARY KEY: value is the rowid
+export const MEO_COL_INDEXED: int32 = 16;      // a non-unique index (CREATE INDEX)
 
 // Limits: columns per table, and encoded record / index key bytes.
 export const MEO_MAX_COLS: int32 = 64;
@@ -32,6 +37,8 @@ export struct MeoColumn {
   affinity: int32;       // MEO_T_INT | MEO_T_REAL | MEO_T_TEXT | MEO_T_BLOB
   cflags: int32;         // MEO_COL_* bits
   index_root: uint32;    // root page of the secondary index, 0 = none
+  idx_name: uint8*;      // CREATE INDEX name, owned like name; 0 for none
+  idx_name_len: int32;
 }
 
 export struct MeoTable {
