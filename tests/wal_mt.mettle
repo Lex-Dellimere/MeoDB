@@ -1,6 +1,464 @@
+// wal_mt: 63 reader threads and one writer share a WAL-mode MeoDb. The writer
+// moves money between random accounts in explicit transactions; every reader
+// sums all 2,000 balances in one statement and must always see 2,000,000, and
+// must see the version counter never go backwards. Half way through, the
+// writer opens a transaction that adds 1,000,000 to one account and holds it
+// open for 300 ms before rolling it back: readers must keep reading, must not
+// see the uncommitted money, and must not wait for the writer. No op may fail,
+// BUSY included. The run ends inside a deadline (no deadlock).
+
 import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/platform/futex_linux.mettle";
+import "../src/meodb.mettle";
+
+const MT_DB: string = "/dev/shm/meodb_wal_mt.db";
+const MT_READERS: int32 = 63;
+const MT_ROWS: int32 = 2000;
+const MT_BAL: int64 = 1000;
+const MT_TOTAL: int64 = 2000000;
+const MT_RUN_MS: int64 = 3000;
+const MT_HOLD_AT_MS: int64 = 1500;
+const MT_HOLD_MS: int64 = 300;
+const MT_MIN_TXNS: int32 = 50;
+const MT_MIN_READS: int32 = 20;
+const MT_HOLD_LAT_US: int64 = 150000;
+const MT_DEADLINE_MS: int64 = 120000;
+
+struct MtReader {
+  tid: int32;
+  err: int32;         // first failing code, 0 = none
+  what: int32;        // what failed: 1 select, 2 count, 3 sum, 4 version, 5 version row
+  reads: int32;
+  hold_reads: int32;  // reads that started and ended inside the hold window
+  max_us: int64;
+  max_hold_us: int64;
+  last_v: int64;
+}
+
+var g_db: MeoDb* = 0;
+var g_go: int32 = 0;
+var g_stop: int32 = 0;
+var g_hold: int32 = 0;
+var g_w_err: int32 = 0;
+var g_w_what: int32 = 0;
+var g_w_txns: int32 = 0;
+
+fn mt_fail(msg: string) -> int32 {
+  println("FAIL wal_mt: {msg}");
+  return 1;
+}
+
+fn mt_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  var wpath: string = db + "-wal";
+  meo_file_unlink(jpath);
+  meo_file_unlink(wpath);
+  free(jpath.chars);
+  free(wpath.chars);
+  return rc;
+}
+
+// --- setup ------------------------------------------------------------------
+
+fn mt_create(name: string, with_pad: bool) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(g_db, name, &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  if (with_pad) {
+    meo_q_column_def(q, "bal", MEO_T_INT, MEO_COL_NOT_NULL);
+    meo_q_column_def(q, "pad", MEO_T_TEXT, 0);
+  } else {
+    meo_q_column_def(q, "v", MEO_T_INT, 0);
+  }
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn mt_fill() -> int32 {
+  var pad: uint8[] = new uint8[200];
+  defer free(pad.data);
+  var i: int32 = 0;
+  while (i < 200) {
+    pad[i] = (uint8)(97 + i % 26);
+    i += 1;
+  }
+  var rc: int32 = meo_db_begin(g_db, MEO_TX_DEFAULT);
+  var k: int32 = 1;
+  var v: MeoValue;
+  while (rc == MEO_OK && k <= MT_ROWS) {
+    var q: MeoQuery* = 0;
+    rc = meo_q_insert(g_db, "acct", &q);
+    if (rc != MEO_OK) { break; }
+    meo_q_into(q, "id");
+    meo_q_into(q, "bal");
+    meo_q_into(q, "pad");
+    meo_value_set_int(&v, (int64)k);
+    meo_q_value(q, &v);
+    meo_value_set_int(&v, MT_BAL);
+    meo_q_value(q, &v);
+    meo_value_set_text(&v, pad.data, 200);
+    meo_q_value(q, &v);
+    rc = meo_q_step(q);
+    meo_q_free(q);
+    if (rc == MEO_DONE) { rc = MEO_OK; }
+    k += 1;
+  }
+  if (rc == MEO_OK) {
+    var q2: MeoQuery* = 0;
+    rc = meo_q_insert(g_db, "ver", &q2);
+    if (rc == MEO_OK) {
+      meo_q_into(q2, "id");
+      meo_q_into(q2, "v");
+      meo_value_set_int(&v, 1);
+      meo_q_value(q2, &v);
+      meo_value_set_int(&v, 0);
+      meo_q_value(q2, &v);
+      rc = meo_q_step(q2);
+      meo_q_free(q2);
+      if (rc == MEO_DONE) { rc = MEO_OK; }
+    }
+  }
+  if (rc != MEO_OK) {
+    meo_db_rollback(g_db);
+    return rc;
+  }
+  return meo_db_commit(g_db);
+}
+
+// --- writer -----------------------------------------------------------------
+
+// UPDATE <table> SET <col> = <col> + delta WHERE id = id.
+fn mt_add(table: string, col: string, id: int64, delta: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_update(g_db, table, &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_assign_add(q, col, delta);
+  var v: MeoValue;
+  meo_value_set_int(&v, id);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var ch: int32 = meo_q_changes(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return rc; }
+  if (ch != 1) { return -9001; }
+  return MEO_OK;
+}
+
+fn mt_w_err(rc: int32, what: int32) {
+  if (g_w_err == 0) {
+    g_w_err = rc;
+    g_w_what = what;
+  }
+}
+
+// begin; a -= x; b += x; ver += 1; commit.
+fn mt_transfer(seed: int64) -> int32 {
+  var a: int64 = seed % (int64)MT_ROWS + 1;
+  var b: int64 = (seed / 7 + 1 + a) % (int64)MT_ROWS + 1;
+  if (b == a) { b = a % (int64)MT_ROWS + 1; }
+  var x: int64 = seed % 97 + 1;
+  var rc: int32 = meo_db_begin(g_db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) {
+    mt_w_err(rc, 1);
+    return rc;
+  }
+  rc = mt_add("acct", "bal", a, 0 - x);
+  if (rc == MEO_OK) { rc = mt_add("acct", "bal", b, x); }
+  if (rc == MEO_OK) { rc = mt_add("ver", "v", 1, 1); }
+  if (rc != MEO_OK) {
+    mt_w_err(rc, 2);
+    meo_db_rollback(g_db);
+    return rc;
+  }
+  rc = meo_db_commit(g_db);
+  if (rc != MEO_OK) {
+    mt_w_err(rc, 3);
+    return rc;
+  }
+  g_w_txns += 1;
+  return MEO_OK;
+}
+
+// An open transaction holding 1,000,000 of money nobody may see.
+fn mt_hold() -> int32 {
+  var rc: int32 = meo_db_begin(g_db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) {
+    mt_w_err(rc, 4);
+    return rc;
+  }
+  rc = mt_add("acct", "bal", 1, 1000000);
+  if (rc != MEO_OK) {
+    mt_w_err(rc, 5);
+    meo_db_rollback(g_db);
+    return rc;
+  }
+  meo_atomic_store_i32(&g_hold, 1);
+  meo_sleep_us(MT_HOLD_MS * 1000);
+  meo_atomic_store_i32(&g_hold, 0);
+  rc = meo_db_rollback(g_db);
+  if (rc != MEO_OK) {
+    mt_w_err(rc, 6);
+    return rc;
+  }
+  return MEO_OK;
+}
+
+fn mt_writer(arg: cstring) -> uint32 {
+  while (meo_atomic_load_i32(&g_go) == 0) { meo_sleep_us(200); }
+  var t0: int64 = meo_clock_monotonic_us();
+  var held: bool = false;
+  var seed: int64 = 12345;
+  while (g_w_err == 0) {
+    var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+    if (ms >= MT_RUN_MS) { break; }
+    if (!held && ms >= MT_HOLD_AT_MS) {
+      held = true;
+      mt_hold();
+      continue;
+    }
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    mt_transfer(seed);
+  }
+  meo_atomic_store_i32(&g_stop, 1);
+  return 0;
+}
+
+// --- readers ----------------------------------------------------------------
+
+fn mt_r_err(r: MtReader*, rc: int32, what: int32) {
+  if (r->err == 0) {
+    r->err = rc;
+    r->what = what;
+  }
+}
+
+// One statement over every account: count and sum of bal.
+fn mt_read_sum(r: MtReader*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(g_db, "acct", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_pick(q, "bal");
+  var n: int64 = 0;
+  var sum: int64 = 0;
+  while (true) {
+    rc = meo_q_step(q);
+    if (rc != MEO_ROW) { break; }
+    sum += meo_q_column_int64(q, 0);
+    n += 1;
+  }
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return rc; }
+  if (n != (int64)MT_ROWS) {
+    mt_r_err(r, (int32)n, 2);
+    return -9002;
+  }
+  if (sum != MT_TOTAL) {
+    mt_r_err(r, (int32)sum, 3);
+    return -9003;
+  }
+  return MEO_OK;
+}
+
+fn mt_read_ver(r: MtReader*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(g_db, "ver", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_pick(q, "v");
+  var v: MeoValue;
+  meo_value_set_int(&v, 1);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var got: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW) { return rc; }
+  if (got < r->last_v) {
+    mt_r_err(r, (int32)got, 4);
+    return -9004;
+  }
+  r->last_v = got;
+  return MEO_OK;
+}
+
+fn mt_note(r: MtReader*, us: int64, h0: int32) {
+  var h1: int32 = meo_atomic_load_i32(&g_hold);
+  if (us > r->max_us) { r->max_us = us; }
+  if (h0 == 1 && h1 == 1) {
+    r->hold_reads += 1;
+    if (us > r->max_hold_us) { r->max_hold_us = us; }
+  }
+}
+
+fn mt_reader(arg: cstring) -> uint32 {
+  var r: MtReader* = (MtReader*)arg;
+  while (meo_atomic_load_i32(&g_go) == 0) { meo_sleep_us(200); }
+  while (meo_atomic_load_i32(&g_stop) == 0 && r->err == 0) {
+    var h0: int32 = meo_atomic_load_i32(&g_hold);
+    var t0: int64 = meo_clock_monotonic_us();
+    var rc: int32 = mt_read_sum(r);
+    mt_note(r, meo_clock_monotonic_us() - t0, h0);
+    if (rc != MEO_OK) {
+      mt_r_err(r, rc, 1);
+      break;
+    }
+    h0 = meo_atomic_load_i32(&g_hold);
+    t0 = meo_clock_monotonic_us();
+    rc = mt_read_ver(r);
+    mt_note(r, meo_clock_monotonic_us() - t0, h0);
+    if (rc != MEO_OK) {
+      mt_r_err(r, rc, 5);
+      break;
+    }
+    r->reads += 1;
+  }
+  return 0;
+}
+
+// --- main -------------------------------------------------------------------
+
+fn mt_final() -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(g_db, "acct", &q);
+  if (rc != MEO_OK) { return mt_fail("final select rc={rc}"); }
+  meo_q_pick(q, "bal");
+  var sum: int64 = 0;
+  var n: int64 = 0;
+  while (true) {
+    rc = meo_q_step(q);
+    if (rc != MEO_ROW) { break; }
+    sum += meo_q_column_int64(q, 0);
+    n += 1;
+  }
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return mt_fail("final scan rc={rc}"); }
+  if (n != (int64)MT_ROWS || sum != MT_TOTAL) {
+    return mt_fail("final: {n} rows, sum {sum}");
+  }
+  var q2: MeoQuery* = 0;
+  meo_q_select(g_db, "ver", &q2);
+  meo_q_pick(q2, "v");
+  rc = meo_q_step(q2);
+  var v: int64 = meo_q_column_int64(q2, 0);
+  meo_q_free(q2);
+  if (rc != MEO_ROW || v != (int64)g_w_txns) {
+    return mt_fail("final: ver {v} after {g_w_txns} commits (rc={rc})");
+  }
+  return 0;
+}
+
+fn mt_main() -> int32 {
+  var rc: int32 = mt_reset(MT_DB);
+  if (rc != MEO_OK) { return mt_fail("reset rc={rc}"); }
+  rc = meo_db_open(MT_DB,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL, 64, &g_db);
+  if (rc != MEO_OK) { return mt_fail("open rc={rc}"); }
+  if (!meo_db_wal_mode(g_db)) { return mt_fail("not in wal mode"); }
+  meo_db_wal_autocheckpoint(g_db, 64);
+  rc = mt_create("acct", true);
+  if (rc == MEO_OK) { rc = mt_create("ver", false); }
+  if (rc != MEO_OK) { return mt_fail("create rc={rc}"); }
+  rc = mt_fill();
+  if (rc != MEO_OK) { return mt_fail("fill rc={rc}"); }
+
+  var rs: MtReader*[] = new MtReader*[64];
+  var hs: int64[] = new int64[64];
+  var i: int32 = 0;
+  while (i < MT_READERS) {
+    rs[i] = new MtReader;
+    rs[i]->tid = i;
+    rs[i]->err = 0;
+    rs[i]->what = 0;
+    rs[i]->reads = 0;
+    rs[i]->hold_reads = 0;
+    rs[i]->max_us = 0;
+    rs[i]->max_hold_us = 0;
+    rs[i]->last_v = 0;
+    hs[i] = CreateThread(0, 0, &mt_reader, (cstring)rs[i], 0, 0);
+    if (hs[i] == 0) { return mt_fail("reader {i} did not start"); }
+    i += 1;
+  }
+  var wh: int64 = CreateThread(0, 0, &mt_writer, 0, 0, 0);
+  if (wh == 0) { return mt_fail("writer did not start"); }
+  var t0: int64 = meo_clock_realtime_us();
+  meo_atomic_store_i32(&g_go, 1);
+
+  var left: int64 = MT_DEADLINE_MS;
+  if (thread_join(wh, (uint32)left) != WAIT_OBJECT_0()) {
+    mt_fail("writer still running after {MT_DEADLINE_MS} ms (deadlock?)");
+    syscall(231, (int64)1);
+  }
+  thread_close(wh);
+  i = 0;
+  while (i < MT_READERS) {
+    left = MT_DEADLINE_MS - (meo_clock_realtime_us() - t0) / 1000;
+    if (left < 1) { left = 1; }
+    if (thread_join(hs[i], (uint32)left) != WAIT_OBJECT_0()) {
+      mt_fail("reader {i} still running after {MT_DEADLINE_MS} ms (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  var ms: int64 = (meo_clock_realtime_us() - t0) / 1000;
+
+  if (g_w_err != 0) { return mt_fail("writer step {g_w_what}: rc={g_w_err}"); }
+  var min_reads: int32 = 1000000000;
+  var min_hold: int32 = 1000000000;
+  var total_reads: int64 = 0;
+  var max_us: int64 = 0;
+  var max_hold_us: int64 = 0;
+  var bad: int32 = 0;
+  i = 0;
+  while (i < MT_READERS) {
+    var r: MtReader* = rs[i];
+    if (r->err != 0 && bad == 0) {
+      bad = 1;
+      println("FAIL wal_mt: reader {i} check {r->what}: value/rc {r->err}");
+    }
+    if (r->reads < min_reads) { min_reads = r->reads; }
+    if (r->hold_reads < min_hold) { min_hold = r->hold_reads; }
+    total_reads += (int64)r->reads;
+    if (r->max_us > max_us) { max_us = r->max_us; }
+    if (r->max_hold_us > max_hold_us) { max_hold_us = r->max_hold_us; }
+    i += 1;
+  }
+  println("wal_mt: {g_w_txns} txns, {total_reads} reads (min {min_reads}/reader), {ms} ms");
+  println("wal_mt: reads inside the hold: min {min_hold}/reader; max latency {max_hold_us} us in the hold, {max_us} us overall");
+  if (bad != 0) { return 1; }
+  if (g_w_txns < MT_MIN_TXNS) { return mt_fail("only {g_w_txns} txns committed"); }
+  if (min_reads < MT_MIN_READS) { return mt_fail("a reader did only {min_reads} reads"); }
+  if (min_hold < 1) { return mt_fail("a reader did no read inside the hold"); }
+  if (max_hold_us >= MT_HOLD_LAT_US) {
+    return mt_fail("a read inside the hold took {max_hold_us} us");
+  }
+  if (mt_final() != 0) { return 1; }
+  rc = meo_db_close(g_db);
+  if (rc != MEO_OK) { return mt_fail("close rc={rc}"); }
+  i = 0;
+  while (i < MT_READERS) {
+    free(rs[i]);
+    i += 1;
+  }
+  free(rs.data);
+  free(hs.data);
+  meo_file_unlink(MT_DB);
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_mt (stub)");
+  if (mt_main() != 0) { return 1; }
+  println("PASS wal_mt");
   return 0;
 }
