@@ -65,6 +65,9 @@ fn project() {
   // The change feed and the persisted commit counter.
   mb_bin("feed_self", "tests/feed_self.mettle");
 
+  // Table writes reaching the feed.
+  mb_bin("feed_table", "tests/feed_table.mettle");
+
   // Shared value types and status codes.
   mb_bin("ws0_self", "tests/ws0_self.mettle");
 

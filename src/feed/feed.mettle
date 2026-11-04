@@ -2,23 +2,26 @@
 // WHEN, holding only changes whose transaction committed durably.
 //
 // Shape. A MeoFeed is attached to one pager (meo_feed_attach). Writes made
-// through meo_feed_insert are captured into a PENDING buffer owned by the
-// writer. The pager's commit hook (pager/pager.mettle, header note) moves the
-// pending events into a bounded RING after the commit is durable, stamping each
-// with the new commit_seq and a wall-clock time; every rollback path discards
-// the pending buffer. Readers pull from the ring with their own cursor
+// through meo_feed_insert, and through the table layer (insert, update,
+// delete), are captured into a PENDING buffer owned by the writer. The pager's
+// commit hook (pager/pager.mettle, header note) moves the pending events into
+// a bounded RING after the commit is durable, stamping each with the new
+// commit_seq and a wall-clock time; every rollback path discards the pending
+// buffer. Readers pull from the ring with their own cursor
 // (MeoFeedCursor) and never block the writer for longer than a short copy.
 //
 // What is reported: the key, its kind (INSERT / REPLACE with the old rowid /
-// ROOT_MOVED), the rowid, the caller's table_id. Values are not reported --
-// MeoSQL maps key -> rowid only, so a consumer re-queries on change. MeoChange
-// is built to grow: a payload field will be appended to the struct, readers
-// only ever read fields by name, and meo_feed_read writes every field, so an
-// existing caller keeps compiling and keeps its meaning.
+// DELETE / ROOT_MOVED), the rowid, the table_id, and for table writes the row
+// record as a value. meo_feed_insert reports no value (val_len 0). MeoChange
+// grows by appending fields; readers only read fields by name, and
+// meo_feed_read writes every field, so an existing caller keeps compiling and
+// keeps its meaning.
 //
-// Only writes made through meo_feed_insert are captured. A commit that changed
-// pages some other way still advances meo_feed_last_commit (and the persisted
-// commit_seq), but carries no events.
+// Catalog changes (create/drop table, add column) and index trees are not
+// captured. A commit that changed pages some other way still advances
+// meo_feed_last_commit (and the persisted commit_seq), but carries no events.
+// The table_id of meo_feed_insert is caller-assigned and should not collide
+// with catalog table ids.
 //
 // Import graph: feed imports pager and btree; the pager does not import feed.
 // The pager calls back through the fn-pointer hook in MeoPager (hook_ctx,
@@ -27,9 +30,10 @@
 // the graph acyclic.
 //
 // Allocations: meo_feed_new allocates the MeoFeed, the ring (cap records) and
-// the pending array; every record owns one key buffer, malloc'd on first use
-// and recycled afterwards: publishing SWAPS the pending record's buffer with
-// the ring slot's, so the hook never allocates and never frees under the lock.
+// the pending array; every record owns one key and one value buffer, malloc'd
+// on first use and recycled afterwards: publishing SWAPS the pending record's
+// buffers with the ring slot's, so the hook never allocates and never frees
+// under the lock.
 // meo_feed_free releases all of it (and detaches first if still attached).
 //
 // Invariants:
@@ -67,12 +71,13 @@ export const MEO_CHANGE_INSERT: int32 = 1;     // key was absent
 export const MEO_CHANGE_REPLACE: int32 = 2;    // key existed; old_rowid is set
 export const MEO_CHANGE_ROOT_MOVED: int32 = 3; // rowid = new root, old_rowid = old
 export const MEO_CHANGE_GAP: int32 = 4;        // events lost: reload fully
+export const MEO_CHANGE_DELETE: int32 = 5;    // row deleted; val = the deleted row
 
 // Pending events one transaction may capture before it is reported as a gap.
 export const MEO_FEED_PENDING_MAX: int32 = 65536;
 // Largest ring meo_feed_new accepts.
 export const MEO_FEED_MAX_CAP: int32 = 1048576;
-// A key buffer of this many bytes holds any key the b-tree can store, so a
+// A key buffer of this many bytes holds any one event's key plus value, so a
 // reader passing keycap >= MEO_FEED_MAX_KEY always makes progress.
 export const MEO_FEED_MAX_KEY: int32 = 4096;
 
@@ -80,8 +85,16 @@ const FEED_PEND_INITIAL: int32 = 16;
 
 // One change as a reader receives it. key points into the reader's keybuf
 // (meo_feed_read copies the bytes there), so it is valid for exactly as long
-// as the caller keeps that buffer unchanged. Fields may be appended later
-// (a value payload); none will be removed or reordered in meaning.
+// as the caller keeps that buffer unchanged. Fields may be appended later;
+// none will be removed or reordered in meaning.
+//
+// Table writes carry the row record as val (record/codec encoding; read
+// columns with meo_rec_get). The INTEGER PRIMARY KEY column is stored NULL,
+// its value is rowid. key is the 8-byte meo_key_rowid(rowid). Kinds: INSERT
+// (new row), REPLACE (update; old_rowid = rowid before, rowid = rowid after,
+// equal unless the INTEGER PRIMARY KEY changed; val = the new row), DELETE
+// (val = the deleted row). table_id is the catalog table id (MeoTable.id,
+// stable for the db's lifetime). Table writes never emit ROOT_MOVED.
 export struct MeoChange {
   seq: uint64;        // global event sequence, 1, 2, 3...; never reused
   commit_seq: uint64; // the persisted commit counter of the commit
@@ -92,6 +105,8 @@ export struct MeoChange {
   key_len: int32;
   rowid: uint64;      // ROOT_MOVED: the new root page
   old_rowid: uint64;  // REPLACE: the previous rowid; ROOT_MOVED: the old root
+  val: uint8*;        // into keybuf right after the key; 0 when val_len == 0
+  val_len: int32;
 }
 
 // A reader's position: the seq of the next event it wants. A zeroed cursor
@@ -101,7 +116,8 @@ export struct MeoFeedCursor {
   next_seq: uint64;
 }
 
-// Internal record: ring slot or pending entry. key is owned by the record.
+// Internal record: ring slot or pending entry. key and val are owned by the
+// record.
 export struct MeoFeedRec {
   seq: uint64;
   commit_seq: uint64;
@@ -113,6 +129,9 @@ export struct MeoFeedRec {
   key_cap: int32;
   rowid: uint64;
   old_rowid: uint64;
+  val: uint8*;
+  val_len: int32;
+  val_cap: int32;
 }
 
 // The feed. Fields are private to this module; use the functions.
@@ -177,6 +196,10 @@ fn feed_free_keys(recs: MeoFeedRec*, n: int32) {
     if (recs[i].key != 0) {
       free(recs[i].key);
       recs[i].key = 0;
+    }
+    if (recs[i].val != 0) {
+      free(recs[i].val);
+      recs[i].val = 0;
     }
     i += 1;
   }
@@ -248,8 +271,14 @@ fn feed_pend_reserve(f: MeoFeed*) -> bool {
 // be recorded turns the transaction into a gap, because the b-tree write it
 // describes has already happened.
 fn feed_pend(f: MeoFeed*, table_id: uint32, kind: int32, key: uint8*,
-    key_len: int32, rowid: uint64, old_rowid: uint64) {
+    key_len: int32, rowid: uint64, old_rowid: uint64, val: uint8*,
+    val_len: int32) {
   if (f->overflowed) { return; }
+  // One event must fit a reader's MEO_FEED_MAX_KEY buffer, or it could stall.
+  if (key_len + val_len > MEO_FEED_MAX_KEY) {
+    feed_overflow(f);
+    return;
+  }
   if (f->pend_n >= f->pend_max || !feed_pend_reserve(f)) {
     feed_overflow(f);
     return;
@@ -265,8 +294,20 @@ fn feed_pend(f: MeoFeed*, table_id: uint32, kind: int32, key: uint8*,
     r->key = buf;
     r->key_cap = key_len;
   }
+  if (val_len > r->val_cap) {
+    var vbuf: uint8* = malloc((int64)val_len);
+    if (vbuf == 0) {
+      feed_overflow(f);
+      return;
+    }
+    if (r->val != 0) { free(r->val); }
+    r->val = vbuf;
+    r->val_cap = val_len;
+  }
   if (key_len > 0) { meo_bytes_copy(r->key, key, (int64)key_len); }
+  if (val_len > 0) { meo_bytes_copy(r->val, val, (int64)val_len); }
   r->key_len = key_len;
+  r->val_len = val_len;
   r->seq = 0;
   r->commit_seq = 0;
   r->time_us = 0;
@@ -280,8 +321,8 @@ fn feed_pend(f: MeoFeed*, table_id: uint32, kind: int32, key: uint8*,
 // --- publishing (called by the pager, writer thread) -----------------------
 
 // Append one record to the ring. Caller holds the lock. With `src` non-zero its
-// key buffer is swapped into the slot (and the slot's old buffer goes back to
-// src for reuse); with src == 0 the slot becomes a keyless GAP.
+// key and value buffers are swapped into the slot (and the slot's old buffers
+// go back to src for reuse); with src == 0 the slot becomes a keyless GAP.
 fn feed_ring_push(f: MeoFeed*, src: MeoFeedRec*, kind: int32,
     commit_seq: uint64, time_us: int64) {
   var seq: uint64 = f->next_seq;
@@ -289,17 +330,26 @@ fn feed_ring_push(f: MeoFeed*, src: MeoFeedRec*, kind: int32,
   if (src != 0) {
     var k: uint8* = slot->key;
     var kc: int32 = slot->key_cap;
+    var v: uint8* = slot->val;
+    var vc: int32 = slot->val_cap;
     slot->key = src->key;
     slot->key_cap = src->key_cap;
     slot->key_len = src->key_len;
+    slot->val = src->val;
+    slot->val_cap = src->val_cap;
+    slot->val_len = src->val_len;
     slot->table_id = src->table_id;
     slot->rowid = src->rowid;
     slot->old_rowid = src->old_rowid;
     src->key = k;
     src->key_cap = kc;
     src->key_len = 0;
+    src->val = v;
+    src->val_cap = vc;
+    src->val_len = 0;
   } else {
     slot->key_len = 0;
+    slot->val_len = 0;
     slot->table_id = 0;
     slot->rowid = 0;
     slot->old_rowid = 0;
@@ -396,9 +446,9 @@ export fn meo_feed_detach(p: MeoPager*) -> int32 {
 // when *root changed (a root split, or the tree's first page). Answers what
 // meo_bt_insert answered, or -MEO_ERR_USAGE when f is not attached to p.
 //
-// table_id is the caller's name for the tree. There is no catalog yet, so the
-// caller assigns it, and it must stay the same when the root moves: the root
-// page number is NOT an identity (a split changes it; ROOT_MOVED reports it).
+// table_id is the caller's name for the tree, so it must stay the same when the
+// root moves: the root page number is NOT an identity (a split changes it;
+// ROOT_MOVED reports it). Keep it clear of catalog table ids.
 //
 // Outside a transaction the events stay pending until a counted autocommit
 // flush (meo_pager_flush / meo_pager_close) publishes them.
@@ -419,13 +469,28 @@ export fn meo_feed_insert(f: MeoFeed*, p: MeoPager*, table_id: uint32,
   }
   var rc: int32 = meo_bt_insert(p, root, meo_cmp_cb, key, rowid);
   if (rc != MEO_OK) { return rc; }
-  feed_pend(f, table_id, kind, key.data, key.len, rowid, old_rowid);
+  feed_pend(f, table_id, kind, key.data, key.len, rowid, old_rowid, 0, 0);
   var new_root: uint32 = root[0];
   if (new_root != old_root) {
     feed_pend(f, table_id, MEO_CHANGE_ROOT_MOVED, 0, 0, (uint64)new_root,
-      (uint64)old_root);
+      (uint64)old_root, 0, 0);
   }
   return MEO_OK;
+}
+
+// The feed attached to `p`, or 0. The feed is the only user of the pager hook.
+export fn meo_feed_of(p: MeoPager*) -> MeoFeed* {
+  if (p == 0) { return 0; }
+  return (MeoFeed*)meo_pager_hook_ctx(p);
+}
+
+// Record one event for the open transaction. Writer side: the caller holds the
+// db lock. A no-op when f == 0; never fails (same rule as feed_pend).
+export fn meo_feed_capture(f: MeoFeed*, table_id: uint32, kind: int32,
+    key: uint8*, key_len: int32, rowid: uint64, old_rowid: uint64,
+    val: uint8*, val_len: int32) {
+  if (f == 0) { return; }
+  feed_pend(f, table_id, kind, key, key_len, rowid, old_rowid, val, val_len);
 }
 
 // --- readers (any thread) --------------------------------------------------
@@ -435,14 +500,15 @@ fn feed_cursor_pos(cur: MeoFeedCursor*) -> uint64 {
   return cur->next_seq;
 }
 
-// Copy up to `cap` events at or after the cursor into out[], their key bytes
-// into keybuf (each out[i].key points there), and advance the cursor. Returns
-// the count (0 = nothing new). A cursor behind the ring first receives one
-// MEO_CHANGE_GAP (seq = the newest lost seq, commit_seq = the newest published
-// commit) and jumps to the oldest retained event. Stops early when the next
-// key would not fit keybuf; -MEO_ERR_FULL only when not even one event fits
-// (keycap >= MEO_FEED_MAX_KEY always fits). -MEO_ERR_USAGE for bad arguments
-// or a cursor past the newest event (one from another feed).
+// Copy up to `cap` events at or after the cursor into out[], their key and
+// value bytes into keybuf (each out[i].key and .val point there), and advance
+// the cursor. Returns the count (0 = nothing new). A cursor behind the ring
+// first receives one MEO_CHANGE_GAP (seq = the newest lost seq, commit_seq and time_us = those of
+// the newest published commit) and jumps to the oldest retained event. Stops
+// early when the next key plus value would not fit keybuf; -MEO_ERR_FULL only
+// when not even one event fits (MEO_FEED_MAX_KEY bytes hold any one event's key
+// plus value, so keycap >= MEO_FEED_MAX_KEY always fits). -MEO_ERR_USAGE for
+// bad arguments or a cursor past the newest event (one from another feed).
 export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
     cap: int32, keybuf: uint8*, keycap: int32) -> int32 {
   if (f == 0 || cur == 0 || out == 0 || cap < 1 || keycap < 0) {
@@ -462,11 +528,13 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
     var g: MeoChange* = &out[0];
     g->seq = f->first_seq - 1;
     g->commit_seq = f->last_commit;
-    g->time_us = 0;
+    g->time_us = f->last_time;
     g->table_id = 0;
     g->kind = MEO_CHANGE_GAP;
     g->key = 0;
     g->key_len = 0;
+    g->val = 0;
+    g->val_len = 0;
     g->rowid = 0;
     g->old_rowid = 0;
     n = 1;
@@ -474,7 +542,7 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
   }
   while (n < cap && pos < f->next_seq) {
     var r: MeoFeedRec* = &f->ring[(int64)((pos - 1) % (uint64)f->cap)];
-    if (r->key_len > keycap - used) {
+    if (r->key_len + r->val_len > keycap - used) {
       if (n == 0) { rc = -MEO_ERR_FULL; }
       break;
     }
@@ -494,6 +562,14 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
       c->key = 0;
     }
     used += r->key_len;
+    c->val_len = r->val_len;
+    if (r->val_len > 0) {
+      meo_bytes_copy(keybuf + used, r->val, (int64)r->val_len);
+      c->val = keybuf + used;
+    } else {
+      c->val = 0;
+    }
+    used += r->val_len;
     n += 1;
     pos += 1;
   }
@@ -519,6 +595,16 @@ export fn meo_feed_last_commit(f: MeoFeed*) -> uint64 {
   if (f == 0) { return 0; }
   spin_lock(&f->lock);
   var v: uint64 = f->last_commit;
+  spin_unlock(&f->lock);
+  return v;
+}
+
+// time_us of the newest commit this feed published (the one meo_feed_last_commit
+// names), 0 before the first.
+export fn meo_feed_last_time(f: MeoFeed*) -> int64 {
+  if (f == 0) { return 0; }
+  spin_lock(&f->lock);
+  var v: int64 = f->last_time;
   spin_unlock(&f->lock);
   return v;
 }

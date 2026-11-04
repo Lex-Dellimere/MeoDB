@@ -23,6 +23,7 @@ import "../mem/arena.mettle";
 import "../catalog/schema.mettle";
 import "../catalog/catalog.mettle";
 import "../db/db.mettle";
+import "../feed/feed.mettle";
 
 // One row: its rowid and a view of its record bytes (see the header).
 export struct MeoTblRow {
@@ -490,6 +491,18 @@ fn tbl_finish(db: MeoDb*, t: MeoTable*, rc: int32, dirty: bool) -> int32 {
   return MEO_OK;
 }
 
+// Report one finished row write to the attached feed, if any. Called only
+// after the whole write succeeded; a rollback drops what it recorded.
+fn tbl_feed(db: MeoDb*, t: MeoTable*, kind: int32, rowid: int64, old_rowid: int64,
+    rec: uint8*, rec_len: int32) {
+  var f: MeoFeed* = meo_feed_of(db->pager);
+  if (f == 0) { return; }
+  var k: uint8[8];
+  meo_key_rowid(&k[0], 8, rowid);
+  meo_feed_capture(f, (uint32)t->id, kind, &k[0], 8, (uint64)rowid, (uint64)old_rowid,
+    rec, rec_len);
+}
+
 // Phase B: write one row that meo_tbl_check_rows accepted, under `rowid`, and
 // its index entries. No re-check, so no Phase-A code: any failure here is a
 // storage failure and the caller treats the statement as having written.
@@ -509,8 +522,9 @@ export fn meo_tbl_write_row(db: MeoDb*, t: MeoTable*, vals: MeoValue*, n: int32,
   rc = tbl_put_row(db, t, buf, len, rowid, &dirty);
   if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, rowid, true, kbuf, &dirty); }
   free(kbuf);
-  free(buf);
   rc = tbl_finish(db, t, rc, dirty);
+  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_INSERT, rowid, 0, buf + 8, len - 8); }
+  free(buf);
   if (rc != MEO_OK) { return rc; }
   db->last_rowid = rowid;
   return MEO_OK;
@@ -530,7 +544,9 @@ export fn meo_tbl_delete(db: MeoDb*, t: MeoTable*, rowid: int64) -> int32 {
   if (rc != MEO_OK) { return rc; }
   rc = tbl_del_row(db, t, rowid);
   if (rc == 1) { return -MEO_ERR_CORRUPT; }
-  return tbl_finish(db, t, rc, dirty);
+  rc = tbl_finish(db, t, rc, dirty);
+  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_DELETE, rowid, 0, row.rec, row.rec_len); }
+  return rc;
 }
 
 // Replace the row with this rowid by `vals` (n == t->n_cols), as accepted by
@@ -564,7 +580,9 @@ export fn meo_tbl_update(db: MeoDb*, t: MeoTable*, rowid: int64, vals: MeoValue*
   }
   if (rc == MEO_OK) { rc = tbl_put_row(db, t, buf, len, nid, &dirty); }
   if (rc == MEO_OK) { rc = tbl_index_rec(db, t, buf + 8, len - 8, nid, true, kbuf, &dirty); }
-  return tbl_finish(db, t, rc, dirty);
+  rc = tbl_finish(db, t, rc, dirty);
+  if (rc == MEO_OK) { tbl_feed(db, t, MEO_CHANGE_REPLACE, nid, rowid, buf + 8, len - 8); }
+  return rc;
 }
 
 // The rowid a unique index maps `v` to: MEO_OK and *rowid_out, 1 absent

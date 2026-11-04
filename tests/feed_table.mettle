@@ -1,0 +1,453 @@
+// feed_table: table writes reach the change feed (src/table/table.mettle ->
+// src/feed/feed.mettle), driven through the typed query API.
+//
+// A program, not @test functions: every case needs a real db file. Prints
+// "PASS <case>" per case and "FAIL <case>: <detail>" per failing check.
+//
+//   t1_insert     an autocommit insert is exactly one INSERT with the catalog
+//                 table id, the rowid, an 8-byte rowid key, the row as val (the
+//                 INTEGER PRIMARY KEY column NULL), the pager's commit_seq and a
+//                 commit time.
+//   t2_tx_order   insert, update and delete in one transaction publish three
+//                 events in that order under one commit_seq, none before it.
+//   t3_id_change  an update that changes the INTEGER PRIMARY KEY is a REPLACE
+//                 whose old_rowid differs from its rowid.
+//   t4_rollback   a rolled-back transaction emits nothing.
+//   t5_conflict   a statement refused by a UNIQUE column emits nothing.
+//   t6_gap_time   a reader that fell behind gets a GAP stamped with the newest
+//                 commit's time and commit_seq.
+//   t7_keybuf     a keybuf one byte short of key + val is -MEO_ERR_FULL; a
+//                 MEO_FEED_MAX_KEY buffer reads the largest row.
+//   t8_feed_insert  meo_feed_insert events carry no value.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/btree.mettle";
+import "../src/feed/feed.mettle";
+import "../src/mem/arena.mettle";
+import "../src/meosql.mettle";
+import "tinytest.mettle";
+
+const FT_DB: string = "/dev/shm/meosql_feed_table.dat";
+const FT_DB2: string = "/dev/shm/meosql_feed_table_pager.dat";
+const FT_OUT_CAP: int32 = 64;
+const FT_KEY_CAP: int32 = 65536;
+
+var g_out: MeoChange* = 0;
+var g_kb: uint8* = 0;
+
+// --- helpers ---------------------------------------------------------------
+
+fn ft_remove(db: string) {
+  meo_file_unlink(db);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+}
+
+fn ft_text(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn ft_int(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn ft_real(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+// t(id INTEGER PRIMARY KEY, name TEXT UNIQUE, score REAL).
+fn ft_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "t", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "name", MEO_T_TEXT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "score", MEO_T_REAL, 0);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// Open a fresh db with table t and a feed of `cap` events attached.
+fn ft_open(path: string, cap: int32, db: MeoDb**, f: MeoFeed**) -> bool {
+  ft_remove(path);
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE,
+    0, db);
+  if (!meo_t_check_i64(rc, MEO_OK, "open")) { return false; }
+  if (!meo_t_check_i64(ft_create(db[0]), MEO_OK, "create table")) { return false; }
+  f[0] = meo_feed_new(cap);
+  if (!meo_t_check(f[0] != 0, "feed_new")) { return false; }
+  return meo_t_check_i64(meo_feed_attach(db[0]->pager, f[0]), MEO_OK, "attach");
+}
+
+fn ft_close(db: MeoDb*, f: MeoFeed*) {
+  meo_db_close(db);
+  meo_feed_free(f);
+}
+
+fn ft_insert(db: MeoDb*, id: int64, name: string, score: float64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, "t", &q);
+  var a: MeoValue = ft_int(id);
+  var b: MeoValue = ft_text(name);
+  var c: MeoValue = ft_real(score);
+  meo_q_value(q, &a);
+  meo_q_value(q, &b);
+  meo_q_value(q, &c);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+// UPDATE t SET name, score [, id = nid when nid >= 0] WHERE id = id.
+fn ft_update(db: MeoDb*, id: int64, nid: int64, name: string, score: float64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_update(db, "t", &q);
+  var n: MeoValue = ft_text(name);
+  var s: MeoValue = ft_real(score);
+  var w: MeoValue = ft_int(id);
+  var i: MeoValue = ft_int(nid);
+  if (nid >= 0) { meo_q_assign(q, "id", &i); }
+  meo_q_assign(q, "name", &n);
+  meo_q_assign(q, "score", &s);
+  meo_q_where(q, "id", MEO_Q_EQ, &w);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+fn ft_delete(db: MeoDb*, id: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_delete(db, "t", &q);
+  var w: MeoValue = ft_int(id);
+  meo_q_where(q, "id", MEO_Q_EQ, &w);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+fn ft_read(f: MeoFeed*, cur: MeoFeedCursor*) -> int32 {
+  return meo_feed_read(f, cur, g_out, FT_OUT_CAP, g_kb, FT_KEY_CAP);
+}
+
+// Is the change a table write: the table's id, its rowid key, the rowid.
+fn ft_is(c: MeoChange*, name: string, t: MeoTable*, kind: int32, rowid: int64,
+    old_rowid: int64) -> bool {
+  var k: int64 = 0;
+  if (!meo_t_check_i64(c->kind, kind, "{name}: kind")) { return false; }
+  if (!meo_t_check_i64(c->table_id, t->id, "{name}: table_id")) { return false; }
+  if (!meo_t_check_i64((int64)c->rowid, rowid, "{name}: rowid")) { return false; }
+  if (!meo_t_check_i64((int64)c->old_rowid, old_rowid, "{name}: old_rowid")) { return false; }
+  if (!meo_t_check_i64(c->key_len, 8, "{name}: key_len")) { return false; }
+  if (!meo_t_check_i64(meo_key_rowid_decode(c->key, c->key_len, &k), 8,
+      "{name}: key decodes")) {
+    return false;
+  }
+  return meo_t_check_i64(k, rowid, "{name}: key rowid");
+}
+
+// Does the change's val hold (NULL, name, score)? Column 0 is the INTEGER
+// PRIMARY KEY, stored NULL.
+fn ft_val_is(c: MeoChange*, name: string, want_name: string, score: float64) -> bool {
+  if (!meo_t_check(c->val != 0 && c->val_len > 0, "{name}: has val")) { return false; }
+  var v: MeoValue;
+  if (!meo_t_check_i64(meo_rec_get(c->val, c->val_len, 0, &v), MEO_OK, "{name}: get id")) {
+    return false;
+  }
+  if (!meo_t_check_i64(v.type, MEO_T_NULL, "{name}: id stored NULL")) { return false; }
+  if (!meo_t_check_i64(meo_rec_get(c->val, c->val_len, 1, &v), MEO_OK, "{name}: get name")) {
+    return false;
+  }
+  if (!meo_t_check_i64(v.type, MEO_T_TEXT, "{name}: name type")) { return false; }
+  if (!meo_t_check_i64(v.n, (int64)want_name.length, "{name}: name length")) { return false; }
+  if (!meo_t_check(meo_bytes_equal(v.p, want_name.chars, (int64)want_name.length),
+      "{name}: name bytes")) {
+    return false;
+  }
+  if (!meo_t_check_i64(meo_rec_get(c->val, c->val_len, 2, &v), MEO_OK, "{name}: get score")) {
+    return false;
+  }
+  if (!meo_t_check_i64(v.type, MEO_T_REAL, "{name}: score type")) { return false; }
+  return meo_t_check(v.f == score, "{name}: score value");
+}
+
+// --- cases -----------------------------------------------------------------
+
+fn t1_insert() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 64, &db, &f)) { return 1; }
+  var t: MeoTable* = meo_cat_find(db->cat, "t".chars, 1);
+  if (!meo_t_check(t != 0, "t1: find t")) { return 1; }
+  var cur: MeoFeedCursor;
+  meo_feed_cursor_end(f, &cur);
+  if (!meo_t_check_i64(ft_insert(db, 1, "a", 1.5), MEO_DONE, "t1: insert")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 1, "t1: one event")) { return 1; }
+  var c: MeoChange* = &g_out[0];
+  if (!ft_is(c, "t1", t, MEO_CHANGE_INSERT, 1, 0)) { return 1; }
+  if (!ft_val_is(c, "t1", "a", 1.5)) { return 1; }
+  if (!meo_t_check_i64((int64)c->commit_seq, (int64)meo_pager_commit_seq(db->pager),
+      "t1: commit_seq")) {
+    return 1;
+  }
+  if (!meo_t_check(c->time_us > 0, "t1: time_us")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 0, "t1: drained")) { return 1; }
+  ft_close(db, f);
+  println("PASS t1_insert");
+  return 0;
+}
+
+fn t2_tx_order() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 64, &db, &f)) { return 1; }
+  var t: MeoTable* = meo_cat_find(db->cat, "t".chars, 1);
+  if (!meo_t_check(t != 0, "t2: find t")) { return 1; }
+  if (!meo_t_check_i64(ft_insert(db, 1, "a", 1.5), MEO_DONE, "t2: seed 1")) { return 1; }
+  if (!meo_t_check_i64(ft_insert(db, 2, "b", 2.5), MEO_DONE, "t2: seed 2")) { return 1; }
+  var cur: MeoFeedCursor;
+  meo_feed_cursor_end(f, &cur);
+  if (!meo_t_check_i64(meo_db_begin(db, MEO_TX_DEFAULT), MEO_OK, "t2: begin")) { return 1; }
+  if (!meo_t_check_i64(ft_insert(db, 10, "c", 3.5), MEO_DONE, "t2: insert")) { return 1; }
+  if (!meo_t_check_i64(ft_update(db, 10, -1, "cc", 4.5), MEO_DONE, "t2: update")) { return 1; }
+  if (!meo_t_check_i64(ft_delete(db, 2), MEO_DONE, "t2: delete")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 3, "t2: three pending")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 0, "t2: nothing before commit")) { return 1; }
+  if (!meo_t_check_i64(meo_db_commit(db), MEO_OK, "t2: commit")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 3, "t2: three events")) { return 1; }
+  if (!ft_is(&g_out[0], "t2 insert", t, MEO_CHANGE_INSERT, 10, 0)) { return 1; }
+  if (!ft_val_is(&g_out[0], "t2 insert", "c", 3.5)) { return 1; }
+  if (!ft_is(&g_out[1], "t2 update", t, MEO_CHANGE_REPLACE, 10, 10)) { return 1; }
+  if (!ft_val_is(&g_out[1], "t2 update", "cc", 4.5)) { return 1; }
+  if (!ft_is(&g_out[2], "t2 delete", t, MEO_CHANGE_DELETE, 2, 0)) { return 1; }
+  if (!ft_val_is(&g_out[2], "t2 delete", "b", 2.5)) { return 1; }
+  var cs: uint64 = meo_pager_commit_seq(db->pager);
+  var i: int32 = 0;
+  while (i < 3) {
+    if (!meo_t_check_i64((int64)g_out[i].commit_seq, (int64)cs, "t2: one commit_seq")) {
+      return 1;
+    }
+    if (!meo_t_check(g_out[i].time_us == g_out[0].time_us, "t2: one time")) { return 1; }
+    i += 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[1].seq, (int64)(g_out[0].seq + 1), "t2: consecutive seq")) { return 1; }
+  ft_close(db, f);
+  println("PASS t2_tx_order");
+  return 0;
+}
+
+fn t3_id_change() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 64, &db, &f)) { return 1; }
+  var t: MeoTable* = meo_cat_find(db->cat, "t".chars, 1);
+  if (!meo_t_check(t != 0, "t3: find t")) { return 1; }
+  if (!meo_t_check_i64(ft_insert(db, 5, "a", 1.5), MEO_DONE, "t3: seed")) { return 1; }
+  var cur: MeoFeedCursor;
+  meo_feed_cursor_end(f, &cur);
+  if (!meo_t_check_i64(ft_update(db, 5, 50, "a2", 9.5), MEO_DONE, "t3: update id")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 1, "t3: one event")) { return 1; }
+  if (!ft_is(&g_out[0], "t3", t, MEO_CHANGE_REPLACE, 50, 5)) { return 1; }
+  if (!ft_val_is(&g_out[0], "t3", "a2", 9.5)) { return 1; }
+  ft_close(db, f);
+  println("PASS t3_id_change");
+  return 0;
+}
+
+fn t4_rollback() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 64, &db, &f)) { return 1; }
+  var cur: MeoFeedCursor;
+  meo_feed_cursor_end(f, &cur);
+  if (!meo_t_check_i64(meo_db_begin(db, MEO_TX_DEFAULT), MEO_OK, "t4: begin")) { return 1; }
+  if (!meo_t_check_i64(ft_insert(db, 1, "a", 1.5), MEO_DONE, "t4: insert")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 1, "t4: one pending")) { return 1; }
+  if (!meo_t_check_i64(meo_db_rollback(db), MEO_OK, "t4: rollback")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 0, "t4: pending dropped")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 0, "t4: no events")) { return 1; }
+  // The feed is clean afterwards: the next commit is one INSERT, not a GAP.
+  if (!meo_t_check_i64(ft_insert(db, 2, "b", 2.5), MEO_DONE, "t4: insert after")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 1, "t4: one event after")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "t4: INSERT after")) { return 1; }
+  ft_close(db, f);
+  println("PASS t4_rollback");
+  return 0;
+}
+
+fn t5_conflict() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 64, &db, &f)) { return 1; }
+  if (!meo_t_check_i64(ft_insert(db, 1, "a", 1.5), MEO_DONE, "t5: seed")) { return 1; }
+  var cur: MeoFeedCursor;
+  meo_feed_cursor_end(f, &cur);
+  var rc: int32 = ft_insert(db, 2, "a", 2.5);
+  if (!meo_t_check(rc < 0, "t5: duplicate name refused")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 0, "t5: nothing pending")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 0, "t5: no events")) { return 1; }
+  ft_close(db, f);
+  println("PASS t5_conflict");
+  return 0;
+}
+
+fn t6_gap_time() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 2, &db, &f)) { return 1; }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var i: int64 = 1;
+  while (i <= 5) {
+    if (!meo_t_check_i64(ft_insert(db, i, "n{i}", 1.0), MEO_DONE, "t6: insert")) { return 1; }
+    i += 1;
+  }
+  if (!meo_t_check(meo_feed_last_time(f) != 0, "t6: last_time set")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 3, "t6: GAP then two events")) { return 1; }
+  var g: MeoChange* = &g_out[0];
+  if (!meo_t_check_i64(g->kind, MEO_CHANGE_GAP, "t6: first is GAP")) { return 1; }
+  if (!meo_t_check_i64(g->time_us, meo_feed_last_time(f), "t6: GAP time_us")) { return 1; }
+  if (!meo_t_check_i64((int64)g->commit_seq, (int64)meo_feed_last_commit(f),
+      "t6: GAP commit_seq")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(g->val_len, 0, "t6: GAP val_len")) { return 1; }
+  if (!meo_t_check(g->val == 0, "t6: GAP val")) { return 1; }
+  if (!meo_t_check_i64(g_out[1].kind, MEO_CHANGE_INSERT, "t6: then INSERT")) { return 1; }
+  ft_close(db, f);
+  println("PASS t6_gap_time");
+  return 0;
+}
+
+fn t7_keybuf() -> int32 {
+  var db: MeoDb* = 0;
+  var f: MeoFeed* = 0;
+  if (!ft_open(FT_DB, 64, &db, &f)) { return 1; }
+  var t: MeoTable* = meo_cat_find(db->cat, "t".chars, 1);
+  if (!meo_t_check(t != 0, "t7: find t")) { return 1; }
+  var cur: MeoFeedCursor;
+  meo_feed_cursor_end(f, &cur);
+  if (!meo_t_check_i64(ft_insert(db, 1, "abc", 1.5), MEO_DONE, "t7: insert")) { return 1; }
+  if (!meo_t_check_i64(ft_read(f, &cur), 1, "t7: probe")) { return 1; }
+  var need: int32 = g_out[0].key_len + g_out[0].val_len;
+  // The probe consumed the event; rewind to read it again.
+  cur.next_seq = g_out[0].seq;
+  if (!meo_t_check_i64(meo_feed_read(f, &cur, g_out, FT_OUT_CAP, g_kb, need - 1),
+      -MEO_ERR_FULL, "t7: one byte short")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_feed_read(f, &cur, g_out, FT_OUT_CAP, g_kb, need), 1,
+      "t7: exact fit")) {
+    return 1;
+  }
+  if (!ft_val_is(&g_out[0], "t7 exact", "abc", 1.5)) { return 1; }
+  // The largest name the row limit takes: read with a MEO_FEED_MAX_KEY buffer.
+  var big: uint8* = malloc((int64)MEO_REC_MAX);
+  if (!meo_t_check(big != 0, "t7: alloc")) { return 1; }
+  var n: int32 = MEO_REC_MAX;
+  var rc: int32 = -1;
+  var fill: int32 = 0;
+  while (fill < n) {
+    big[fill] = 120;
+    fill += 1;
+  }
+  while (n > 0 && rc != MEO_DONE) {
+    var q: MeoQuery* = 0;
+    meo_q_insert(db, "t", &q);
+    var a: MeoValue = ft_int(2);
+    var b: MeoValue;
+    meo_value_set_text(&b, big, n);
+    var c: MeoValue = ft_real(2.5);
+    meo_q_value(q, &a);
+    meo_q_value(q, &b);
+    meo_q_value(q, &c);
+    rc = meo_q_step(q);
+    meo_q_free(q);
+    if (rc != MEO_DONE) { n -= 1; }
+  }
+  if (!meo_t_check_i64(rc, MEO_DONE, "t7: big insert")) { return 1; }
+  if (!meo_t_check(n > MEO_REC_MAX - 64, "t7: row is near the limit")) { return 1; }
+  meo_feed_cursor_end(f, &cur);
+  cur.next_seq -= 1;
+  var got: int32 = meo_feed_read(f, &cur, g_out, FT_OUT_CAP, g_kb, MEO_FEED_MAX_KEY);
+  if (!meo_t_check_i64(got, 1, "t7: big row read")) { return 1; }
+  if (!meo_t_check(g_out[0].val_len > n, "t7: val holds the name")) { return 1; }
+  var v: MeoValue;
+  meo_rec_get(g_out[0].val, g_out[0].val_len, 1, &v);
+  if (!meo_t_check_i64(v.n, n, "t7: big name length")) { return 1; }
+  if (!meo_t_check(meo_bytes_equal(v.p, big, (int64)n), "t7: big name bytes")) { return 1; }
+  free(big);
+  ft_close(db, f);
+  println("PASS t7_keybuf");
+  return 0;
+}
+
+fn t8_feed_insert() -> int32 {
+  ft_remove(FT_DB2);
+  var p: MeoPager* = meo_pager_open(FT_DB2, 16, MEO_PAGER_CREATE);
+  if (!meo_t_check(p != 0, "t8: open")) { return 1; }
+  var f: MeoFeed* = meo_feed_new(8);
+  if (!meo_t_check(f != 0, "t8: feed_new")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "t8: attach")) { return 1; }
+  if (!meo_t_check(meo_feed_of(p) == f, "t8: feed_of")) { return 1; }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, 7);
+  var k: MeoBtKey = { data: &kb[0], len: n };
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "t8: begin")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_insert(f, p, 7, &root, &meo_key_compare, k, 70),
+      MEO_OK, "t8: insert")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "t8: commit")) { return 1; }
+  // INSERT, then ROOT_MOVED for the tree's first page.
+  if (!meo_t_check_i64(ft_read(f, &cur), 2, "t8: two events")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "t8: INSERT")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].rowid, 70, "t8: rowid")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].val_len, 0, "t8: INSERT val_len")) { return 1; }
+  if (!meo_t_check(g_out[0].val == 0, "t8: INSERT val")) { return 1; }
+  if (!meo_t_check_i64(g_out[1].kind, MEO_CHANGE_ROOT_MOVED, "t8: ROOT_MOVED")) { return 1; }
+  if (!meo_t_check_i64(g_out[1].val_len, 0, "t8: ROOT_MOVED val_len")) { return 1; }
+  meo_pager_close(p);
+  meo_pager_free(p);
+  meo_feed_free(f);
+  println("PASS t8_feed_insert");
+  return 0;
+}
+
+fn main() -> int32 {
+  var outs: MeoChange[] = new MeoChange[FT_OUT_CAP];
+  var kbs: uint8[] = new uint8[FT_KEY_CAP];
+  g_out = outs.data;
+  g_kb = kbs.data;
+  var rc: int32 = t1_insert();
+  if (rc == 0) { rc = t2_tx_order(); }
+  if (rc == 0) { rc = t3_id_change(); }
+  if (rc == 0) { rc = t4_rollback(); }
+  if (rc == 0) { rc = t5_conflict(); }
+  if (rc == 0) { rc = t6_gap_time(); }
+  if (rc == 0) { rc = t7_keybuf(); }
+  if (rc == 0) { rc = t8_feed_insert(); }
+  ft_remove(FT_DB);
+  ft_remove(FT_DB2);
+  free(outs.data);
+  free(kbs.data);
+  if (rc == 0) { println("PASS feed_table"); }
+  return meo_t_report();
+}
