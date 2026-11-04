@@ -1,0 +1,824 @@
+// range_self: range access paths and the streaming x/y scan, driven through
+// the typed query API.
+//
+// A program, not @test functions: every case needs a real db file. Prints
+// "PASS <case>" per case and "FAIL <case>: <detail>" per failing check.
+//
+//   c1_rowid_range   t >= 100 AND t < 200 on the rowid alias takes the rowid
+//                    range path and yields exactly those rows; a non-indexed
+//                    column still filters by a full scan.
+//   c2_real_bounds   REAL bounds, one-sided and empty ranges, bounds beyond
+//                    the int64 range, a bound that cannot be compared.
+//   c3_text_index    a TEXT UNIQUE column takes the index range path.
+//   c4_cross_types   a REAL index with INTEGER bounds, an INTEGER index with
+//                    REAL bounds.
+//   c5_writes        UPDATE and DELETE through a range path collect first:
+//                    the right rows change, COUNT agrees, an update that moves
+//                    keys inside its own range touches each row once.
+//   c6_order_limit   ORDER BY, LIMIT and OFFSET over range paths.
+//   c7_scan_xy       meo_q_scan_xy / meo_q_scan_xyg: NaN gaps, groups, every
+//                    x path, early stop codes, errors, empty windows.
+//   c8_big           100k rows: the same windows through the range paths.
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meosql.mettle";
+import "tinytest.mettle";
+
+const RG_DB: string = "/dev/shm/meosql_range_self.dat";
+const RG_DB2: string = "/dev/shm/meosql_range_self_b.dat";
+const RG_N: int32 = 1000;
+const RG_IDS: int32 = 1024;
+const RG_BIG: int32 = 100000;
+const RG_BATCH: int32 = 2000;
+
+var g_ids: int64* = 0;     // rowids of the last rg_select
+var g_n: int32 = 0;
+var g_access: int32 = 0;   // plan access of the last rg_select
+
+// --- helpers ---------------------------------------------------------------
+
+fn rg_remove(db: string) {
+  meo_file_unlink(db);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+}
+
+fn rg_i(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn rg_r(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+fn rg_t(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn i64_min() -> int64 { return (int64)((uint64)1 << 63); }
+fn i64_max() -> int64 { return (int64)(((uint64)1 << 63) - (uint64)1); }
+
+// One filter: up to two terms, an optional order, limit and offset.
+struct RgF {
+  tbl: string;
+  c1: string;
+  op1: int32;
+  v1: MeoValue;
+  c2: string;
+  op2: int32;
+  v2: MeoValue;
+  ord: string;
+  desc: bool;
+  limit: int64;
+  offset: int64;
+}
+
+fn rg_f(f: RgF*, tbl: string, c1: string, op1: int32, v1: MeoValue) {
+  f->tbl = tbl;
+  f->c1 = c1;
+  f->op1 = op1;
+  f->v1 = v1;
+  f->c2 = "";
+  f->op2 = 0;
+  meo_value_set_null(&f->v2);
+  f->ord = "";
+  f->desc = false;
+  f->limit = -1;
+  f->offset = 0;
+}
+
+fn rg_and(f: RgF*, c2: string, op2: int32, v2: MeoValue) {
+  f->c2 = c2;
+  f->op2 = op2;
+  f->v2 = v2;
+}
+
+fn rg_where(q: MeoQuery*, f: RgF*) {
+  meo_q_where(q, f->c1, f->op1, &f->v1);
+  if (f->c2.length > 0) { meo_q_where(q, f->c2, f->op2, &f->v2); }
+}
+
+// SELECT t under f into g_ids / g_n / g_access. MEO_OK or the failing code.
+fn rg_select(db: MeoDb*, f: RgF*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(db, f->tbl, &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_pick(q, "t");
+  rg_where(q, f);
+  if (f->ord.length > 0) { meo_q_order(q, f->ord, f->desc); }
+  if (f->limit >= 0) { meo_q_limit(q, f->limit); }
+  if (f->offset > 0) { meo_q_offset(q, f->offset); }
+  g_n = 0;
+  rc = meo_q_step(q);
+  g_access = q->plan.access;
+  while (rc == MEO_ROW) {
+    if (g_n < RG_IDS) { g_ids[g_n] = meo_q_column_int64(q, 0); }
+    g_n += 1;
+    rc = meo_q_step(q);
+  }
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn rg_count(db: MeoDb*, f: RgF*) -> int64 {
+  var q: MeoQuery* = 0;
+  if (meo_q_count(db, f->tbl, &q) != MEO_OK) { return -1; }
+  rg_where(q, f);
+  var n: int64 = -1;
+  if (meo_q_step(q) == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+// The rowids under f are exactly lo..hi (none when hi < lo), COUNT agrees,
+// and the plan took `want` (0: not checked).
+fn rg_expect(db: MeoDb*, f: RgF*, label: string, lo: int64, hi: int64, want: int32) -> bool {
+  if (!meo_t_check_i64(rg_select(db, f), MEO_OK, label)) { return false; }
+  var n: int64 = hi - lo + 1;
+  if (n < 0) { n = 0; }
+  if (!meo_t_check_i64(g_n, n, label + " rows")) { return false; }
+  if (!meo_t_check_i64(rg_count(db, f), n, label + " count")) { return false; }
+  if (want != 0 && !meo_t_check_i64(g_access, want, label + " access")) { return false; }
+  var i: int32 = 0;
+  var mn: int64 = i64_max();
+  var mx: int64 = i64_min();
+  while (i < g_n) {
+    if (g_ids[i] < mn) { mn = g_ids[i]; }
+    if (g_ids[i] > mx) { mx = g_ids[i]; }
+    i += 1;
+  }
+  if (n == 0) { return true; }
+  // Distinct rowids, n of them, all inside lo..hi: exactly the range.
+  if (!meo_t_check_i64(mn, lo, label + " min")) { return false; }
+  return meo_t_check_i64(mx, hi, label + " max");
+}
+
+fn rg_exec(q: MeoQuery*, changes: int32*) -> int32 {
+  var rc: int32 = meo_q_step(q);
+  changes[0] = meo_q_changes(q);
+  meo_q_free(q);
+  return rc;
+}
+
+// r1(t INTEGER PRIMARY KEY, v REAL, name TEXT UNIQUE, k INTEGER UNIQUE,
+//    w REAL UNIQUE, grp INTEGER, plain REAL), rows t = 1..n:
+//   v = t / 2, name = "k" + 3 digits of t - 1, k = 3t, w = t / 4, grp = t % 4,
+//   plain = t % 7 (NULL when t % 10 == 0).
+fn rg_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "r1", &q);
+  meo_q_column_def(q, "t", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "v", MEO_T_REAL, 0);
+  meo_q_column_def(q, "name", MEO_T_TEXT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "k", MEO_T_INT, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "w", MEO_T_REAL, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "grp", MEO_T_INT, 0);
+  meo_q_column_def(q, "plain", MEO_T_REAL, 0);
+  var ch: int32 = 0;
+  var rc: int32 = rg_exec(q, &ch);
+  if (rc != MEO_DONE) { return rc; }
+  var ins: MeoQuery* = 0;
+  rc = meo_q_insert(db, "r1", &ins);
+  if (rc != MEO_OK) { return rc; }
+  var nm: uint8[4];
+  var t: int32 = 1;
+  while (t <= RG_N) {
+    var a: MeoValue = rg_i(t);
+    var b: MeoValue = rg_r((float64)t * 0.5);
+    nm[0] = (uint8)107;
+    nm[1] = (uint8)(48 + (t - 1) / 100);
+    nm[2] = (uint8)(48 + ((t - 1) / 10) % 10);
+    nm[3] = (uint8)(48 + (t - 1) % 10);
+    var c: MeoValue;
+    meo_value_set_text(&c, &nm[0], 4);
+    var d: MeoValue = rg_i((int64)t * 3);
+    var e: MeoValue = rg_r((float64)t * 0.25);
+    var g: MeoValue = rg_i(t % 4);
+    var p: MeoValue = rg_r((float64)(t % 7));
+    if (t % 10 == 0) { meo_value_set_null(&p); }
+    meo_q_value(ins, &a);
+    meo_q_value(ins, &b);
+    meo_q_value(ins, &c);
+    meo_q_value(ins, &d);
+    meo_q_value(ins, &e);
+    meo_q_value(ins, &g);
+    meo_q_value(ins, &p);
+    t += 1;
+  }
+  rc = rg_exec(ins, &ch);
+  if (rc != MEO_DONE || ch != RG_N) { return -MEO_ERR_USAGE; }
+  return MEO_OK;
+}
+
+fn rg_open(path: string, db: MeoDb**) -> bool {
+  rg_remove(path);
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, db);
+  if (!meo_t_check_i64(rc, MEO_OK, "open")) { return false; }
+  return meo_t_check_i64(rg_create(db[0]), MEO_OK, "create r1");
+}
+
+// --- c1 ----------------------------------------------------------------------
+
+fn c1_rowid_range(db: MeoDb*) -> int32 {
+  var f: RgF;
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_i(100));
+  rg_and(&f, "t", MEO_Q_LT, rg_i(200));
+  if (!rg_expect(db, &f, "c1 t in [100,200)", 100, 199, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_i(100));
+  rg_and(&f, "t", MEO_Q_LE, rg_i(200));
+  if (!rg_expect(db, &f, "c1 t in (100,200]", 101, 200, MEO_PATH_ROWID_RANGE)) { return 1; }
+  // The upper term first: the order of the terms does not matter.
+  rg_f(&f, "r1", "t", MEO_Q_LT, rg_i(200));
+  rg_and(&f, "t", MEO_Q_GE, rg_i(100));
+  if (!rg_expect(db, &f, "c1 upper first", 100, 199, MEO_PATH_ROWID_RANGE)) { return 1; }
+  // A range on a non-indexed column is a full scan, with the same answer.
+  rg_f(&f, "r1", "v", MEO_Q_GE, rg_r(50.0));
+  rg_and(&f, "v", MEO_Q_LT, rg_r(100.0));
+  if (!rg_expect(db, &f, "c1 v unindexed", 100, 199, MEO_PATH_FULL_SCAN)) { return 1; }
+  // A range term on another column rides along and is re-checked.
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_i(100));
+  rg_and(&f, "v", MEO_Q_LT, rg_r(100.0));
+  if (!rg_expect(db, &f, "c1 t with v", 100, 199, MEO_PATH_ROWID_RANGE)) { return 1; }
+  // A point path still wins over a range.
+  rg_f(&f, "r1", "t", MEO_Q_EQ, rg_i(150));
+  rg_and(&f, "k", MEO_Q_GT, rg_i(0));
+  if (!rg_expect(db, &f, "c1 eq beats range", 150, 150, MEO_PATH_ROWID_EQ)) { return 1; }
+  // The rowid alias is preferred over an indexed column.
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t("k050"));
+  rg_and(&f, "t", MEO_Q_LT, rg_i(60));
+  if (!rg_expect(db, &f, "c1 rowid beats index", 51, 59, MEO_PATH_ROWID_RANGE)) { return 1; }
+  println("PASS c1_rowid_range");
+  return 0;
+}
+
+// --- c2 ----------------------------------------------------------------------
+
+fn c2_real_bounds(db: MeoDb*) -> int32 {
+  var f: RgF;
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_r(99.5));
+  rg_and(&f, "t", MEO_Q_LE, rg_r(199.2));
+  if (!rg_expect(db, &f, "c2 (99.5,199.2]", 100, 199, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_r(100.0));
+  rg_and(&f, "t", MEO_Q_LE, rg_r(199.0));
+  if (!rg_expect(db, &f, "c2 [100.0,199.0]", 100, 199, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_r(100.0));
+  rg_and(&f, "t", MEO_Q_LT, rg_r(199.0));
+  if (!rg_expect(db, &f, "c2 (100.0,199.0)", 101, 198, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_i(990));
+  if (!rg_expect(db, &f, "c2 only GT", 991, 1000, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_r(990.5));
+  if (!rg_expect(db, &f, "c2 only GT real", 991, 1000, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_LE, rg_i(5));
+  if (!rg_expect(db, &f, "c2 only LE", 1, 5, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_LE, rg_r(5.9));
+  if (!rg_expect(db, &f, "c2 only LE real", 1, 5, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_LT, rg_r(5.0));
+  if (!rg_expect(db, &f, "c2 only LT real", 1, 4, MEO_PATH_ROWID_RANGE)) { return 1; }
+  // Empty: lower above upper, bounds with no rowid between them.
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_i(500));
+  rg_and(&f, "t", MEO_Q_LT, rg_i(400));
+  if (!rg_expect(db, &f, "c2 lo > hi", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_i(500));
+  rg_and(&f, "t", MEO_Q_LT, rg_i(501));
+  if (!rg_expect(db, &f, "c2 (500,501)", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_r(500.2));
+  rg_and(&f, "t", MEO_Q_LT, rg_r(500.8));
+  if (!rg_expect(db, &f, "c2 (500.2,500.8)", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  // Beyond the int64 range.
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_r(1.0e30));
+  if (!rg_expect(db, &f, "c2 above int64", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_LT, rg_r(-1.0e30));
+  if (!rg_expect(db, &f, "c2 below int64", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_r(9.3e18));
+  if (!rg_expect(db, &f, "c2 GE 9.3e18", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_LE, rg_r(-9.3e18));
+  if (!rg_expect(db, &f, "c2 LE -9.3e18", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_r(-1.0e30));
+  rg_and(&f, "t", MEO_Q_LT, rg_r(1.0e30));
+  if (!rg_expect(db, &f, "c2 whole line", 1, 1000, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_i(i64_min()));
+  rg_and(&f, "t", MEO_Q_LE, rg_i(i64_max()));
+  if (!rg_expect(db, &f, "c2 int64 extremes", 1, 1000, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_i(i64_max()));
+  if (!rg_expect(db, &f, "c2 GT int64 max", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_LT, rg_i(i64_min()));
+  if (!rg_expect(db, &f, "c2 LT int64 min", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  // A bound that cannot be compared is no range at all.
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_t("a"));
+  if (!rg_expect(db, &f, "c2 text bound", 1, 0, MEO_PATH_FULL_SCAN)) { return 1; }
+  var nul: MeoValue;
+  meo_value_set_null(&nul);
+  rg_f(&f, "r1", "t", MEO_Q_GE, nul);
+  rg_and(&f, "t", MEO_Q_LT, rg_i(10));
+  if (!rg_expect(db, &f, "c2 null bound", 1, 0, MEO_PATH_ROWID_RANGE)) { return 1; }
+  println("PASS c2_real_bounds");
+  return 0;
+}
+
+// --- c3 ----------------------------------------------------------------------
+
+fn c3_text_index(db: MeoDb*) -> int32 {
+  var f: RgF;
+  // name = "k" + (t - 1) as 3 digits, so name k050 is t = 51.
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t("k050"));
+  rg_and(&f, "name", MEO_Q_LT, rg_t("k060"));
+  if (!rg_expect(db, &f, "c3 [k050,k060)", 51, 60, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_GT, rg_t("k050"));
+  rg_and(&f, "name", MEO_Q_LE, rg_t("k060"));
+  if (!rg_expect(db, &f, "c3 (k050,k060]", 52, 61, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t("k990"));
+  if (!rg_expect(db, &f, "c3 only GE", 991, 1000, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_LT, rg_t("k010"));
+  if (!rg_expect(db, &f, "c3 only LT", 1, 10, MEO_PATH_INDEX_RANGE)) { return 1; }
+  // A prefix sorts before the keys it prefixes.
+  rg_f(&f, "r1", "name", MEO_Q_GT, rg_t("k05"));
+  rg_and(&f, "name", MEO_Q_LT, rg_t("k051"));
+  if (!rg_expect(db, &f, "c3 prefix", 51, 51, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_GT, rg_t("k999"));
+  if (!rg_expect(db, &f, "c3 above all", 1, 0, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_LT, rg_t("a"));
+  if (!rg_expect(db, &f, "c3 below all", 1, 0, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t("k500"));
+  rg_and(&f, "name", MEO_Q_LT, rg_t("k400"));
+  if (!rg_expect(db, &f, "c3 lo > hi", 1, 0, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t(""));
+  if (!rg_expect(db, &f, "c3 from empty", 1, 1000, MEO_PATH_INDEX_RANGE)) { return 1; }
+  // A number cannot bound a TEXT column: full scan, no rows.
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_i(5));
+  if (!rg_expect(db, &f, "c3 int on text", 1, 0, MEO_PATH_FULL_SCAN)) { return 1; }
+  println("PASS c3_text_index");
+  return 0;
+}
+
+// --- c4 ----------------------------------------------------------------------
+
+fn c4_cross_types(db: MeoDb*) -> int32 {
+  var f: RgF;
+  // w REAL = t / 4 with INTEGER bounds: [10, 20) is t = 40..79.
+  rg_f(&f, "r1", "w", MEO_Q_GE, rg_i(10));
+  rg_and(&f, "w", MEO_Q_LT, rg_i(20));
+  if (!rg_expect(db, &f, "c4 real idx int bounds", 40, 79, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "w", MEO_Q_GT, rg_i(10));
+  rg_and(&f, "w", MEO_Q_LE, rg_i(20));
+  if (!rg_expect(db, &f, "c4 real idx (10,20]", 41, 80, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "w", MEO_Q_GT, rg_r(10.1));
+  rg_and(&f, "w", MEO_Q_LT, rg_r(10.6));
+  if (!rg_expect(db, &f, "c4 real idx real bounds", 41, 42, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "w", MEO_Q_LT, rg_i(1));
+  if (!rg_expect(db, &f, "c4 real idx only LT", 1, 3, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "w", MEO_Q_GT, rg_i(249));
+  if (!rg_expect(db, &f, "c4 real idx only GT", 997, 1000, MEO_PATH_INDEX_RANGE)) { return 1; }
+  // k INTEGER = 3t with REAL bounds: k in (299.5, 330.2] is 300..330, t = 100..110.
+  rg_f(&f, "r1", "k", MEO_Q_GT, rg_r(299.5));
+  rg_and(&f, "k", MEO_Q_LE, rg_r(330.2));
+  if (!rg_expect(db, &f, "c4 int idx real bounds", 100, 110, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_GE, rg_r(300.0));
+  rg_and(&f, "k", MEO_Q_LT, rg_r(330.0));
+  if (!rg_expect(db, &f, "c4 int idx integral reals", 100, 109, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_GT, rg_r(2999.5));
+  if (!rg_expect(db, &f, "c4 int idx only GT", 1000, 1000, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_LT, rg_r(3.5));
+  if (!rg_expect(db, &f, "c4 int idx only LT", 1, 1, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_GT, rg_r(1.0e30));
+  if (!rg_expect(db, &f, "c4 int idx above", 1, 0, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_LT, rg_r(-1.0e30));
+  if (!rg_expect(db, &f, "c4 int idx below", 1, 0, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_GE, rg_r(-1.0e30));
+  rg_and(&f, "k", MEO_Q_LE, rg_r(1.0e30));
+  if (!rg_expect(db, &f, "c4 int idx whole", 1, 1000, MEO_PATH_INDEX_RANGE)) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_GE, rg_i(i64_min()));
+  rg_and(&f, "k", MEO_Q_LE, rg_i(i64_max()));
+  if (!rg_expect(db, &f, "c4 int idx extremes", 1, 1000, MEO_PATH_INDEX_RANGE)) { return 1; }
+  println("PASS c4_cross_types");
+  return 0;
+}
+
+// --- c5 ----------------------------------------------------------------------
+
+fn c5_writes() -> int32 {
+  var db: MeoDb* = 0;
+  if (!rg_open(RG_DB2, &db)) { return 1; }
+  var f: RgF;
+  var ch: int32 = 0;
+  var q: MeoQuery* = 0;
+  var v: MeoValue = rg_r(99.0);
+  // UPDATE through the rowid range.
+  meo_q_update(db, "r1", &q);
+  meo_q_assign(q, "plain", &v);
+  var lo: MeoValue = rg_i(100);
+  var hi: MeoValue = rg_i(109);
+  meo_q_where(q, "t", MEO_Q_GE, &lo);
+  meo_q_where(q, "t", MEO_Q_LE, &hi);
+  var rc: int32 = meo_q_step(q);
+  var access: int32 = q->plan.access;
+  ch = meo_q_changes(q);
+  meo_q_free(q);
+  if (!meo_t_check_i64(rc, MEO_DONE, "c5 update rc")) { return 1; }
+  if (!meo_t_check_i64(access, MEO_PATH_ROWID_RANGE, "c5 update access")) { return 1; }
+  if (!meo_t_check_i64(ch, 10, "c5 update changes")) { return 1; }
+  rg_f(&f, "r1", "plain", MEO_Q_EQ, rg_r(99.0));
+  if (!meo_t_check_i64(rg_count(db, &f), 10, "c5 updated rows")) { return 1; }
+  // UPDATE through the index range, moving keys inside its own range: every
+  // row must be touched once. k = 3..300 becomes 4..301, all but one still
+  // inside [3, 300].
+  var q2: MeoQuery* = 0;
+  meo_q_update(db, "r1", &q2);
+  meo_q_assign_add(q2, "k", 1);
+  lo = rg_i(3);
+  hi = rg_i(300);
+  meo_q_where(q2, "k", MEO_Q_GE, &lo);
+  meo_q_where(q2, "k", MEO_Q_LE, &hi);
+  rc = meo_q_step(q2);
+  access = q2->plan.access;
+  ch = meo_q_changes(q2);
+  meo_q_free(q2);
+  if (!meo_t_check_i64(rc, MEO_DONE, "c5 update k rc")) { return 1; }
+  if (!meo_t_check_i64(access, MEO_PATH_INDEX_RANGE, "c5 update k access")) { return 1; }
+  if (!meo_t_check_i64(ch, 100, "c5 update k changes")) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_GE, rg_i(3));
+  rg_and(&f, "k", MEO_Q_LE, rg_i(300));
+  if (!meo_t_check_i64(rg_count(db, &f), 99, "c5 k window count")) { return 1; }
+  rg_f(&f, "r1", "k", MEO_Q_EQ, rg_i(301));
+  if (!meo_t_check_i64(rg_count(db, &f), 1, "c5 k 301")) { return 1; }
+  // DELETE through the rowid range.
+  var q3: MeoQuery* = 0;
+  meo_q_delete(db, "r1", &q3);
+  lo = rg_i(900);
+  meo_q_where(q3, "t", MEO_Q_GT, &lo);
+  rc = rg_exec(q3, &ch);
+  if (!meo_t_check_i64(rc, MEO_DONE, "c5 delete rc")) { return 1; }
+  if (!meo_t_check_i64(ch, 100, "c5 delete changes")) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GT, rg_i(900));
+  if (!meo_t_check_i64(rg_count(db, &f), 0, "c5 deleted gone")) { return 1; }
+  // DELETE through the index range: names k100..k109 are t = 101..110.
+  var q4: MeoQuery* = 0;
+  meo_q_delete(db, "r1", &q4);
+  var nlo: MeoValue = rg_t("k100");
+  var nhi: MeoValue = rg_t("k110");
+  meo_q_where(q4, "name", MEO_Q_GE, &nlo);
+  meo_q_where(q4, "name", MEO_Q_LT, &nhi);
+  rc = meo_q_step(q4);
+  access = q4->plan.access;
+  ch = meo_q_changes(q4);
+  meo_q_free(q4);
+  if (!meo_t_check_i64(rc, MEO_DONE, "c5 delete name rc")) { return 1; }
+  if (!meo_t_check_i64(access, MEO_PATH_INDEX_RANGE, "c5 delete name access")) { return 1; }
+  if (!meo_t_check_i64(ch, 10, "c5 delete name changes")) { return 1; }
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t("k100"));
+  rg_and(&f, "name", MEO_Q_LT, rg_t("k110"));
+  if (!meo_t_check_i64(rg_count(db, &f), 0, "c5 name range gone")) { return 1; }
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_i(0));
+  if (!meo_t_check_i64(rg_count(db, &f), 890, "c5 total")) { return 1; }
+  // The same total by a full scan.
+  rg_f(&f, "r1", "v", MEO_Q_GE, rg_r(0.0));
+  if (!meo_t_check_i64(rg_count(db, &f), 890, "c5 total by scan")) { return 1; }
+  meo_db_close(db);
+  println("PASS c5_writes");
+  return 0;
+}
+
+// --- c6 ----------------------------------------------------------------------
+
+fn c6_order_limit(db: MeoDb*) -> int32 {
+  var f: RgF;
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_i(100));
+  rg_and(&f, "t", MEO_Q_LT, rg_i(200));
+  f.ord = "t";
+  f.desc = true;
+  f.limit = 5;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 desc limit")) { return 1; }
+  if (!meo_t_check_i64(g_n, 5, "c6 desc limit rows")) { return 1; }
+  if (!meo_t_check_i64(g_ids[0], 199, "c6 desc first")) { return 1; }
+  if (!meo_t_check_i64(g_ids[4], 195, "c6 desc last")) { return 1; }
+  // Ascending on the rowid needs no sort: the first rows come straight off
+  // the scan.
+  f.desc = false;
+  f.limit = 3;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 asc limit")) { return 1; }
+  if (!meo_t_check_i64(g_n, 3, "c6 asc limit rows")) { return 1; }
+  if (!meo_t_check_i64(g_ids[0], 100, "c6 asc first")) { return 1; }
+  if (!meo_t_check_i64(g_ids[2], 102, "c6 asc third")) { return 1; }
+  // OFFSET without ORDER BY: the rowid range arrives in rowid order.
+  f.ord = "";
+  f.limit = -1;
+  f.offset = 95;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 offset")) { return 1; }
+  if (!meo_t_check_i64(g_n, 5, "c6 offset rows")) { return 1; }
+  if (!meo_t_check_i64(g_ids[0], 195, "c6 offset first")) { return 1; }
+  if (!meo_t_check_i64(g_ids[4], 199, "c6 offset last")) { return 1; }
+  f.offset = 150;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 offset past")) { return 1; }
+  if (!meo_t_check_i64(g_n, 0, "c6 offset past rows")) { return 1; }
+  // OFFSET and LIMIT over an index range (order unspecified, count exact).
+  rg_f(&f, "r1", "name", MEO_Q_GE, rg_t("k050"));
+  rg_and(&f, "name", MEO_Q_LT, rg_t("k060"));
+  f.offset = 7;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 index offset")) { return 1; }
+  if (!meo_t_check_i64(g_n, 3, "c6 index offset rows")) { return 1; }
+  f.offset = 2;
+  f.limit = 4;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 index offset limit")) { return 1; }
+  if (!meo_t_check_i64(g_n, 4, "c6 index offset limit rows")) { return 1; }
+  // ORDER BY the indexed column, descending, with LIMIT: k = 3t.
+  rg_f(&f, "r1", "k", MEO_Q_GE, rg_i(300));
+  rg_and(&f, "k", MEO_Q_LE, rg_i(330));
+  f.ord = "k";
+  f.desc = true;
+  f.limit = 3;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 index desc")) { return 1; }
+  if (!meo_t_check_i64(g_n, 3, "c6 index desc rows")) { return 1; }
+  if (!meo_t_check_i64(g_ids[0], 110, "c6 index desc first")) { return 1; }
+  if (!meo_t_check_i64(g_ids[2], 108, "c6 index desc last")) { return 1; }
+  // LIMIT 0 reads nothing.
+  f.limit = 0;
+  if (!meo_t_check_i64(rg_select(db, &f), MEO_OK, "c6 limit 0")) { return 1; }
+  if (!meo_t_check_i64(g_n, 0, "c6 limit 0 rows")) { return 1; }
+  println("PASS c6_order_limit");
+  return 0;
+}
+
+// --- c7 ----------------------------------------------------------------------
+
+struct RgAcc {
+  n: int32;
+  sum_x: float64;
+  sum_y: float64;
+  nans: int32;
+  asc: bool;
+  last_x: float64;
+  stop_at: int32;          // stop after this many rows (0: never)
+  stop_rc: int32;          // ... answering this
+  gn: int32[4];
+  gsum: float64[4];
+}
+
+fn rg_acc(a: RgAcc*, stop_at: int32, stop_rc: int32) {
+  a->n = 0;
+  a->sum_x = 0.0;
+  a->sum_y = 0.0;
+  a->nans = 0;
+  a->asc = true;
+  a->last_x = 0.0;
+  a->stop_at = stop_at;
+  a->stop_rc = stop_rc;
+  var i: int32 = 0;
+  while (i < 4) {
+    a->gn[i] = 0;
+    a->gsum[i] = 0.0;
+    i += 1;
+  }
+}
+
+fn rg_cb(ctx: rawptr, x: float64, y: float64) -> int32 {
+  var a: RgAcc* = (RgAcc*)ctx;
+  a->n += 1;
+  if (a->n > 1 && x < a->last_x) { a->asc = false; }
+  a->last_x = x;
+  a->sum_x = a->sum_x + x;
+  if (y != y) {
+    a->nans += 1;
+  } else {
+    a->sum_y = a->sum_y + y;
+  }
+  if (a->stop_at > 0 && a->n >= a->stop_at) { return a->stop_rc; }
+  return 0;
+}
+
+fn rg_gcb(ctx: rawptr, g: int64, x: float64, y: float64) -> int32 {
+  var a: RgAcc* = (RgAcc*)ctx;
+  a->n += 1;
+  if (g >= 0 && g < 4) {
+    a->gn[(int32)g] += 1;
+    a->gsum[(int32)g] = a->gsum[(int32)g] + y;
+  }
+  return 0;
+}
+
+// Run meo_q_scan_xy with a fresh accumulator; the scan's answer.
+fn rg_xy(db: MeoDb*, a: RgAcc*, x: string, y: string, lo: float64, hi: float64) -> int32 {
+  rg_acc(a, 0, 0);
+  return meo_q_scan_xy(db, "r1", x, y, lo, hi, rg_cb, a);
+}
+
+fn c7_scan_xy(db: MeoDb*) -> int32 {
+  var a: RgAcc;
+  // x = rowid alias, y = REAL: sum of v = t / 2 over [100, 199].
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "v", 100.0, 199.0), MEO_OK, "c7 rowid rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 100, "c7 rowid n")) { return 1; }
+  if (!meo_t_check(a.sum_y == 7475.0, "c7 rowid sum_y")) { return 1; }
+  if (!meo_t_check(a.sum_x == 14950.0, "c7 rowid sum_x")) { return 1; }
+  if (!meo_t_check(a.asc, "c7 rowid ascending")) { return 1; }
+  // Fractional window edges on the rowid: [99.5, 199.5] is still 100..199.
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "v", 99.5, 199.5), MEO_OK, "c7 rowid frac rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 100, "c7 rowid frac n")) { return 1; }
+  // NULL y arrives as NaN: plain is NULL where t % 10 == 0.
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "plain", 100.0, 199.0), MEO_OK, "c7 nan rc")) { return 1; }
+  var want_y: float64 = 0.0;
+  var t: int32 = 100;
+  while (t <= 199) {
+    if (t % 10 != 0) { want_y = want_y + (float64)(t % 7); }
+    t += 1;
+  }
+  if (!meo_t_check_i64(a.n, 100, "c7 nan n")) { return 1; }
+  if (!meo_t_check_i64(a.nans, 10, "c7 nan count")) { return 1; }
+  if (!meo_t_check(a.sum_y == want_y, "c7 nan sum_y")) { return 1; }
+  // y that is INTEGER is converted: grp.
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "grp", 1.0, 8.0), MEO_OK, "c7 int y rc")) { return 1; }
+  if (!meo_t_check(a.sum_y == 12.0, "c7 int y sum")) { return 1; }   // grp of t = 1..8
+  // x indexed REAL: w = t / 4 in [10, 19.9] is t = 40..79.
+  if (!meo_t_check_i64(rg_xy(db, &a, "w", "v", 10.0, 19.9), MEO_OK, "c7 real idx rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 40, "c7 real idx n")) { return 1; }
+  if (!meo_t_check(a.asc, "c7 real idx ascending")) { return 1; }
+  if (!meo_t_check(a.sum_y == 1190.0, "c7 real idx sum_y")) { return 1; }   // sum t/2, t = 40..79
+  if (!meo_t_check(a.sum_x == 595.0, "c7 real idx sum_x")) { return 1; }    // sum t/4
+  // x indexed INTEGER, REAL window: k = 3t in [299.5, 330.5] is t = 100..110.
+  if (!meo_t_check_i64(rg_xy(db, &a, "k", "t", 299.5, 330.5), MEO_OK, "c7 int idx rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 11, "c7 int idx n")) { return 1; }
+  if (!meo_t_check(a.asc, "c7 int idx ascending")) { return 1; }
+  if (!meo_t_check(a.sum_y == 1155.0, "c7 int idx sum_y")) { return 1; }
+  // x unindexed: full scan. v = t / 2 in [50, 99.5] is t = 100..199.
+  if (!meo_t_check_i64(rg_xy(db, &a, "v", "t", 50.0, 99.5), MEO_OK, "c7 full rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 100, "c7 full n")) { return 1; }
+  if (!meo_t_check(a.sum_y == 14950.0, "c7 full sum_y")) { return 1; }
+  // A NULL x is skipped: plain has 100 NULLs in 1000 rows.
+  if (!meo_t_check_i64(rg_xy(db, &a, "plain", "t", 0.0, 6.0), MEO_OK, "c7 null x rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 900, "c7 null x n")) { return 1; }
+  // The whole line.
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "v", -1.0e300, 1.0e300), MEO_OK, "c7 whole rowid")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c7 whole rowid n")) { return 1; }
+  if (!meo_t_check_i64(rg_xy(db, &a, "k", "v", -1.0e300, 1.0e300), MEO_OK, "c7 whole idx")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c7 whole idx n")) { return 1; }
+  if (!meo_t_check_i64(rg_xy(db, &a, "w", "v", -1.0e300, 1.0e300), MEO_OK, "c7 whole real idx")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c7 whole real idx n")) { return 1; }
+  // Empty windows, and a TEXT x that is never a number.
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "v", 200.0, 100.0), MEO_OK, "c7 lo > hi rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 0, "c7 lo > hi n")) { return 1; }
+  if (!meo_t_check_i64(rg_xy(db, &a, "w", "v", 5000.0, 6000.0), MEO_OK, "c7 above rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 0, "c7 above n")) { return 1; }
+  if (!meo_t_check_i64(rg_xy(db, &a, "name", "v", 0.0, 1000.0), MEO_OK, "c7 text x rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 0, "c7 text x n")) { return 1; }
+  var nan: float64 = 0.0;
+  nan = nan / nan;
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "v", nan, 100.0), MEO_OK, "c7 nan bound rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 0, "c7 nan bound n")) { return 1; }
+  // Grouped: per-group sums of v over the whole table.
+  rg_acc(&a, 0, 0);
+  var rc: int32 = meo_q_scan_xyg(db, "r1", "t", "v", "grp", 1.0, 1000.0, rg_gcb, &a);
+  if (!meo_t_check_i64(rc, MEO_OK, "c7 group rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c7 group n")) { return 1; }
+  var g: int32 = 0;
+  while (g < 4) {
+    var want: float64 = 0.0;
+    t = 1;
+    while (t <= RG_N) {
+      if (t % 4 == g) { want = want + (float64)t * 0.5; }
+      t += 1;
+    }
+    if (!meo_t_check_i64(a.gn[g], 250, "c7 group count")) { return 1; }
+    if (!meo_t_check(a.gsum[g] == want, "c7 group sum")) { return 1; }
+    g += 1;
+  }
+  // Grouped over an index range, and a group column that is not INTEGER
+  // skips every row.
+  rg_acc(&a, 0, 0);
+  rc = meo_q_scan_xyg(db, "r1", "w", "v", "grp", 10.0, 19.9, rg_gcb, &a);
+  if (!meo_t_check_i64(rc, MEO_OK, "c7 group idx rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 40, "c7 group idx n")) { return 1; }
+  rg_acc(&a, 0, 0);
+  rc = meo_q_scan_xyg(db, "r1", "t", "v", "v", 1.0, 1000.0, rg_gcb, &a);
+  if (!meo_t_check_i64(rc, MEO_OK, "c7 group real rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 0, "c7 group real n")) { return 1; }
+  // A nonzero callback answer stops the scan and comes back, on every path.
+  rg_acc(&a, 3, 7);
+  rc = meo_q_scan_xy(db, "r1", "t", "v", 1.0, 1000.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, 7, "c7 stop rowid rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 3, "c7 stop rowid n")) { return 1; }
+  rg_acc(&a, 3, 7);
+  rc = meo_q_scan_xy(db, "r1", "k", "v", 1.0, 5000.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, 7, "c7 stop idx rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 3, "c7 stop idx n")) { return 1; }
+  rg_acc(&a, 3, 7);
+  rc = meo_q_scan_xy(db, "r1", "v", "t", 1.0, 5000.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, 7, "c7 stop full rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 3, "c7 stop full n")) { return 1; }
+  rg_acc(&a, 3, 1);
+  rc = meo_q_scan_xy(db, "r1", "k", "v", 1.0, 5000.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, 1, "c7 stop 1 rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 3, "c7 stop 1 n")) { return 1; }
+  rg_acc(&a, 3, -5);
+  rc = meo_q_scan_xy(db, "r1", "t", "v", 1.0, 1000.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, -5, "c7 stop negative rc")) { return 1; }
+  // The lock is released after a stop: a query runs afterwards.
+  var f: RgF;
+  rg_f(&f, "r1", "t", MEO_Q_GE, rg_i(0));
+  if (!meo_t_check_i64(rg_count(db, &f), 1000, "c7 count after stop")) { return 1; }
+  // Unknown names.
+  if (!meo_t_check_i64(rg_xy(db, &a, "nope", "v", 0.0, 1.0), -MEO_ERR_SCHEMA, "c7 bad x")) { return 1; }
+  if (!meo_t_check_i64(rg_xy(db, &a, "t", "nope", 0.0, 1.0), -MEO_ERR_SCHEMA, "c7 bad y")) { return 1; }
+  rc = meo_q_scan_xy(db, "nope", "t", "v", 0.0, 1.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, -MEO_ERR_SCHEMA, "c7 bad table")) { return 1; }
+  rc = meo_q_scan_xyg(db, "r1", "t", "v", "nope", 0.0, 1.0, rg_gcb, &a);
+  if (!meo_t_check_i64(rc, -MEO_ERR_SCHEMA, "c7 bad group")) { return 1; }
+  println("PASS c7_scan_xy");
+  return 0;
+}
+
+// --- c8 ----------------------------------------------------------------------
+
+// big(t INTEGER PRIMARY KEY, x REAL UNIQUE, y REAL): x = t / 2, y = t.
+fn c8_big() -> int32 {
+  rg_remove(RG_DB);
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(RG_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (!meo_t_check_i64(rc, MEO_OK, "c8 open")) { return 1; }
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "big", &q);
+  meo_q_column_def(q, "t", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "x", MEO_T_REAL, MEO_COL_UNIQUE);
+  meo_q_column_def(q, "y", MEO_T_REAL, 0);
+  var ch: int32 = 0;
+  if (!meo_t_check_i64(rg_exec(q, &ch), MEO_DONE, "c8 create")) { return 1; }
+  var id: int32 = 1;
+  while (id <= RG_BIG) {
+    var ins: MeoQuery* = 0;
+    meo_q_insert(db, "big", &ins);
+    var n: int32 = 0;
+    while (n < RG_BATCH) {
+      var a: MeoValue = rg_i(id);
+      var b: MeoValue = rg_r((float64)id * 0.5);
+      var c: MeoValue = rg_r((float64)id);
+      meo_q_value(ins, &a);
+      meo_q_value(ins, &b);
+      meo_q_value(ins, &c);
+      id += 1;
+      n += 1;
+    }
+    rc = rg_exec(ins, &ch);
+    if (!meo_t_check_i64(rc, MEO_DONE, "c8 insert")) { return 1; }
+  }
+  var f: RgF;
+  rg_f(&f, "big", "t", MEO_Q_GE, rg_i(50000));
+  rg_and(&f, "t", MEO_Q_LT, rg_i(51000));
+  if (!rg_expect(db, &f, "c8 rowid window", 50000, 50999, MEO_PATH_ROWID_RANGE)) { return 1; }
+  rg_f(&f, "big", "x", MEO_Q_GE, rg_r(25000.0));
+  rg_and(&f, "x", MEO_Q_LT, rg_r(25500.0));
+  if (!rg_expect(db, &f, "c8 index window", 50000, 50999, MEO_PATH_INDEX_RANGE)) { return 1; }
+  var a: RgAcc;
+  rg_acc(&a, 0, 0);
+  rc = meo_q_scan_xy(db, "big", "t", "y", 50000.0, 50999.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, MEO_OK, "c8 xy rowid rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c8 xy rowid n")) { return 1; }
+  if (!meo_t_check(a.sum_y == 50499500.0, "c8 xy rowid sum")) { return 1; }
+  rg_acc(&a, 0, 0);
+  rc = meo_q_scan_xy(db, "big", "x", "y", 25000.0, 25499.5, rg_cb, &a);
+  if (!meo_t_check_i64(rc, MEO_OK, "c8 xy index rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c8 xy index n")) { return 1; }
+  if (!meo_t_check(a.sum_y == 50499500.0, "c8 xy index sum")) { return 1; }
+  if (!meo_t_check(a.asc, "c8 xy index ascending")) { return 1; }
+  rg_acc(&a, 0, 0);
+  rc = meo_q_scan_xy(db, "big", "y", "t", 99001.0, 100000.0, rg_cb, &a);
+  if (!meo_t_check_i64(rc, MEO_OK, "c8 xy full rc")) { return 1; }
+  if (!meo_t_check_i64(a.n, 1000, "c8 xy full n")) { return 1; }
+  meo_db_close(db);
+  println("PASS c8_big");
+  return 0;
+}
+
+fn main() -> int32 {
+  var ids: int64[] = new int64[RG_IDS];
+  g_ids = ids.data;
+  rg_remove(RG_DB);
+  rg_remove(RG_DB2);
+  var db: MeoDb* = 0;
+  var rc: int32 = 0;
+  if (rg_open(RG_DB, &db)) {
+    rc = c1_rowid_range(db);
+    if (rc == 0) { rc = c2_real_bounds(db); }
+    if (rc == 0) { rc = c3_text_index(db); }
+    if (rc == 0) { rc = c4_cross_types(db); }
+    if (rc == 0) { rc = c6_order_limit(db); }
+    if (rc == 0) { rc = c7_scan_xy(db); }
+    meo_db_close(db);
+  } else {
+    rc = 1;
+  }
+  if (rc == 0) { rc = c5_writes(); }
+  if (rc == 0) { rc = c8_big(); }
+  rg_remove(RG_DB);
+  rg_remove(RG_DB2);
+  free(ids.data);
+  if (rc == 0) { println("PASS range_self"); }
+  return meo_t_report();
+}

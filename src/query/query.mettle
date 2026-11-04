@@ -12,11 +12,14 @@
 import "std/mem";
 import "std/thread";
 import "../error/status.mettle";
+import "../format/bytes.mettle";
 import "../record/value.mettle";
 import "../mem/arena.mettle";
 import "../catalog/schema.mettle";
 import "../db/db.mettle";
 import "../db/flags.mettle";
+import "../catalog/catalog.mettle";
+import "../table/table.mettle";
 import "spec.mettle";
 import "plan.mettle";
 import "exec.mettle";
@@ -484,4 +487,210 @@ export fn meo_q_cell(q: MeoQuery*, row: int32, col: int32, out: MeoValue*) -> in
   if (v == 0) { return -MEO_ERR_USAGE; }
   out[0] = v[0];
   return MEO_OK;
+}
+
+// --- streaming x/y scan -----------------------------------------------------
+
+// One scan: the callbacks, the column positions and the x window.
+struct QScan {
+  fn_xy: fn(rawptr, float64, float64) -> int32;
+  fn_xyg: fn(rawptr, int64, float64, float64) -> int32;
+  ctx: rawptr;
+  grouped: bool;
+  xc: int32;
+  yc: int32;
+  gc: int32;
+  lo: float64;
+  hi: float64;
+}
+
+fn q_nan() -> float64 {
+  var b: uint8[8];
+  meo_put_u64le(&b[0], 0, (uint64)0x7FF8 << 48);
+  return meo_get_f64le(&b[0], 0);
+}
+
+fn q_col(t: MeoTable*, name: string) -> int32 {
+  var nm: MeoQName;
+  nm.p = name.chars;
+  nm.n = (int32)name.length;
+  return meo_plan_col(t, &nm);
+}
+
+// One row: skipped unless x is a number inside the window (and the group an
+// INTEGER), else handed to the callback. 0 to go on; a callback's nonzero
+// answer or a negative code stops the scan.
+fn q_scan_row(sc: QScan*, t: MeoTable*, row: MeoTblRow*) -> int32 {
+  var v: MeoValue;
+  var rc: int32 = meo_tbl_row_get(t, row, sc->xc, &v);
+  if (rc != MEO_OK) { return rc; }
+  var x: float64 = 0.0;
+  if (v.type == MEO_T_INT) {
+    x = (float64)v.i;
+  } else if (v.type == MEO_T_REAL) {
+    x = v.f;
+  } else {
+    return 0;
+  }
+  if (!(x >= sc->lo && x <= sc->hi)) { return 0; }
+  var g: int64 = 0;
+  if (sc->grouped) {
+    rc = meo_tbl_row_get(t, row, sc->gc, &v);
+    if (rc != MEO_OK) { return rc; }
+    if (v.type != MEO_T_INT) { return 0; }
+    g = v.i;
+  }
+  rc = meo_tbl_row_get(t, row, sc->yc, &v);
+  if (rc != MEO_OK) { return rc; }
+  var y: float64 = q_nan();
+  if (v.type == MEO_T_INT) { y = (float64)v.i; }
+  if (v.type == MEO_T_REAL) { y = v.f; }
+  if (sc->grouped) { return sc->fn_xyg(sc->ctx, g, x, y); }
+  return sc->fn_xy(sc->ctx, x, y);
+}
+
+// How a scan loop ended: the row step's stop code wins, then a cursor failure
+// (rc < 0; 1 is the cursor's plain "done").
+fn q_scan_end(rc: int32, st: int32) -> int32 {
+  if (st != 0) { return st; }
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// Rowid-alias x: rows arrive in x order.
+fn q_scan_rowids(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
+  var lo: int64 = 0;
+  var hi: int64 = 0;
+  if (meo_tbl_real_bound(sc->lo, false, &lo) != MEO_OK) { return MEO_OK; }
+  if (meo_tbl_real_bound(sc->hi, true, &hi) != MEO_OK) { return MEO_OK; }
+  var cur: MeoTblScan;
+  var rc: int32 = meo_tbl_scan_from(db, t, lo, &cur);
+  if (rc != MEO_OK) { return rc; }
+  var row: MeoTblRow;
+  var st: int32 = 0;
+  while (true) {
+    rc = meo_tbl_scan_next(&cur, &row);
+    if (rc != 0 || row.rowid > hi) { break; }
+    st = q_scan_row(sc, t, &row);
+    if (st != 0) { break; }
+  }
+  meo_tbl_scan_close(&cur);
+  return q_scan_end(rc, st);
+}
+
+// Indexed x: rows arrive in x order.
+fn q_scan_index(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
+  var buf: uint8* = malloc((int64)MEO_REC_MAX);
+  if (buf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(buf);
+  var lo: MeoValue;
+  var hi: MeoValue;
+  meo_value_set_real(&lo, sc->lo);
+  meo_value_set_real(&hi, sc->hi);
+  var cur: MeoTblIdxScan;
+  var rc: int32 = meo_tbl_idx_scan_open(db, t, sc->xc, &lo, &hi, &cur);
+  if (rc != MEO_OK) { return rc; }
+  var row: MeoTblRow;
+  var st: int32 = 0;
+  while (true) {
+    var id: int64 = 0;
+    rc = meo_tbl_idx_scan_next(&cur, &id);
+    if (rc != 0) { break; }
+    rc = meo_tbl_lookup_rowid(db, t, id, buf, MEO_REC_MAX, &row);
+    if (rc == MEO_OK) {
+      st = q_scan_row(sc, t, &row);
+    } else if (rc == 1) {
+      rc = MEO_OK;
+    }
+    if (rc < 0 || st != 0) { break; }
+  }
+  meo_tbl_idx_scan_close(&cur);
+  return q_scan_end(rc, st);
+}
+
+// Unindexed x: every row, rowid order.
+fn q_scan_full(db: MeoDb*, t: MeoTable*, sc: QScan*) -> int32 {
+  var cur: MeoTblScan;
+  var rc: int32 = meo_tbl_scan_open(db, t, &cur);
+  if (rc != MEO_OK) { return rc; }
+  var row: MeoTblRow;
+  var st: int32 = 0;
+  while (true) {
+    rc = meo_tbl_scan_next(&cur, &row);
+    if (rc != 0) { break; }
+    st = q_scan_row(sc, t, &row);
+    if (st != 0) { break; }
+  }
+  meo_tbl_scan_close(&cur);
+  return q_scan_end(rc, st);
+}
+
+// The scan under the db lock. Columns resolve here, so an unknown table or
+// column is -MEO_ERR_SCHEMA.
+fn q_scan_locked(db: MeoDb*, table: string, x: string, y: string, group: string,
+    sc: QScan*) -> int32 {
+  var t: MeoTable* = meo_cat_find(db->cat, table.chars, (int32)table.length);
+  if (t == 0) { return -MEO_ERR_SCHEMA; }
+  sc->xc = q_col(t, x);
+  sc->yc = q_col(t, y);
+  sc->gc = 0;
+  if (sc->grouped) { sc->gc = q_col(t, group); }
+  if (sc->xc < 0 || sc->yc < 0 || sc->gc < 0) { return -MEO_ERR_SCHEMA; }
+  if (!(sc->lo <= sc->hi)) { return MEO_OK; }   // empty, or a NaN bound
+  var f: int32 = t->columns[sc->xc].cflags;
+  var aff: int32 = t->columns[sc->xc].affinity;
+  if (aff != MEO_T_INT && aff != MEO_T_REAL) { return MEO_OK; }   // no numeric x
+  if ((f & MEO_COL_ROWID_ALIAS) != 0) { return q_scan_rowids(db, t, sc); }
+  if (meo_tbl_col_indexed(t, sc->xc)) { return q_scan_index(db, t, sc); }
+  return q_scan_full(db, t, sc);
+}
+
+fn q_scan(db: MeoDb*, table: string, x: string, y: string, group: string, sc: QScan*) -> int32 {
+  var rc: int32 = meo_db_enter(db);
+  if (rc != MEO_OK) { return rc; }
+  rc = q_scan_locked(db, table, x, y, group, sc);
+  meo_db_leave(db);
+  return rc;
+}
+
+// Stream the (x, y) of every row of `table` with lo <= x <= hi to
+// meo_scan_cb(ctx, x, y), without building a result. x must be an INTEGER or
+// REAL column; a row whose x is NULL or not a number is skipped. INTEGER
+// values (timestamps in microseconds, say) arrive as float64. A y that is NULL
+// or not a number arrives as NaN, so a chart can draw a gap. Rows arrive in x
+// order when x is the rowid alias or an indexed column (a range scan, so only
+// the window is read); otherwise every row is read, in rowid order. A nonzero
+// meo_scan_cb answer stops the scan and is returned. Else MEO_OK, or
+// -MEO_ERR_SCHEMA (unknown table or column) or a storage code.
+//
+// The callback runs under the db lock with a page pinned: keep it quick and
+// do not call back into this db.
+export fn meo_q_scan_xy(db: MeoDb*, table: string, x: string, y: string, lo: float64,
+    hi: float64, meo_scan_cb: fn(rawptr, float64, float64) -> int32, ctx: rawptr) -> int32 {
+  if (db == 0 || meo_scan_cb == 0) { return -MEO_ERR_USAGE; }
+  var sc: QScan;
+  sc.fn_xy = meo_scan_cb;
+  sc.fn_xyg = 0;
+  sc.ctx = ctx;
+  sc.grouped = false;
+  sc.lo = lo;
+  sc.hi = hi;
+  return q_scan(db, table, x, y, "", &sc);
+}
+
+// meo_q_scan_xy with a grouping column: meo_scan_gcb(ctx, group, x, y). The
+// group column must be INTEGER; a row whose group is NULL or not an INTEGER is
+// skipped. Same order, locking and stop rules.
+export fn meo_q_scan_xyg(db: MeoDb*, table: string, x: string, y: string, group: string,
+    lo: float64, hi: float64, meo_scan_gcb: fn(rawptr, int64, float64, float64) -> int32,
+    ctx: rawptr) -> int32 {
+  if (db == 0 || meo_scan_gcb == 0) { return -MEO_ERR_USAGE; }
+  var sc: QScan;
+  sc.fn_xy = 0;
+  sc.fn_xyg = meo_scan_gcb;
+  sc.ctx = ctx;
+  sc.grouped = true;
+  sc.lo = lo;
+  sc.hi = hi;
+  return q_scan(db, table, x, y, group, &sc);
 }

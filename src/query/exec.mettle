@@ -3,7 +3,7 @@
 // rollback reload shows up as -MEO_ERR_SCHEMA rather than a stale pointer.
 // SELECT is materialized; later steps walk the buffer without the lock.
 // COUNT counts while scanning. UPDATE and DELETE collect their target rowids
-// first, so no cursor is held while they write.
+// first, so no cursor is held while they write, whichever access path runs.
 
 import "std/mem";
 import "../error/status.mettle";
@@ -514,6 +514,82 @@ fn exec_take(q: MeoQuery*, t: MeoTable*, row: MeoTblRow*, vs: ExecVisit*) -> int
   return rc;
 }
 
+// The inclusive rowid window of a ROWID_RANGE plan, rounded outward for REAL
+// bounds. False when it holds no rowid.
+fn exec_rowid_window(q: MeoQuery*, lo: int64*, hi: int64*) -> bool {
+  lo[0] = (int64)((uint64)1 << 63);
+  hi[0] = (int64)(((uint64)1 << 63) - (uint64)1);
+  if (q->plan.lo_term >= 0) {
+    var v: MeoValue* = &q->vals[q->spec.terms[q->plan.lo_term].v0];
+    if (v->type == MEO_T_INT) {
+      lo[0] = v->i;
+    } else if (meo_tbl_real_bound(v->f, false, lo) != MEO_OK) {
+      return false;
+    }
+  }
+  if (q->plan.hi_term >= 0) {
+    var v: MeoValue* = &q->vals[q->spec.terms[q->plan.hi_term].v0];
+    if (v->type == MEO_T_INT) {
+      hi[0] = v->i;
+    } else if (meo_tbl_real_bound(v->f, true, hi) != MEO_OK) {
+      return false;
+    }
+  }
+  return lo[0] <= hi[0];
+}
+
+// ROWID_RANGE: a table scan from the lower bound to the first rowid past the
+// upper one.
+fn exec_visit_rowids(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
+  var lo: int64 = 0;
+  var hi: int64 = 0;
+  if (!exec_rowid_window(q, &lo, &hi)) { return MEO_OK; }
+  var sc: MeoTblScan;
+  var rc: int32 = meo_tbl_scan_from(q->db, t, lo, &sc);
+  if (rc != MEO_OK) { return rc; }
+  var row: MeoTblRow;
+  while (true) {
+    rc = meo_tbl_scan_next(&sc, &row);
+    if (rc != 0 || row.rowid > hi) { break; }
+    if (exec_match(q, t, &row, &rc)) { rc = exec_take(q, t, &row, vs); }
+    if (rc != MEO_OK || vs->stop) { break; }
+  }
+  meo_tbl_scan_close(&sc);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
+// INDEX_RANGE: walk the index between the bounds, fetching each row by rowid.
+fn exec_visit_index(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
+  var db: MeoDb* = q->db;
+  var lo: MeoValue* = 0;
+  var hi: MeoValue* = 0;
+  if (q->plan.lo_term >= 0) { lo = &q->vals[q->spec.terms[q->plan.lo_term].v0]; }
+  if (q->plan.hi_term >= 0) { hi = &q->vals[q->spec.terms[q->plan.hi_term].v0]; }
+  var buf: uint8* = malloc((int64)MEO_REC_MAX);
+  if (buf == 0) { return -MEO_ERR_NOMEM; }
+  defer free(buf);
+  var sc: MeoTblIdxScan;
+  var rc: int32 = meo_tbl_idx_scan_open(db, t, q->plan.range_col, lo, hi, &sc);
+  if (rc != MEO_OK) { return rc; }
+  var row: MeoTblRow;
+  while (true) {
+    var id: int64 = 0;
+    rc = meo_tbl_idx_scan_next(&sc, &id);
+    if (rc != 0) { break; }
+    rc = meo_tbl_lookup_rowid(db, t, id, buf, MEO_REC_MAX, &row);
+    if (rc == MEO_OK) {
+      if (exec_match(q, t, &row, &rc)) { rc = exec_take(q, t, &row, vs); }
+    } else if (rc == 1) {
+      rc = MEO_OK;
+    }
+    if (rc != MEO_OK || vs->stop) { break; }
+  }
+  meo_tbl_idx_scan_close(&sc);
+  if (rc < 0) { return rc; }
+  return MEO_OK;
+}
+
 // Feed every row the access path yields and the filter accepts to exec_take.
 fn exec_visit(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
   var db: MeoDb* = q->db;
@@ -534,6 +610,8 @@ fn exec_visit(q: MeoQuery*, t: MeoTable*, vs: ExecVisit*) -> int32 {
     if (rc < 0) { return rc; }
     return MEO_OK;
   }
+  if (q->plan.access == MEO_PATH_ROWID_RANGE) { return exec_visit_rowids(q, t, vs); }
+  if (q->plan.access == MEO_PATH_INDEX_RANGE) { return exec_visit_index(q, t, vs); }
   var ids: int64* = 0;
   var n: int32 = exec_candidates(q, t, &ids);
   if (n < 0) { return n; }
@@ -790,7 +868,7 @@ fn exec_run(q: MeoQuery*) -> int32 {
   if (q->spec.kind != MEO_Q_K_CREATE) {
     t = meo_cat_find(db->cat, q->spec.table.p, q->spec.table.n);
   }
-  rc = meo_plan_build(&q->spec, t, q->plan_arena, &q->plan);
+  rc = meo_plan_build(&q->spec, t, q->vals, q->plan_arena, &q->plan);
   if (rc == MEO_OK) {
     q->n_cols = q->plan.n_out;
     if (q->spec.kind == MEO_Q_K_CREATE) {

@@ -244,7 +244,7 @@ fn qs_paths(db: MeoDb*) -> int32 {
   f += qs_w(db, "id = 99", "id", MEO_Q_EQ, vi(99), "", MEO_PATH_ROWID_EQ);
   f += qs_w(db, "u = b", "u", MEO_Q_EQ, vt("b"), "2", MEO_PATH_UNIQUE_EQ);
   f += qs_w(db, "u = NULL", "u", MEO_Q_EQ, vn(), "", MEO_PATH_UNIQUE_EQ);
-  f += qs_w(db, "id > 3", "id", MEO_Q_GT, vi(3), "4,5", MEO_PATH_FULL_SCAN);
+  f += qs_w(db, "id > 3", "id", MEO_Q_GT, vi(3), "4,5", MEO_PATH_ROWID_RANGE);
   // The residual filter re-checks rows a point path finds.
   var q: MeoQuery* = qs_sel(db, "n");
   l[0] = vi(1); l[1] = vi(2); l[2] = vi(4);

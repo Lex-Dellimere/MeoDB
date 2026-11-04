@@ -32,13 +32,30 @@ export struct MeoTblRow {
   rec_len: int32;
 }
 
-// A full-scan cursor in rowid order. Holds one pinned leaf while open.
+// A scan cursor in rowid order, from `start` up. Holds one pinned leaf while
+// open.
 export struct MeoTblScan {
   db: MeoDb*;
   t: MeoTable*;
   cur: MeoBtCursor;
   started: bool;
   done: bool;
+  start: int64;           // the first rowid the scan seeks to
+}
+
+// A range cursor over one unique index, in key order. Holds one pinned leaf
+// and a key buffer while open.
+export struct MeoTblIdxScan {
+  db: MeoDb*;
+  t: MeoTable*;
+  col: int32;
+  cur: MeoBtCursor;
+  started: bool;
+  done: bool;
+  keys: uint8*;           // lo key, then hi key, MEO_REC_MAX bytes each (malloc)
+  lo_n: int32;            // lo key length; the lone type tag when unbounded
+  hi_n: int32;            // hi key length; 0 when unbounded
+  tag: int32;             // MEO_KEY_* of the column's keys
 }
 
 // The table-tree comparator: the 8-byte rowid prefix decides.
@@ -655,7 +672,17 @@ export fn meo_tbl_scan_open(db: MeoDb*, t: MeoTable*, sc: MeoTblScan*) -> int32 
   sc->t = t;
   sc->started = false;
   sc->done = false;
+  sc->start = (int64)((uint64)1 << 63);   // INT64_MIN
   meo_bt_cursor_init(&sc->cur);
+  return MEO_OK;
+}
+
+// meo_tbl_scan_open, but the first row is the first with rowid >= lo. The
+// caller stops at its own upper bound.
+export fn meo_tbl_scan_from(db: MeoDb*, t: MeoTable*, lo: int64, sc: MeoTblScan*) -> int32 {
+  var rc: int32 = meo_tbl_scan_open(db, t, sc);
+  if (rc != MEO_OK) { return rc; }
+  sc->start = lo;
   return MEO_OK;
 }
 
@@ -673,7 +700,7 @@ export fn meo_tbl_scan_next(sc: MeoTblScan*, row: MeoTblRow*) -> int32 {
       return 1;
     }
     var k: uint8[8];
-    meo_key_rowid(&k[0], 8, (int64)((uint64)1 << 63));  // INT64_MIN
+    meo_key_rowid(&k[0], 8, sc->start);
     var key: MeoBtKey = { data: &k[0], len: 8 };
     rc = meo_bt_seek(p, &sc->cur, sc->t->root, meo_tbl_cmp, key);
   } else {
@@ -703,6 +730,186 @@ export fn meo_tbl_scan_close(sc: MeoTblScan*) {
   if (sc == 0 || sc->db == 0) { return; }
   meo_bt_close(sc->db->pager, &sc->cur);
   sc->done = true;
+}
+
+// An int64 bound for the REAL bound `f`, rounded outward (down for a lower
+// bound, up for an upper one) and widened past 2^53, where an INTEGER's float64
+// conversion is itself rounded. MEO_OK and *out, or 1 when no int64 can lie in
+// the range (NaN, a lower bound above INT64_MAX, an upper one below INT64_MIN).
+export fn meo_tbl_real_bound(f: float64, upper: bool, out: int64*) -> int32 {
+  var int64_min: int64 = (int64)((uint64)1 << 63);
+  var int64_max: int64 = (int64)(((uint64)1 << 63) - (uint64)1);
+  if (f != f) { return 1; }
+  if (f >= 9223372036854775808.0) {
+    if (!upper) { return 1; }
+    out[0] = int64_max;
+    return MEO_OK;
+  }
+  if (f < -9223372036854775808.0) {
+    if (upper) { return 1; }
+    out[0] = int64_min;
+    return MEO_OK;
+  }
+  var i: int64 = (int64)f;
+  if (upper && (float64)i < f) { i += 1; }
+  if (!upper && (float64)i > f) { i -= 1; }
+  var big: int64 = 9007199254740992;
+  var pad: int64 = 1024;
+  if (i >= big || i <= -big) {
+    if (upper) {
+      if (i > int64_max - pad) { i = int64_max; } else { i += pad; }
+    } else {
+      if (i < int64_min + pad) { i = int64_min; } else { i -= pad; }
+    }
+  }
+  out[0] = i;
+  return MEO_OK;
+}
+
+// A range bound as a value of column `aff`'s own type, so its key sorts among
+// the column's keys. MEO_OK and *out, 1 when nothing can satisfy it,
+// -MEO_ERR_MISMATCH when it cannot be compared with the column.
+fn tbl_bound_value(aff: int32, v: MeoValue*, upper: bool, out: MeoValue*) -> int32 {
+  if (aff == MEO_T_INT && v->type == MEO_T_INT) {
+    out[0] = v[0];
+    return MEO_OK;
+  }
+  if (aff == MEO_T_INT && v->type == MEO_T_REAL) {
+    var i: int64 = 0;
+    var rc: int32 = meo_tbl_real_bound(v->f, upper, &i);
+    if (rc != MEO_OK) { return rc; }
+    meo_value_set_int(out, i);
+    return MEO_OK;
+  }
+  if (aff == MEO_T_REAL && v->type == MEO_T_INT) {
+    meo_value_set_real(out, (float64)v->i);
+    return MEO_OK;
+  }
+  if (aff == MEO_T_REAL && v->type == MEO_T_REAL) {
+    if (v->f != v->f) { return 1; }
+    out[0] = v[0];
+    return MEO_OK;
+  }
+  if ((aff == MEO_T_TEXT || aff == MEO_T_BLOB) && v->type == aff) {
+    out[0] = v[0];
+    return MEO_OK;
+  }
+  return -MEO_ERR_MISMATCH;
+}
+
+fn tbl_tag_of(aff: int32) -> int32 {
+  if (aff == MEO_T_INT) { return MEO_KEY_INT; }
+  if (aff == MEO_T_REAL) { return MEO_KEY_REAL; }
+  if (aff == MEO_T_TEXT) { return MEO_KEY_TEXT; }
+  return MEO_KEY_BLOB;
+}
+
+// Open a scan of the unique index on `col` over [lo, hi], both inclusive; 0
+// leaves a side unbounded. An INTEGER column takes REAL bounds, a REAL column
+// INTEGER ones, TEXT and BLOB their own type; anything else is
+// -MEO_ERR_MISMATCH, a text/blob bound past MEO_REC_MAX -MEO_ERR_TOOBIG,
+// -MEO_ERR_USAGE for a column with no index. Bounds are rounded outward, so
+// the caller still filters. Nothing is pinned until the first
+// meo_tbl_idx_scan_next.
+export fn meo_tbl_idx_scan_open(db: MeoDb*, t: MeoTable*, col: int32, lo: MeoValue*,
+    hi: MeoValue*, sc: MeoTblIdxScan*) -> int32 {
+  if (db == 0 || t == 0 || sc == 0 || col < 0 || col >= t->n_cols) { return -MEO_ERR_USAGE; }
+  if (!meo_tbl_col_indexed(t, col)) { return -MEO_ERR_USAGE; }
+  if (!t->live) { return -MEO_ERR_SCHEMA; }
+  sc->db = db;
+  sc->t = t;
+  sc->col = col;
+  sc->started = false;
+  sc->done = true;
+  sc->keys = 0;
+  sc->lo_n = 0;
+  sc->hi_n = 0;
+  meo_bt_cursor_init(&sc->cur);
+  var aff: int32 = t->columns[col].affinity;
+  sc->tag = tbl_tag_of(aff);
+  var b: MeoValue;
+  var empty: bool = false;
+  var rc: int32 = MEO_OK;
+  if (lo != 0) {
+    rc = tbl_bound_value(aff, lo, false, &b);
+    if (rc < 0) { return rc; }
+    if (rc == 1) { empty = true; }
+  }
+  var b2: MeoValue;
+  if (hi != 0) {
+    rc = tbl_bound_value(aff, hi, true, &b2);
+    if (rc < 0) { return rc; }
+    if (rc == 1) { empty = true; }
+  }
+  if (empty) { return MEO_OK; }
+  var keys: uint8* = malloc((int64)MEO_REC_MAX * 2);
+  if (keys == 0) { return -MEO_ERR_NOMEM; }
+  keys[0] = (uint8)sc->tag;
+  var n: int32 = 1;
+  if (lo != 0) { n = tbl_key_encode(&b, keys, MEO_REC_MAX); }
+  var hn: int32 = 0;
+  if (n >= 0 && hi != 0) { hn = tbl_key_encode(&b2, keys + MEO_REC_MAX, MEO_REC_MAX); }
+  if (n < 0 || hn < 0) {
+    free(keys);
+    if (n < 0) { return n; }
+    return hn;
+  }
+  sc->lo_n = n;
+  sc->hi_n = hn;
+  sc->keys = keys;
+  sc->done = false;
+  return MEO_OK;
+}
+
+// The next entry in key order: 0 = *rowid_out set, 1 = done, negative on
+// failure.
+export fn meo_tbl_idx_scan_next(sc: MeoTblIdxScan*, rowid_out: int64*) -> int32 {
+  if (sc == 0 || rowid_out == 0) { return -MEO_ERR_USAGE; }
+  if (sc->done) { return 1; }
+  var p: MeoPager* = sc->db->pager;
+  var root: uint32 = sc->t->columns[sc->col].index_root;
+  var rc: int32 = 0;
+  if (!sc->started) {
+    sc->started = true;
+    if (root == 0) {
+      sc->done = true;
+      return 1;
+    }
+    var key: MeoBtKey = { data: sc->keys, len: sc->lo_n };
+    rc = meo_bt_seek(p, &sc->cur, root, meo_key_compare, key);
+  } else {
+    rc = meo_bt_next(p, &sc->cur);
+  }
+  if (rc != 0) {
+    sc->done = true;
+    meo_bt_close(p, &sc->cur);
+    return rc;
+  }
+  var lf: uint8* = sc->cur.leaf->data;
+  var at: int32 = sc->cur.slot_in_leaf;
+  var kp: uint8* = meo_btn_leaf_key_ptr(lf, at);
+  var kl: int32 = meo_btn_leaf_key_len(lf, at);
+  // Past the column's keys, or past the upper bound.
+  var past: bool = kl < 1 || (int32)kp[0] != sc->tag;
+  if (!past && sc->hi_n > 0) {
+    past = meo_key_compare(kp, kl, sc->keys + MEO_REC_MAX, sc->hi_n) > 0;
+  }
+  if (past) {
+    sc->done = true;
+    meo_bt_close(p, &sc->cur);
+    return 1;
+  }
+  rowid_out[0] = (int64)meo_btn_leaf_rowid(lf, at);
+  return 0;
+}
+
+// Release the scan's leaf and key buffer. Always safe.
+export fn meo_tbl_idx_scan_close(sc: MeoTblIdxScan*) {
+  if (sc == 0 || sc->db == 0) { return; }
+  meo_bt_close(sc->db->pager, &sc->cur);
+  sc->done = true;
+  if (sc->keys != 0) { free(sc->keys); }
+  sc->keys = 0;
 }
 
 // Column `col` of a row, the rowid alias filled from the rowid. out.p

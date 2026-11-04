@@ -71,6 +71,9 @@ fn project() {
   // Table writes reaching the feed.
   mb_bin("feed_table", "tests/feed_table.mettle");
 
+  // Range access paths and the streaming x/y scan.
+  mb_bin("range_self", "tests/range_self.mettle");
+
   // Shared value types and status codes.
   mb_bin("ws0_self", "tests/ws0_self.mettle");
 
