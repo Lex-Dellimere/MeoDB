@@ -23,6 +23,17 @@
 // The table_id of meo_feed_insert is caller-assigned and should not collide
 // with catalog table ids.
 //
+// WAL mode. A commit there is not durable when the call returns, so the feed
+// publishes in two steps. At append the pager sends MEO_HOOK_STAGE (writer
+// thread, under the db lock) and the feed moves the pending events into the
+// ring as STAGED events, past visible_seq, which no reader looks at. When the
+// fsync that makes the commit durable completes, hook_commit (from whichever
+// thread led that fsync) makes the oldest staged batch visible and stamps it
+// with the commit_seq and time. Commits become durable in order, so a FIFO of
+// batch ends pairs each hook_commit with its batch. A failed fsync drops the
+// staged batches and the next batch is a GAP. Rollback mode never stages:
+// visible_seq follows next_seq.
+//
 // Import graph: feed imports pager and btree; the pager does not import feed.
 // The pager calls back through the fn-pointer hook in MeoPager (hook_ctx,
 // hook_commit, hook_event), which this module installs with
@@ -49,6 +60,9 @@
 //   exactly one MEO_CHANGE_GAP event instead of partial data. So is the first
 //   commit after anything the feed could not see (attach with unflushed
 //   changes, a detach, an uncertain rollback).
+// * Readers only see events below visible_seq; staged events (WAL mode) lie in
+//   [visible_seq, next_seq) and may already have pushed older events out of
+//   the ring, which a reader sees as a GAP.
 // * A reader that falls behind the ring gets exactly one MEO_CHANGE_GAP event
 //   and its cursor jumps to the oldest retained event. A GAP, from either
 //   source, means "reload fully, then continue".
@@ -82,6 +96,9 @@ export const MEO_FEED_MAX_CAP: int32 = 1048576;
 export const MEO_FEED_MAX_KEY: int32 = 4096;
 
 const FEED_PEND_INITIAL: int32 = 16;
+
+// Staged batches (WAL commits appended but not yet durable) the feed tracks.
+export const MEO_FEED_STAGE_MAX: int32 = 512;
 
 // One change as a reader receives it. key points into the reader's keybuf
 // (meo_feed_read copies the bytes there), so it is valid for exactly as long
@@ -136,11 +153,12 @@ export struct MeoFeedRec {
 
 // The feed. Fields are private to this module; use the functions.
 export struct MeoFeed {
-  lock: int32;          // spin lock over ring, first_seq, next_seq, last_commit
+  lock: int32;          // spin lock over ring, the seq counters, the stage FIFO
   ring: MeoFeedRec*;
   cap: int32;
   first_seq: uint64;    // oldest retained event
-  next_seq: uint64;     // seq the next published event gets
+  next_seq: uint64;     // seq the next pushed event (staged or not) gets
+  visible_seq: uint64;  // readers see [first_seq, visible_seq)
   last_commit: uint64;  // commit_seq of the newest published commit
   last_time: int64;     // newest published time_us (for the clamp)
   // Writer-only below.
@@ -150,6 +168,13 @@ export struct MeoFeed {
   pend_max: int32;
   overflowed: bool;     // the next publish is a single GAP
   pager: rawptr;        // identity of the attached pager, never dereferenced
+  wal: bool;            // the attached pager is in WAL mode
+  // Under the lock: the next staged batch is a GAP, and the staged batches
+  // as a FIFO of their end seqs (st_head, st_n; capacity MEO_FEED_STAGE_MAX).
+  gap_next: bool;
+  st_end: uint64*;
+  st_head: int32;
+  st_n: int32;
 }
 
 // --- lifecycle -------------------------------------------------------------
@@ -174,11 +199,20 @@ export fn meo_feed_new(cap: int32) -> MeoFeed* {
     free(f);
     return 0;
   }
+  var stage_max: int32 = MEO_FEED_STAGE_MAX;
+  var st: uint64[] = new uint64[stage_max];
+  if (st.data == 0) {
+    free(pend.data);
+    free(ring.data);
+    free(f);
+    return 0;
+  }
   f->lock = 0;
   f->ring = ring.data;
   f->cap = cap;
   f->first_seq = 1;
   f->next_seq = 1;
+  f->visible_seq = 1;
   f->last_commit = 0;
   f->last_time = 0;
   f->pend = pend.data;
@@ -187,6 +221,11 @@ export fn meo_feed_new(cap: int32) -> MeoFeed* {
   f->pend_max = MEO_FEED_PENDING_MAX;
   f->overflowed = false;
   f->pager = 0;
+  f->wal = false;
+  f->gap_next = false;
+  f->st_end = st.data;
+  f->st_head = 0;
+  f->st_n = 0;
   return f;
 }
 
@@ -217,6 +256,7 @@ export fn meo_feed_free(f: MeoFeed*) {
   feed_free_keys(f->pend, f->pend_cap);
   free(f->ring);
   free(f->pend);
+  free(f->st_end);
   free(f);
 }
 
@@ -364,12 +404,78 @@ fn feed_ring_push(f: MeoFeed*, src: MeoFeedRec*, kind: int32,
   }
 }
 
+// Move the pending events (or one GAP) into the ring as staged events, past
+// visible_seq, with no commit_seq or time yet. Writer thread, WAL mode, on
+// MEO_HOOK_STAGE; the commit's own hook_commit makes them visible.
+fn feed_stage(f: MeoFeed*) {
+  spin_lock(&f->lock);
+  if (f->st_n >= MEO_FEED_STAGE_MAX) {
+    // No room to track another batch: this commit's events are lost.
+    f->gap_next = true;
+    spin_unlock(&f->lock);
+    feed_drop_pending(f);
+    return;
+  }
+  // Staged events must never outgrow the ring: they would push events a
+  // reader may still be owed past first_seq, beyond visible_seq.
+  var staged: int64 = (int64)(f->next_seq - f->visible_seq);
+  var gap: bool = f->overflowed || f->gap_next || f->pend_n > f->cap ||
+    staged + (int64)f->pend_n > (int64)f->cap;
+  if (gap) {
+    if (staged < (int64)f->cap) {
+      feed_ring_push(f, 0, MEO_CHANGE_GAP, 0, 0);
+      f->gap_next = false;
+    } else {
+      f->gap_next = true;
+    }
+  } else {
+    var i: int32 = 0;
+    while (i < f->pend_n) {
+      feed_ring_push(f, &f->pend[i], f->pend[i].kind, 0, 0);
+      i += 1;
+    }
+  }
+  var tail: int32 = (f->st_head + f->st_n) % MEO_FEED_STAGE_MAX;
+  f->st_end[tail] = f->next_seq;
+  f->st_n += 1;
+  spin_unlock(&f->lock);
+  f->overflowed = false;
+  feed_drop_pending(f);
+}
+
+// WAL mode hook_commit: the oldest staged batch is durable. Stamp it and make
+// it visible. Runs on whichever thread led the fsync, so it never touches the
+// writer-only pending state.
+fn feed_commit_staged(f: MeoFeed*, commit_seq: uint64, t: int64) {
+  spin_lock(&f->lock);
+  if (f->st_n > 0) {
+    var end: uint64 = f->st_end[f->st_head];
+    f->st_head = (f->st_head + 1) % MEO_FEED_STAGE_MAX;
+    f->st_n -= 1;
+    var s: uint64 = f->visible_seq;
+    while (s < end) {
+      var r: MeoFeedRec* = &f->ring[(int64)((s - 1) % (uint64)f->cap)];
+      r->commit_seq = commit_seq;
+      r->time_us = t;
+      s += 1;
+    }
+    if (end > f->visible_seq) { f->visible_seq = end; }
+  }
+  f->last_commit = commit_seq;
+  f->last_time = t;
+  spin_unlock(&f->lock);
+}
+
 // hook_commit: the transaction is durable. Publish its pending events (or one
 // GAP) under one lock hold.
 fn meo_feed_on_commit(ctx: rawptr, commit_seq: uint64, time_us: int64) {
   var f: MeoFeed* = (MeoFeed*)ctx;
   var t: int64 = time_us;
   if (t < f->last_time) { t = f->last_time; }
+  if (f->wal) {
+    feed_commit_staged(f, commit_seq, t);
+    return;
+  }
   var gap: bool = f->overflowed || f->pend_n > f->cap;
   spin_lock(&f->lock);
   if (gap) {
@@ -381,6 +487,7 @@ fn meo_feed_on_commit(ctx: rawptr, commit_seq: uint64, time_us: int64) {
       i += 1;
     }
   }
+  f->visible_seq = f->next_seq;
   f->last_commit = commit_seq;
   f->last_time = t;
   spin_unlock(&f->lock);
@@ -388,9 +495,24 @@ fn meo_feed_on_commit(ctx: rawptr, commit_seq: uint64, time_us: int64) {
   feed_drop_pending(f);
 }
 
-// hook_event: rollback, uncertainty or the pager going away.
+// hook_event: stage, rollback, uncertainty or the pager going away.
 fn meo_feed_on_event(ctx: rawptr, code: int32) {
   var f: MeoFeed* = (MeoFeed*)ctx;
+  if (code == MEO_HOOK_STAGE) {
+    feed_stage(f);
+    return;
+  }
+  if (code == MEO_HOOK_UNCERTAIN && f->wal) {
+    // A failed group fsync, on the leader's thread: the staged batches never
+    // became durable. Pending belongs to the writer and is left alone.
+    spin_lock(&f->lock);
+    f->next_seq = f->visible_seq;
+    f->st_head = 0;
+    f->st_n = 0;
+    f->gap_next = true;
+    spin_unlock(&f->lock);
+    return;
+  }
   feed_drop_pending(f);
   if (code == MEO_HOOK_ROLLBACK) {
     // The disk is back to the last commit: nothing unseen remains.
@@ -417,6 +539,7 @@ export fn meo_feed_attach(p: MeoPager*, f: MeoFeed*) -> int32 {
   if (rc < 0) { return rc; }
   feed_drop_pending(f);
   if (rc == 1) { f->overflowed = true; }
+  f->wal = meo_pager_wal_mode(p);
   f->pager = (rawptr)p;
   return MEO_OK;
 }
@@ -520,7 +643,7 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
   var used: int32 = 0;
   var rc: int32 = MEO_OK;
   spin_lock(&f->lock);
-  if (pos > f->next_seq) {
+  if (pos > f->visible_seq) {
     spin_unlock(&f->lock);
     return -MEO_ERR_USAGE;
   }
@@ -540,7 +663,7 @@ export fn meo_feed_read(f: MeoFeed*, cur: MeoFeedCursor*, out: MeoChange*,
     n = 1;
     pos = f->first_seq;
   }
-  while (n < cap && pos < f->next_seq) {
+  while (n < cap && pos < f->visible_seq) {
     var r: MeoFeedRec* = &f->ring[(int64)((pos - 1) % (uint64)f->cap)];
     if (r->key_len + r->val_len > keycap - used) {
       if (n == 0) { rc = -MEO_ERR_FULL; }
@@ -585,7 +708,7 @@ export fn meo_feed_pending_for(f: MeoFeed*, cur: MeoFeedCursor*) -> bool {
   if (f == 0 || cur == 0) { return false; }
   var pos: uint64 = feed_cursor_pos(cur);
   spin_lock(&f->lock);
-  var more: bool = pos < f->next_seq;
+  var more: bool = pos < f->visible_seq;
   spin_unlock(&f->lock);
   return more;
 }
@@ -614,7 +737,7 @@ export fn meo_feed_last_time(f: MeoFeed*) -> int64 {
 export fn meo_feed_cursor_end(f: MeoFeed*, cur: MeoFeedCursor*) -> int32 {
   if (f == 0 || cur == 0) { return -MEO_ERR_USAGE; }
   spin_lock(&f->lock);
-  cur->next_seq = f->next_seq;
+  cur->next_seq = f->visible_seq;
   spin_unlock(&f->lock);
   return MEO_OK;
 }

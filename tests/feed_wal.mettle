@@ -1,6 +1,556 @@
+// feed_wal: the committed-change feed (src/feed/feed.mettle) on a pager in WAL
+// mode, where a commit is appended first and becomes durable later. Staged
+// events must stay invisible until the group fsync delivers the commit.
+//
+//   mbuild run feed_wal        (and -r for release)
+//
+// Prints "PASS <case>" per case and "FAIL <case>: <detail>" per failing check;
+// a failing case stops the run.
+//
+// Cases:
+//   w1_commit        a commit publishes its inserts with the pager's commit_seq.
+//   w2_rollback      a rollback publishes nothing.
+//   w3_async         commit_async x3: nothing visible before the wait, three
+//                    events with consecutive commit_seq after it, in order.
+//   w4_fail_sync     a failed fsync publishes nothing; the feed's next batch
+//                    after the failure is a GAP.
+//   w5_ring          a batch bigger than the ring is one GAP; a reader behind
+//                    the ring gets a GAP then the retained events.
+//   w6_stage_full    staged commits that outgrow the ring turn into a GAP and
+//                    the feed stays consistent.
+//   w7_rollback_mode w1 and w2 again in rollback mode through the same code.
+
 import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/pager/wal.mettle";
+import "../src/types/key.mettle";
+import "../src/btree/btree.mettle";
+import "../src/feed/feed.mettle";
+import "tinytest.mettle";
+
+const W_DB: string = "build/feed_wal.dat";
+const W_TABLE: uint32 = 7;
+const W_OUT_CAP: int32 = 4096;
+const W_KEY_CAP: int32 = 1048576;
+
+var g_out: MeoChange* = 0;
+var g_kb: uint8* = 0;
+
+// --- helpers ---------------------------------------------------------------
+
+fn fw_unlink_side(db: string, suffix: string) {
+  var path: string = db + suffix;
+  meo_file_unlink(path);
+  free(path.chars);
+}
+
+// Make `db` a zero-byte file and remove any journal and WAL beside it.
+fn fw_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  fw_unlink_side(db, "-journal");
+  fw_unlink_side(db, "-wal");
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+  return rc;
+}
+
+fn fw_open(db: string, wal: bool) -> MeoPager* {
+  var flags: int32 = MEO_PAGER_CREATE;
+  if (wal) { flags = flags | MEO_PAGER_WAL; }
+  return meo_pager_open(db, 16, flags);
+}
+
+fn fw_close(p: MeoPager*) -> int32 {
+  var rc: int32 = meo_pager_close(p);
+  meo_pager_free(p);
+  return rc;
+}
+
+// Insert key v -> rowid through the feed.
+fn fw_ins(f: MeoFeed*, p: MeoPager*, root: uint32*, v: int64,
+    rowid: uint64) -> int32 {
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, v);
+  if (n < 0) { return n; }
+  var k: MeoBtKey = { data: &kb[0], len: n };
+  return meo_feed_insert(f, p, W_TABLE, root, &meo_key_compare, k, rowid);
+}
+
+fn fw_key_is(c: MeoChange*, v: int64) -> bool {
+  var kb: uint8[16];
+  var n: int32 = meo_key_int(&kb[0], 16, v);
+  if (c->key_len != n || c->key == 0) { return false; }
+  return meo_key_compare(c->key, c->key_len, &kb[0], n) == 0;
+}
+
+fn fw_read(f: MeoFeed*, cur: MeoFeedCursor*) -> int32 {
+  return meo_feed_read(f, cur, g_out, W_OUT_CAP, g_kb, W_KEY_CAP);
+}
+
+// One transaction inserting `v`, committed through commit_async. The root is
+// kept in *root; the caller seeds the tree first so one key is one event.
+fn fw_txn_async(f: MeoFeed*, p: MeoPager*, root: uint32*, v: int64,
+    ticket: uint64*) -> int32 {
+  var rc: int32 = meo_pager_begin(p);
+  if (rc < 0) { return rc; }
+  rc = fw_ins(f, p, root, v, (uint64)v);
+  if (rc < 0) { return rc; }
+  return meo_pager_commit_async(p, ticket);
+}
+
+// Open a pager and an attached feed, and commit one seed key so the tree
+// exists. Leaves a cursor at the end. False (after a FAIL line) on error.
+fn fw_setup(tag: string, wal: bool, cap: int32, pp: MeoPager**, ff: MeoFeed**,
+    root: uint32*, cur: MeoFeedCursor*) -> bool {
+  if (!meo_t_check_i64(fw_reset(W_DB), MEO_OK, tag)) { return false; }
+  var p: MeoPager* = fw_open(W_DB, wal);
+  if (!meo_t_check(p != 0, tag)) { return false; }
+  var f: MeoFeed* = meo_feed_new(cap);
+  if (!meo_t_check(f != 0, tag)) { return false; }
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, tag)) { return false; }
+  root[0] = 0;
+  cur->next_seq = 0;
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, tag)) { return false; }
+  if (!meo_t_check_i64(fw_ins(f, p, root, 1, 1), MEO_OK, tag)) { return false; }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, tag)) { return false; }
+  // The seed is INSERT + ROOT_MOVED.
+  if (!meo_t_check_i64(fw_read(f, cur), 2, tag)) { return false; }
+  *pp = p;
+  *ff = f;
+  return true;
+}
+
+// --- w1 / w7: a commit publishes its inserts --------------------------------
+
+fn w1_commit(wal: bool) -> int32 {
+  if (!meo_t_check_i64(fw_reset(W_DB), MEO_OK, "w1: reset")) { return 1; }
+  var p: MeoPager* = fw_open(W_DB, wal);
+  if (!meo_t_check(p != 0, "w1: open")) { return 1; }
+  if (!meo_t_check(meo_pager_wal_mode(p) == wal, "w1: mode")) { return 1; }
+  var f: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check_i64(meo_feed_attach(p, f), MEO_OK, "w1: attach")) {
+    return 1;
+  }
+  var cur: MeoFeedCursor;
+  cur.next_seq = 0;
+  var root: uint32 = 0;
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "w1: begin")) { return 1; }
+  var i: int64 = 1;
+  while (i <= 3) {
+    if (!meo_t_check_i64(fw_ins(f, p, &root, i * 10, (uint64)(100 + i)),
+        MEO_OK, "w1: insert")) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 0, "w1: nothing before the commit")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "w1: commit")) { return 1; }
+  // Three INSERTs and the ROOT_MOVED of the tree's first page.
+  var n: int32 = fw_read(f, &cur);
+  if (!meo_t_check_i64(n, 4, "w1: four events")) { return 1; }
+  var inserts: int32 = 0;
+  var k: int32 = 0;
+  while (k < n) {
+    var c: MeoChange* = &g_out[k];
+    if (!meo_t_check_i64((int64)c->seq, (int64)(k + 1), "w1: seqs")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)c->commit_seq, (int64)meo_pager_commit_seq(p),
+        "w1: commit_seq is the pager's")) {
+      return 1;
+    }
+    if (!meo_t_check(c->time_us > 0, "w1: a time")) { return 1; }
+    if (c->kind == MEO_CHANGE_INSERT) { inserts += 1; }
+    k += 1;
+  }
+  if (!meo_t_check_i64(inserts, 3, "w1: three INSERT")) { return 1; }
+  if (!meo_t_check(fw_key_is(&g_out[0], 10), "w1: first key")) { return 1; }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f),
+      (int64)meo_pager_commit_seq(p), "w1: last_commit")) {
+    return 1;
+  }
+  // visible_seq advanced: a cursor at the end is past all four events.
+  var end: MeoFeedCursor;
+  meo_feed_cursor_end(f, &end);
+  if (!meo_t_check_i64((int64)end.next_seq, 5, "w1: visible_seq advanced")) {
+    return 1;
+  }
+  if (!meo_t_check_false(meo_feed_pending_for(f, &cur), "w1: drained")) {
+    return 1;
+  }
+  fw_close(p);
+  meo_feed_free(f);
+  if (wal) { println("PASS w1_commit"); } else { println("PASS w1_commit_rollback_mode"); }
+  return 0;
+}
+
+// --- w2: rollback publishes nothing -----------------------------------------
+
+fn w2_rollback(wal: bool) -> int32 {
+  var p: MeoPager* = 0;
+  var f: MeoFeed* = 0;
+  var root: uint32 = 0;
+  var cur: MeoFeedCursor;
+  if (!fw_setup("w2: setup", wal, 64, &p, &f, &root, &cur)) { return 1; }
+  var saved: uint32 = root;
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "w2: begin")) { return 1; }
+  var i: int64 = 100;
+  while (i < 103) {
+    fw_ins(f, p, &root, i, (uint64)i);
+    i += 1;
+  }
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 3, "w2: three pending")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_rollback(p), MEO_OK, "w2: rollback")) {
+    return 1;
+  }
+  root = saved;
+  if (!meo_t_check_i64(meo_feed_pending_count(f), 0, "w2: pending dropped")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 0, "w2: nothing published")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "w2: begin 2")) { return 1; }
+  fw_ins(f, p, &root, 200, 200);
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "w2: commit")) { return 1; }
+  if (!meo_t_check_i64(fw_read(f, &cur), 1, "w2: only the new insert")) {
+    return 1;
+  }
+  if (!meo_t_check(fw_key_is(&g_out[0], 200), "w2: key 200")) { return 1; }
+  fw_close(p);
+  meo_feed_free(f);
+  if (wal) { println("PASS w2_rollback"); } else { println("PASS w2_rollback_rollback_mode"); }
+  return 0;
+}
+
+// --- w3: commit_async stays invisible until the wait -------------------------
+
+fn w3_async() -> int32 {
+  var p: MeoPager* = 0;
+  var f: MeoFeed* = 0;
+  var root: uint32 = 0;
+  var cur: MeoFeedCursor;
+  if (!fw_setup("w3: setup", true, 64, &p, &f, &root, &cur)) { return 1; }
+  var seed_seq: uint64 = meo_pager_commit_seq(p);
+  var t1: uint64 = 0;
+  var t2: uint64 = 0;
+  var t3: uint64 = 0;
+  if (!meo_t_check_i64(fw_txn_async(f, p, &root, 10, &t1), MEO_OK, "w3: a1")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_txn_async(f, p, &root, 20, &t2), MEO_OK, "w3: a2")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_txn_async(f, p, &root, 30, &t3), MEO_OK, "w3: a3")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 0, "w3: nothing visible before wait")) {
+    return 1;
+  }
+  if (!meo_t_check_false(meo_feed_pending_for(f, &cur),
+      "w3: pending_for false before wait")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f), (int64)seed_seq,
+      "w3: last_commit unchanged before wait")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit_wait(p, t3), MEO_OK, "w3: wait")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 3, "w3: three events after wait")) {
+    return 1;
+  }
+  var k: int32 = 0;
+  while (k < 3) {
+    var c: MeoChange* = &g_out[k];
+    if (!meo_t_check_i64(c->kind, MEO_CHANGE_INSERT, "w3: INSERT")) { return 1; }
+    if (!meo_t_check(fw_key_is(c, (int64)(k + 1) * 10), "w3: order")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)c->commit_seq, (int64)(seed_seq + 1 + (uint64)k),
+        "w3: consecutive commit_seq")) {
+      return 1;
+    }
+    if (k > 0 && !meo_t_check(c->time_us >= g_out[k - 1].time_us,
+        "w3: time nondecreasing")) {
+      return 1;
+    }
+    k += 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit_wait(p, t1), MEO_OK, "w3: old ticket")) {
+    return 1;
+  }
+  fw_close(p);
+  meo_feed_free(f);
+  println("PASS w3_async");
+  return 0;
+}
+
+// --- w4: a failed fsync publishes nothing; the next batch is a GAP -----------
+
+fn w4_fail_sync() -> int32 {
+  var p: MeoPager* = 0;
+  var f: MeoFeed* = 0;
+  var root: uint32 = 0;
+  var cur: MeoFeedCursor;
+  if (!fw_setup("w4: setup", true, 64, &p, &f, &root, &cur)) { return 1; }
+  var syncs: int64 = meo_wal_test_ctl(MEO_WAL_T_SYNC_COUNT, 0);
+  meo_wal_test_ctl(MEO_WAL_T_FAIL_SYNC_AT, syncs + 1);
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "w4: begin")) { return 1; }
+  fw_ins(f, p, &root, 10, 10);
+  if (!meo_t_check_i64(meo_pager_commit(p), -MEO_ERR_IO,
+      "w4: commit fails on the fsync")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 0, "w4: nothing published")) {
+    return 1;
+  }
+  if (!meo_t_check_false(meo_feed_pending_for(f, &cur),
+      "w4: pending_for false")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_begin(p), -MEO_ERR_IO, "w4: begin fails")) {
+    return 1;
+  }
+  fw_close(p);
+  meo_wal_test_ctl(MEO_WAL_T_RESET, 0);
+
+  // The same feed on a reopened pager: its next batch is a GAP, then events.
+  var p2: MeoPager* = fw_open(W_DB, true);
+  if (!meo_t_check(p2 != 0, "w4: reopen")) { return 1; }
+  if (!meo_t_check_i64(meo_feed_attach(p2, f), MEO_OK, "w4: reattach")) {
+    return 1;
+  }
+  root = 0;
+  var lk: MeoFeedCursor;
+  meo_feed_cursor_end(f, &lk);
+  var rc: int32 = meo_pager_begin(p2);
+  if (!meo_t_check_i64(rc, MEO_OK, "w4: begin 2")) { return 1; }
+  fw_ins(f, p2, &root, 20, 20);
+  if (!meo_t_check_i64(meo_pager_commit(p2), MEO_OK, "w4: commit 2")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &lk), 1, "w4: one event")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP, "w4: GAP first")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq,
+      (int64)meo_pager_commit_seq(p2), "w4: GAP carries the commit_seq")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_begin(p2), MEO_OK, "w4: begin 3")) { return 1; }
+  fw_ins(f, p2, &root, 30, 30);
+  if (!meo_t_check_i64(meo_pager_commit(p2), MEO_OK, "w4: commit 3")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &lk), 1, "w4: next batch is plain")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "w4: INSERT")) {
+    return 1;
+  }
+  fw_close(p2);
+  meo_feed_free(f);
+
+  // A brand-new feed on the reopened file starts clean.
+  var p3: MeoPager* = fw_open(W_DB, true);
+  var f3: MeoFeed* = meo_feed_new(64);
+  if (!meo_t_check_i64(meo_feed_attach(p3, f3), MEO_OK, "w4: attach new")) {
+    return 1;
+  }
+  var c3: MeoFeedCursor;
+  c3.next_seq = 0;
+  var r3: uint32 = 0;
+  meo_pager_begin(p3);
+  fw_ins(f3, p3, &r3, 40, 40);
+  if (!meo_t_check_i64(meo_pager_commit(p3), MEO_OK, "w4: commit new")) {
+    return 1;
+  }
+  // INSERT + ROOT_MOVED (a fresh root), and no GAP.
+  if (!meo_t_check_i64(fw_read(f3, &c3), 2, "w4: new feed, two events")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_INSERT, "w4: no GAP")) {
+    return 1;
+  }
+  fw_close(p3);
+  meo_feed_free(f3);
+  println("PASS w4_fail_sync");
+  return 0;
+}
+
+// --- w5: the ring is smaller than the data ----------------------------------
+
+fn w5_ring() -> int32 {
+  var p: MeoPager* = 0;
+  var f: MeoFeed* = 0;
+  var root: uint32 = 0;
+  var cur: MeoFeedCursor;
+  if (!fw_setup("w5: setup", true, 4, &p, &f, &root, &cur)) { return 1; }
+  var all: MeoFeedCursor;
+  all.next_seq = 0;
+  // Ten inserts in one transaction do not fit a ring of four: one GAP.
+  if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "w5: begin")) { return 1; }
+  var i: int64 = 100;
+  while (i < 110) {
+    fw_ins(f, p, &root, i, (uint64)i);
+    i += 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit(p), MEO_OK, "w5: commit")) { return 1; }
+  if (!meo_t_check_i64(fw_read(f, &cur), 1, "w5: one event")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP, "w5: a GAP")) { return 1; }
+  if (!meo_t_check_i64((int64)g_out[0].commit_seq,
+      (int64)meo_pager_commit_seq(p), "w5: GAP commit_seq")) {
+    return 1;
+  }
+  // Six single-key commits, each waited: the ring keeps the newest four.
+  var k: int64 = 0;
+  while (k < 6) {
+    var t: uint64 = 0;
+    if (!meo_t_check_i64(fw_txn_async(f, p, &root, 200 + k, &t), MEO_OK,
+        "w5: txn")) {
+      return 1;
+    }
+    if (!meo_t_check_i64(meo_pager_commit_wait(p, t), MEO_OK, "w5: wait")) {
+      return 1;
+    }
+    k += 1;
+  }
+  var n: int32 = fw_read(f, &all);
+  if (!meo_t_check_i64(n, 5, "w5: a GAP then the four retained")) { return 1; }
+  if (!meo_t_check_i64(g_out[0].kind, MEO_CHANGE_GAP, "w5: GAP first")) {
+    return 1;
+  }
+  var j: int32 = 1;
+  while (j < 5) {
+    if (!meo_t_check_i64(g_out[j].kind, MEO_CHANGE_INSERT, "w5: INSERT")) {
+      return 1;
+    }
+    if (!meo_t_check(fw_key_is(&g_out[j], 202 + (int64)j - 1),
+        "w5: the newest keys, in order")) {
+      return 1;
+    }
+    if (!meo_t_check_i64((int64)g_out[j].commit_seq,
+        (int64)(meo_pager_commit_seq(p) - 4 + (uint64)j),
+        "w5: commit_seq")) {
+      return 1;
+    }
+    j += 1;
+  }
+  fw_close(p);
+  meo_feed_free(f);
+  println("PASS w5_ring");
+  return 0;
+}
+
+// --- w6: staged commits that outgrow the ring --------------------------------
+
+fn w6_stage_full() -> int32 {
+  var p: MeoPager* = 0;
+  var f: MeoFeed* = 0;
+  var root: uint32 = 0;
+  var cur: MeoFeedCursor;
+  if (!fw_setup("w6: setup", true, 4, &p, &f, &root, &cur)) { return 1; }
+  var seed_seq: uint64 = meo_pager_commit_seq(p);
+  // Four commits of two events each are staged before any fsync runs: the
+  // ring (4) cannot hold them, so the later ones become GAPs, never a stall
+  // and never events out of order.
+  var tk: uint64 = 0;
+  var i: int64 = 0;
+  while (i < 4) {
+    if (!meo_t_check_i64(meo_pager_begin(p), MEO_OK, "w6: begin")) { return 1; }
+    fw_ins(f, p, &root, 300 + i * 2, 1);
+    fw_ins(f, p, &root, 301 + i * 2, 1);
+    if (!meo_t_check_i64(meo_pager_commit_async(p, &tk), MEO_OK, "w6: async")) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 0, "w6: nothing visible yet")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit_wait(p, tk), MEO_OK, "w6: wait")) {
+    return 1;
+  }
+  if (!meo_t_check_i64((int64)meo_feed_last_commit(f),
+      (int64)(seed_seq + 4), "w6: last_commit is the fourth")) {
+    return 1;
+  }
+  var n: int32 = fw_read(f, &cur);
+  if (!meo_t_check(n >= 1 && n <= 5, "w6: a bounded read")) { return 1; }
+  var j: int32 = 0;
+  while (j < n) {
+    var kind: int32 = g_out[j].kind;
+    if (!meo_t_check(kind == MEO_CHANGE_INSERT || kind == MEO_CHANGE_GAP,
+        "w6: INSERT or GAP only")) {
+      return 1;
+    }
+    if (!meo_t_check(g_out[j].commit_seq > seed_seq || kind == MEO_CHANGE_GAP,
+        "w6: stamped with a new commit_seq")) {
+      return 1;
+    }
+    if (j > 0 && !meo_t_check(g_out[j].commit_seq >= g_out[j - 1].commit_seq,
+        "w6: commit_seq nondecreasing")) {
+      return 1;
+    }
+    j += 1;
+  }
+  // The batches that did not fit were lost, so the next batch is a GAP; after
+  // that the feed is plain again.
+  var t: uint64 = 0;
+  if (!meo_t_check_i64(fw_txn_async(f, p, &root, 900, &t), MEO_OK, "w6: next")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit_wait(p, t), MEO_OK, "w6: wait next")) {
+    return 1;
+  }
+  var m: int32 = fw_read(f, &cur);
+  if (!meo_t_check(m >= 1, "w6: next batch visible")) { return 1; }
+  if (!meo_t_check_i64(g_out[m - 1].kind, MEO_CHANGE_GAP,
+      "w6: the next batch is a GAP")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_txn_async(f, p, &root, 901, &t), MEO_OK, "w6: after")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(meo_pager_commit_wait(p, t), MEO_OK, "w6: wait after")) {
+    return 1;
+  }
+  if (!meo_t_check_i64(fw_read(f, &cur), 1, "w6: one event")) { return 1; }
+  if (!meo_t_check(fw_key_is(&g_out[0], 901), "w6: key 901")) { return 1; }
+  fw_close(p);
+  meo_feed_free(f);
+  println("PASS w6_stage_full");
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS feed_wal (stub)");
-  return 0;
+  var outs: MeoChange[] = new MeoChange[W_OUT_CAP];
+  var kbs: uint8[] = new uint8[W_KEY_CAP];
+  g_out = outs.data;
+  g_kb = kbs.data;
+  var rc: int32 = w1_commit(true);
+  if (rc == 0) { rc = w2_rollback(true); }
+  if (rc == 0) { rc = w3_async(); }
+  if (rc == 0) { rc = w4_fail_sync(); }
+  if (rc == 0) { rc = w5_ring(); }
+  if (rc == 0) { rc = w6_stage_full(); }
+  if (rc == 0) { rc = w1_commit(false); }
+  if (rc == 0) { rc = w2_rollback(false); }
+  free(outs.data);
+  free(kbs.data);
+  if (rc == 0) { println("PASS feed_wal"); }
+  return meo_t_report();
 }
