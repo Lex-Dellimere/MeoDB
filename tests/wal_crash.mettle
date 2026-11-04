@@ -1,6 +1,383 @@
+// wal_crash: a process killed at every I/O point of a WAL-mode workload.
+//
+// A program, not @test functions: the cases fork and need real files. Run it
+// with
+//
+//   mbuild run wal_crash
+//
+// It prints "PASS wal_crash" when every crash point recovers, and "FAIL ..."
+// with the crash point at the first one that does not.
+//
+// The workload W opens a new WAL database with 8 frames and autocheckpoint 16,
+// creates t(id, pad), then runs 12 transactions of 20 rows with a 1000-byte
+// pad each. Transaction 5 rolls back after its inserts (the small cache makes
+// it spill), the rest commit. The reference run counts the WAL's I/O points
+// (meo_wal_test_ctl) and records the point of every commit-frame write.
+//
+// For each point k (and N + 1, which never fires) a forked child runs W with
+// CRASH_AT k, plain and with TORN (half of the write at k lands first). The
+// child dies at k, so a commit is in the log exactly when its frame write came
+// before k. The parent reopens the file and checks:
+//   * the table holds exactly the rows of the committed transactions (absent
+//     before the CREATE committed), each with its whole pad;
+//   * the free list reads back (meo_free_init);
+//   * one more transaction commits, and survives a close and a reopen.
+//
+// CRASH MECHANISM: raw fork (57) with no execve. The parent has no database
+// open at the fork, so the child shares nothing with it but the files on disk;
+// the child ends at the crash point with exit_group (231) and the parent reaps
+// it with wait4 (61).
+
 import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/pager/pager.mettle";
+import "../src/pager/wal.mettle";
+import "../src/meodb.mettle";
+
+const WC_FRAMES: int32 = 8;
+const WC_AUTOCKPT: int32 = 16;
+const WC_TXNS: int32 = 12;
+const WC_ROLLBACK_TXN: int32 = 5;
+const WC_ROWS: int32 = 20;
+const WC_PAD: int32 = 1000;
+const WC_EXTRA_ID: int64 = 99999;
+const WC_CRASH_CODE: int32 = 77;
+const WC_MAX_IDS: int32 = 260;
+
+var wc_path: string = "";
+
+fn wc_fail(msg: string) -> int32 {
+  println("FAIL wal_crash: {msg}");
+  return 1;
+}
+
+fn wc_unlink_all() {
+  var j: string = wc_path + "-journal";
+  var w: string = wc_path + "-wal";
+  meo_file_unlink(wc_path);
+  meo_file_unlink(j);
+  meo_file_unlink(w);
+  free(j.chars);
+  free(w.chars);
+}
+
+fn wc_ctl(op: int32, arg: int64) -> int64 {
+  return meo_wal_test_ctl(op, arg);
+}
+
+// The pad of row `id`: WC_PAD bytes that depend on the id.
+fn wc_fill_pad(buf: uint8*, id: int64) {
+  var i: int32 = 0;
+  while (i < WC_PAD) {
+    buf[i] = (uint8)(65 + ((int32)id + i) % 23);
+    i += 1;
+  }
+}
+
+// --- the workload -----------------------------------------------------------
+
+fn wc_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "pad", MEO_T_TEXT, 0);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// Insert ids first..first+n-1 (MEO_OK or the failing code).
+fn wc_insert(db: MeoDb*, first: int64, n: int32, pad: uint8*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_into(q, "id");
+  meo_q_into(q, "pad");
+  var v: MeoValue;
+  meo_value_set_int(&v, 0);
+  meo_q_value(q, &v);
+  meo_value_set_text(&v, pad, WC_PAD);
+  meo_q_value(q, &v);
+  rc = MEO_DONE;
+  var i: int32 = 0;
+  while (i < n && rc == MEO_DONE) {
+    var id: int64 = first + (int64)i;
+    wc_fill_pad(pad, id);
+    meo_value_set_int(&v, id);
+    meo_q_set_value(q, 0, &v);
+    meo_value_set_text(&v, pad, WC_PAD);
+    meo_q_set_value(q, 1, &v);
+    rc = meo_q_step(q);
+    meo_q_reset(q);
+    i += 1;
+  }
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// Workload W. cio (13 slots, or 0) gets the commit-frame I/O point of the
+// create (slot 0) and of each committed transaction. 0 or the failing stage.
+fn wc_work(cio: int64*, pad: uint8*) -> int32 {
+  wc_unlink_all();
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(wc_path,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL, WC_FRAMES, &db);
+  if (rc != MEO_OK) { return 2; }
+  if (meo_db_wal_autocheckpoint(db, WC_AUTOCKPT) != MEO_OK) { return 3; }
+  if (wc_create(db) != MEO_OK) { return 4; }
+  if (cio != 0) { cio[0] = wc_ctl(MEO_WAL_T_LAST_COMMIT_IO, 0); }
+  var j: int32 = 1;
+  while (j <= WC_TXNS) {
+    if (meo_db_begin(db, MEO_TX_DEFAULT) != MEO_OK) { return 5; }
+    if (wc_insert(db, (int64)(j * 100 + 1), WC_ROWS, pad) != MEO_OK) { return 6; }
+    if (j == WC_ROLLBACK_TXN) {
+      if (meo_db_rollback(db) != MEO_OK) { return 7; }
+    } else {
+      if (meo_db_commit(db) != MEO_OK) { return 8; }
+      if (cio != 0) { cio[j] = wc_ctl(MEO_WAL_T_LAST_COMMIT_IO, 0); }
+    }
+    j += 1;
+  }
+  if (meo_db_close(db) != MEO_OK) { return 9; }
+  return 0;
+}
+
+// --- the check after a crash ------------------------------------------------
+
+// The ids that must be present, ascending: the rows of every transaction whose
+// commit frame was written before point k (all of them for k = 0) and of
+// transaction `also` (0 = none), then `extra` when it is non-zero. Answers the
+// count.
+fn wc_expect(cio: int64*, k: int32, also: int32, extra: int64, ids: int64*) -> int32 {
+  var n: int32 = 0;
+  var j: int32 = 1;
+  while (j <= WC_TXNS) {
+    if (j != WC_ROLLBACK_TXN && (k == 0 || cio[j] < (int64)k || j == also)) {
+      var i: int32 = 1;
+      while (i <= WC_ROWS) {
+        ids[n] = (int64)(j * 100 + i);
+        n += 1;
+        i += 1;
+      }
+    }
+    j += 1;
+  }
+  if (extra != 0) {
+    ids[n] = extra;
+    n += 1;
+  }
+  return n;
+}
+
+// Select id, pad in id order and compare with ids[0..n). 0 = same set with
+// whole pads, -1 = differs (reported), -2 = no such table, else the code.
+fn wc_scan(db: MeoDb*, ids: int64*, n: int32, pad: uint8*, quiet: bool) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(db, "t", &q);
+  if (rc != MEO_OK) {
+    if (rc == -MEO_ERR_SCHEMA) { return -2; }
+    return rc;
+  }
+  meo_q_pick(q, "id");
+  meo_q_pick(q, "pad");
+  meo_q_order(q, "id", false);
+  var got: int32 = 0;
+  var bad: int32 = 0;
+  while (true) {
+    rc = meo_q_step(q);
+    if (rc != MEO_ROW) { break; }
+    var id: int64 = meo_q_column_int64(q, 0);
+    if (got >= n) {
+      if (!quiet) { println("wal_crash: extra row id {id}"); }
+      bad = 1;
+      got += 1;
+      continue;
+    }
+    if (id != ids[got]) {
+      if (!quiet) { println("wal_crash: row {got} is id {id}, want {ids[got]}"); }
+      bad = 1;
+    } else {
+      var txt: uint8* = meo_q_column_text(q, 1);
+      wc_fill_pad(pad, id);
+      if (txt == 0 || meo_q_column_bytes(q, 1) != WC_PAD || meo_bytes_compare(txt, pad, (int64)WC_PAD) != 0) {
+        if (!quiet) { println("wal_crash: id {id} has a damaged pad"); }
+        bad = 1;
+      }
+    }
+    got += 1;
+  }
+  meo_q_free(q);
+  if (rc == -MEO_ERR_SCHEMA) { return -2; }
+  if (rc != MEO_DONE) { return rc; }
+  if (got != n) {
+    if (!quiet) { println("wal_crash: {got} rows, want {n}"); }
+    bad = 1;
+  }
+  return -bad;
+}
+
+fn wc_reopen(db: MeoDb**) -> int32 {
+  return meo_db_open(wc_path,
+    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE | MEO_OPEN_WAL, WC_FRAMES, db);
+}
+
+// Reopen after a crash at point k and check everything. A torn write that
+// lands on a commit frame may have written every byte that differs from what
+// the file held there already, so the commit is then whole: the set may or may
+// not hold that transaction (or the table, for the create), nothing in between.
+// 0 = recovered.
+fn wc_verify(cio: int64*, k: int32, torn: bool, tag: string, pad: uint8*, ids: int64*) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = wc_reopen(&db);
+  if (rc != MEO_OK) { return wc_fail("{tag}: reopen rc={rc}"); }
+  var also: int32 = 0;
+  var may0: bool = false;
+  if (torn && k != 0) {
+    may0 = cio[0] == (int64)k;
+    var i: int32 = 1;
+    while (i <= WC_TXNS) {
+      if (i != WC_ROLLBACK_TXN && cio[i] == (int64)k) { also = i; }
+      i += 1;
+    }
+  }
+  var absent: bool = k != 0 && cio[0] >= (int64)k;
+  var n: int32 = wc_expect(cio, k, 0, 0, ids);
+  rc = wc_scan(db, ids, n, pad, also != 0);
+  if (rc == -1 && also != 0) {
+    n = wc_expect(cio, k, also, 0, ids);
+    rc = wc_scan(db, ids, n, pad, false);
+    if (rc == 0) { println("wal_crash: {tag}: torn commit frame of txn {also} counts as committed"); }
+  } else {
+    also = 0;
+  }
+  var gone: bool = rc == -2;
+  if (gone) {
+    if (!absent) { return wc_fail("{tag}: table missing"); }
+  } else {
+    if (rc != 0) { return wc_fail("{tag}: scan rc={rc}"); }
+    if (absent && !may0) { return wc_fail("{tag}: table should be absent"); }
+  }
+  rc = meo_free_init(db->pager);
+  if (rc != MEO_OK) { return wc_fail("{tag}: free list rc={rc}"); }
+
+  // One more transaction on top of whatever survived.
+  if (gone) {
+    rc = wc_create(db);
+    if (rc != MEO_OK) { return wc_fail("{tag}: create after recovery rc={rc}"); }
+  }
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc == MEO_OK) { rc = wc_insert(db, WC_EXTRA_ID, 1, pad); }
+  if (rc == MEO_OK) { rc = meo_db_commit(db); }
+  if (rc != MEO_OK) { return wc_fail("{tag}: insert after recovery rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return wc_fail("{tag}: close rc={rc}"); }
+
+  var db2: MeoDb* = 0;
+  rc = wc_reopen(&db2);
+  if (rc != MEO_OK) { return wc_fail("{tag}: second reopen rc={rc}"); }
+  if (gone) {
+    ids[0] = WC_EXTRA_ID;
+    n = 1;
+  } else {
+    n = wc_expect(cio, k, also, WC_EXTRA_ID, ids);
+  }
+  rc = wc_scan(db2, ids, n, pad, false);
+  if (rc != 0) { return wc_fail("{tag}: scan after insert rc={rc}"); }
+  rc = meo_db_close(db2);
+  if (rc != MEO_OK) { return wc_fail("{tag}: second close rc={rc}"); }
+  return 0;
+}
+
+// --- the crash loop ---------------------------------------------------------
+
+// Fork a child that runs W with a crash at point k. 0 = the child behaved
+// (exit 77 when k fires, 0 when it does not).
+fn wc_crash_run(k: int32, torn: bool, n_points: int32, pad: uint8*, tag: string) -> int32 {
+  var pid: int64 = syscall(57);
+  if (pid == 0) {
+    wc_ctl(MEO_WAL_T_RESET, 0);
+    wc_ctl(MEO_WAL_T_CRASH_AT, (int64)k);
+    if (torn) { wc_ctl(MEO_WAL_T_TORN, 1); }
+    var rc: int32 = wc_work(0, pad);
+    if (rc != 0) { syscall(231, (int64)(100 + rc)); }
+    syscall(231, (int64)0);
+  }
+  if (pid < 0) { return wc_fail("{tag}: fork failed"); }
+  var status: int32 = 0;
+  var w: int64 = syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  if (w < 0) { return wc_fail("{tag}: wait4 failed"); }
+  if ((status & 0x7F) != 0) { return wc_fail("{tag}: child died on signal {status & 0x7F}"); }
+  var code: int32 = (status >> 8) & 0xFF;
+  var want: int32 = 0;
+  if (k <= n_points) { want = WC_CRASH_CODE; }
+  if (code != want) { return wc_fail("{tag}: child exit {code}, want {want}"); }
+  return 0;
+}
 
 fn main() -> int32 {
-  println("PASS wal_crash (stub)");
+  var t0: int64 = meo_clock_monotonic_us();
+  var pid: int64 = syscall(39);
+  wc_path = "/dev/shm/meodb_wal_crash_{pid}.db";
+  var pad_a: uint8[] = new uint8[WC_PAD + 8];
+  var cio_a: int64[] = new int64[WC_TXNS + 1];
+  var ids_a: int64[] = new int64[WC_MAX_IDS];
+  var pad: uint8* = pad_a.data;
+  var cio: int64* = cio_a.data;
+  var ids: int64* = ids_a.data;
+
+  // Reference run.
+  wc_ctl(MEO_WAL_T_RESET, 0);
+  var rc: int32 = wc_work(cio, pad);
+  if (rc != 0) { return wc_fail("reference run stage {rc}"); }
+  var n_points: int32 = (int32)wc_ctl(MEO_WAL_T_IO_COUNT, 0);
+  wc_ctl(MEO_WAL_T_RESET, 0);
+  var prev: int64 = cio[0];
+  var j: int32 = 1;
+  while (j <= WC_TXNS) {
+    if (j != WC_ROLLBACK_TXN) {
+      if (cio[j] <= prev) { return wc_fail("commit points not increasing at txn {j}"); }
+      prev = cio[j];
+    }
+    j += 1;
+  }
+  if (cio[0] <= 0 || cio[WC_TXNS] >= (int64)n_points) {
+    return wc_fail("odd reference run: {n_points} points, create at {cio[0]}, last commit at {cio[WC_TXNS]}");
+  }
+  println("wal_crash: {n_points} I/O points, create commit at {cio[0]}, last commit at {cio[WC_TXNS]}");
+
+  var runs: int32 = 0;
+  var k: int32 = 1;
+  while (k <= n_points + 1) {
+    var pass: int32 = 0;
+    while (pass < 2) {
+      var torn: bool = pass == 1;
+      var tag: string = "k={k}";
+      if (torn) { tag = "k={k} torn"; }
+      rc = wc_crash_run(k, torn, n_points, pad, tag);
+      if (rc == 0) {
+        // A run that never fires finished W: everything committed.
+        var kk: int32 = k;
+        if (k > n_points) { kk = 0; }
+        rc = wc_verify(cio, kk, torn, tag, pad, ids);
+      }
+      if (rc != 0) { return 1; }
+      runs += 1;
+      pass += 1;
+    }
+    if (k % 25 == 0) { println("wal_crash: k={k} of {n_points + 1} ok"); }
+    k += 1;
+  }
+  wc_unlink_all();
+  var ms: int64 = (meo_clock_monotonic_us() - t0) / 1000;
+  println("wal_crash: {runs} crash runs in {ms} ms");
+  println("PASS wal_crash");
   return 0;
 }
