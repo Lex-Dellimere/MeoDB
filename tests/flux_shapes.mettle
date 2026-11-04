@@ -1,0 +1,725 @@
+// flux_shapes: every statement shape flux_orm produces, run through meo_q_*
+// the way its adapter will. A local copy of flux's RcStmt (FsStmt: op, table,
+// cols, terms over argv ranges, order, limit/offset, argv) goes through one
+// translator (fs_run, the adapter body of DECISIONS.md D11e): SET values first,
+// then term values, INSERT cells row-major. Each case checks rows, changes and
+// last insert rowid. Cases follow the D11e call-site table plus the newer
+// shapes: versioned save and delete, created/updated INT timestamps,
+// update_all / delete_all with terms, count with terms, the migration ledger,
+// and the relation preload IN query. Joins are refused by the adapter itself
+// and never reach MeoSQL, so they have no case here.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meosql.mettle";
+
+// Red-check switch: 1 expects the stale versioned save to change a row.
+// Must be 0 when committed.
+const FS_RED: int32 = 0;
+const FS_DB: string = "build/flux_shapes.db";
+
+// flux's RC_OP_* and RC_W_* numbers (adapter/stmt.mettle).
+const FS_CREATE: int32 = 1;
+const FS_INSERT: int32 = 2;
+const FS_SELECT: int32 = 3;
+const FS_UPDATE: int32 = 4;
+const FS_DELETE: int32 = 5;
+const FS_COUNT: int32 = 6;
+const W_EQ: int32 = 0;
+const W_NE: int32 = 1;
+const W_LT: int32 = 2;
+const W_LE: int32 = 3;
+const W_GT: int32 = 4;
+const W_GE: int32 = 5;
+const W_IN: int32 = 6;
+const W_NULL: int32 = 7;
+const W_NOT_NULL: int32 = 8;
+const FS_CAP: int32 = 32;
+
+struct FsCol {
+  name: string;
+  ty: int32;       // MEO_T_* (the adapter maps RC_T_* to these)
+  flags: int32;    // MEO_COL_*
+}
+
+struct FsTerm {
+  col: string;
+  op: int32;       // W_*
+  arg0: int32;
+  n_args: int32;
+}
+
+struct FsStmt {
+  op: int32;
+  table: string;
+  if_not_exists: bool;
+  cols: FsCol*;
+  n_cols: int32;
+  terms: FsTerm*;
+  n_terms: int32;
+  order_col: string;
+  order_desc: bool;
+  has_order: bool;
+  limit: int64;
+  offset: int64;
+  args: MeoValue*;
+  n_args: int32;
+}
+
+struct FsRes {
+  rc: int32;
+  rows: int32;
+  cols: int32;
+  changes: int32;
+  last_id: int64;
+  out: string;     // column `col` of every row joined by ",", N for NULL
+}
+
+fn fs_fail(msg: string) -> int32 {
+  println("FAIL flux_shapes: {msg}");
+  return 1;
+}
+
+fn fs_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn vi(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn vr(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+fn vt(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn vn() -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_null(&v);
+  return v;
+}
+
+fn fs_same(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  return meo_bytes_equal(a.chars, b.chars, (int64)a.length);
+}
+
+// --- the statement and its translator ----------------------------------------
+
+fn fs_new(st: FsStmt*, op: int32, table: string) {
+  st->op = op;
+  st->table = table;
+  st->if_not_exists = false;
+  st->cols = (FsCol*)malloc((int64)FS_CAP * (int64)sizeof(FsCol));
+  st->n_cols = 0;
+  st->terms = (FsTerm*)malloc((int64)FS_CAP * (int64)sizeof(FsTerm));
+  st->n_terms = 0;
+  st->order_col = "";
+  st->order_desc = false;
+  st->has_order = false;
+  st->limit = -1;
+  st->offset = 0;
+  st->args = (MeoValue*)malloc((int64)FS_CAP * (int64)sizeof(MeoValue));
+  st->n_args = 0;
+}
+
+fn fs_free(st: FsStmt*) {
+  free(st->cols);
+  free(st->terms);
+  free(st->args);
+}
+
+fn fs_col(st: FsStmt*, name: string, ty: int32, flags: int32) {
+  st->cols[st->n_cols].name = name;
+  st->cols[st->n_cols].ty = ty;
+  st->cols[st->n_cols].flags = flags;
+  st->n_cols += 1;
+}
+
+fn fs_arg(st: FsStmt*, v: MeoValue) {
+  st->args[st->n_args] = v;
+  st->n_args += 1;
+}
+
+// A term over the next n argv entries (pushed by the caller), like the builder.
+fn fs_term(st: FsStmt*, col: string, op: int32, n: int32) {
+  st->terms[st->n_terms].col = col;
+  st->terms[st->n_terms].op = op;
+  st->terms[st->n_terms].arg0 = st->n_args - n;
+  st->terms[st->n_terms].n_args = n;
+  st->n_terms += 1;
+}
+
+fn fs_cmp(op: int32) -> int32 {
+  if (op == W_EQ) { return MEO_Q_EQ; }
+  if (op == W_NE) { return MEO_Q_NE; }
+  if (op == W_LT) { return MEO_Q_LT; }
+  if (op == W_LE) { return MEO_Q_LE; }
+  if (op == W_GT) { return MEO_Q_GT; }
+  return MEO_Q_GE;
+}
+
+fn fs_kind(db: MeoDb*, st: FsStmt*, q: MeoQuery**) -> int32 {
+  if (st->op == FS_CREATE) { return meo_q_create(db, st->table, q); }
+  if (st->op == FS_INSERT) { return meo_q_insert(db, st->table, q); }
+  if (st->op == FS_SELECT) { return meo_q_select(db, st->table, q); }
+  if (st->op == FS_UPDATE) { return meo_q_update(db, st->table, q); }
+  if (st->op == FS_DELETE) { return meo_q_delete(db, st->table, q); }
+  return meo_q_count(db, st->table, q);
+}
+
+// The builder calls for st; MEO_OK or the first failing code.
+fn fs_build(st: FsStmt*, q: MeoQuery*) -> int32 {
+  var rc: int32 = MEO_OK;
+  if (st->op == FS_CREATE && st->if_not_exists) { rc = meo_q_if_not_exists(q); }
+  var i: int32 = 0;
+  while (i < st->n_cols && rc == MEO_OK) {
+    var c: FsCol* = &st->cols[i];
+    if (st->op == FS_CREATE) { rc = meo_q_column_def(q, c->name, c->ty, c->flags); }
+    if (st->op == FS_INSERT) { rc = meo_q_into(q, c->name); }
+    if (st->op == FS_SELECT) { rc = meo_q_pick(q, c->name); }
+    if (st->op == FS_UPDATE) { rc = meo_q_assign(q, c->name, &st->args[i]); }
+    i += 1;
+  }
+  if (st->op == FS_INSERT) {
+    i = 0;
+    while (i < st->n_args && rc == MEO_OK) {
+      rc = meo_q_value(q, &st->args[i]);
+      i += 1;
+    }
+  }
+  i = 0;
+  while (i < st->n_terms && rc == MEO_OK) {
+    var t: FsTerm* = &st->terms[i];
+    if (t->op == W_IN) {
+      rc = meo_q_where_in(q, t->col, &st->args[t->arg0], t->n_args);
+    } else if (t->op == W_NULL) {
+      rc = meo_q_where_null(q, t->col);
+    } else if (t->op == W_NOT_NULL) {
+      rc = meo_q_where_not_null(q, t->col);
+    } else {
+      rc = meo_q_where(q, t->col, fs_cmp(t->op), &st->args[t->arg0]);
+    }
+    i += 1;
+  }
+  if (rc == MEO_OK && st->has_order) { rc = meo_q_order(q, st->order_col, st->order_desc); }
+  if (rc == MEO_OK && st->limit >= 0) { rc = meo_q_limit(q, st->limit); }
+  if (rc == MEO_OK && st->offset > 0) { rc = meo_q_offset(q, st->offset); }
+  return rc;
+}
+
+// Run st once and copy the whole result, as the adapter does into RcResult.
+fn fs_run(db: MeoDb*, st: FsStmt*, col: int32, res: FsRes*) -> int32 {
+  res->rows = 0;
+  res->cols = 0;
+  res->changes = 0;
+  res->last_id = 0;
+  res->out = "";
+  var q: MeoQuery* = 0;
+  res->rc = fs_kind(db, st, &q);
+  if (res->rc != MEO_OK) { return res->rc; }
+  res->rc = fs_build(st, q);
+  if (res->rc == MEO_OK) { res->rc = meo_q_step(q); }
+  if (res->rc == MEO_ROW || res->rc == MEO_DONE) {
+    res->rows = meo_q_row_count(q);
+    res->cols = meo_q_column_count(q);
+    res->changes = meo_q_changes(q);
+    res->last_id = meo_q_last_insert_rowid(q);
+    var r: int32 = 0;
+    while (r < res->rows) {
+      var v: MeoValue;
+      meo_q_cell(q, r, col, &v);
+      var part: string = "N";
+      if (v.type == MEO_T_INT) { part = "{v.i}"; }
+      if (v.type == MEO_T_TEXT) { part = str_from_bytes((cstring)v.p, (int64)v.n); }
+      if (r > 0) { res->out = res->out + ","; }
+      res->out = res->out + part;
+      r += 1;
+    }
+  }
+  meo_q_free(q);
+  fs_free(st);
+  return res->rc;
+}
+
+// rc, row count, changes and last rowid, plus column `col` joined, all as wanted.
+fn fs_expect(name: string, res: FsRes*, rc: int32, rows: int32, changes: int32, last: int64,
+    out: string) -> int32 {
+  if (res->rc != rc) { return fs_fail("{name}: rc {res->rc} want {rc}"); }
+  if (res->rows != rows) { return fs_fail("{name}: {res->rows} rows want {rows}"); }
+  if (res->changes != changes) { return fs_fail("{name}: changes {res->changes} want {changes}"); }
+  if (res->last_id != last) { return fs_fail("{name}: last id {res->last_id} want {last}"); }
+  if (!fs_same(res->out, out)) { return fs_fail("{name}: got [{res->out}] want [{out}]"); }
+  return 0;
+}
+
+// --- the user model ------------------------------------------------------------
+// users: id 0 AUTO PK, email 1, name 2, age 3, active 4 (BOOL), score 5,
+// created_at 6 (TIME), role 7. notes: id, text, version, created_at,
+// updated_at. posts: id, user_id, title.
+
+fn fs_user_cols(st: FsStmt*, with_pk: bool) {
+  if (with_pk) { fs_col(st, "id", MEO_T_INT, MEO_COL_PK); }
+  fs_col(st, "email", MEO_T_TEXT, MEO_COL_UNIQUE | MEO_COL_NOT_NULL);
+  fs_col(st, "name", MEO_T_TEXT, MEO_COL_NOT_NULL);
+  fs_col(st, "age", MEO_T_INT, 0);
+  fs_col(st, "active", MEO_T_INT, MEO_COL_NOT_NULL);
+  fs_col(st, "score", MEO_T_REAL, 0);
+  fs_col(st, "created_at", MEO_T_INT, MEO_COL_NOT_NULL);
+  fs_col(st, "role", MEO_T_INT, 0);
+}
+
+fn fs_user_args(st: FsStmt*, email: string, name: string, age: int64, active: int64,
+    score: MeoValue, created: int64, role: int64) {
+  fs_arg(st, vt(email));
+  fs_arg(st, vt(name));
+  fs_arg(st, vi(age));
+  fs_arg(st, vi(active));
+  fs_arg(st, score);
+  fs_arg(st, vi(created));
+  fs_arg(st, vi(role));
+}
+
+// SELECT all user fields with column `col` reported.
+fn fs_users_select(st: FsStmt*) {
+  fs_new(st, FS_SELECT, "users");
+  fs_user_cols(st, true);
+}
+
+// --- cases ---------------------------------------------------------------------
+
+// rc_migration_ledger_ddl / _select / _insert, and the users CREATE from
+// rc_migration_create_stmt, in the order a migration run sends them.
+fn c_migrations(db: MeoDb*) -> int32 {
+  var res: FsRes;
+  var k: int32 = 0;
+  while (k < 2) {
+    var st: FsStmt;
+    fs_new(&st, FS_CREATE, "schema_migrations");
+    st.if_not_exists = true;
+    fs_col(&st, "version", MEO_T_INT, MEO_COL_PK);
+    fs_col(&st, "name", MEO_T_TEXT, MEO_COL_NOT_NULL);
+    fs_col(&st, "applied_at", MEO_T_INT, MEO_COL_NOT_NULL);
+    fs_run(db, &st, 0, &res);
+    if (fs_expect("ledger ddl", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+    k += 1;
+  }
+  var sel: FsStmt;
+  fs_new(&sel, FS_SELECT, "schema_migrations");
+  fs_col(&sel, "version", MEO_T_INT, 0);
+  sel.has_order = true;
+  sel.order_col = "version";
+  fs_run(db, &sel, 0, &res);
+  if (fs_expect("ledger select empty", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+
+  var cr: FsStmt;
+  fs_new(&cr, FS_CREATE, "users");
+  cr.if_not_exists = true;
+  fs_user_cols(&cr, true);
+  fs_run(db, &cr, 0, &res);
+  if (fs_expect("create users", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+  var cn: FsStmt;
+  fs_new(&cn, FS_CREATE, "notes");
+  cn.if_not_exists = true;
+  fs_col(&cn, "id", MEO_T_INT, MEO_COL_PK);
+  fs_col(&cn, "text", MEO_T_TEXT, 0);
+  fs_col(&cn, "version", MEO_T_INT, MEO_COL_NOT_NULL);
+  fs_col(&cn, "created_at", MEO_T_INT, MEO_COL_NOT_NULL);
+  fs_col(&cn, "updated_at", MEO_T_INT, MEO_COL_NOT_NULL);
+  fs_run(db, &cn, 0, &res);
+  if (fs_expect("create notes", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+  var cp: FsStmt;
+  fs_new(&cp, FS_CREATE, "posts");
+  cp.if_not_exists = true;
+  fs_col(&cp, "id", MEO_T_INT, MEO_COL_PK);
+  fs_col(&cp, "user_id", MEO_T_INT, MEO_COL_NOT_NULL);
+  fs_col(&cp, "title", MEO_T_TEXT, 0);
+  fs_run(db, &cp, 0, &res);
+  if (fs_expect("create posts", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+
+  var v: int64 = 2;
+  while (v >= 1) {
+    var ins: FsStmt;
+    fs_new(&ins, FS_INSERT, "schema_migrations");
+    fs_col(&ins, "version", MEO_T_INT, 0);
+    fs_col(&ins, "name", MEO_T_TEXT, 0);
+    fs_col(&ins, "applied_at", MEO_T_INT, 0);
+    fs_arg(&ins, vi(v));
+    fs_arg(&ins, vt("m{v}"));
+    fs_arg(&ins, vi(1700000000000000 + v));
+    fs_run(db, &ins, 0, &res);
+    // version is the rowid alias, so the last id is the version.
+    if (fs_expect("ledger insert {v}", &res, MEO_DONE, 0, 1, v, "") != 0) { return 1; }
+    v -= 1;
+  }
+  var sel2: FsStmt;
+  fs_new(&sel2, FS_SELECT, "schema_migrations");
+  fs_col(&sel2, "version", MEO_T_INT, 0);
+  sel2.has_order = true;
+  sel2.order_col = "version";
+  fs_run(db, &sel2, 0, &res);
+  return fs_expect("ledger select", &res, MEO_ROW, 2, 0, 0, "1,2");
+}
+
+// rc_persist_insert (AUTO pk omitted) and rc_query_insert_batch(m, 2).
+fn c_inserts(db: MeoDb*) -> int32 {
+  var res: FsRes;
+  var one: FsStmt;
+  fs_new(&one, FS_INSERT, "users");
+  fs_user_cols(&one, false);
+  fs_user_args(&one, "a@x", "ann", 30, 1, vr(9.5), 1, 1);
+  fs_run(db, &one, 0, &res);
+  if (fs_expect("persist insert", &res, MEO_DONE, 0, 1, 1, "") != 0) { return 1; }
+  var two: FsStmt;
+  fs_new(&two, FS_INSERT, "users");
+  fs_user_cols(&two, false);
+  fs_user_args(&two, "b@x", "bob", 31, 1, vn(), 3, 2);
+  fs_user_args(&two, "c@x", "cy", 45, 0, vr(1.0), 8, 2);
+  fs_run(db, &two, 0, &res);
+  if (fs_expect("insert batch", &res, MEO_DONE, 0, 2, 3, "") != 0) { return 1; }
+  var three: FsStmt;
+  fs_new(&three, FS_INSERT, "users");
+  fs_user_cols(&three, false);
+  fs_user_args(&three, "d@x", "dee", 22, 1, vn(), 9, 3);
+  fs_run(db, &three, 0, &res);
+  if (fs_expect("insert 4", &res, MEO_DONE, 0, 1, 4, "") != 0) { return 1; }
+  // Duplicate email: flux maps CONFLICT.
+  var dup: FsStmt;
+  fs_new(&dup, FS_INSERT, "users");
+  fs_user_cols(&dup, false);
+  fs_user_args(&dup, "a@x", "again", 1, 1, vn(), 1, 1);
+  fs_run(db, &dup, 0, &res);
+  if (fs_expect("insert dup", &res, -MEO_ERR_CONFLICT, 0, 0, 0, "") != 0) { return 1; }
+
+  var posts: FsStmt;
+  fs_new(&posts, FS_INSERT, "posts");
+  fs_col(&posts, "user_id", MEO_T_INT, 0);
+  fs_col(&posts, "title", MEO_T_TEXT, 0);
+  fs_arg(&posts, vi(1));
+  fs_arg(&posts, vt("p1"));
+  fs_arg(&posts, vi(2));
+  fs_arg(&posts, vt("p2"));
+  fs_arg(&posts, vi(1));
+  fs_arg(&posts, vt("p3"));
+  fs_arg(&posts, vi(4));
+  fs_arg(&posts, vt("p4"));
+  fs_run(db, &posts, 0, &res);
+  return fs_expect("insert posts", &res, MEO_DONE, 0, 4, 4, "");
+}
+
+// rc_query_select and every where/order/limit/offset call site.
+fn c_selects(db: MeoDb*) -> int32 {
+  var res: FsRes;
+  var all: FsStmt;
+  fs_users_select(&all);
+  fs_run(db, &all, 0, &res);
+  if (fs_expect("select all", &res, MEO_ROW, 4, 0, 0, "1,2,3,4") != 0) { return 1; }
+  if (res.cols != 8) { return fs_fail("select all: {res.cols} columns"); }
+
+  var eq: FsStmt;
+  fs_users_select(&eq);
+  fs_arg(&eq, vt("b@x"));
+  fs_term(&eq, "email", W_EQ, 1);
+  fs_run(db, &eq, 2, &res);
+  if (fs_expect("where_eq", &res, MEO_ROW, 1, 0, 0, "bob") != 0) { return 1; }
+
+  // where_eq(f, RcNull) and where_null both become NULL terms.
+  var nul: FsStmt;
+  fs_users_select(&nul);
+  fs_term(&nul, "score", W_NULL, 0);
+  fs_run(db, &nul, 0, &res);
+  if (fs_expect("where_null", &res, MEO_ROW, 2, 0, 0, "2,4") != 0) { return 1; }
+
+  // where_not_null and where_cmp(NE, RcNull).
+  var nn: FsStmt;
+  fs_users_select(&nn);
+  fs_term(&nn, "score", W_NOT_NULL, 0);
+  fs_run(db, &nn, 0, &res);
+  if (fs_expect("where_not_null", &res, MEO_ROW, 2, 0, 0, "1,3") != 0) { return 1; }
+
+  // where_cmp with each operator on age (30, 31, 45, 22).
+  var ops: int32[5];
+  ops[0] = W_NE;
+  ops[1] = W_LT;
+  ops[2] = W_LE;
+  ops[3] = W_GT;
+  ops[4] = W_GE;
+  var want: string[5];
+  want[0] = "2,3,4";
+  want[1] = "4";
+  want[2] = "1,4";
+  want[3] = "2,3";
+  want[4] = "1,2,3";
+  var i: int32 = 0;
+  while (i < 5) {
+    var cmp: FsStmt;
+    fs_users_select(&cmp);
+    fs_arg(&cmp, vi(30));
+    fs_term(&cmp, "age", ops[i], 1);
+    fs_run(db, &cmp, 0, &res);
+    var n: int32 = 1 + (int32)(want[i].length / 2);
+    if (fs_expect("where_cmp {ops[i]}", &res, MEO_ROW, n, 0, 0, want[i]) != 0) { return 1; }
+    i += 1;
+  }
+
+  var inq: FsStmt;
+  fs_users_select(&inq);
+  fs_arg(&inq, vi(30));
+  fs_arg(&inq, vi(31));
+  fs_term(&inq, "age", W_IN, 2);
+  fs_run(db, &inq, 0, &res);
+  if (fs_expect("where_in", &res, MEO_ROW, 2, 0, 0, "1,2") != 0) { return 1; }
+
+  // order_by(f, asc = false) -> meo_q_order(q, col, !asc); then limit/offset.
+  var ord: FsStmt;
+  fs_users_select(&ord);
+  ord.has_order = true;
+  ord.order_col = "name";
+  ord.order_desc = true;
+  ord.limit = 2;
+  ord.offset = 1;
+  fs_run(db, &ord, 2, &res);
+  if (fs_expect("order desc limit offset", &res, MEO_ROW, 2, 0, 0, "cy,bob") != 0) { return 1; }
+
+  // t_stmt's check_select shape: argv [email, 30, 31, role], score NULL and
+  // active NOT NULL take no argv; offset 20 skips everything.
+  var big: FsStmt;
+  fs_users_select(&big);
+  fs_arg(&big, vt("a@x"));
+  fs_term(&big, "email", W_EQ, 1);
+  fs_arg(&big, vi(30));
+  fs_arg(&big, vi(31));
+  fs_term(&big, "age", W_IN, 2);
+  fs_term(&big, "score", W_NULL, 0);
+  fs_arg(&big, vi(1));
+  fs_term(&big, "role", W_GE, 1);
+  fs_term(&big, "active", W_NOT_NULL, 0);
+  big.has_order = true;
+  big.order_col = "name";
+  big.order_desc = true;
+  big.limit = 10;
+  big.offset = 20;
+  fs_run(db, &big, 0, &res);
+  if (fs_expect("check_select shape", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+  var big2: FsStmt;
+  fs_users_select(&big2);
+  fs_arg(&big2, vt("b@x"));
+  fs_term(&big2, "email", W_EQ, 1);
+  fs_arg(&big2, vi(30));
+  fs_arg(&big2, vi(31));
+  fs_term(&big2, "age", W_IN, 2);
+  fs_term(&big2, "score", W_NULL, 0);
+  fs_arg(&big2, vi(1));
+  fs_term(&big2, "role", W_GE, 1);
+  fs_term(&big2, "active", W_NOT_NULL, 0);
+  big2.limit = 10;
+  fs_run(db, &big2, 0, &res);
+  if (fs_expect("check_select shape hit", &res, MEO_ROW, 1, 0, 0, "2") != 0) { return 1; }
+
+  // rc_persist_load: all fields, pk EQ, limit 1.
+  var load: FsStmt;
+  fs_users_select(&load);
+  fs_arg(&load, vi(3));
+  fs_term(&load, "id", W_EQ, 1);
+  load.limit = 1;
+  fs_run(db, &load, 1, &res);
+  if (fs_expect("persist load", &res, MEO_ROW, 1, 0, 0, "c@x") != 0) { return 1; }
+
+  // Relation preload: posts WHERE user_id IN (parent ids), as load.mettle does.
+  var pre: FsStmt;
+  fs_new(&pre, FS_SELECT, "posts");
+  fs_col(&pre, "id", MEO_T_INT, 0);
+  fs_col(&pre, "user_id", MEO_T_INT, 0);
+  fs_col(&pre, "title", MEO_T_TEXT, 0);
+  fs_arg(&pre, vi(1));
+  fs_arg(&pre, vi(3));
+  fs_arg(&pre, vi(4));
+  fs_term(&pre, "user_id", W_IN, 3);
+  fs_run(db, &pre, 2, &res);
+  if (fs_expect("preload in", &res, MEO_ROW, 3, 0, 0, "p1,p3,p4") != 0) { return 1; }
+
+  // count with terms.
+  var cnt: FsStmt;
+  fs_new(&cnt, FS_COUNT, "users");
+  fs_arg(&cnt, vi(30));
+  fs_term(&cnt, "age", W_GE, 1);
+  fs_arg(&cnt, vi(1));
+  fs_term(&cnt, "active", W_EQ, 1);
+  fs_run(db, &cnt, 0, &res);
+  return fs_expect("count with terms", &res, MEO_ROW, 1, 0, 0, "2");
+}
+
+// Notes with created/updated INT timestamps; versioned save and delete.
+fn c_versioned(db: MeoDb*) -> int32 {
+  var res: FsRes;
+  var t0: int64 = 1730000000123456;
+  var ins: FsStmt;
+  fs_new(&ins, FS_INSERT, "notes");
+  fs_col(&ins, "text", MEO_T_TEXT, 0);
+  fs_col(&ins, "version", MEO_T_INT, 0);
+  fs_col(&ins, "created_at", MEO_T_INT, 0);
+  fs_col(&ins, "updated_at", MEO_T_INT, 0);
+  fs_arg(&ins, vt("first"));
+  fs_arg(&ins, vi(1));
+  fs_arg(&ins, vi(t0));
+  fs_arg(&ins, vi(t0));
+  fs_run(db, &ins, 0, &res);
+  if (fs_expect("note insert", &res, MEO_DONE, 0, 1, 1, "") != 0) { return 1; }
+
+  // Versioned save: SET text, updated_at, version = old + 1 WHERE id EQ AND
+  // version EQ old; argv [text, t1, 2, id, 1].
+  var k: int32 = 0;
+  while (k < 2) {
+    var up: FsStmt;
+    fs_new(&up, FS_UPDATE, "notes");
+    fs_col(&up, "text", MEO_T_TEXT, 0);
+    fs_col(&up, "updated_at", MEO_T_INT, 0);
+    fs_col(&up, "version", MEO_T_INT, 0);
+    fs_arg(&up, vt("second"));
+    fs_arg(&up, vi(t0 + 1000));
+    fs_arg(&up, vi(2));
+    fs_arg(&up, vi(1));
+    fs_term(&up, "id", W_EQ, 1);
+    fs_arg(&up, vi(1));
+    fs_term(&up, "version", W_EQ, 1);
+    fs_run(db, &up, 0, &res);
+    // The second run is stale (version is 2 now): 0 changes, flux's CONFLICT.
+    var want: int32 = 1;
+    if (k == 1) { want = FS_RED; }
+    if (fs_expect("versioned save {k}", &res, MEO_DONE, 0, want, 0, "") != 0) { return 1; }
+    k += 1;
+  }
+  var rd: FsStmt;
+  fs_new(&rd, FS_SELECT, "notes");
+  fs_col(&rd, "text", MEO_T_TEXT, 0);
+  fs_col(&rd, "version", MEO_T_INT, 0);
+  fs_col(&rd, "created_at", MEO_T_INT, 0);
+  fs_col(&rd, "updated_at", MEO_T_INT, 0);
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "notes", &q);
+  fs_build(&rd, q);
+  fs_free(&rd);
+  var rc: int32 = meo_q_step(q);
+  var ok: bool = rc == MEO_ROW && meo_q_column_int64(q, 1) == 2;
+  ok = ok && meo_q_column_int64(q, 2) == t0 && meo_q_column_int64(q, 3) == t0 + 1000;
+  ok = ok && meo_q_column_bytes(q, 0) == 6;
+  meo_q_free(q);
+  if (!ok) { return fs_fail("note after save rc={rc}"); }
+
+  // Versioned delete: stale version first (0 changes), then the current one.
+  var d1: FsStmt;
+  fs_new(&d1, FS_DELETE, "notes");
+  fs_arg(&d1, vi(1));
+  fs_term(&d1, "id", W_EQ, 1);
+  fs_arg(&d1, vi(1));
+  fs_term(&d1, "version", W_EQ, 1);
+  fs_run(db, &d1, 0, &res);
+  if (fs_expect("versioned delete stale", &res, MEO_DONE, 0, 0, 0, "") != 0) { return 1; }
+  var d2: FsStmt;
+  fs_new(&d2, FS_DELETE, "notes");
+  fs_arg(&d2, vi(1));
+  fs_term(&d2, "id", W_EQ, 1);
+  fs_arg(&d2, vi(2));
+  fs_term(&d2, "version", W_EQ, 1);
+  fs_run(db, &d2, 0, &res);
+  return fs_expect("versioned delete", &res, MEO_DONE, 0, 1, 0, "");
+}
+
+// update_all, plain update by pk, delete_all and rc_persist_delete.
+fn c_bulk(db: MeoDb*) -> int32 {
+  var res: FsRes;
+  // update_all(users, active = false) WHERE created_at LT 5: users 1 and 2.
+  var ua: FsStmt;
+  fs_new(&ua, FS_UPDATE, "users");
+  fs_col(&ua, "active", MEO_T_INT, 0);
+  fs_arg(&ua, vi(0));
+  fs_arg(&ua, vi(5));
+  fs_term(&ua, "created_at", W_LT, 1);
+  fs_run(db, &ua, 0, &res);
+  if (fs_expect("update_all", &res, MEO_DONE, 0, 2, 0, "") != 0) { return 1; }
+
+  // rc_query_update(m, mask) by pk: SET name, score; argv [name, score, id].
+  var up: FsStmt;
+  fs_new(&up, FS_UPDATE, "users");
+  fs_col(&up, "name", MEO_T_TEXT, 0);
+  fs_col(&up, "score", MEO_T_REAL, 0);
+  fs_arg(&up, vt("dora"));
+  fs_arg(&up, vr(4.25));
+  fs_arg(&up, vi(4));
+  fs_term(&up, "id", W_EQ, 1);
+  fs_run(db, &up, 0, &res);
+  if (fs_expect("update by pk", &res, MEO_DONE, 0, 1, 0, "") != 0) { return 1; }
+
+  // delete_all WHERE active EQ false: users 1, 2, 3.
+  var da: FsStmt;
+  fs_new(&da, FS_DELETE, "users");
+  fs_arg(&da, vi(0));
+  fs_term(&da, "active", W_EQ, 1);
+  fs_run(db, &da, 0, &res);
+  if (fs_expect("delete_all", &res, MEO_DONE, 0, 3, 0, "") != 0) { return 1; }
+
+  // rc_persist_delete: pk EQ only.
+  var pd: FsStmt;
+  fs_new(&pd, FS_DELETE, "posts");
+  fs_arg(&pd, vi(2));
+  fs_term(&pd, "id", W_EQ, 1);
+  fs_run(db, &pd, 0, &res);
+  if (fs_expect("persist delete", &res, MEO_DONE, 0, 1, 0, "") != 0) { return 1; }
+
+  var left: FsStmt;
+  fs_users_select(&left);
+  fs_run(db, &left, 2, &res);
+  if (fs_expect("users left", &res, MEO_ROW, 1, 0, 0, "dora") != 0) { return 1; }
+  var cnt: FsStmt;
+  fs_new(&cnt, FS_COUNT, "posts");
+  fs_run(db, &cnt, 0, &res);
+  return fs_expect("count posts", &res, MEO_ROW, 1, 0, 0, "3");
+}
+
+fn fs_main() -> int32 {
+  var rc: int32 = fs_reset(FS_DB);
+  if (rc != MEO_OK) { return fs_fail("reset rc={rc}"); }
+  var db: MeoDb* = 0;
+  rc = meo_db_open(FS_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return fs_fail("open rc={rc}"); }
+  // Migrations run inside one transaction, as flux's runner does.
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return fs_fail("begin rc={rc}"); }
+  if (c_migrations(db) != 0) { return 1; }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return fs_fail("commit rc={rc}"); }
+  if (c_inserts(db) != 0) { return 1; }
+  if (c_selects(db) != 0) { return 1; }
+  if (c_versioned(db) != 0) { return 1; }
+  if (c_bulk(db) != 0) { return 1; }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return fs_fail("close rc={rc}"); }
+  return 0;
+}
+
+fn main() -> int32 {
+  if (fs_main() != 0) { return 1; }
+  println("PASS flux_shapes");
+  return 0;
+}

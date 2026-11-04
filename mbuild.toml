@@ -131,3 +131,23 @@ main = "tests/cli_self.mettle"
 # The server over loopback with raw frames: handshake, queries, errors.
 [bin.srv_smoke]
 main = "tests/srv_smoke.mettle"
+
+# End to end through the typed API: every type, transactions, reopen.
+[bin.query_e2e]
+main = "tests/query_e2e.mettle"
+
+# A process killed mid-transaction, and a corrupted file.
+[bin.query_crash]
+main = "tests/query_crash.mettle"
+
+# 64 threads sharing one database.
+[bin.query_mt]
+main = "tests/query_mt.mettle"
+
+# Every statement shape flux_orm produces, run through the typed API.
+[bin.flux_shapes]
+main = "tests/flux_shapes.mettle"
+
+# Imports only meo_core.mettle, proving tables work without the query layer.
+[bin.core_only]
+main = "tests/core_only.mettle"

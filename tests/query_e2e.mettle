@@ -1,0 +1,510 @@
+// query_e2e: the typed API end to end. Tables with every affinity, a rowid
+// alias, a text PRIMARY KEY, UNIQUE and NOT NULL; NULL/INT/REAL/TEXT/BLOB
+// round-trip bit for bit (int64 min/max, -0.0, a NaN payload, empty and 1 KB
+// text/blob); select with a filter, update, delete, count; explicit commit and
+// rollback (rolled-back rows and the rolled-back table are gone); TX errors;
+// CONFLICT, CONSTRAINT, MISMATCH and SCHEMA codes; close and reopen keeps it.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "../src/error/status.mettle";
+import "../src/format/bytes.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meosql.mettle";
+
+// Red-check switch: 1 expects one row too many after the rollback.
+// Must be 0 when committed.
+const E2E_RED: int32 = 0;
+const E2E_DB: string = "build/query_e2e.db";
+const E2E_BIG: int32 = 1024;
+
+fn e2e_fail(msg: string) -> int32 {
+  println("FAIL query_e2e: {msg}");
+  return 1;
+}
+
+fn e2e_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn vi(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn vr(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+fn vt(s: string) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_text(&v, s.chars, (int32)s.length);
+  return v;
+}
+
+fn vb(p: uint8*, n: int32) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_blob(&v, p, n);
+  return v;
+}
+
+fn vn() -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_null(&v);
+  return v;
+}
+
+fn f64_bits(x: float64) -> uint64 {
+  var b: uint8[8];
+  meo_put_f64le(&b[0], 0, x);
+  return meo_get_u64le(&b[0], 0);
+}
+
+fn f64_from(bits: uint64) -> float64 {
+  var b: uint8[8];
+  meo_put_u64le(&b[0], 0, bits);
+  return meo_get_f64le(&b[0], 0);
+}
+
+fn i64_min() -> int64 { return (int64)((uint64)1 << 63); }
+fn i64_max() -> int64 { return (int64)(((uint64)1 << 63) - (uint64)1); }
+fn nan_bits() -> uint64 { return (uint64)0x7FF8000000000123; }
+fn negz_bits() -> uint64 { return (uint64)1 << 63; }
+
+// Same type and same bits (REAL by bits, so -0.0 and NaN payloads count).
+fn e2e_same(a: MeoValue*, b: MeoValue*) -> bool {
+  if (a->type != b->type) { return false; }
+  if (a->type == MEO_T_INT) { return a->i == b->i; }
+  if (a->type == MEO_T_REAL) { return f64_bits(a->f) == f64_bits(b->f); }
+  if (a->type == MEO_T_TEXT || a->type == MEO_T_BLOB) {
+    if (a->n != b->n) { return false; }
+    if (a->n == 0) { return true; }
+    return meo_bytes_equal(a->p, b->p, (int64)a->n);
+  }
+  return true;
+}
+
+// Step a write query once, free it; answers the step code, *ch = changes.
+fn e2e_run(q: MeoQuery*, ch: int32*) -> int32 {
+  var rc: int32 = meo_q_step(q);
+  if (ch != 0) { ch[0] = meo_q_changes(q); }
+  meo_q_free(q);
+  return rc;
+}
+
+fn e2e_count(db: MeoDb*, tbl: string) -> int64 {
+  var q: MeoQuery* = 0;
+  if (meo_q_count(db, tbl, &q) != MEO_OK) { return -1; }
+  var n: int64 = -1;
+  if (meo_q_step(q) == MEO_ROW) { n = meo_q_column_int64(q, 0); }
+  meo_q_free(q);
+  return n;
+}
+
+// INSERT one row of n values (table order).
+fn e2e_ins(db: MeoDb*, tbl: string, vals: MeoValue*, n: int32, rowid: int64*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, tbl, &q);
+  if (rc != MEO_OK) { return rc; }
+  var i: int32 = 0;
+  while (i < n) {
+    meo_q_value(q, &vals[i]);
+    i += 1;
+  }
+  rc = meo_q_step(q);
+  if (rowid != 0) { rowid[0] = meo_q_last_insert_rowid(q); }
+  meo_q_free(q);
+  return rc;
+}
+
+fn e2e_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "vals", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "i", MEO_T_INT, 0);
+  meo_q_column_def(q, "r", MEO_T_REAL, 0);
+  meo_q_column_def(q, "t", MEO_T_TEXT, 0);
+  meo_q_column_def(q, "b", MEO_T_BLOB, 0);
+  var rc: int32 = e2e_run(q, 0);
+  if (rc != MEO_DONE) { return e2e_fail("create vals rc={rc}"); }
+  var q2: MeoQuery* = 0;
+  meo_q_create(db, "users", &q2);
+  meo_q_column_def(q2, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q2, "email", MEO_T_TEXT, MEO_COL_UNIQUE | MEO_COL_NOT_NULL);
+  meo_q_column_def(q2, "name", MEO_T_TEXT, MEO_COL_NOT_NULL);
+  meo_q_column_def(q2, "score", MEO_T_REAL, 0);
+  rc = e2e_run(q2, 0);
+  if (rc != MEO_DONE) { return e2e_fail("create users rc={rc}"); }
+  var q3: MeoQuery* = 0;
+  meo_q_create(db, "codes", &q3);
+  meo_q_column_def(q3, "code", MEO_T_TEXT, MEO_COL_PK);
+  meo_q_column_def(q3, "n", MEO_T_INT, 0);
+  rc = e2e_run(q3, 0);
+  if (rc != MEO_DONE) { return e2e_fail("create codes rc={rc}"); }
+  // Again: SCHEMA, and with if_not_exists a no-op.
+  var q4: MeoQuery* = 0;
+  meo_q_create(db, "codes", &q4);
+  meo_q_column_def(q4, "code", MEO_T_TEXT, MEO_COL_PK);
+  rc = e2e_run(q4, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("create twice rc={rc}"); }
+  var q5: MeoQuery* = 0;
+  meo_q_create(db, "codes", &q5);
+  meo_q_if_not_exists(q5);
+  meo_q_column_def(q5, "code", MEO_T_TEXT, MEO_COL_PK);
+  var ch: int32 = -1;
+  rc = e2e_run(q5, &ch);
+  if (rc != MEO_DONE || ch != 0) { return e2e_fail("create if_not_exists rc={rc} ch={ch}"); }
+  return 0;
+}
+
+// The expected rows of "vals" (5 columns each), filled into rows[0..20).
+fn e2e_rows(rows: MeoValue*, text: uint8*, blob: uint8*, z: uint8*) {
+  rows[0] = vi(1);
+  rows[1] = vi(i64_min());
+  rows[2] = vr(f64_from(negz_bits()));
+  rows[3] = vt("");
+  rows[4] = vb(z, 0);
+  rows[5] = vi(2);
+  rows[6] = vi(i64_max());
+  rows[7] = vr(f64_from(nan_bits()));
+  meo_value_set_text(&rows[8], text, E2E_BIG);
+  rows[9] = vn();
+  rows[10] = vi(3);
+  rows[11] = vi(0);
+  rows[12] = vr(1.5);
+  rows[13] = vn();
+  rows[14] = vb(blob, E2E_BIG);
+  rows[15] = vi(4);
+  rows[16] = vn();
+  rows[17] = vn();
+  rows[18] = vn();
+  rows[19] = vn();
+}
+
+// Every row of "vals", in id order, equals want[0..n*5).
+fn e2e_check_vals(db: MeoDb*, want: MeoValue*, n: int32, tag: string) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "vals", &q);
+  meo_q_order(q, "id", false);
+  var r: int32 = 0;
+  var bad: string = "";
+  while (bad.length == 0) {
+    var rc: int32 = meo_q_step(q);
+    if (rc == MEO_DONE) { break; }
+    if (rc != MEO_ROW) {
+      bad = "step rc={rc}";
+      break;
+    }
+    if (r >= n) {
+      bad = "extra row";
+      break;
+    }
+    if (meo_q_column_count(q) != 5) { bad = "column count {meo_q_column_count(q)}"; }
+    var c: int32 = 0;
+    while (c < 5 && bad.length == 0) {
+      var got: MeoValue;
+      var cell: MeoValue;
+      meo_q_column(q, c, &got);
+      meo_q_cell(q, r, c, &cell);
+      if (!e2e_same(&got, &want[r * 5 + c])) { bad = "row {r} col {c} type {got.type}"; }
+      if (!e2e_same(&cell, &want[r * 5 + c])) { bad = "cell {r},{c} differs"; }
+      c += 1;
+    }
+    r += 1;
+  }
+  if (bad.length == 0 && r != n) { bad = "{r} rows, want {n}"; }
+  meo_q_free(q);
+  if (bad.length != 0) { return e2e_fail("{tag}: {bad}"); }
+  return 0;
+}
+
+fn e2e_values(db: MeoDb*, want: MeoValue*) -> int32 {
+  var rowid: int64 = 0;
+  var r: int32 = 0;
+  while (r < 3) {
+    var rc: int32 = e2e_ins(db, "vals", &want[r * 5], 5, &rowid);
+    if (rc != MEO_DONE || rowid != (int64)(r + 1)) {
+      return e2e_fail("insert vals row {r} rc={rc} rowid={rowid}");
+    }
+    r += 1;
+  }
+  // A NULL alias gets max+1.
+  var nul: MeoValue[5];
+  var i: int32 = 0;
+  while (i < 5) {
+    nul[i] = vn();
+    i += 1;
+  }
+  var rc: int32 = e2e_ins(db, "vals", &nul[0], 5, &rowid);
+  if (rc != MEO_DONE || rowid != 4) { return e2e_fail("null alias rc={rc} rowid={rowid}"); }
+  if (e2e_check_vals(db, want, 4, "round-trip") != 0) { return 1; }
+
+  // Filter: i > 0 is row 2 only; i IS NULL is row 4 only.
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "vals", &q);
+  meo_q_pick(q, "id");
+  var zero: MeoValue = vi(0);
+  meo_q_where(q, "i", MEO_Q_GT, &zero);
+  rc = meo_q_step(q);
+  var id: int64 = meo_q_column_int64(q, 0);
+  var rc2: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_ROW || id != 2 || rc2 != MEO_DONE) { return e2e_fail("where i > 0: {rc} {id} {rc2}"); }
+  var q2: MeoQuery* = 0;
+  meo_q_count(db, "vals", &q2);
+  meo_q_where_null(q2, "i");
+  rc = meo_q_step(q2);
+  id = meo_q_column_int64(q2, 0);
+  meo_q_free(q2);
+  if (rc != MEO_ROW || id != 1) { return e2e_fail("count i is null: {rc} {id}"); }
+  return 0;
+}
+
+fn e2e_update_delete(db: MeoDb*, want: MeoValue*) -> int32 {
+  var q: MeoQuery* = 0;
+  var ch: int32 = -1;
+  meo_q_update(db, "vals", &q);
+  var nt: MeoValue = vt("updated");
+  var three: MeoValue = vi(3);
+  meo_q_assign(q, "t", &nt);
+  meo_q_where(q, "id", MEO_Q_EQ, &three);
+  var rc: int32 = e2e_run(q, &ch);
+  if (rc != MEO_DONE || ch != 1) { return e2e_fail("update rc={rc} ch={ch}"); }
+  var q2: MeoQuery* = 0;
+  meo_q_delete(db, "vals", &q2);
+  var four: MeoValue = vi(4);
+  meo_q_where(q2, "id", MEO_Q_EQ, &four);
+  rc = e2e_run(q2, &ch);
+  if (rc != MEO_DONE || ch != 1) { return e2e_fail("delete rc={rc} ch={ch}"); }
+  want[13] = vt("updated");
+  if (e2e_count(db, "vals") != 3) { return e2e_fail("count after delete"); }
+  return e2e_check_vals(db, want, 3, "after update/delete");
+}
+
+fn e2e_user(db: MeoDb*, id: int64, email: string, name: MeoValue, score: MeoValue) -> int32 {
+  var row: MeoValue[4];
+  row[0] = vi(id);
+  row[1] = vt(email);
+  row[2] = name;
+  row[3] = score;
+  return e2e_ins(db, "users", &row[0], 4, 0);
+}
+
+fn e2e_errors(db: MeoDb*) -> int32 {
+  var rc: int32 = e2e_user(db, 1, "a@x", vt("A"), vr(1.0));
+  if (rc != MEO_DONE) { return e2e_fail("user 1 rc={rc}"); }
+  // INTEGER into REAL converts.
+  rc = e2e_user(db, 2, "b@x", vt("B"), vi(2));
+  if (rc != MEO_DONE) { return e2e_fail("user 2 rc={rc}"); }
+  rc = e2e_user(db, 1, "c@x", vt("C"), vn());
+  if (rc != -MEO_ERR_CONFLICT) { return e2e_fail("dup pk rc={rc}"); }
+  rc = e2e_user(db, 3, "a@x", vt("C"), vn());
+  if (rc != -MEO_ERR_CONFLICT) { return e2e_fail("dup unique rc={rc}"); }
+  rc = e2e_user(db, 3, "c@x", vn(), vn());
+  if (rc != -MEO_ERR_CONSTRAINT) { return e2e_fail("not null rc={rc}"); }
+  rc = e2e_user(db, 3, "c@x", vt("C"), vt("high"));
+  if (rc != -MEO_ERR_MISMATCH) { return e2e_fail("text into REAL rc={rc}"); }
+  rc = e2e_user(db, 3, "c@x", vi(7), vn());
+  if (rc != -MEO_ERR_MISMATCH) { return e2e_fail("int into TEXT rc={rc}"); }
+  if (e2e_count(db, "users") != 2) { return e2e_fail("failed inserts wrote rows"); }
+
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "users", &q);
+  meo_q_pick(q, "score");
+  var two: MeoValue = vi(2);
+  meo_q_where(q, "id", MEO_Q_EQ, &two);
+  rc = meo_q_step(q);
+  var ty: int32 = meo_q_column_type(q, 0);
+  var sc: float64 = meo_q_column_double(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW || ty != MEO_T_REAL || sc != 2.0) { return e2e_fail("converted score {ty}"); }
+
+  var row: MeoValue[2];
+  row[0] = vt("k1");
+  row[1] = vi(1);
+  rc = e2e_ins(db, "codes", &row[0], 2, 0);
+  if (rc != MEO_DONE) { return e2e_fail("codes k1 rc={rc}"); }
+  rc = e2e_ins(db, "codes", &row[0], 2, 0);
+  if (rc != -MEO_ERR_CONFLICT) { return e2e_fail("dup text pk rc={rc}"); }
+  row[0] = vn();
+  rc = e2e_ins(db, "codes", &row[0], 2, 0);
+  if (rc != -MEO_ERR_CONSTRAINT) { return e2e_fail("null text pk rc={rc}"); }
+
+  // Unknown names are SCHEMA at the first step.
+  var q2: MeoQuery* = 0;
+  meo_q_select(db, "nope", &q2);
+  rc = e2e_run(q2, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("unknown table rc={rc}"); }
+  var q3: MeoQuery* = 0;
+  meo_q_select(db, "users", &q3);
+  meo_q_pick(q3, "nope");
+  rc = e2e_run(q3, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("unknown pick rc={rc}"); }
+  var q4: MeoQuery* = 0;
+  meo_q_delete(db, "users", &q4);
+  meo_q_where(q4, "nope", MEO_Q_EQ, &two);
+  rc = e2e_run(q4, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("unknown filter rc={rc}"); }
+  var q5: MeoQuery* = 0;
+  meo_q_insert(db, "nope", &q5);
+  meo_q_value(q5, &two);
+  rc = e2e_run(q5, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("insert unknown table rc={rc}"); }
+  return 0;
+}
+
+fn e2e_tx(db: MeoDb*) -> int32 {
+  if (meo_db_commit(db) != -MEO_ERR_TX) { return e2e_fail("commit without begin"); }
+  if (meo_db_rollback(db) != -MEO_ERR_TX) { return e2e_fail("rollback without begin"); }
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc != MEO_OK) { return e2e_fail("begin rc={rc}"); }
+  if (meo_db_begin(db, MEO_TX_DEFAULT) != -MEO_ERR_TX) { return e2e_fail("nested begin"); }
+  rc = e2e_user(db, 10, "t10", vt("T"), vn());
+  if (rc == MEO_DONE) { rc = e2e_user(db, 11, "t11", vt("T"), vn()); }
+  if (rc != MEO_DONE) { return e2e_fail("insert in tx rc={rc}"); }
+  rc = meo_db_commit(db);
+  if (rc != MEO_OK) { return e2e_fail("commit rc={rc}"); }
+  if (e2e_count(db, "users") != 4) { return e2e_fail("committed rows missing"); }
+
+  rc = meo_db_begin(db, MEO_TX_IMMEDIATE);
+  if (rc != MEO_OK) { return e2e_fail("begin 2 rc={rc}"); }
+  rc = MEO_DONE;
+  var i: int32 = 0;
+  while (i < 5 && rc == MEO_DONE) {
+    rc = e2e_user(db, (int64)(20 + i), "r{i}", vt("R"), vn());
+    i += 1;
+  }
+  if (rc != MEO_DONE) { return e2e_fail("insert to roll back rc={rc}"); }
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "ghost", &q);
+  meo_q_column_def(q, "x", MEO_T_INT, 0);
+  rc = e2e_run(q, 0);
+  if (rc != MEO_DONE) { return e2e_fail("create ghost rc={rc}"); }
+  if (e2e_count(db, "users") != 9 || e2e_count(db, "ghost") != 0) { return e2e_fail("inside tx"); }
+  rc = meo_db_rollback(db);
+  if (rc != MEO_OK) { return e2e_fail("rollback rc={rc}"); }
+  if (e2e_count(db, "users") != 4 + (int64)E2E_RED) { return e2e_fail("rolled-back rows remain"); }
+  var q2: MeoQuery* = 0;
+  meo_q_count(db, "ghost", &q2);
+  rc = e2e_run(q2, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("rolled-back table still there rc={rc}"); }
+  if (meo_db_in_tx(db)) { return e2e_fail("still in tx"); }
+  return 0;
+}
+
+// Everything committed before the close is there after it.
+fn e2e_reopen(want: MeoValue*) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(E2E_DB, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return e2e_fail("reopen rc={rc}"); }
+  if (e2e_check_vals(db, want, 3, "after reopen") != 0) { return 1; }
+  if (e2e_count(db, "users") != 4) { return e2e_fail("users after reopen"); }
+  if (e2e_count(db, "codes") != 1) { return e2e_fail("codes after reopen"); }
+  var q: MeoQuery* = 0;
+  meo_q_count(db, "ghost", &q);
+  rc = e2e_run(q, 0);
+  if (rc != -MEO_ERR_SCHEMA) { return e2e_fail("ghost after reopen rc={rc}"); }
+  // The unique index survived: a duplicate email is still refused.
+  rc = e2e_user(db, 30, "a@x", vt("Z"), vn());
+  if (rc != -MEO_ERR_CONFLICT) { return e2e_fail("unique after reopen rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return e2e_fail("close 2 rc={rc}"); }
+  return 0;
+}
+
+// The README example, verbatim between the markers; answers the rows seen.
+fn e2e_readme(path: string) -> int32 {
+  var seen: int32 = 0;
+  // README begin
+  var db: MeoDb* = 0;
+  meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "users", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);   // INTEGER PRIMARY KEY: the rowid
+  meo_q_column_def(q, "name", MEO_T_TEXT, MEO_COL_NOT_NULL);
+  meo_q_step(q);                                     // MEO_DONE
+  meo_q_free(q);
+
+  var ann: string = "ann";
+  var bob: string = "bob";
+  var v: MeoValue;
+  var ins: MeoQuery* = 0;
+  meo_q_insert(db, "users", &ins);
+  meo_q_into(ins, "name");                           // id left out: 1, 2, ...
+  meo_value_set_text(&v, ann.chars, 3);
+  meo_q_value(ins, &v);                              // values are copied
+  meo_value_set_text(&v, bob.chars, 3);
+  meo_q_value(ins, &v);                              // a second row
+  meo_q_step(ins);
+  meo_q_free(ins);
+
+  var sel: MeoQuery* = 0;
+  meo_q_select(db, "users", &sel);
+  meo_q_pick(sel, "id");
+  meo_q_pick(sel, "name");
+  meo_value_set_int(&v, 1);
+  meo_q_where(sel, "id", MEO_Q_GT, &v);
+  while (meo_q_step(sel) == MEO_ROW) {
+    var name: string = str_from_cstr((cstring)meo_q_column_text(sel, 1));
+    println("{meo_q_column_int64(sel, 0)} {name}");    // 2 bob
+    seen += 1;
+  }
+  meo_q_free(sel);
+  meo_db_close(db);
+  // README end
+  return seen;
+}
+
+fn e2e_main() -> int32 {
+  var rc: int32 = e2e_reset(E2E_DB);
+  if (rc != MEO_OK) { return e2e_fail("reset rc={rc}"); }
+  var text: uint8[] = new uint8[E2E_BIG];
+  var blob: uint8[] = new uint8[E2E_BIG];
+  defer free(text.data);
+  defer free(blob.data);
+  var i: int32 = 0;
+  while (i < E2E_BIG) {
+    text[i] = (uint8)(97 + i % 26);
+    blob[i] = (uint8)((i * 7) & 0xFF);   // includes 0 bytes
+    i += 1;
+  }
+  var z: uint8[1];
+  var want: MeoValue[20];
+  e2e_rows(&want[0], text.data, blob.data, &z[0]);
+
+  var db: MeoDb* = 0;
+  rc = meo_db_open(E2E_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return e2e_fail("open rc={rc}"); }
+  if (e2e_create(db) != 0) { return 1; }
+  if (e2e_values(db, &want[0]) != 0) { return 1; }
+  if (e2e_update_delete(db, &want[0]) != 0) { return 1; }
+  if (e2e_errors(db) != 0) { return 1; }
+  if (e2e_tx(db) != 0) { return 1; }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return e2e_fail("close rc={rc}"); }
+
+  if (e2e_reopen(&want[0]) != 0) { return 1; }
+  var rpath: string = "build/query_e2e_readme.db";
+  if (e2e_reset(rpath) != MEO_OK) { return e2e_fail("readme reset"); }
+  if (e2e_readme(rpath) != 1) { return e2e_fail("readme example"); }
+  return 0;
+}
+
+fn main() -> int32 {
+  if (e2e_main() != 0) { return 1; }
+  println("PASS query_e2e");
+  return 0;
+}

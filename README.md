@@ -15,25 +15,78 @@ A relational database written in Mettle, and the storage backend for
 
 ## Status
 
-The single-node storage layer is built, and real-time access has started: an
-in-process change feed reports committed b-tree writes (see
-[Change feed](#change-feed)). Distribution, concurrency (beyond one writer and
-concurrent feed readers), remote real-time access and the SQL layer are not
-built yet.
+MeoSQL has no SQL language. Programs call a typed query API (`meo_q_*`): a
+query is built with function calls and run with `meo_q_step`.
 
-| Done | Module |
+Built: the single-node engine. Tables with INTEGER, REAL, TEXT and BLOB
+columns, PRIMARY KEY, NOT NULL and UNIQUE; insert, select (filters, IN, NULL
+tests, ORDER BY, LIMIT/OFFSET), update, delete and count; unique indexes;
+transactions with a rollback journal and crash recovery; one database shared by
+up to 64 threads through a database-wide lock (one writer at a time). An
+in-process change feed reports committed writes (see
+[Change feed](#change-feed)).
+
+In progress: a network server, so flux_orm can reach MeoSQL over TCP. Not built
+yet: joins, distribution, replication, and concurrent readers.
+
+| Module | What it does |
 |---|---|
-| Page format, CRC checksums, page-0 metadata | `src/format/` |
-| Page cache with eviction and pinning | `src/pager/pager.mettle` |
-| On-disk freelist | `src/pager/freelist.mettle` |
-| Rollback journal and crash recovery | `src/pager/journal.mettle` |
-| Order-preserving key encoding | `src/types/key.mettle` |
-| B+ tree for tables and indexes (no delete or rebalance yet) | `src/btree/` |
-| Persisted commit counter (`commit_seq`) and pager commit hook | `src/format/meta.mettle`, `src/pager/pager.mettle` |
-| In-process committed-change feed | `src/feed/feed.mettle` |
+| `src/format/`, `src/pager/` | Pages with CRC checksums, page cache, freelist, rollback journal |
+| `src/btree/`, `src/types/key.mettle` | B+ tree with delete, order-preserving keys |
+| `src/record/` | Row values and the record format |
+| `src/catalog/`, `src/table/` | Table schemas stored in the file, rows and indexes |
+| `src/db/`, `src/conc/` | Database handle, transactions, the thread lock |
+| `src/query/` | The typed query API |
+| `src/feed/feed.mettle` | In-process committed-change feed |
 
-Still missing from phase 3: `tests/phase3.mettle`, an end-to-end test of
-commit, rollback and crash recovery through the b-tree.
+`src/meo_core.mettle` imports the engine without the query layer;
+`src/meosql.mettle` imports everything.
+
+## Using MeoSQL
+
+Import `src/meosql.mettle`. Every call returns `MEO_OK` (0), `MEO_ROW` /
+`MEO_DONE` from a step, or a negative `-MEO_ERR_*` code; checks are left out
+here.
+
+```
+var db: MeoDb* = 0;
+meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+var q: MeoQuery* = 0;
+meo_q_create(db, "users", &q);
+meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);   // INTEGER PRIMARY KEY: the rowid
+meo_q_column_def(q, "name", MEO_T_TEXT, MEO_COL_NOT_NULL);
+meo_q_step(q);                                     // MEO_DONE
+meo_q_free(q);
+var ann: string = "ann";
+var bob: string = "bob";
+var v: MeoValue;
+var ins: MeoQuery* = 0;
+meo_q_insert(db, "users", &ins);
+meo_q_into(ins, "name");                           // id left out: 1, 2, ...
+meo_value_set_text(&v, ann.chars, 3);
+meo_q_value(ins, &v);                              // values are copied
+meo_value_set_text(&v, bob.chars, 3);
+meo_q_value(ins, &v);                              // a second row
+meo_q_step(ins);
+meo_q_free(ins);
+var sel: MeoQuery* = 0;
+meo_q_select(db, "users", &sel);
+meo_q_pick(sel, "id");
+meo_q_pick(sel, "name");
+meo_value_set_int(&v, 1);
+meo_q_where(sel, "id", MEO_Q_GT, &v);
+while (meo_q_step(sel) == MEO_ROW) {
+  var name: string = str_from_cstr((cstring)meo_q_column_text(sel, 1));
+  println("{meo_q_column_int64(sel, 0)} {name}");    // 2 bob
+}
+meo_q_free(sel);
+meo_db_close(db);
+```
+
+Values are passed in a `MeoValue`; each value a builder takes gets the next
+slot, so a query can be run again with `meo_q_reset` and `meo_q_set_value`.
+Write queries report `meo_q_changes` and `meo_q_last_insert_rowid`. Explicit
+transactions use `meo_db_begin`, `meo_db_commit` and `meo_db_rollback`.
 
 ## Change feed
 

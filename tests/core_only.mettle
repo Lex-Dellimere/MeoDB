@@ -1,0 +1,171 @@
+// core_only: the embedded core without the query layer. Imports only
+// meo_core.mettle (and std): creates a table through the catalog, writes rows
+// with meo_tbl_check_rows + meo_tbl_write_row in one transaction, refuses a
+// duplicate UNIQUE value, scans the rows back with meo_tbl_scan_*, and finds
+// them again after close and reopen.
+
+import "std/io";
+import "std/mem";
+import "../src/meo_core.mettle";
+
+// Red-check switch: 1 expects one row too many after reopen. Must be 0 when
+// committed.
+const CO_RED: int32 = 0;
+const CO_DB: string = "build/core_only.db";
+const CO_ROWS: int32 = 200;
+
+fn co_fail(msg: string) -> int32 {
+  println("FAIL core_only: {msg}");
+  return 1;
+}
+
+fn co_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn co_col(c: MeoColumn*, name: string, aff: int32, flags: int32) {
+  c->name = name.chars;
+  c->name_len = (int32)name.length;
+  c->affinity = aff;
+  c->cflags = flags;
+  c->index_root = 0;
+}
+
+fn co_table(db: MeoDb*) -> MeoTable* {
+  var nm: string = "kv";
+  return meo_cat_find(db->cat, nm.chars, 2);
+}
+
+// rows: (NULL id -> rowid, "key-<i>", i * 1.5); one statement in one
+// transaction, Phase A then the writes.
+fn co_write(db: MeoDb*, t: MeoTable*, first: int32, n: int32) -> int32 {
+  var rows: MeoValue* = (MeoValue*)malloc((int64)n * 3 * (int64)sizeof(MeoValue));
+  var ids: int64* = (int64*)malloc((int64)n * 8);
+  var keys: string* = (string*)malloc((int64)n * (int64)sizeof(string));
+  var arena: MeoArena* = meo_arena_new(4096);
+  var i: int32 = 0;
+  while (i < n) {
+    keys[i] = "key-{first + i}";
+    meo_value_set_null(&rows[i * 3]);
+    meo_value_set_text(&rows[i * 3 + 1], keys[i].chars, (int32)keys[i].length);
+    meo_value_set_real(&rows[i * 3 + 2], (float64)(first + i) * 1.5);
+    i += 1;
+  }
+  var rc: int32 = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc == MEO_OK) {
+    rc = meo_tbl_check_rows(db, t, rows, n, 3, arena, ids);
+    i = 0;
+    while (rc == MEO_OK && i < n) {
+      rc = meo_tbl_write_row(db, t, &rows[i * 3], 3, ids[i]);
+      i += 1;
+    }
+    if (rc == MEO_OK) { rc = meo_db_commit(db); } else { meo_db_rollback(db); }
+  }
+  i = 0;
+  while (i < n) {
+    free(keys[i].chars);
+    i += 1;
+  }
+  free(keys);
+  free(ids);
+  free(rows);
+  meo_arena_free(arena);
+  return rc;
+}
+
+// Scan in rowid order: rowids 1..n, key and score as written.
+fn co_scan(db: MeoDb*, t: MeoTable*, n: int32) -> int32 {
+  var rc: int32 = meo_db_enter(db);
+  if (rc != MEO_OK) { return co_fail("enter rc={rc}"); }
+  var sc: MeoTblScan;
+  rc = meo_tbl_scan_open(db, t, &sc);
+  if (rc != MEO_OK) {
+    meo_db_leave(db);
+    return co_fail("scan open rc={rc}");
+  }
+  var row: MeoTblRow;
+  var v: MeoValue;
+  var got: int32 = 0;
+  var bad: string = "";
+  while (bad.length == 0) {
+    rc = meo_tbl_scan_next(&sc, &row);
+    if (rc == 1) { break; }
+    var want: int64 = (int64)(got + 1);
+    if (rc != 0) {
+      bad = "scan rc={rc}";
+    } else if (row.rowid != want) {
+      bad = "rowid {row.rowid}";
+    } else {
+      var k: string = "key-{want}";
+      meo_tbl_row_get(t, &row, 0, &v);
+      if (v.type != MEO_T_INT || v.i != want) { bad = "alias column"; }
+      meo_tbl_row_get(t, &row, 1, &v);
+      if (v.type != MEO_T_TEXT || (int64)v.n != (int64)k.length
+          || !meo_bytes_equal(v.p, k.chars, (int64)v.n)) {
+        bad = "key text";
+      }
+      meo_tbl_row_get(t, &row, 2, &v);
+      if (v.type != MEO_T_REAL || v.f != (float64)want * 1.5) { bad = "score"; }
+      free(k.chars);
+      got += 1;
+    }
+  }
+  meo_tbl_scan_close(&sc);
+  meo_db_leave(db);
+  if (bad.length != 0) { return co_fail("{bad} at row {got + 1}"); }
+  if (got != n) { return co_fail("{got} rows, want {n}"); }
+  return 0;
+}
+
+fn co_reopen() -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(CO_DB, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return co_fail("reopen rc={rc}"); }
+  var t: MeoTable* = co_table(db);
+  if (t == 0) { return co_fail("table missing after reopen"); }
+  if (co_scan(db, t, CO_ROWS + CO_RED) != 0) { return 1; }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return co_fail("close 2 rc={rc}"); }
+  return 0;
+}
+
+fn co_main() -> int32 {
+  var rc: int32 = co_reset(CO_DB);
+  if (rc != MEO_OK) { return co_fail("reset rc={rc}"); }
+  var db: MeoDb* = 0;
+  rc = meo_db_open(CO_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return co_fail("open rc={rc}"); }
+  var cols: MeoColumn[3];
+  co_col(&cols[0], "id", MEO_T_INT, MEO_COL_PK | MEO_COL_ROWID_ALIAS);
+  co_col(&cols[1], "k", MEO_T_TEXT, MEO_COL_UNIQUE | MEO_COL_NOT_NULL);
+  co_col(&cols[2], "score", MEO_T_REAL, 0);
+  var t: MeoTable* = 0;
+  var nm: string = "kv";
+  rc = meo_db_begin(db, MEO_TX_DEFAULT);
+  if (rc == MEO_OK) { rc = meo_cat_create_table(db->cat, nm.chars, 2, &cols[0], 3, &t); }
+  if (rc == MEO_OK) { rc = meo_db_commit(db); }
+  if (rc != MEO_OK) { return co_fail("create rc={rc}"); }
+  rc = co_write(db, t, 1, CO_ROWS / 2);
+  if (rc == MEO_OK) { rc = co_write(db, t, CO_ROWS / 2 + 1, CO_ROWS / 2); }
+  if (rc != MEO_OK) { return co_fail("write rc={rc}"); }
+  // key-1 again: Phase A refuses it and nothing is written.
+  rc = co_write(db, t, 1, 1);
+  if (rc != -MEO_ERR_CONFLICT) { return co_fail("duplicate unique rc={rc}"); }
+  if (co_scan(db, t, CO_ROWS) != 0) { return 1; }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return co_fail("close rc={rc}"); }
+  return co_reopen();
+}
+
+fn main() -> int32 {
+  if (co_main() != 0) { return 1; }
+  println("PASS core_only");
+  return 0;
+}

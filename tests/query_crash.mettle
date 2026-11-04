@@ -1,0 +1,255 @@
+// query_crash: a process killed mid-transaction, and a corrupted file.
+//
+//   c1_kill     100 committed rows. A forked child opens the file with 8
+//               frames (so dirty pages spill to disk), begins, inserts 500
+//               rows through meo_q_* and ends with exit_group: no commit, no
+//               close. The hot journal is left behind; reopen shows exactly
+//               the 100 committed rows with their values, and the table still
+//               takes inserts.
+//   c2_corrupt  10 rows in a one-leaf table, closed. One byte of that leaf is
+//               flipped on disk; opening or reading answers -MEO_ERR_CORRUPT,
+//               never a row.
+//
+// CRASH MECHANISM: raw fork (57) with no execve. The parent has no database
+// open at the fork, so the child shares nothing with it but the file on disk;
+// the child ends with exit_group (231) and the parent reaps it with wait4 (61).
+
+import "std/io";
+import "std/mem";
+import "../src/error/status.mettle";
+import "../src/format/page.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/meosql.mettle";
+
+// Red-check switch: 1 skips the byte flip, so c2 must fail. Must be 0 when
+// committed.
+const QC_RED: int32 = 0;
+const QC_DB: string = "build/query_crash.db";
+const QC_DB2: string = "build/query_crash_corrupt.db";
+const QC_BASE: int32 = 100;
+const QC_CHILD_ROWS: int32 = 500;
+const QC_PAD: int32 = 200;
+
+fn qc_fail(msg: string) -> int32 {
+  println("FAIL query_crash: {msg}");
+  return 1;
+}
+
+fn qc_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn qc_exists(path: string) -> bool {
+  var f: MeoFile = meo_file_open(path, MEO_OPEN_READ);
+  if (!f.is_open) { return false; }
+  var n: int64 = meo_file_size(f);
+  meo_file_close(f);
+  return n > 0;
+}
+
+fn qc_create(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, "t", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "k", MEO_T_INT, MEO_COL_NOT_NULL);
+  meo_q_column_def(q, "pad", MEO_T_TEXT, 0);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  return rc;
+}
+
+// Insert ids first..first+n-1 with k = id * 3 and a QC_PAD-byte pad, through
+// one reused query. MEO_DONE or the failing code.
+fn qc_fill(db: MeoDb*, first: int32, n: int32, pad: uint8*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "t", &q);
+  if (rc != MEO_OK) { return rc; }
+  var v: MeoValue;
+  meo_value_set_int(&v, 0);
+  meo_q_value(q, &v);
+  meo_q_value(q, &v);
+  meo_value_set_text(&v, pad, QC_PAD);
+  meo_q_value(q, &v);
+  var i: int32 = 0;
+  rc = MEO_DONE;
+  while (i < n && rc == MEO_DONE) {
+    var id: int64 = (int64)(first + i);
+    meo_value_set_int(&v, id);
+    meo_q_set_value(q, 0, &v);
+    meo_value_set_int(&v, id * 3);
+    meo_q_set_value(q, 1, &v);
+    rc = meo_q_step(q);
+    meo_q_reset(q);
+    i += 1;
+  }
+  meo_q_free(q);
+  return rc;
+}
+
+// Every row in id order is 1..n with k = id * 3; answers the row count, or a
+// negative code from the step.
+fn qc_scan(db: MeoDb*, n: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "t", &q);
+  meo_q_pick(q, "id");
+  meo_q_pick(q, "k");
+  meo_q_order(q, "id", false);
+  var got: int32 = 0;
+  var rc: int32 = 0;
+  while (true) {
+    rc = meo_q_step(q);
+    if (rc != MEO_ROW) { break; }
+    var id: int64 = meo_q_column_int64(q, 0);
+    if (id != (int64)(got + 1) || meo_q_column_int64(q, 1) != id * 3) {
+      rc = -1000;
+      break;
+    }
+    got += 1;
+  }
+  meo_q_free(q);
+  if (rc == -1000) {
+    qc_fail("row {got + 1} has wrong values");
+    return -1;
+  }
+  if (rc != MEO_DONE) { return rc; }
+  if (got != n) { println("query_crash: {got} rows, want {n}"); }
+  return got;
+}
+
+// The child: begin, insert, die. Exit 0 = reached the kill point.
+fn qc_child(pad: uint8*) {
+  var db: MeoDb* = 0;
+  if (meo_db_open(QC_DB, MEO_OPEN_READ | MEO_OPEN_WRITE, 8, &db) != MEO_OK) { syscall(231, (int64)2); }
+  if (meo_db_begin(db, MEO_TX_DEFAULT) != MEO_OK) { syscall(231, (int64)3); }
+  if (qc_fill(db, QC_BASE + 1, QC_CHILD_ROWS, pad) != MEO_DONE) { syscall(231, (int64)4); }
+  syscall(231, (int64)0);
+}
+
+fn c1_kill(pad: uint8*) -> int32 {
+  if (qc_reset(QC_DB) != MEO_OK) { return qc_fail("c1 reset"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(QC_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return qc_fail("c1 open rc={rc}"); }
+  rc = qc_create(db);
+  if (rc == MEO_DONE) { rc = qc_fill(db, 1, QC_BASE, pad); }
+  if (rc != MEO_DONE) { return qc_fail("c1 base rows rc={rc}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return qc_fail("c1 close rc={rc}"); }
+  var size0: int64 = 0;
+  var f: MeoFile = meo_file_open(QC_DB, MEO_OPEN_READ);
+  if (f.is_open) {
+    size0 = meo_file_size(f);
+    meo_file_close(f);
+  }
+
+  var pid: int64 = syscall(57);
+  if (pid == 0) { qc_child(pad); }
+  if (pid < 0) { return qc_fail("fork failed"); }
+  var status: int32 = 0;
+  var w: int64 = syscall(61, pid, (int64)&status, (int64)0, (int64)0);
+  if (w < 0) { return qc_fail("wait4 failed"); }
+  if ((status & 0x7F) != 0) { return qc_fail("child died on signal {status & 0x7F}"); }
+  var code: int32 = (status >> 8) & 0xFF;
+  if (code != 0) { return qc_fail("child exit {code}"); }
+  // The child really wrote: a hot journal, and the file grew.
+  var jpath: string = QC_DB + "-journal";
+  var hot: bool = qc_exists(jpath);
+  free(jpath.chars);
+  if (!hot) { return qc_fail("no journal after the kill"); }
+  var f2: MeoFile = meo_file_open(QC_DB, MEO_OPEN_READ);
+  var size1: int64 = 0;
+  if (f2.is_open) {
+    size1 = meo_file_size(f2);
+    meo_file_close(f2);
+  }
+  if (size1 <= size0) { return qc_fail("child left the file at {size1} bytes (was {size0})"); }
+  return c1_reopen(pad);
+}
+
+fn c1_reopen(pad: uint8*) -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(QC_DB, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return qc_fail("c1 reopen rc={rc}"); }
+  var n: int32 = qc_scan(db, QC_BASE);
+  if (n != QC_BASE) { return qc_fail("c1 after the kill: scan {n}"); }
+  rc = qc_fill(db, QC_BASE + 1, 5, pad);
+  if (rc != MEO_DONE) { return qc_fail("c1 insert after recovery rc={rc}"); }
+  n = qc_scan(db, QC_BASE + 5);
+  if (n != QC_BASE + 5) { return qc_fail("c1 after recovery insert: scan {n}"); }
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return qc_fail("c1 close 2 rc={rc}"); }
+  return 0;
+}
+
+fn c2_corrupt(pad: uint8*) -> int32 {
+  if (qc_reset(QC_DB2) != MEO_OK) { return qc_fail("c2 reset"); }
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(QC_DB2, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc != MEO_OK) { return qc_fail("c2 open rc={rc}"); }
+  rc = qc_create(db);
+  if (rc == MEO_DONE) { rc = qc_fill(db, 1, 10, pad); }
+  if (rc != MEO_DONE) { return qc_fail("c2 rows rc={rc}"); }
+  var nm: string = "t";
+  var t: MeoTable* = meo_cat_find(db->cat, nm.chars, 1);
+  if (t == 0 || t->root == 0) { return qc_fail("c2 table root"); }
+  var root: int64 = (int64)t->root;
+  rc = meo_db_close(db);
+  if (rc != MEO_OK) { return qc_fail("c2 close rc={rc}"); }
+
+  // Flip one byte inside the leaf's cell area.
+  var f: MeoFile = meo_file_open(QC_DB2, MEO_OPEN_READ | MEO_OPEN_WRITE);
+  if (!f.is_open) { return qc_fail("c2 file open"); }
+  var off: int64 = root * (int64)MEO_PAGE_SIZE + (int64)(MEO_PAGE_SIZE - 300);
+  var b: uint8[1];
+  rc = meo_file_read_at(f, off, &b[0], 1);   // answers the byte count
+  if (rc == 1) { rc = MEO_OK; } else if (rc >= 0) { rc = -MEO_ERR_IO; }
+  if (QC_RED == 0) { b[0] = b[0] ^ (uint8)0x5A; }
+  if (rc == MEO_OK) { rc = meo_file_write_at(f, off, &b[0], 1); }
+  if (rc == MEO_OK) { rc = meo_file_sync(f); }
+  meo_file_close(f);
+  if (rc != MEO_OK) { return qc_fail("c2 flip rc={rc}"); }
+  return c2_read();
+}
+
+fn c2_read() -> int32 {
+  var db: MeoDb* = 0;
+  var rc: int32 = meo_db_open(QC_DB2, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &db);
+  if (rc == -MEO_ERR_CORRUPT) { return 0; }
+  if (rc != MEO_OK) { return qc_fail("c2 reopen rc={rc}, want OK or CORRUPT"); }
+  var q: MeoQuery* = 0;
+  meo_q_select(db, "t", &q);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != -MEO_ERR_CORRUPT) { return qc_fail("c2 select rc={rc}, want CORRUPT"); }
+  // A count reads the same leaf.
+  var q2: MeoQuery* = 0;
+  meo_q_count(db, "t", &q2);
+  rc = meo_q_step(q2);
+  meo_q_free(q2);
+  if (rc != -MEO_ERR_CORRUPT) { return qc_fail("c2 count rc={rc}, want CORRUPT"); }
+  meo_db_close(db);
+  return 0;
+}
+
+fn main() -> int32 {
+  var pad: uint8[] = new uint8[QC_PAD];
+  var i: int32 = 0;
+  while (i < QC_PAD) {
+    pad[i] = (uint8)(65 + i % 23);
+    i += 1;
+  }
+  var rc: int32 = c1_kill(pad.data);
+  if (rc == 0) { rc = c2_corrupt(pad.data); }
+  free(pad.data);
+  if (rc != 0) { return 1; }
+  println("PASS query_crash");
+  return 0;
+}

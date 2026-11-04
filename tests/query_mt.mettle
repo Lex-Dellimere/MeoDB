@@ -1,0 +1,347 @@
+// query_mt: 64 threads share one MeoDb. Each runs 500 mixed ops: inserts
+// (rowids per query, checked), point selects of its own rows, counts of its
+// own rows, and col = col + 1 on one shared counter row. Threads 0..7 wrap
+// every 10 ops in an explicit transaction. Afterwards every inserted row is
+// there exactly once with its value and rowid, the counter equals the number
+// of increments (no lost update), no op got BUSY under the default timeout,
+// and the run ends inside a deadline (no deadlock).
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/error/status.mettle";
+import "../src/platform/file.mettle";
+import "../src/platform/file_linux.mettle";
+import "../src/platform/clock_linux.mettle";
+import "../src/meosql.mettle";
+
+// Red-check switch: 1 expects one increment more than were made. Must be 0
+// when committed.
+const MT_RED: int32 = 0;
+// On tmpfs: on disk every autocommit write pays its fsyncs (~5 ms each here),
+// which turns 22,400 serialized commits into minutes and tests the disk, not
+// the lock.
+const MT_DB: string = "/dev/shm/meosql_query_mt.db";
+const MT_THREADS: int32 = 64;
+const MT_OPS: int32 = 500;
+const MT_TX_THREADS: int32 = 8;
+const MT_DEADLINE_MS: int64 = 120000;
+
+struct MtArg {
+  tid: int32;
+  err: int32;        // first failing code, 0 = none
+  err_op: int32;
+  busy: int32;
+  n_ins: int32;
+  n_adds: int32;
+  ids: int64*;       // rowid of insert seq, MT_OPS entries
+}
+
+var g_db: MeoDb* = 0;
+
+fn mt_fail(msg: string) -> int32 {
+  println("FAIL query_mt: {msg}");
+  return 1;
+}
+
+fn mt_reset(db: string) -> int32 {
+  var f: MeoFile = meo_file_open(db, MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
+  if (!f.is_open) { return -MEO_ERR_IO; }
+  var rc: int32 = meo_file_truncate(f, 0);
+  meo_file_close(f);
+  var jpath: string = db + "-journal";
+  meo_file_unlink(jpath);
+  free(jpath.chars);
+  return rc;
+}
+
+fn mt_val(tid: int32, seq: int32) -> int64 {
+  return (int64)tid * 1000003 + (int64)seq;
+}
+
+// Record a failure; BUSY is counted separately.
+fn mt_err(a: MtArg*, rc: int32, op: int32) -> int32 {
+  if (rc == -MEO_ERR_BUSY) { a->busy += 1; }
+  if (a->err == 0) {
+    a->err = rc;
+    a->err_op = op;
+  }
+  return rc;
+}
+
+fn mt_insert(a: MtArg*, op: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(g_db, "m", &q);
+  if (rc != MEO_OK) { return mt_err(a, rc, op); }
+  var v: MeoValue;
+  meo_q_into(q, "tid");
+  meo_q_into(q, "seq");
+  meo_q_into(q, "val");
+  meo_value_set_int(&v, (int64)a->tid);
+  meo_q_value(q, &v);
+  meo_value_set_int(&v, (int64)a->n_ins);
+  meo_q_value(q, &v);
+  meo_value_set_int(&v, mt_val(a->tid, a->n_ins));
+  meo_q_value(q, &v);
+  rc = meo_q_step(q);
+  var ch: int32 = meo_q_changes(q);
+  var id: int64 = meo_q_last_insert_rowid(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return mt_err(a, rc, op); }
+  if (ch != 1 || id <= 0) { return mt_err(a, -9001, op); }
+  a->ids[a->n_ins] = id;
+  a->n_ins += 1;
+  return MEO_OK;
+}
+
+// SELECT tid, seq, val WHERE id = one of this thread's rowids.
+fn mt_point(a: MtArg*, op: int32) -> int32 {
+  if (a->n_ins == 0) { return MEO_OK; }
+  var seq: int32 = (op * 7) % a->n_ins;
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_select(g_db, "m", &q);
+  if (rc != MEO_OK) { return mt_err(a, rc, op); }
+  meo_q_pick(q, "tid");
+  meo_q_pick(q, "seq");
+  meo_q_pick(q, "val");
+  var v: MeoValue;
+  meo_value_set_int(&v, a->ids[seq]);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var ok: bool = rc == MEO_ROW;
+  if (ok) {
+    ok = meo_q_column_int64(q, 0) == (int64)a->tid && meo_q_column_int64(q, 1) == (int64)seq;
+    ok = ok && meo_q_column_int64(q, 2) == mt_val(a->tid, seq);
+    if (ok) { rc = meo_q_step(q); }
+  }
+  meo_q_free(q);
+  if (rc < 0) { return mt_err(a, rc, op); }
+  if (!ok || rc != MEO_DONE) { return mt_err(a, -9002, op); }
+  return MEO_OK;
+}
+
+// COUNT WHERE tid = mine: nobody else writes those rows.
+fn mt_count(a: MtArg*, op: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_count(g_db, "m", &q);
+  if (rc != MEO_OK) { return mt_err(a, rc, op); }
+  var v: MeoValue;
+  meo_value_set_int(&v, (int64)a->tid);
+  meo_q_where(q, "tid", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var n: int64 = meo_q_column_int64(q, 0);
+  meo_q_free(q);
+  if (rc != MEO_ROW) { return mt_err(a, rc, op); }
+  if (n != (int64)a->n_ins) { return mt_err(a, -9003, op); }
+  return MEO_OK;
+}
+
+// UPDATE ctr SET n = n + 1 WHERE id = 1.
+fn mt_add(a: MtArg*, op: int32) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_update(g_db, "ctr", &q);
+  if (rc != MEO_OK) { return mt_err(a, rc, op); }
+  meo_q_assign_add(q, "n", 1);
+  var v: MeoValue;
+  meo_value_set_int(&v, 1);
+  meo_q_where(q, "id", MEO_Q_EQ, &v);
+  rc = meo_q_step(q);
+  var ch: int32 = meo_q_changes(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return mt_err(a, rc, op); }
+  if (ch != 1) { return mt_err(a, -9004, op); }
+  a->n_adds += 1;
+  return MEO_OK;
+}
+
+fn mt_op(a: MtArg*, op: int32) -> int32 {
+  var k: int32 = op % 10;
+  if (k <= 5) { return mt_insert(a, op); }
+  if (k <= 7) { return mt_point(a, op); }
+  if (k == 8) { return mt_count(a, op); }
+  return mt_add(a, op);
+}
+
+fn mt_worker(arg: cstring) -> uint32 {
+  var a: MtArg* = (MtArg*)arg;
+  var tx: bool = a->tid < MT_TX_THREADS;
+  var op: int32 = 0;
+  while (op < MT_OPS && a->err == 0) {
+    if (tx && op % 10 == 0) {
+      var b: int32 = meo_db_begin(g_db, MEO_TX_DEFAULT);
+      if (b != MEO_OK) {
+        mt_err(a, b, op);
+        break;
+      }
+    }
+    var rc: int32 = mt_op(a, op);
+    if (tx && (op % 10 == 9 || rc != MEO_OK)) {
+      // A failed op ends the run; roll back so the lock is released.
+      var c: int32 = MEO_OK;
+      if (rc == MEO_OK) { c = meo_db_commit(g_db); } else { meo_db_rollback(g_db); }
+      if (c != MEO_OK) { mt_err(a, c, op); }
+    }
+    op += 1;
+  }
+  return 0;
+}
+
+fn mt_setup() -> int32 {
+  var rc: int32 = mt_reset(MT_DB);
+  if (rc != MEO_OK) { return mt_fail("reset rc={rc}"); }
+  rc = meo_db_open(MT_DB, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &g_db);
+  if (rc != MEO_OK) { return mt_fail("open rc={rc}"); }
+  var q: MeoQuery* = 0;
+  meo_q_create(g_db, "m", &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "tid", MEO_T_INT, MEO_COL_NOT_NULL);
+  meo_q_column_def(q, "seq", MEO_T_INT, MEO_COL_NOT_NULL);
+  meo_q_column_def(q, "val", MEO_T_INT, MEO_COL_NOT_NULL);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return mt_fail("create m rc={rc}"); }
+  var q2: MeoQuery* = 0;
+  meo_q_create(g_db, "ctr", &q2);
+  meo_q_column_def(q2, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q2, "n", MEO_T_INT, MEO_COL_NOT_NULL);
+  rc = meo_q_step(q2);
+  meo_q_free(q2);
+  if (rc != MEO_DONE) { return mt_fail("create ctr rc={rc}"); }
+  var q3: MeoQuery* = 0;
+  meo_q_insert(g_db, "ctr", &q3);
+  var v: MeoValue;
+  meo_value_set_int(&v, 1);
+  meo_q_value(q3, &v);
+  meo_value_set_int(&v, 0);
+  meo_q_value(q3, &v);
+  rc = meo_q_step(q3);
+  meo_q_free(q3);
+  if (rc != MEO_DONE) { return mt_fail("insert ctr rc={rc}"); }
+  return 0;
+}
+
+// Every row exactly once, with its value and the rowid its insert reported.
+fn mt_verify(args: MtArg**) -> int32 {
+  var want: int64 = 0;
+  var adds: int64 = 0;
+  var i: int32 = 0;
+  while (i < MT_THREADS) {
+    want += (int64)args[i]->n_ins;
+    adds += (int64)args[i]->n_adds;
+    i += 1;
+  }
+  var seen: uint8[] = new uint8[MT_THREADS * MT_OPS];
+  defer free(seen.data);
+  i = 0;
+  while (i < MT_THREADS * MT_OPS) {
+    seen[i] = 0;
+    i += 1;
+  }
+  var q: MeoQuery* = 0;
+  meo_q_select(g_db, "m", &q);
+  meo_q_pick(q, "id");
+  meo_q_pick(q, "tid");
+  meo_q_pick(q, "seq");
+  meo_q_pick(q, "val");
+  var n: int64 = 0;
+  var bad: int32 = 0;
+  var rc: int32 = 0;
+  while (bad == 0) {
+    rc = meo_q_step(q);
+    if (rc != MEO_ROW) { break; }
+    var id: int64 = meo_q_column_int64(q, 0);
+    var tid: int64 = meo_q_column_int64(q, 1);
+    var seq: int64 = meo_q_column_int64(q, 2);
+    if (tid < 0 || tid >= (int64)MT_THREADS || seq < 0 || seq >= (int64)args[tid]->n_ins) {
+      bad = 1;
+    } else if (seen[tid * (int64)MT_OPS + seq] != 0) {
+      bad = 2;
+    } else if (meo_q_column_int64(q, 3) != mt_val((int32)tid, (int32)seq)) {
+      bad = 3;
+    } else if (args[tid]->ids[seq] != id) {
+      bad = 4;
+    } else {
+      seen[tid * (int64)MT_OPS + seq] = 1;
+    }
+    n += 1;
+  }
+  meo_q_free(q);
+  if (bad != 0) { return mt_fail("row {n}: check {bad} (1 range, 2 twice, 3 value, 4 rowid)"); }
+  if (rc != MEO_DONE) { return mt_fail("final select rc={rc}"); }
+  if (n != want) { return mt_fail("{n} rows, {want} inserted"); }
+
+  var q2: MeoQuery* = 0;
+  meo_q_select(g_db, "ctr", &q2);
+  meo_q_pick(q2, "n");
+  rc = meo_q_step(q2);
+  var got: int64 = meo_q_column_int64(q2, 0);
+  meo_q_free(q2);
+  if (rc != MEO_ROW || got != adds + (int64)MT_RED) {
+    return mt_fail("counter {got} after {adds} increments (rc={rc})");
+  }
+  println("query_mt: {n} rows, {adds} increments");
+  return 0;
+}
+
+fn mt_main() -> int32 {
+  if (mt_setup() != 0) { return 1; }
+  var args: MtArg*[] = new MtArg*[64];
+  var hs: int64[] = new int64[64];
+  var i: int32 = 0;
+  var t0: int64 = meo_clock_realtime_us();
+  while (i < MT_THREADS) {
+    args[i] = new MtArg;
+    args[i]->tid = i;
+    args[i]->err = 0;
+    args[i]->err_op = 0;
+    args[i]->busy = 0;
+    args[i]->n_ins = 0;
+    args[i]->n_adds = 0;
+    args[i]->ids = (int64*)malloc((int64)MT_OPS * 8);
+    hs[i] = CreateThread(0, 0, &mt_worker, (cstring)args[i], 0, 0);
+    if (hs[i] == 0) { return mt_fail("thread {i} did not start"); }
+    i += 1;
+  }
+  i = 0;
+  while (i < MT_THREADS) {
+    var left: int64 = MT_DEADLINE_MS - (meo_clock_realtime_us() - t0) / 1000;
+    if (left < 1) { left = 1; }
+    if (thread_join(hs[i], (uint32)left) != WAIT_OBJECT_0()) {
+      mt_fail("thread {i} still running after {MT_DEADLINE_MS} ms (deadlock?)");
+      syscall(231, (int64)1);
+    }
+    thread_close(hs[i]);
+    i += 1;
+  }
+  var ms: int64 = (meo_clock_realtime_us() - t0) / 1000;
+  var busy: int32 = 0;
+  i = 0;
+  while (i < MT_THREADS) {
+    busy += args[i]->busy;
+    if (args[i]->err != 0) {
+      return mt_fail("thread {i} op {args[i]->err_op}: rc={args[i]->err}");
+    }
+    i += 1;
+  }
+  if (busy != 0) { return mt_fail("{busy} ops got BUSY"); }
+  if (mt_verify(args.data) != 0) { return 1; }
+  var rc: int32 = meo_db_close(g_db);
+  if (rc != MEO_OK) { return mt_fail("close rc={rc}"); }
+  println("query_mt: {MT_THREADS} threads x {MT_OPS} ops in {ms} ms");
+  i = 0;
+  while (i < MT_THREADS) {
+    free(args[i]->ids);
+    free(args[i]);
+    i += 1;
+  }
+  free(args.data);
+  free(hs.data);
+  meo_file_unlink(MT_DB);
+  return 0;
+}
+
+fn main() -> int32 {
+  if (mt_main() != 0) { return 1; }
+  println("PASS query_mt");
+  return 0;
+}
