@@ -30,11 +30,14 @@ Layers 3, 4a, 5. Consumer: flux_orm.
 
 ## M4 — Change feed + in-process real-time
 Layer 6. Consumers: mistplot live push, raize notifications.
-Started early, below the table layer: the pager commit hook and persisted `commit_seq` are committed (c48a114), and `src/feed/feed.mettle` (capture through `meo_feed_insert`) is in progress. M4 moves capture up to `table/` so SQL writes are reported too.
+Started early, below the table layer: the pager commit hook, persisted `commit_seq` and `src/feed/feed.mettle` (capture through `meo_feed_insert`) are built, and mistplot uses them. M4 moves capture up to `table/` so SQL writes are reported too, keeping the existing `meo_feed_*` and `MeoChange` names and meanings (new fields are appended).
 - [ ] Every committed insert/update/delete emits one event (table id, op, rowid, new row) with a 64-bit commit sequence, in commit order.
 - [ ] A rolled-back transaction emits nothing.
 - [ ] `meo_feed_subscribe(db, table, ring)` delivers into a bounded ring per subscriber. A slow subscriber gets an "overrun, resync from seq N" marker and never blocks the writer.
 - [ ] Callbacks run on a feed thread, never under the db lock (asserted). A mistplot demo calls `mp_live_push` from the feed thread under its own app lock.
+- [ ] A ring-overrun GAP event carries the last commit time, not 0, and that time can be read directly.
+- [ ] `meo_key_int` has an inverse, so consumers don't decode keys by hand.
+- [ ] `meo_peek_commit_seq` tells a transient CORRUPT (autocommit flush mid-write) apart from real damage.
 
 ## M5 — WAL + MVCC concurrent readers
 Layer 4b. Consumer: raize_web read-heavy load.
