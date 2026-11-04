@@ -55,11 +55,17 @@ Layer 7.
 - [ ] Graph writes go through the same transactions and the change feed.
 
 ## M7 — Network server + remote real-time
-Layers 8 and 11.
-- [ ] `meo_srv_` serves a length-prefixed frame protocol (a typed query frame, step, free, begin/commit) with thread-per-connection.
-- [ ] `meo_cli_` passes the M2 query suite remotely.
-- [ ] Remote `SUBSCRIBE table` pushes M4 events over TCP within 50 ms p99 on localhost; raize can relay them to browsers.
-- [ ] 64 concurrent connections; a killed client never leaves the db lock held (server-side timeout + rollback).
+Layers 8 and 11. Consumer: flux_orm, which reaches MeoSQL over TCP instead of compiling it in. Remote subscribe comes after M4.
+- [ ] A `meosql` binary serves one database file over TCP, bound to 127.0.0.1 by default, one thread per connection, up to 64 connections. Further connections get a BUSY frame and are closed.
+- [ ] Length-prefixed binary frames: HELLO (version check, optional token), PING, BEGIN, COMMIT, ROLLBACK, QUERY (a typed statement with typed values), BYE. A result comes back whole, with affected rows and the last rowid.
+- [ ] The frame codec round-trips every frame kind and value exactly. Every truncated or corrupted frame is refused without a crash or an out-of-bounds read (`wire_self`).
+- [ ] `meo_cli_` passes the M2 query suite and every flux_orm query shape remotely, with the same results as embedded (`srv_e2e`).
+- [ ] 64 clients on loopback, mixed insert/select, some in explicit transactions: no lost row, no deadlock (`srv_mt`).
+- [ ] A client killed mid-transaction: its writes are gone, and another connection gets the lock within 1 s. A client that hangs mid-transaction is cut off after the transaction idle timeout (`srv_kill`).
+- [ ] An oversize frame gets TOOBIG, a wrong version gets VERSION, a wrong token gets AUTH, and a result over the frame limit gets TOOBIG with the connection still usable (`srv_limits`).
+- [ ] Stopping the server rolls back open transactions. Reopening shows only committed data (`srv_stop`).
+- [ ] flux_orm's network adapter passes its tests against a running server.
+- [ ] After M4: remote `SUBSCRIBE table` pushes events within 50 ms p99 on localhost, and raize can relay them to browsers.
 
 ## M8 — Replication + fault tolerance (log shipping)
 Layer 9, step 1.

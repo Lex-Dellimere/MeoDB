@@ -13,14 +13,16 @@ Build order: [ROADMAP.md](ROADMAP.md).
 | 2 | B-tree + key encoding | `src/btree/`, `src/types/key.mettle` | `meo_bt_`, `meo_btn_`, `meo_key_` | 1 | tables, indexes, graph | built; delete in M2 |
 | 3 | Records, catalog, tables, db handle | `src/record/`, `src/catalog/`, `src/table/`, `src/db/` | `meo_rec_`, `meo_cat_`, `meo_tbl_`, `meo_db_` | 2, 4a | mistplot (data mapping), flux_orm via 5 | M2 |
 | 4a | Concurrency v1: db-wide lock | `src/conc/` | `meo_lock_` | std/thread | raize_web (64 threads) | M2 |
-| 5 | Typed queries (no query language) | `src/query/` | `meo_q_` | 3 | flux_orm | M2 |
+| 5 | Typed queries (no query language) | `src/query/` | `meo_q_` | 3 | the server (flux_orm), embedded apps | M2 |
 | 4b | Concurrency v2: WAL + MVCC readers | `src/wal/`, `src/conc/` | `meo_wal_`, `meo_snap_` | 1, 2 | raize_web read-heavy load | later (M5) |
 | 6 | Change feed | `src/feed/` | `meo_feed_` | 1 (pager commit hook), 3 | mistplot live push, raize notifications | built for pager-level writes (`meo_feed_insert`); table writes in M4 |
 | 7 | Graph | `src/graph/` | `meo_graph_` | 3 (node/edge tables, adjacency index) | apps that model relations | later (M6) |
-| 8 | Server + network | `src/net/`, `src/client/` | `meo_srv_`, `meo_cli_` | 5, 6 | remote raize workers, tools | later (M7) |
+| 8a | Wire protocol (frame codec) | `src/wire/` | `meo_wire_` | 0, record values | server and client | M7 |
+| 8b | Server | `src/net/`, `src/server/` | `meo_sock_`, `meo_srv_` | 5, 8a | flux_orm over TCP, tools | M7 |
+| 8c | Client | `src/client/` | `meo_cli_` | 8a, `src/net/` | MeoSQL's own tests; reference for other clients | M7 |
 | 9 | Replication + fault tolerance | `src/repl/`, `src/raft/` | `meo_repl_`, `meo_raft_` | 4b (WAL is the log), 8 | high availability | later (M8, M9) |
 | 10 | Distribution / sharding | `src/shard/` | `meo_shard_` | 8, 9 | data beyond one node | later (M10) |
-| 11 | Real-time access over the network | `src/net/` (subscribe frames) | `meo_sub_` | 6, 8 | browser dashboards via raize | later (M7) |
+| 11 | Real-time access over the network | `src/server/` (push frames) | `meo_sub_` | 6, 8 | mistplot, browser dashboards via raize | later (M7, after M4) |
 
 The layer numbers show dependency, not build order. 4b is built after 6, for example.
 
@@ -32,7 +34,8 @@ A consumer imports exactly one root file through `mettle.deps`:
 |---|---|---|
 | `src/meo_core.mettle` | layers 0-4a | embedded storage and tables, no query layer |
 | `src/meosql.mettle` | meo_core + layer 5 | flux_orm, most apps |
-| `src/meo_server.mettle` (later) | meosql + 6, 8, 11 | a networked node |
+| `src/meo_server.mettle` | meosql + 8a, 8b (later 6, 11) | the `meosql` server, or a program that embeds one |
+| `src/meo_client.mettle` | 8a, 8c, no engine | programs that talk to a server |
 
 Rules: no circular imports (E0006 fails the build), no lower layer imports a higher one, nothing imports a root. Exports are global across the import graph in Mettle, so every export carries the `meo_`/`Meo`/`MEO_` prefix.
 
@@ -44,6 +47,13 @@ Rules: no circular imports (E0006 fails the build), no lower layer imports a hig
 - **Catalog.** Schemas live in a table tree at `meta.catalog_root`. They are loaded at open.
 - **Queries.** There is no query language. A caller builds a query with function calls (`meo_q_select`, `meo_q_where`, `meo_q_order`, ...) and passes values as `MeoValue`. A planner picks a rowid lookup, an index lookup or a full scan. A select result is built at the first `meo_q_step` and then read row by row or as a whole. flux_orm translates its own query struct into these calls.
 - **Concurrency v1.** One lock per db handle, built on the runtime's futex mutex and re-entrant for its owner. One thread works inside the engine at a time. An explicit transaction holds the lock until it ends.
+
+## The network server
+
+- **Process.** The `meosql` binary owns one database file. One thread accepts connections and each connection gets its own thread, up to 64. Bound to 127.0.0.1 unless told otherwise; an optional shared token is checked at HELLO. No TLS and no users yet.
+- **Transactions.** A connection that runs BEGIN holds the db lock until its COMMIT or ROLLBACK, so other connections wait (and get BUSY after the busy timeout). If the client disconnects, hangs past the transaction idle timeout or the server stops, the server rolls the transaction back on that connection's thread and the lock is free.
+- **Protocol.** Little-endian frames with a 12-byte header (length, kind, request id). A QUERY carries the same statement shape flux_orm builds: kind, table, columns, filter terms, order, limit, offset, typed values. Results come back whole; there are no server-side cursors.
+- **Clients.** flux_orm writes its own small codec from the protocol spec and does not compile MeoSQL. `src/client/` is MeoSQL's reference client.
 
 ## How later layers fit Mettle's limits
 
