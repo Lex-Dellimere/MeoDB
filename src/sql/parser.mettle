@@ -1,6 +1,5 @@
-// sql/parser: one statement -> MeoAst in the statement arena (D7).
-// Real: CREATE TABLE, INSERT ... VALUES, SELECT (* | cols) FROM t.
-// WS7: WHERE, ORDER BY, LIMIT, OFFSET, UPDATE, DELETE (now UNSUPPORTED).
+// sql/parser: one statement -> MeoAst in the statement arena. Recursive
+// descent over the grammar in sql/ast, one function per statement.
 
 import "../error/status.mettle";
 import "../record/value.mettle";
@@ -94,10 +93,24 @@ fn prs_unquote(ps: PrsState*, out_p: uint8**, out_n: int32*) -> int32 {
   return MEO_OK;
 }
 
+// Words that end or shape a clause; a bare one is never a name, so
+// `SELECT FROM t` fails at FROM rather than at t.
+fn prs_reserved(ps: PrsState*) -> bool {
+  return prs_is(ps, "SELECT") || prs_is(ps, "FROM") || prs_is(ps, "WHERE")
+    || prs_is(ps, "AND") || prs_is(ps, "OR") || prs_is(ps, "ORDER") || prs_is(ps, "BY")
+    || prs_is(ps, "LIMIT") || prs_is(ps, "OFFSET") || prs_is(ps, "INSERT")
+    || prs_is(ps, "INTO") || prs_is(ps, "VALUES") || prs_is(ps, "UPDATE")
+    || prs_is(ps, "SET") || prs_is(ps, "DELETE") || prs_is(ps, "CREATE")
+    || prs_is(ps, "TABLE") || prs_is(ps, "NULL") || prs_is(ps, "NOT")
+    || prs_is(ps, "IS") || prs_is(ps, "IN") || prs_is(ps, "JOIN")
+    || prs_is(ps, "LEFT") || prs_is(ps, "ON");
+}
+
 // name := IDENT | "QUOTED"
 fn prs_name(ps: PrsState*, out: MeoAstName*) -> int32 {
   out->off = ps->tok.off;
   if (ps->tok.kind == MEO_TK_IDENT) {
+    if (prs_reserved(ps)) { return prs_fail(ps, -MEO_ERR_SQL); }
     out->p = ps->lx.src + ps->tok.off;
     out->n = ps->tok.len;
   } else if (ps->tok.kind == MEO_TK_QIDENT) {
@@ -125,6 +138,55 @@ fn prs_digits(ps: PrsState*, start: int32, end: int32, out: uint64*) -> bool {
   return true;
 }
 
+// digits.digits -> float64. Up to 18 digits and 22 fraction digits it is one
+// exact integer divided by an exact power of ten, so correctly rounded; longer
+// literals take the digit loop and may be an ulp off.
+fn prs_real(ps: PrsState*, s: int32, e: int32, neg: bool) -> float64 {
+  var mant: uint64 = 0;
+  var nd: int32 = 0;
+  var nf: int32 = 0;
+  var frac: bool = false;
+  var i: int32 = s;
+  while (i < e) {
+    var c: uint8 = ps->lx.src[i];
+    if (c == (uint8)46) {
+      frac = true;
+    } else {
+      if (nd < 18) { mant = mant * (uint64)10 + (uint64)(c - (uint8)48); }
+      nd += 1;
+      if (frac) { nf += 1; }
+    }
+    i += 1;
+  }
+  var f: float64 = 0.0;
+  if (nd <= 18 && nf <= 22) {
+    var p10: float64 = 1.0;
+    var k: int32 = 0;
+    while (k < nf) {
+      p10 = p10 * 10.0;
+      k += 1;
+    }
+    f = (float64)mant / p10;
+  } else {
+    var scale: float64 = 1.0;
+    frac = false;
+    i = s;
+    while (i < e) {
+      var d: uint8 = ps->lx.src[i];
+      if (d == (uint8)46) {
+        frac = true;
+      } else {
+        f = f * 10.0 + (float64)(int32)(d - (uint8)48);
+        if (frac) { scale = scale * 10.0; }
+      }
+      i += 1;
+    }
+    f = f / scale;
+  }
+  if (neg) { f = 0.0 - f; }
+  return f;
+}
+
 // A numeric literal token (INT or REAL), negated when `neg`.
 fn prs_number(ps: PrsState*, neg: bool, out: MeoValue*) -> int32 {
   var s: int32 = ps->tok.off;
@@ -140,24 +202,7 @@ fn prs_number(ps: PrsState*, neg: bool, out: MeoValue*) -> int32 {
     return prs_advance(ps);
   }
   if (ps->tok.kind == MEO_TK_REAL) {
-    // WS7: exact decimal -> binary conversion (this one can be 1 ulp off).
-    var f: float64 = 0.0;
-    var i: int32 = s;
-    while (i < e && ps->lx.src[i] != (uint8)46) {
-      f = f * 10.0 + (float64)(int32)(ps->lx.src[i] - (uint8)48);
-      i += 1;
-    }
-    i += 1;
-    var scale: float64 = 1.0;
-    var frac: float64 = 0.0;
-    while (i < e) {
-      frac = frac * 10.0 + (float64)(int32)(ps->lx.src[i] - (uint8)48);
-      scale = scale * 10.0;
-      i += 1;
-    }
-    f = f + frac / scale;
-    if (neg) { f = 0.0 - f; }
-    meo_value_set_real(out, f);
+    meo_value_set_real(out, prs_real(ps, s, e, neg));
     return prs_advance(ps);
   }
   return prs_fail(ps, -MEO_ERR_SQL);
@@ -323,6 +368,10 @@ fn prs_insert(ps: PrsState*) -> int32 {
       ps->err_off[0] = row_off;
       return -MEO_ERR_SQL;
     }
+    if (a->n_names > 0 && width != a->n_names) {
+      ps->err_off[0] = row_off;
+      return -MEO_ERR_SQL;
+    }
     a->n_rows += 1;
     if (ps->tok.kind != MEO_TK_COMMA) { break; }
     rc = prs_advance(ps);
@@ -331,7 +380,123 @@ fn prs_insert(ps: PrsState*) -> int32 {
   return MEO_OK;
 }
 
-// SELECT (* | name {, name}) FROM name   [WS7: where, ORDER BY, LIMIT, OFFSET]
+// IN ( operand {, operand} ) -> t->list / n_list
+fn prs_in_list(ps: PrsState*, t: MeoAstTerm*) -> int32 {
+  var rc: int32 = prs_expect(ps, MEO_TK_LPAREN);
+  if (rc != MEO_OK) { return rc; }
+  var cap: int32 = 0;
+  while (true) {
+    var g: uint8* = prs_grow(ps, (uint8*)t->list, t->n_list, &cap,
+      (int64)sizeof(MeoAstOperand));
+    if (g == 0) { return -MEO_ERR_NOMEM; }
+    t->list = (MeoAstOperand*)g;
+    rc = prs_operand(ps, &t->list[t->n_list]);
+    if (rc != MEO_OK) { return rc; }
+    t->n_list += 1;
+    if (ps->tok.kind != MEO_TK_COMMA) { break; }
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+  }
+  return prs_expect(ps, MEO_TK_RPAREN);
+}
+
+// term := name = operand | name IN ( ... ) | name IS [NOT] NULL
+fn prs_term(ps: PrsState*, t: MeoAstTerm*) -> int32 {
+  var rc: int32 = prs_name(ps, &t->col);
+  if (rc != MEO_OK) { return rc; }
+  if (ps->tok.kind == MEO_TK_EQ) {
+    t->kind = MEO_AST_T_EQ;
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+    return prs_operand(ps, &t->rhs);
+  }
+  if (prs_is(ps, "IN")) {
+    t->kind = MEO_AST_T_IN;
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+    return prs_in_list(ps, t);
+  }
+  if (prs_is(ps, "IS")) {
+    t->kind = MEO_AST_T_IS_NULL;
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+    if (prs_is(ps, "NOT")) {
+      t->kind = MEO_AST_T_NOT_NULL;
+      rc = prs_advance(ps);
+      if (rc != MEO_OK) { return rc; }
+    }
+    return prs_expect_kw(ps, "NULL");
+  }
+  // Valid SQL the term kinds cannot hold yet.
+  if (ps->tok.kind == MEO_TK_CMP || prs_is(ps, "LIKE") || prs_is(ps, "BETWEEN")) {
+    return prs_fail(ps, -MEO_ERR_UNSUPPORTED);
+  }
+  return prs_fail(ps, -MEO_ERR_SQL);
+}
+
+// [WHERE term {AND term}] -> ast->where_terms / n_where
+fn prs_where(ps: PrsState*) -> int32 {
+  if (!prs_is(ps, "WHERE")) { return MEO_OK; }
+  var a: MeoAst* = ps->ast;
+  var cap: int32 = 0;
+  while (true) {
+    var rc: int32 = prs_advance(ps);  // WHERE or AND
+    if (rc != MEO_OK) { return rc; }
+    var g: uint8* = prs_grow(ps, (uint8*)a->where_terms, a->n_where, &cap,
+      (int64)sizeof(MeoAstTerm));
+    if (g == 0) { return -MEO_ERR_NOMEM; }
+    a->where_terms = (MeoAstTerm*)g;
+    rc = prs_term(ps, &a->where_terms[a->n_where]);
+    if (rc != MEO_OK) { return rc; }
+    a->n_where += 1;
+    if (!prs_is(ps, "AND")) { return MEO_OK; }
+  }
+  return MEO_OK;
+}
+
+// A non-negative integer literal (LIMIT / OFFSET).
+fn prs_count(ps: PrsState*, out: int64*) -> int32 {
+  if (ps->tok.kind != MEO_TK_INT) { return prs_fail(ps, -MEO_ERR_SQL); }
+  var v: MeoValue;
+  var rc: int32 = prs_number(ps, false, &v);
+  if (rc != MEO_OK) { return rc; }
+  out[0] = v.i;
+  return MEO_OK;
+}
+
+// ORDER BY name [ASC|DESC] {, name [ASC|DESC]}
+fn prs_order(ps: PrsState*) -> int32 {
+  var a: MeoAst* = ps->ast;
+  var rc: int32 = prs_advance(ps);
+  if (rc == MEO_OK) { rc = prs_expect_kw(ps, "BY"); }
+  if (rc != MEO_OK) { return rc; }
+  var cap: int32 = 0;
+  while (true) {
+    var g: uint8* = prs_grow(ps, (uint8*)a->order, a->n_order, &cap,
+      (int64)sizeof(MeoAstOrder));
+    if (g == 0) { return -MEO_ERR_NOMEM; }
+    a->order = (MeoAstOrder*)g;
+    var o: MeoAstOrder* = &a->order[a->n_order];
+    rc = prs_name(ps, &o->col);
+    if (rc != MEO_OK) { return rc; }
+    o->desc = false;
+    if (prs_is(ps, "DESC")) {
+      o->desc = true;
+      rc = prs_advance(ps);
+    } else if (prs_is(ps, "ASC")) {
+      rc = prs_advance(ps);
+    }
+    if (rc != MEO_OK) { return rc; }
+    a->n_order += 1;
+    if (ps->tok.kind != MEO_TK_COMMA) { return MEO_OK; }
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+  }
+  return MEO_OK;
+}
+
+// SELECT (* | name {, name}) FROM name [where] [ORDER BY ...] [LIMIT int]
+//   [OFFSET int]
 fn prs_select(ps: PrsState*) -> int32 {
   var a: MeoAst* = ps->ast;
   a->kind = MEO_AST_SELECT;
@@ -345,12 +510,63 @@ fn prs_select(ps: PrsState*) -> int32 {
   if (rc == MEO_OK) { rc = prs_expect_kw(ps, "FROM"); }
   if (rc == MEO_OK) { rc = prs_name(ps, &a->table); }
   if (rc != MEO_OK) { return rc; }
-  if (prs_is(ps, "WHERE") || prs_is(ps, "ORDER") || prs_is(ps, "LIMIT")
-      || prs_is(ps, "OFFSET") || prs_is(ps, "JOIN") || prs_is(ps, "LEFT")
-      || prs_is(ps, "INNER") || ps->tok.kind == MEO_TK_COMMA) {
-    return prs_fail(ps, -MEO_ERR_UNSUPPORTED);  // WS7: where / order / limit
+  if (prs_is(ps, "JOIN") || prs_is(ps, "LEFT") || prs_is(ps, "INNER")
+      || prs_is(ps, "CROSS") || ps->tok.kind == MEO_TK_COMMA) {
+    return prs_fail(ps, -MEO_ERR_UNSUPPORTED);
+  }
+  rc = prs_where(ps);
+  if (rc != MEO_OK) { return rc; }
+  if (prs_is(ps, "ORDER")) {
+    rc = prs_order(ps);
+    if (rc != MEO_OK) { return rc; }
+  }
+  if (prs_is(ps, "LIMIT")) {
+    rc = prs_advance(ps);
+    if (rc == MEO_OK) { rc = prs_count(ps, &a->limit); }
+    if (rc != MEO_OK) { return rc; }
+  }
+  if (prs_is(ps, "OFFSET")) {
+    rc = prs_advance(ps);
+    if (rc == MEO_OK) { rc = prs_count(ps, &a->offset); }
+    if (rc != MEO_OK) { return rc; }
   }
   return MEO_OK;
+}
+
+// UPDATE name SET name = operand {, name = operand} [where]
+fn prs_update(ps: PrsState*) -> int32 {
+  var a: MeoAst* = ps->ast;
+  a->kind = MEO_AST_UPDATE;
+  var rc: int32 = prs_name(ps, &a->table);
+  if (rc == MEO_OK) { rc = prs_expect_kw(ps, "SET"); }
+  if (rc != MEO_OK) { return rc; }
+  var cap: int32 = 0;
+  while (true) {
+    var g: uint8* = prs_grow(ps, (uint8*)a->sets, a->n_sets, &cap,
+      (int64)sizeof(MeoAstAssign));
+    if (g == 0) { return -MEO_ERR_NOMEM; }
+    a->sets = (MeoAstAssign*)g;
+    var st: MeoAstAssign* = &a->sets[a->n_sets];
+    rc = prs_name(ps, &st->col);
+    if (rc == MEO_OK) { rc = prs_expect(ps, MEO_TK_EQ); }
+    if (rc == MEO_OK) { rc = prs_operand(ps, &st->val); }
+    if (rc != MEO_OK) { return rc; }
+    a->n_sets += 1;
+    if (ps->tok.kind != MEO_TK_COMMA) { break; }
+    rc = prs_advance(ps);
+    if (rc != MEO_OK) { return rc; }
+  }
+  return prs_where(ps);
+}
+
+// DELETE FROM name [where]
+fn prs_delete(ps: PrsState*) -> int32 {
+  var a: MeoAst* = ps->ast;
+  a->kind = MEO_AST_DELETE;
+  var rc: int32 = prs_expect_kw(ps, "FROM");
+  if (rc == MEO_OK) { rc = prs_name(ps, &a->table); }
+  if (rc != MEO_OK) { return rc; }
+  return prs_where(ps);
 }
 
 // Parse exactly one statement of src[0..n) into *ast, allocating in `arena`.
@@ -379,8 +595,12 @@ export fn meo_sql_parse(src: uint8*, n: int32, arena: MeoArena*, ast: MeoAst*,
   } else if (prs_is(&ps, "SELECT")) {
     rc = prs_advance(&ps);
     if (rc == MEO_OK) { rc = prs_select(&ps); }
-  } else if (prs_is(&ps, "UPDATE") || prs_is(&ps, "DELETE")) {
-    return prs_fail(&ps, -MEO_ERR_UNSUPPORTED);  // WS7: UPDATE, DELETE
+  } else if (prs_is(&ps, "UPDATE")) {
+    rc = prs_advance(&ps);
+    if (rc == MEO_OK) { rc = prs_update(&ps); }
+  } else if (prs_is(&ps, "DELETE")) {
+    rc = prs_advance(&ps);
+    if (rc == MEO_OK) { rc = prs_delete(&ps); }
   } else {
     return prs_fail(&ps, -MEO_ERR_SQL);
   }

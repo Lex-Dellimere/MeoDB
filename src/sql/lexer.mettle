@@ -1,6 +1,6 @@
-// sql/lexer: SQL bytes -> (kind, off, len) tokens, no allocation (D7).
+// sql/lexer: SQL bytes -> (kind, off, len) tokens, no allocation.
 // Keywords lex as IDENT and are matched with meo_lex_kw; quoted spans include
-// their quotes. WS7 owns it (parse_self).
+// their quotes.
 
 import "../error/status.mettle";
 
@@ -19,6 +19,7 @@ export const MEO_TK_STAR: int32 = 11;
 export const MEO_TK_EQ: int32 = 12;
 export const MEO_TK_MINUS: int32 = 13;
 export const MEO_TK_DOT: int32 = 14;
+export const MEO_TK_CMP: int32 = 15;    // < <= > >= <> !=
 
 export struct MeoToken {
   kind: int32;   // MEO_TK_*
@@ -72,14 +73,17 @@ fn lex_quoted(lx: MeoLexer*, start: int32, q: uint8) -> int32 {
 // The next token. MEO_OK with *tok set (MEO_TK_EOF at the end), or
 // -MEO_ERR_SQL with tok->off at the offending byte.
 export fn meo_lex_next(lx: MeoLexer*, tok: MeoToken*) -> int32 {
-  while (lx->pos < lx->n) {
+  var skip: bool = true;
+  while (skip && lx->pos < lx->n) {
     var c0: uint8 = lx->src[lx->pos];
     if (lex_is_space(c0)) {
       lx->pos += 1;
     } else if (c0 == (uint8)45 && lx->pos + 1 < lx->n && lx->src[lx->pos + 1] == (uint8)45) {
-      while (lx->pos < lx->n && lx->src[lx->pos] != (uint8)10) { lx->pos += 1; }
+      var j: int32 = lx->pos + 2;
+      while (j < lx->n && lx->src[j] != (uint8)10) { j += 1; }
+      lx->pos = j;
     } else {
-      break;
+      skip = false;
     }
   }
   var s: int32 = lx->pos;
@@ -130,6 +134,14 @@ export fn meo_lex_next(lx: MeoLexer*, tok: MeoToken*) -> int32 {
     tok->kind = MEO_TK_MINUS;
   } else if (c == (uint8)46) {
     tok->kind = MEO_TK_DOT;
+  } else if (c == (uint8)60 || c == (uint8)62) {
+    tok->kind = MEO_TK_CMP;
+    if (e < lx->n && (lx->src[e] == (uint8)61 || (c == (uint8)60 && lx->src[e] == (uint8)62))) {
+      e += 1;
+    }
+  } else if (c == (uint8)33 && e < lx->n && lx->src[e] == (uint8)61) {
+    tok->kind = MEO_TK_CMP;
+    e += 1;
   } else {
     return -MEO_ERR_SQL;
   }

@@ -90,3 +90,7 @@ main = "tests/record_self.mettle"
 # The db lock under 64 threads.
 [bin.lock_self]
 main = "tests/lock_self.mettle"
+
+# Lexer and parser for the whole SQL subset, including error offsets.
+[bin.parse_self]
+main = "tests/parse_self.mettle"
