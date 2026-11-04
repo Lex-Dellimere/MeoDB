@@ -146,4 +146,43 @@ fn project() {
 
   // Stopping the server with open transactions.
   mb_bin("srv_stop", "tests/srv_stop.mettle");
+
+  // Futex, clock and meta fields for the WAL.
+  mb_bin("m5_base_self", "tests/m5_base_self.mettle");
+
+  // Shared reader page cache.
+  mb_bin("pcache_self", "tests/pcache_self.mettle");
+
+  // WAL format, index and recovery.
+  mb_bin("wal_self", "tests/wal_self.mettle");
+
+  // Group commit, read marks, checkpoint and restart.
+  mb_bin("wal_sync_self", "tests/wal_sync_self.mettle");
+
+  // Pager writer in WAL mode.
+  mb_bin("wal_pager_self", "tests/wal_pager_self.mettle");
+
+  // Snapshot views.
+  mb_bin("wal_snap_self", "tests/wal_snap_self.mettle");
+
+  // Change feed in WAL mode.
+  mb_bin("feed_wal", "tests/feed_wal.mettle");
+
+  // Db layer in WAL mode.
+  mb_bin("wal_db_self", "tests/wal_db_self.mettle");
+
+  // 63 readers and one writer.
+  mb_bin("wal_mt", "tests/wal_mt.mettle");
+
+  // Crash at every WAL I/O point.
+  mb_bin("wal_crash", "tests/wal_crash.mettle");
+
+  // Group commit through the db layer.
+  mb_bin("wal_group", "tests/wal_group.mettle");
+
+  // Reader scaling.
+  mb_bin("wal_scale", "tests/wal_scale.mettle");
+
+  // Server in WAL mode.
+  mb_bin("srv_wal", "tests/srv_wal.mettle");
 }
